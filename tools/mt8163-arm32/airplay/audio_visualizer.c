@@ -17,6 +17,9 @@
 #define INITIAL_NOISE_FLOOR 8U
 #define LEVEL_FLOOR_LOG2_Q8 (3U << 8)
 #define LEVEL_RANGE_LOG2_Q8 (11U << 8)
+#define DISPLAY_MIN_RANGE 32U
+#define DISPLAY_CONTRAST_RANGE 28U
+#define DISPLAY_TRANSIENT_LIMIT 84U
 
 struct band_coefficients {
 	int32_t b0;
@@ -93,6 +96,7 @@ static uint8_t normalize_level(struct audio_visualizer_band *band,
 	uint32_t logarithmic;
 	uint32_t raw;
 	uint32_t difference;
+	uint8_t previous;
 
 	/*
 	 * The floor follows falling energy in about 0.3 seconds, but rises only
@@ -126,6 +130,7 @@ static uint8_t normalize_level(struct audio_visualizer_band *band,
 	 * daemon performs a final small amount of display smoothing, so keeping a
 	 * long envelope here makes percussion visibly trail the music.
 	 */
+	previous = band->level;
 	if (raw > band->level) {
 		difference = raw - band->level;
 		band->level = (uint8_t)(band->level +
@@ -135,7 +140,103 @@ static uint8_t normalize_level(struct audio_visualizer_band *band,
 		band->level = (uint8_t)(band->level -
 			(difference + 2U) / 3U);
 	}
+	band->previous_level = previous;
 	return band->level;
+}
+
+static uint8_t clamp_level(uint32_t value)
+{
+	return value > 255U ? 255U : (uint8_t)value;
+}
+
+static void shape_display_levels(struct audio_visualizer *visualizer,
+				 uint8_t levels[AUDIO_VISUALIZER_BANDS])
+{
+	uint32_t minimum = 255U;
+	uint32_t maximum = 0;
+	unsigned int band;
+
+	for (band = 0; band < AUDIO_VISUALIZER_BANDS; ++band) {
+		if (levels[band] < minimum)
+			minimum = levels[band];
+		if (levels[band] > maximum)
+			maximum = levels[band];
+	}
+
+	for (band = 0; band < AUDIO_VISUALIZER_BANDS; ++band) {
+		struct audio_visualizer_band *state = &visualizer->bands[band];
+		uint32_t level = levels[band];
+		uint32_t range;
+		uint32_t dynamic;
+		uint32_t contrast;
+		uint32_t movement;
+		uint32_t transient;
+		uint32_t shaped;
+
+		if (state->display_peak == 0 && state->display_floor == 0) {
+			state->display_floor = level > DISPLAY_MIN_RANGE
+				? (uint8_t)(level - DISPLAY_MIN_RANGE) : 0;
+			state->display_peak = clamp_level(level + DISPLAY_MIN_RANGE);
+		}
+
+		if (level < state->display_floor) {
+			state->display_floor = (uint8_t)(
+				(3U * state->display_floor + level + 2U) / 4U);
+		} else {
+			state->display_floor = (uint8_t)(
+				state->display_floor +
+				(level - state->display_floor + 63U) / 64U);
+		}
+
+		if (level > state->display_peak) {
+			state->display_peak = (uint8_t)(
+				(3U * state->display_peak + level + 3U) / 4U);
+		} else {
+			state->display_peak = (uint8_t)(
+				state->display_peak -
+				(state->display_peak - level + 31U) / 32U);
+		}
+
+		if (state->display_peak < state->display_floor + DISPLAY_MIN_RANGE)
+			state->display_peak = clamp_level(
+				state->display_floor + DISPLAY_MIN_RANGE);
+
+		range = state->display_peak - state->display_floor;
+		if (range < DISPLAY_MIN_RANGE)
+			range = DISPLAY_MIN_RANGE;
+		dynamic = level > state->display_floor
+			? ((level - state->display_floor) * 255U) / range : 0;
+
+		range = maximum > minimum ? maximum - minimum : DISPLAY_MIN_RANGE;
+		if (range < DISPLAY_CONTRAST_RANGE)
+			range = DISPLAY_CONTRAST_RANGE;
+		contrast = level > minimum
+			? ((level - minimum) * 255U) / range : 0;
+		if (contrast > 255U)
+			contrast = 255U;
+
+		movement = level > state->previous_level
+			? level - state->previous_level
+			: state->previous_level - level;
+		transient = movement * 4U;
+		if (transient > DISPLAY_TRANSIENT_LIMIT)
+			transient = DISPLAY_TRANSIENT_LIMIT;
+
+		/*
+		 * Dense mixes tend to keep every fixed band high at once, which
+		 * makes absolute levels look static on a 12-pixel ring.  Blend
+		 * absolute level with adaptive per-band range, cross-band contrast
+		 * and short transients so busy choruses still visibly breathe.
+		 */
+		shaped = (level * 3U + dynamic * 2U + contrast * 3U + 4U) / 8U;
+		if (level < state->previous_level && shaped > level)
+			shaped = (level * 4U + shaped + 2U) / 5U;
+		if (shaped + transient > 255U)
+			shaped = 255U;
+		else
+			shaped += transient;
+		levels[band] = (uint8_t)shaped;
+	}
 }
 
 void audio_visualizer_init(struct audio_visualizer *visualizer)
@@ -197,4 +298,5 @@ void audio_visualizer_process(struct audio_visualizer *visualizer,
 		levels[band] = normalize_level(&visualizer->bands[band],
 					      magnitude);
 	}
+	shape_display_levels(visualizer, levels);
 }
