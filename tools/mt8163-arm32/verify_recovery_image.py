@@ -39,7 +39,7 @@ STOCK_DTB_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57
 PADDED_STOCK_DTB_SHA256 = "08b16ec39554d644d8cbdf8f5816559f85414ab45bc1901de46a7cd43dc286ed"
 BUSYBOX_SHA256 = "d4c8fd2aea01abd851c703f39b29c0de748b2751e4e1a85cae570fa53ad8f4fb"
 LOADER_SHA256 = "1063871174f1bd4f08f4d330e20b07aeb0820327ee739a4d8d1b644df842cb6b"
-INIT_SHA256 = "74943829c95f200b40a1dd845a962570f6bf3bc186863ecc93957380a40c8162"
+INIT_SHA256 = "db0c684595b4221e5e8b74c4df280d26931931c113b408adc220b456a76b011f"
 ADBD_SHA256 = "1c0d14afb1ce19494ee1da935e1076f49ff57e359d348262a28bb3d56abeb930"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -62,7 +62,6 @@ UI_BINARY_NAMES = {
     "usr/local/sbin/libreecho-web",
     "usr/local/sbin/libreecho-logd",
     "usr/local/sbin/libreecho-networkd",
-    "usr/local/sbin/libreecho-timed",
     "usr/local/sbin/libreecho-audiod",
     "usr/local/sbin/libreecho-micd",
     "usr/local/sbin/libreecho-ledd",
@@ -73,17 +72,16 @@ UI_INIT_NAMES = {
     "etc/init.d/libreecho-web.init",
     "etc/init.d/libreecho-logd.init",
     "etc/init.d/libreecho-networkd.init",
-    "etc/init.d/libreecho-timed.init",
     "etc/init.d/libreecho-audiod.init",
     "etc/init.d/libreecho-micd.init",
     "etc/init.d/libreecho-ledd.init",
     "etc/init.d/libreecho-btd.init",
     "etc/init.d/libreecho-airplayd.init",
+    "etc/init.d/libreecho-ttsd.init",
 }
 UI_FIXED_NAMES = UI_BINARY_NAMES | UI_INIT_NAMES | {
     "etc/libreecho/web-config.json",
     "etc/libreecho/airplay2.conf",
-    "etc/libreecho/ntp.conf",
     "usr/local/share/libreecho/ui-manifest.txt",
 }
 UI_OPTIONAL_NAMES = {"etc/libreecho/users"}
@@ -949,6 +947,8 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                        expected_ui_diff_sha256: str | None,
                        expected_airplay_payload_sha256: str | None,
                        expected_airplay_payload_size: int | None,
+                       expected_tts_payload_sha256: str | None,
+                       expected_tts_payload_size: int | None,
                        expected_nqptp_sha256: str | None,
                        expected_shairport_sync_sha256: str | None,
                        expected_avahi_daemon_sha256: str | None,
@@ -1005,6 +1005,49 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         entries, manifest, expected_ui_manifest_sha256,
         expected_ui_commit, expected_ui_diff_sha256,
     )
+    tts = manifest.get("tts", {"enabled": False})
+    if not isinstance(tts, dict) or not isinstance(tts.get("enabled"), bool):
+        fail("TTS manifest record is malformed")
+    if expected_tts_payload_sha256 is not None or expected_tts_payload_size is not None:
+        payload = tts.get("payload")
+        if (expected_tts_payload_sha256 is None or expected_tts_payload_size is None or
+                not tts.get("enabled") or not tts.get("external_payload") or
+                tts.get("voices") != ["southern-female", "alan"] or
+                tts.get("default_voice") != "southern-female" or
+                tts.get("threads") != 4 or tts.get("streaming") is not True or
+                tts.get("in_process") is not True or
+                tts.get("cpu_boost_during_synthesis") is not True or
+                not isinstance(payload, dict) or payload.get("format") != "squashfs-lz4" or
+                payload.get("filename") != "tts.squashfs" or
+                payload.get("sha256") != expected_tts_payload_sha256 or
+                payload.get("size") != expected_tts_payload_size):
+            fail("external TTS payload manifest is incomplete or mismatched")
+        files = payload.get("files")
+        if not isinstance(files, dict) or not files:
+            fail("external TTS payload file manifest is missing")
+        for required in (
+            "usr/local/sbin/libreecho-ttsd",
+            "usr/local/share/libreecho/tts/models/alan/model.onnx",
+            "usr/local/share/libreecho/tts/models/alan/tokens.txt",
+            "usr/local/share/libreecho/tts/models/southern-female/model.onnx",
+            "usr/local/share/libreecho/tts/models/southern-female/tokens.txt",
+        ):
+            if required not in files:
+                fail(f"external TTS payload member missing: {required}")
+        for voice in ("alan", "southern-female"):
+            prefix = f"usr/local/share/libreecho/tts/models/{voice}/espeak-ng-data/"
+            if not any(str(relative).startswith(prefix) for relative in files):
+                fail(f"external TTS payload lacks eSpeak data for {voice}")
+        for relative, record in files.items():
+            if (not isinstance(relative, str) or not relative or relative.startswith("/") or
+                    "//" in relative or "/../" in f"/{relative}/" or
+                    not isinstance(record, dict) or
+                    not re.fullmatch(r"[0-9a-f]{64}", str(record.get("sha256", "")))):
+                fail(f"external TTS payload contains an unsafe file record: {relative!r}")
+        if "usr/local/sbin/libreecho-ttsd" in entries:
+            fail("external TTS daemon leaked into the boot ramdisk")
+    elif tts.get("enabled"):
+        fail("TTS manifest is enabled without an expected external payload")
     airplay = manifest.get("airplay", {"enabled": False})
     if not isinstance(airplay, dict) or not isinstance(airplay.get("enabled"), bool):
         fail("AirPlay manifest record is malformed")
@@ -1428,6 +1471,10 @@ def main() -> None:
                         help="require this external AirPlay 2 SquashFS payload")
     parser.add_argument("--expected-airplay-payload-size", type=int,
                         help="require this external AirPlay 2 payload size")
+    parser.add_argument("--expected-tts-payload-sha256",
+                        help="require this external two-voice TTS SquashFS payload")
+    parser.add_argument("--expected-tts-payload-size", type=int,
+                        help="require this external two-voice TTS payload size")
     parser.add_argument("--expected-dtb-sha256")
     parser.add_argument(
         "--expected-connectivity-bundle",
@@ -1544,6 +1591,7 @@ def main() -> None:
         args.expected_ui_manifest_sha256, args.expected_ui_commit,
         args.expected_ui_diff_sha256,
         args.expected_airplay_payload_sha256, args.expected_airplay_payload_size,
+        args.expected_tts_payload_sha256, args.expected_tts_payload_size,
         args.expected_nqptp_sha256, args.expected_shairport_sync_sha256,
         args.expected_avahi_daemon_sha256, args.expected_dbus_daemon_sha256,
     )
@@ -1566,6 +1614,7 @@ def main() -> None:
         f"connectivity_bundle={'yes' if connectivity_enabled else 'no'} "
         f"audio_tools={'yes' if args.expected_tinyplay_sha256 and args.expected_tinycap_sha256 and args.expected_tinymix_sha256 else 'no'} "
         f"airplay={'yes' if args.expected_airplay_payload_sha256 or (args.expected_nqptp_sha256 and args.expected_shairport_sync_sha256 and args.expected_avahi_daemon_sha256 and args.expected_dbus_daemon_sha256) else 'no'} "
+        f"tts={'yes' if args.expected_tts_payload_sha256 else 'no'} "
         f"network_activation={network_activation} status=PREPARED_NOT_FLASHED"
     )
 

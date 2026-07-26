@@ -12,8 +12,6 @@ plane has configured loopback. They do not replace the existing kernel or
 initramfs control plane:
 
 - `networkd` attaches to the existing `wpa_supplicant` control socket.
-- `timed` waits for network readiness, synchronizes UTC from validated public
-  NTP peers, and writes successful synchronization back to the PMIC RTC.
 - `audiod` uses the existing ALSA device and mixer controls.
 - `micd` owns on-demand microphone capture and starts with capture idle.
 - `ledd` uses the existing LED sysfs/I2C controls.
@@ -25,7 +23,7 @@ bundle installs it as `/etc/libreecho/users` with mode `0600`; the boot service
 then enables local-user authentication automatically. Passwords are never
 stored in this repository.
 
-The image init script starts `logd`, `networkd`, `timed`, `audiod`, `micd`,
-`ledd`, and `web` in that order (with integration daemons before `web`). Each
-service is idempotent and can still be restarted through its init script for
-development.
+The image init script starts `logd`, `networkd`, `audiod`, `micd`, `ledd`, and
+`web` in that order (with any additional integration daemons between the
+hardware adapters and web). Each service is idempotent and can still be
+restarted through its init script for development.

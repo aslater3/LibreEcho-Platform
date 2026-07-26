@@ -55,8 +55,7 @@ ui_diff_sha256=$(git -C "$UI_SOURCE" diff --binary HEAD | sha256sum | awk '{prin
     GC_LDFLAGS="$GC_LDFLAGS" release
 
 for binary in \
-    libreecho-web libreecho-logd libreecho-networkd libreecho-timed \
-    libreecho-audiod libreecho-micd libreecho-ledd libreecho-btd libreecho-airplayd
+    libreecho-web libreecho-logd libreecho-networkd libreecho-audiod libreecho-micd libreecho-ledd libreecho-btd libreecho-airplayd
 do
     path="$UI_SOURCE/build/$binary"
     [[ -f "$path" && ! -L "$path" ]] || {
@@ -78,16 +77,15 @@ mkdir -p "$OUTPUT/sbin" "$OUTPUT/share/libreecho/web" \
     "$OUTPUT/etc/init.d" "$OUTPUT/etc/libreecho"
 
 for binary in \
-    libreecho-web libreecho-logd libreecho-networkd libreecho-timed \
-    libreecho-audiod libreecho-micd libreecho-ledd libreecho-btd libreecho-airplayd
+    libreecho-web libreecho-logd libreecho-networkd libreecho-audiod libreecho-micd libreecho-ledd libreecho-btd libreecho-airplayd
 do
     install -m 0755 "$UI_SOURCE/build/$binary" "$OUTPUT/sbin/$binary"
 done
 
 for script in \
     libreecho-web.init libreecho-logd.init libreecho-networkd.init \
-    libreecho-timed.init libreecho-audiod.init libreecho-micd.init \
-    libreecho-ledd.init libreecho-btd.init libreecho-airplayd.init
+    libreecho-audiod.init libreecho-micd.init libreecho-ledd.init \
+    libreecho-btd.init libreecho-airplayd.init libreecho-ttsd.init
 do
     install -m 0755 "$UI_SOURCE/init/$script" "$OUTPUT/etc/init.d/$script"
 done
@@ -97,8 +95,6 @@ install -m 0600 "$UI_SOURCE/config/defaults.json" \
     "$OUTPUT/etc/libreecho/web-config.json"
 install -m 0644 "$UI_SOURCE/config/airplay2.conf" \
     "$OUTPUT/etc/libreecho/airplay2.conf"
-install -m 0644 "$UI_SOURCE/config/ntp.conf" \
-    "$OUTPUT/etc/libreecho/ntp.conf"
 if [[ -n "$USERS_SOURCE" ]]; then
     install -m 0600 "$USERS_SOURCE" "$OUTPUT/etc/libreecho/users"
 fi

@@ -616,10 +616,9 @@ fi
 # The UI control plane is part of the image contract.  Start each daemon in a
 # fixed order once loopback exists; the init scripts remain idempotent and
 # write their own PID files, so a later manual restart is safe.  Starting
-# timed waits for a default route and DNS before starting ntpd, then persists
-# synchronized UTC into the PMIC RTC.  audiod only opens the adapter and never
-# initiates playback.  micd starts with capture idle and opens the microphone
-# endpoint only for an explicit stream request.
+# audiod only opens the adapter and never initiates playback.  micd starts
+# with capture idle and opens the microphone endpoint only for an explicit
+# stream request.
 start_ui_services()
 {
     [ -x /usr/local/sbin/libreecho-web ] || {
@@ -627,7 +626,7 @@ start_ui_services()
         return 0
     }
     $BB mkdir -p /var/run /var/log /var/log/libreecho /run/libreecho
-    for service in logd networkd timed audiod micd ledd btd airplayd web; do
+    for service in logd networkd audiod micd ledd btd airplayd ttsd web; do
         script="/etc/init.d/libreecho-$service.init"
         if [ -x "$script" ]; then
             "$script" start >/tmp/libreecho-"$service".init.log 2>&1

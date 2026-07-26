@@ -37,7 +37,7 @@ SOURCE_BOOT_SHA256 = "c0f52a3b079d214495cd3dd22f92fd85695d1b868c58b491a2edb933bc
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
 BUSYBOX_SHA256 = "d4c8fd2aea01abd851c703f39b29c0de748b2751e4e1a85cae570fa53ad8f4fb"
 MUSL_LOADER_SHA256 = "1063871174f1bd4f08f4d330e20b07aeb0820327ee739a4d8d1b644df842cb6b"
-RECOVERY_INIT_SHA256 = "74943829c95f200b40a1dd845a962570f6bf3bc186863ecc93957380a40c8162"
+RECOVERY_INIT_SHA256 = "db0c684595b4221e5e8b74c4df280d26931931c113b408adc220b456a76b011f"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
 CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
@@ -693,21 +693,18 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
 
     for binary in (
         "libreecho-web", "libreecho-logd", "libreecho-networkd",
-        "libreecho-timed", "libreecho-audiod", "libreecho-micd",
-        "libreecho-ledd", "libreecho-btd",
+        "libreecho-audiod", "libreecho-micd", "libreecho-ledd", "libreecho-btd",
         "libreecho-airplayd",
     ):
         copy_file(f"sbin/{binary}", f"usr/local/sbin/{binary}", 0o755, True)
     for script in (
         "libreecho-web.init", "libreecho-logd.init", "libreecho-networkd.init",
-        "libreecho-timed.init", "libreecho-audiod.init",
-        "libreecho-micd.init", "libreecho-ledd.init", "libreecho-btd.init",
-        "libreecho-airplayd.init",
+        "libreecho-audiod.init", "libreecho-micd.init", "libreecho-ledd.init", "libreecho-btd.init",
+        "libreecho-airplayd.init", "libreecho-ttsd.init",
     ):
         copy_file(f"etc/init.d/{script}", f"etc/init.d/{script}", 0o755)
     copy_file("etc/libreecho/web-config.json", "etc/libreecho/web-config.json", 0o600)
     copy_file("etc/libreecho/airplay2.conf", "etc/libreecho/airplay2.conf", 0o644)
-    copy_file("etc/libreecho/ntp.conf", "etc/libreecho/ntp.conf", 0o644)
     if "etc/libreecho/users" in bundled_files:
         users_file = pinned_source(bundle, "etc/libreecho/users", "UI users file")
         if users_file.stat().st_mode & 0o077 or not read(users_file).strip():
@@ -936,6 +933,74 @@ def add_airplay_external_payload(payload: Path, payload_manifest: Path,
             "files": feature_files,
         },
         "runtime": {},
+    }
+
+
+def add_tts_external_payload(payload: Path, payload_manifest: Path,
+                             manifest: dict[str, object]) -> None:
+    """Record the persistent two-voice TTS payload without bloating boot.img."""
+    if payload.is_symlink() or not payload.is_file():
+        raise SystemExit(f"ERROR: TTS feature payload is not a regular file: {payload}")
+    if payload_manifest.is_symlink() or not payload_manifest.is_file():
+        raise SystemExit(f"ERROR: TTS feature manifest is not a regular file: {payload_manifest}")
+    try:
+        feature = json.loads(payload_manifest.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"ERROR: TTS feature manifest is invalid: {payload_manifest}") from exc
+    if (not isinstance(feature, dict) or feature.get("schema_version") != 1 or
+            feature.get("feature_id") != "tts" or
+            feature.get("format") != "squashfs-lz4"):
+        raise SystemExit("ERROR: TTS feature manifest contract changed")
+    feature_payload = feature.get("payload")
+    feature_files = feature.get("files")
+    if not isinstance(feature_payload, dict) or not isinstance(feature_files, dict):
+        raise SystemExit("ERROR: TTS feature manifest lacks payload/files records")
+    required_files = (
+        "usr/local/sbin/libreecho-ttsd",
+        "usr/local/share/libreecho/tts/models/alan/model.onnx",
+        "usr/local/share/libreecho/tts/models/alan/tokens.txt",
+        "usr/local/share/libreecho/tts/models/southern-female/model.onnx",
+        "usr/local/share/libreecho/tts/models/southern-female/tokens.txt",
+    )
+    for required in required_files:
+        if required not in feature_files:
+            raise SystemExit(f"ERROR: TTS feature member missing: {required}")
+    for voice in ("alan", "southern-female"):
+        prefix = f"usr/local/share/libreecho/tts/models/{voice}/espeak-ng-data/"
+        if not any(str(relative).startswith(prefix) for relative in feature_files):
+            raise SystemExit(f"ERROR: TTS feature lacks eSpeak English data for {voice}")
+    payload_hash = sha256(read(payload))
+    payload_size = payload.stat().st_size
+    if (feature_payload.get("filename") != payload.name or
+            feature_payload.get("sha256") != payload_hash or
+            feature_payload.get("size") != payload_size):
+        raise SystemExit("ERROR: TTS feature payload does not match its manifest")
+    for relative, record in feature_files.items():
+        if (not isinstance(relative, str) or not relative or relative.startswith("/") or
+                "//" in relative or "/../" in f"/{relative}/" or
+                not isinstance(record, dict) or
+                not re.fullmatch(r"[0-9a-f]{64}", str(record.get("sha256", "")))):
+            raise SystemExit(f"ERROR: unsafe TTS feature file record: {relative!r}")
+    manifest["tts"] = {
+        "enabled": True,
+        "activation": "automatic-after-audio-engine",
+        "autostart": True,
+        "audio_transport": "audiod-to-streamed-announcement-priority-bus",
+        "voices": ["southern-female", "alan"],
+        "default_voice": "southern-female",
+        "threads": 4,
+        "streaming": True,
+        "in_process": True,
+        "cpu_boost_during_synthesis": True,
+        "external_payload": True,
+        "payload": {
+            "filename": payload.name,
+            "sha256": payload_hash,
+            "size": payload_size,
+            "format": "squashfs-lz4",
+            "manifest_sha256": sha256(read(payload_manifest)),
+            "files": feature_files,
+        },
     }
 
 
@@ -1448,6 +1513,10 @@ def main() -> None:
                         help="external SquashFS AirPlay 2 feature payload")
     parser.add_argument("--airplay-payload-manifest", type=Path,
                         help="manifest for the external AirPlay 2 feature payload")
+    parser.add_argument("--tts-payload", type=Path,
+                        help="external SquashFS two-voice TTS feature payload")
+    parser.add_argument("--tts-payload-manifest", type=Path,
+                        help="manifest for the external two-voice TTS feature payload")
     parser.add_argument("--startup-audio", type=Path,
                         help="stereo 48kHz PCM16 WAV to play once after successful init")
     parser.add_argument("--ssh-enabled", action="store_true",
@@ -1588,6 +1657,17 @@ def main() -> None:
         raise SystemExit(f"ERROR: AirPlay payload inputs are all-or-nothing; missing {missing}")
     if airplay_legacy_enabled and airplay_payload_enabled:
         raise SystemExit("ERROR: choose embedded AirPlay assets or an external feature payload, not both")
+    tts_payload_options = {
+        "tts_payload": args.tts_payload,
+        "tts_payload_manifest": args.tts_payload_manifest,
+    }
+    tts_payload_enabled = all(value is not None for value in tts_payload_options.values())
+    if any(value is not None for value in tts_payload_options.values()) and not tts_payload_enabled:
+        missing = ", ".join(
+            "--" + name.replace("_", "-")
+            for name, value in tts_payload_options.items() if value is None
+        )
+        raise SystemExit(f"ERROR: TTS payload inputs are all-or-nothing; missing {missing}")
 
     source = read(args.source_boot)
     require_hash("source boot envelope", source, SOURCE_BOOT_SHA256)
@@ -1674,6 +1754,11 @@ def main() -> None:
             "tinyalsa_pcm": "hw:0,23",
             "runtime": {},
         },
+        "tts": {
+            "enabled": False,
+            "activation": "manual-only",
+            "autostart": False,
+        },
     }
     overlay = Path(__file__).resolve().parent / "initramfs"
     with tempfile.TemporaryDirectory(prefix="libreecho-arm32-initramfs-") as temporary:
@@ -1706,6 +1791,10 @@ def main() -> None:
                 stage, args.nqptp.resolve(), args.shairport_sync.resolve(),
                 args.avahi_daemon.resolve(), args.dbus_daemon.resolve(),
                 args.airplay_runtime.resolve(), manifest,
+            )
+        if tts_payload_enabled:
+            add_tts_external_payload(
+                args.tts_payload.resolve(), args.tts_payload_manifest.resolve(), manifest,
             )
         if args.startup_audio is not None:
             add_startup_audio(stage, args.startup_audio.resolve(), manifest)

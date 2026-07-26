@@ -262,23 +262,6 @@ class SourceTests(unittest.TestCase):
         self.assertIn("set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 1)", producer)
         self.assertIn("set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 0)", producer)
 
-    def test_ui_bundle_packages_microphone_and_time_services(self) -> None:
-        builder = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
-        image = (TOOLS_DIR / "build_recovery_image.py").read_text()
-        verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
-        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
-
-        for required in (
-            "libreecho-micd", "libreecho-timed", "libreecho-timed.init",
-            "etc/libreecho/ntp.conf",
-        ):
-            self.assertIn(required, builder + image + verifier_source)
-        self.assertIn(
-            "for service in logd networkd timed audiod micd ledd btd airplayd web",
-            init,
-        )
-        self.assertIn("persists", init)
-
     def test_puffin_speaker_profile_matches_stock_dump(self) -> None:
         kernel = TOOLS_DIR.parent.parent
         codec = (kernel / "sound/soc/codecs/tlv320aic32x4.c").read_text()
