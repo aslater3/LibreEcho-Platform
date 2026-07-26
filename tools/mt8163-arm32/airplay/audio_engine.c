@@ -31,6 +31,8 @@
 #include "puffin_downmix.h"
 
 #define DEFAULT_ROOT "/run/libreecho-audio"
+#define AIRPLAY_ACTIVE_FILE "airplay.active"
+#define AIRPLAY_VOLUME_FILE "airplay.volume"
 #define LED_SOCKET "/run/libreecho/led.sock"
 #define DEFAULT_CARD 0U
 #define DEFAULT_DEVICE 23U
@@ -101,6 +103,16 @@ static int set_stereo_control(struct mixer *mixer, const char *name, int value)
     return mixer_ctl_set_value(control, 1, value);
 }
 
+static int get_stereo_control(struct mixer *mixer, const char *name, int *value)
+{
+    struct mixer_ctl *control = mixer_get_ctl_by_name(mixer, name);
+
+    if (!control || mixer_ctl_get_num_values(control) < 1)
+        return -1;
+    *value = mixer_ctl_get_value(control, 0);
+    return *value < 0 ? -1 : 0;
+}
+
 static int set_single_control(struct mixer *mixer, const char *name, int value)
 {
     struct mixer_ctl *control = mixer_get_ctl_by_name(mixer, name);
@@ -112,16 +124,23 @@ static int set_single_control(struct mixer *mixer, const char *name, int value)
 
 /* Arm the output while keeping the codec muted.  This is used before a
  * stream exists, so enabling the physical amplifier cannot produce a pop. */
-static int arm_output_controls(unsigned int card, int volume)
+static int arm_output_controls(unsigned int card, int volume,
+                               int *saved_volume)
 {
     struct mixer *mixer;
     int result = 0;
+
+    if (saved_volume)
+        *saved_volume = -1;
 
     mixer = mixer_open(card);
     if (!mixer) {
         fprintf(stderr, "audio-engine: mixer %u unavailable\n", card);
         return -1;
     }
+    if (saved_volume &&
+        get_stereo_control(mixer, "PCM Playback Volume", saved_volume) < 0)
+        *saved_volume = -1;
     if (set_enum_control(mixer, "MFP Gpio Mute", "On") < 0)
         result = -1;
     if (set_enum_control(mixer, "Ext_Speaker_Amp_Switch", "Off") < 0)
@@ -178,7 +197,7 @@ static int enable_output_controls(unsigned int card)
     return result;
 }
 
-static int disable_output_controls(unsigned int card)
+static int disable_output_controls(unsigned int card, int restore_volume)
 {
     struct mixer *mixer;
     int result = 0;
@@ -192,6 +211,9 @@ static int disable_output_controls(unsigned int card)
     if (set_enum_control(mixer, "MFP Gpio Mute", "On") < 0)
         result = -1;
     if (set_enum_control(mixer, "Ext_Speaker_Amp_Switch", "Off") < 0)
+        result = -1;
+    if (restore_volume >= 0 &&
+        set_stereo_control(mixer, "PCM Playback Volume", restore_volume) < 0)
         result = -1;
     mixer_close(mixer);
     if (result < 0)
@@ -434,6 +456,61 @@ static int32_t db_to_q15(double db)
 	return (int32_t)lround(gain);
 }
 
+static int airplay_is_active(const char *root)
+{
+	char path[256];
+
+	if (snprintf(path, sizeof(path), "%s/%s", root,
+		     AIRPLAY_ACTIVE_FILE) < 0)
+		return 0;
+	return access(path, F_OK) == 0;
+}
+
+static int airplay_volume_to_mixer(const char *root)
+{
+	char path[256];
+	char buffer[64];
+	char *end;
+	double db;
+	int fd;
+	ssize_t n;
+
+	if (snprintf(path, sizeof(path), "%s/%s", root,
+		     AIRPLAY_VOLUME_FILE) < 0)
+		return 127;
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return 127;
+	n = read(fd, buffer, sizeof(buffer) - 1);
+	close(fd);
+	if (n <= 0)
+		return 127;
+	buffer[n] = '\0';
+	db = strtod(buffer, &end);
+	if (end == buffer || !isfinite(db))
+		return 127;
+	if (db <= -63.5)
+		return 0;
+	if (db >= 0.0)
+		return 127;
+	return (int)lround(127.0 + (db * 2.0));
+}
+
+static int set_pcm_volume(unsigned int card, int volume)
+{
+	struct mixer *mixer;
+	int result;
+
+	if (volume < 0 || volume > 127)
+		return -1;
+	mixer = mixer_open(card);
+	if (!mixer)
+		return -1;
+	result = set_stereo_control(mixer, "PCM Playback Volume", volume);
+	mixer_close(mixer);
+	return result;
+}
+
 static int read_media_gain(const char *root)
 {
 	char path[256];
@@ -554,7 +631,10 @@ static int read_sources(struct source_bus *sources, const char *root)
 		else if (sources[i].idle_periods > 0)
 			--sources[i].idle_periods;
 	}
-	sources[SOURCE_MEDIA].gain_q15 = read_media_gain(root);
+	/* During an AirPlay session the codec volume is the authoritative phone
+	 * volume.  Do not attenuate the media bus a second time. */
+	sources[SOURCE_MEDIA].gain_q15 = airplay_is_active(root)
+		? 32768 : read_media_gain(root);
 	return received_any;
 }
 
@@ -628,6 +708,9 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	int16_t *second = NULL;
 	int result = -1;
 	int announcement_led_active = 0;
+	int saved_volume = -1;
+	int airplay_volume = -1;
+	int airplay_session = 0;
 	unsigned int i;
 
 	memset(sources, 0, sizeof(sources));
@@ -677,7 +760,11 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		sync_playback_status(sources, &status);
 		render_period(sources, second, &dynamics);
 
-		if (arm_output_controls(card, -1) < 0) {
+		saved_volume = -1;
+		airplay_session = airplay_is_active(root);
+		airplay_volume = airplay_session
+			? airplay_volume_to_mixer(root) : -1;
+		if (arm_output_controls(card, airplay_volume, &saved_volume) < 0) {
 			fprintf(stderr, "audio-engine: output arm failed\n");
 			clear_source_activity(sources, &announcement_led_active,
 					      &visualizer, &status);
@@ -690,7 +777,8 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				pcm ? pcm_get_error(pcm) : "open failed");
 			if (pcm)
 				pcm_close(pcm);
-			(void)disable_output_controls(card);
+			(void)disable_output_controls(card,
+				airplay_session ? saved_volume : -1);
 			clear_source_activity(sources, &announcement_led_active,
 					      &visualizer, &status);
 			usleep(250000);
@@ -702,7 +790,8 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		    enable_output_controls(card) < 0) {
 			fprintf(stderr, "audio-engine: playback start failed: %s\n",
 				pcm_get_error(pcm));
-			(void)disable_output_controls(card);
+			(void)disable_output_controls(card,
+				airplay_session ? saved_volume : -1);
 			pcm_close(pcm);
 			clear_source_activity(sources, &announcement_led_active,
 					      &visualizer, &status);
@@ -711,6 +800,13 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		process_music_visualizer(&visualizer, sources, second);
 
 		while (!stopping && sources_active(sources)) {
+			if (airplay_session && airplay_is_active(root)) {
+				int requested = airplay_volume_to_mixer(root);
+
+				if (requested != airplay_volume &&
+				    set_pcm_volume(card, requested) == 0)
+					airplay_volume = requested;
+			}
 			(void)poll_sources(sources, 20);
 			if (read_sources(sources, root) < 0) {
 				stopping = 1;
@@ -730,7 +826,8 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		}
 		clear_source_activity(sources, &announcement_led_active,
 				      &visualizer, &status);
-		(void)disable_output_controls(card);
+		(void)disable_output_controls(card,
+			airplay_session ? saved_volume : -1);
 		pcm_close(pcm);
 	}
 	result = stopping ? 0 : -1;
@@ -745,6 +842,8 @@ out:
 	}
 	free(output);
 	close_sources(sources);
+	if (airplay_session && saved_volume >= 0)
+		(void)disable_output_controls(card, saved_volume);
 	return result;
 }
 

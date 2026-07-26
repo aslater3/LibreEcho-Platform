@@ -21,6 +21,8 @@
 #define DEFAULT_INPUT_FIFO "/run/libreecho/airplay.pcm"
 #define DEFAULT_MEDIA_FIFO "/run/libreecho-audio/media.pcm"
 #define DEFAULT_VOLUME_FILE "/run/libreecho-audio/media.volume"
+#define DEFAULT_AIRPLAY_VOLUME_FILE "/run/libreecho-audio/airplay.volume"
+#define DEFAULT_AIRPLAY_ACTIVE_FILE "/run/libreecho-audio/airplay.active"
 #define BUFFER_SIZE 8192
 
 static volatile sig_atomic_t stopping;
@@ -106,6 +108,18 @@ static int set_volume(const char *path, const char *text)
 	return 0;
 }
 
+static int set_active(const char *path, int active)
+{
+	int fd;
+
+	if (!active)
+		return unlink(path) < 0 && errno != ENOENT ? 1 : 0;
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0640);
+	if (fd < 0)
+		return 1;
+	return close(fd) < 0 ? 1 : 0;
+}
+
 static int forward_stream(const char *input_path, const char *output_path)
 {
 	unsigned char buffer[BUFFER_SIZE];
@@ -153,10 +167,18 @@ int main(int argc, char **argv)
 	struct sigaction action;
 
 	if (argc == 2 && (!strcmp(argv[1], "--start") ||
-			 !strcmp(argv[1], "--stop")))
-		return access(DEFAULT_MEDIA_FIFO, F_OK) == 0 ? 0 : 1;
-	if (argc == 3 && !strcmp(argv[1], "--set-volume"))
-		return set_volume(DEFAULT_VOLUME_FILE, argv[2]);
+			 !strcmp(argv[1], "--stop"))) {
+		int active = !strcmp(argv[1], "--start");
+
+		if (active && access(DEFAULT_MEDIA_FIFO, F_OK) != 0)
+			return 1;
+		return set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, active);
+	}
+	if (argc == 3 && !strcmp(argv[1], "--set-volume")) {
+		if (set_volume(DEFAULT_VOLUME_FILE, argv[2]) != 0)
+			return 1;
+		return set_volume(DEFAULT_AIRPLAY_VOLUME_FILE, argv[2]);
+	}
 	if (argc > 1)
 		input_path = argv[1];
 	if (argc > 2)
@@ -172,10 +194,13 @@ int main(int argc, char **argv)
 	(void)sigaction(SIGTERM, &action, NULL);
 	(void)sigaction(SIGINT, &action, NULL);
 	signal(SIGPIPE, SIG_IGN);
+	if (set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 1) != 0)
+		return 1;
 
 	while (!stopping) {
 		if (forward_stream(input_path, output_path) < 0 && !stopping)
 			usleep(250000);
 	}
+	(void)set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 0);
 	return 0;
 }
