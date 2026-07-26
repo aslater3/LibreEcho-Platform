@@ -26,6 +26,7 @@
 #include <tinyalsa/mixer.h>
 #include <tinyalsa/pcm.h>
 
+#include "aec_reference.h"
 #include "audio_visualizer.h"
 #include "playback_status.h"
 #include "puffin_downmix.h"
@@ -685,6 +686,21 @@ static void render_period(struct source_bus *sources, int16_t *output,
 	}
 }
 
+static int write_period(struct pcm *pcm, const int16_t *samples,
+			struct le_aec_reference_sender *reference,
+			unsigned int activity_mask)
+{
+	if (pcm_writei(pcm, samples, PERIOD_SIZE) != (int)PERIOD_SIZE)
+		return -1;
+	/*
+	 * Reference delivery is intentionally lossy.  A missing or slow AEC
+	 * consumer must never delay the sole owner of the speaker PCM.
+	 */
+	(void)le_aec_reference_publish(reference, samples, PERIOD_SIZE,
+				       DEFAULT_CHANNELS, activity_mask);
+	return 0;
+}
+
 static int run_engine(const char *root, unsigned int card, unsigned int device)
 {
 	struct pcm_config config = {
@@ -704,6 +720,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	struct puffin_dynamics dynamics;
 	struct music_visualizer visualizer;
 	struct playback_status status;
+	struct le_aec_reference_sender reference;
 	int16_t *output = NULL;
 	int16_t *second = NULL;
 	int result = -1;
@@ -715,6 +732,8 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 
 	memset(sources, 0, sizeof(sources));
 	memset(&status, 0, sizeof(status));
+	memset(&reference, 0, sizeof(reference));
+	reference.fd = -1;
 	audio_visualizer_init(&visualizer.analyzer);
 	memset(visualizer.levels, 0, sizeof(visualizer.levels));
 	visualizer.frame_periods = 0;
@@ -731,6 +750,10 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		fprintf(stderr, "audio-engine: status path is too long\n");
 		goto out;
 	}
+	if (le_aec_reference_init(&reference, root) < 0)
+		fprintf(stderr,
+			"audio-engine: AEC reference tap unavailable: %s\n",
+			strerror(errno));
 	sync_playback_status(sources, &status);
 	output = malloc(bytes * 2);
 	if (!output)
@@ -742,6 +765,8 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 
 	while (!stopping) {
 		struct pcm *pcm = NULL;
+		unsigned int first_activity;
+		unsigned int second_activity;
 
 		if (poll_sources(sources, -1) < 0)
 			break;
@@ -753,12 +778,14 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		sync_playback_status(sources, &status);
 		puffin_dynamics_init(&dynamics);
 		render_period(sources, output, &dynamics);
+		first_activity = source_activity_mask(sources);
 		(void)poll_sources(sources, 20);
 		if (read_sources(sources, root) < 0)
 			break;
 		sync_announcement_led(sources, &announcement_led_active);
 		sync_playback_status(sources, &status);
 		render_period(sources, second, &dynamics);
+		second_activity = source_activity_mask(sources);
 
 		saved_volume = -1;
 		airplay_session = airplay_is_active(root);
@@ -785,8 +812,8 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			continue;
 		}
 		if (pcm_prepare(pcm) < 0 ||
-		    pcm_writei(pcm, output, PERIOD_SIZE) != (int)PERIOD_SIZE ||
-		    pcm_writei(pcm, second, PERIOD_SIZE) != (int)PERIOD_SIZE ||
+		    write_period(pcm, output, &reference, first_activity) < 0 ||
+		    write_period(pcm, second, &reference, second_activity) < 0 ||
 		    enable_output_controls(card) < 0) {
 			fprintf(stderr, "audio-engine: playback start failed: %s\n",
 				pcm_get_error(pcm));
@@ -815,8 +842,8 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			sync_announcement_led(sources, &announcement_led_active);
 			sync_playback_status(sources, &status);
 			render_period(sources, output, &dynamics);
-			if (pcm_writei(pcm, output, PERIOD_SIZE) !=
-			    (int)PERIOD_SIZE) {
+			if (write_period(pcm, output, &reference,
+					 source_activity_mask(sources)) < 0) {
 				fprintf(stderr,
 					"audio-engine: PCM write failed: %s\n",
 					pcm_get_error(pcm));
@@ -840,6 +867,7 @@ out:
 			sources[i].idle_periods = 0;
 		sync_playback_status(sources, &status);
 	}
+	le_aec_reference_close(&reference);
 	free(output);
 	close_sources(sources);
 	if (airplay_session && saved_volume >= 0)

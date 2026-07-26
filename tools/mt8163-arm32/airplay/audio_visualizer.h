@@ -11,7 +11,10 @@ struct audio_visualizer_band {
 	int32_t output_1;
 	int32_t output_2;
 	uint32_t noise_floor;
+	uint8_t previous_level;
 	uint8_t level;
+	uint8_t display_floor;
+	uint8_t display_peak;
 };
 
 struct audio_visualizer {

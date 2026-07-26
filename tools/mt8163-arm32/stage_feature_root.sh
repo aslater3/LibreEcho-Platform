@@ -64,11 +64,31 @@ actual_size=$($BB stat -c %s "$PAYLOAD_FILE" 2>/dev/null)
     exit 1
 }
 
+RESTART_AGENT=0
+case "$FEATURE_ID" in
+    tts|wakeword|stt)
+        if [ -x /etc/init.d/libreecho-agentd.init ] &&
+                /etc/init.d/libreecho-agentd.init status >/dev/null 2>&1; then
+            RESTART_AGENT=1
+            /etc/init.d/libreecho-agentd.init stop \
+                >/tmp/assistant-feature-stop.log 2>&1 || true
+        fi
+        ;;
+esac
 if [ "$FEATURE_ID" = airplay2 ] && [ -x /etc/init.d/libreecho-airplayd.init ]; then
     /etc/init.d/libreecho-airplayd.init stop >/tmp/airplay-feature-stop.log 2>&1 || true
 fi
 if [ "$FEATURE_ID" = tts ] && [ -x /etc/init.d/libreecho-ttsd.init ]; then
     /etc/init.d/libreecho-ttsd.init stop >/tmp/tts-feature-stop.log 2>&1 || true
+fi
+if [ "$FEATURE_ID" = wakeword ] && [ -x /etc/init.d/libreecho-waked.init ]; then
+    /etc/init.d/libreecho-waked.init stop >/tmp/wakeword-feature-stop.log 2>&1 || true
+fi
+if [ "$FEATURE_ID" = stt ] && [ -x /etc/init.d/libreecho-sttd.init ]; then
+    /etc/init.d/libreecho-sttd.init stop >/tmp/stt-feature-stop.log 2>&1 || true
+fi
+if [ "$FEATURE_ID" = assistant ] && [ -x /etc/init.d/libreecho-agentd.init ]; then
+    /etc/init.d/libreecho-agentd.init stop >/tmp/assistant-feature-stop.log 2>&1 || true
 fi
 
 DEST=/data/libreecho/features/$FEATURE_ID
@@ -76,6 +96,7 @@ $BB mkdir -p "$DEST/staging"
 $BB cp "$PAYLOAD_FILE" "$DEST/staging/payload.squashfs.new" || exit 1
 staged=$($BB sha256sum "$DEST/staging/payload.squashfs.new" | $BB awk '{print $1}')
 [ "$staged" = "$PAYLOAD_SHA256" ] || { echo FEATURE_STAGE_COPY_HASH_MISMATCH; exit 1; }
+$BB rm -f "$DEST/payload.squashfs.previous"
 if [ -f "$DEST/payload.squashfs" ]; then
     $BB mv "$DEST/payload.squashfs" "$DEST/payload.squashfs.previous"
 fi
@@ -88,6 +109,20 @@ if [ "$FEATURE_ID" = airplay2 ] && [ -x /etc/init.d/libreecho-airplayd.init ]; t
 fi
 if [ "$FEATURE_ID" = tts ] && [ -x /etc/init.d/libreecho-ttsd.init ]; then
     /etc/init.d/libreecho-ttsd.init start >/tmp/tts-feature-start.log 2>&1 || true
+fi
+if [ "$FEATURE_ID" = wakeword ] && [ -x /etc/init.d/libreecho-waked.init ]; then
+    /etc/init.d/libreecho-waked.init start >/tmp/wakeword-feature-start.log 2>&1 || true
+fi
+if [ "$FEATURE_ID" = stt ] && [ -x /etc/init.d/libreecho-sttd.init ]; then
+    /etc/init.d/libreecho-sttd.init start >/tmp/stt-feature-start.log 2>&1 || true
+fi
+if [ "$FEATURE_ID" = assistant ] && [ -x /etc/init.d/libreecho-agentd.init ]; then
+    /etc/init.d/libreecho-agentd.init start >/tmp/assistant-feature-start.log 2>&1 || true
+fi
+if [ "$RESTART_AGENT" = 1 ] &&
+        [ -x /etc/init.d/libreecho-agentd.init ]; then
+    /etc/init.d/libreecho-agentd.init start \
+        >/tmp/assistant-feature-start.log 2>&1 || true
 fi
 $BB rm -f "$CONFIG" "$PAYLOAD_FILE" "$MANIFEST_FILE"
 echo "FEATURE_STAGE_OK:$FEATURE_ID"

@@ -1,0 +1,16 @@
+LibreEcho development wake-word model notice
+============================================
+
+The bundled alexa_v0.1.onnx model and the shared openWakeWord preprocessing
+models were obtained from dscripka/openWakeWord v0.5.1:
+
+    https://github.com/dscripka/openWakeWord
+
+The openWakeWord project distributes its bundled pretrained models under
+Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+(CC BY-NC-SA 4.0). This notice applies to the model files, not to LibreEcho's
+independently implemented runtime integration.
+
+This is a development payload for private hardware validation. A permissively
+redistributable LibreEcho release must replace alexa_v0.1.onnx with a model
+trained from appropriately licensed data.

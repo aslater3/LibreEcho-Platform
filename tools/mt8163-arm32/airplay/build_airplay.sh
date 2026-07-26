@@ -17,6 +17,7 @@ AIRPLAY_AUDIO_SOURCE=${LIBREECHO_AIRPLAY_AUDIO_SOURCE:-$SCRIPT_DIR/airplay_audio
 AUDIO_ENGINE_SOURCE=${LIBREECHO_AUDIO_ENGINE_SOURCE:-$SCRIPT_DIR/audio_engine.c}
 AUDIO_VISUALIZER_SOURCE=${LIBREECHO_AUDIO_VISUALIZER_SOURCE:-$SCRIPT_DIR/audio_visualizer.c}
 PLAYBACK_STATUS_SOURCE=${LIBREECHO_PLAYBACK_STATUS_SOURCE:-$SCRIPT_DIR/playback_status.c}
+AEC_REFERENCE_SOURCE=${LIBREECHO_AEC_REFERENCE_SOURCE:-$SCRIPT_DIR/aec_reference.c}
 
 for archive in "$NQPTP_ARCHIVE" "$SHAIRPORT_ARCHIVE" "$FFMPEG_ARCHIVE" "$TINYALSA_ARCHIVE"; do
     [[ -f "$archive" ]] || { echo "ERROR: AirPlay source archive is missing: $archive" >&2; exit 1; }
@@ -60,6 +61,10 @@ command -v readelf >/dev/null 2>&1 || { echo "ERROR: readelf is required" >&2; e
 }
 [[ -f "$PLAYBACK_STATUS_SOURCE" ]] || {
     echo "ERROR: playback status source is missing: $PLAYBACK_STATUS_SOURCE" >&2
+    exit 1
+}
+[[ -f "$AEC_REFERENCE_SOURCE" ]] || {
+    echo "ERROR: AEC reference source is missing: $AEC_REFERENCE_SOURCE" >&2
     exit 1
 }
 
@@ -178,7 +183,7 @@ build_audio_components() {
     "$CC" $bridge_cflags "$AIRPLAY_AUDIO_SOURCE" -lm \
         -o "$OUTPUT/libreecho-airplay-audio"
     "$CC" $bridge_cflags "$AUDIO_ENGINE_SOURCE" "$AUDIO_VISUALIZER_SOURCE" \
-        "$PLAYBACK_STATUS_SOURCE" \
+        "$PLAYBACK_STATUS_SOURCE" "$AEC_REFERENCE_SOURCE" \
         "$tinyalsa_source/src/libtinyalsa.a" -ldl -lm \
         -o "$OUTPUT/libreecho-audio-engine"
 }

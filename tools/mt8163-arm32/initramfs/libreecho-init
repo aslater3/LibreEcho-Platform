@@ -626,7 +626,24 @@ start_ui_services()
         return 0
     }
     $BB mkdir -p /var/run /var/log /var/log/libreecho /run/libreecho
-    for service in logd networkd audiod micd ledd btd airplayd ttsd web; do
+    ha_enabled=0
+    config=/data/libreecho/config/web-config.json
+    if [ -r "$config" ]; then
+        integrations=$($BB sed -n \
+            's/^[[:space:]]*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*$/\1/p' \
+            "$config" 2>/dev/null | $BB head -n 1)
+        case "$integrations" in
+            ''|*[!0-9]*) ;;
+            *) [ $((integrations & 1)) -ne 0 ] && ha_enabled=1 ;;
+        esac
+    fi
+    if [ "$ha_enabled" -eq 1 ]; then
+        log ui-home-assistant-mode-enabled
+        services="logd networkd audiod micd waked ledd btd airplayd wyomingd web"
+    else
+        services="logd networkd audiod micd waked sttd ledd btd airplayd ttsd agentd web"
+    fi
+    for service in $services; do
         script="/etc/init.d/libreecho-$service.init"
         if [ -x "$script" ]; then
             "$script" start >/tmp/libreecho-"$service".init.log 2>&1

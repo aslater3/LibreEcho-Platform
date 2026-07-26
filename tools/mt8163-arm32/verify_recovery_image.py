@@ -39,7 +39,7 @@ STOCK_DTB_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57
 PADDED_STOCK_DTB_SHA256 = "08b16ec39554d644d8cbdf8f5816559f85414ab45bc1901de46a7cd43dc286ed"
 BUSYBOX_SHA256 = "d4c8fd2aea01abd851c703f39b29c0de748b2751e4e1a85cae570fa53ad8f4fb"
 LOADER_SHA256 = "1063871174f1bd4f08f4d330e20b07aeb0820327ee739a4d8d1b644df842cb6b"
-INIT_SHA256 = "db0c684595b4221e5e8b74c4df280d26931931c113b408adc220b456a76b011f"
+INIT_SHA256 = "49f215e7a82c65ea8dcd13065fa1eb1cd14ef8cab2695f66b4273feda1fcb9ac"
 ADBD_SHA256 = "1c0d14afb1ce19494ee1da935e1076f49ff57e359d348262a28bb3d56abeb930"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -67,6 +67,7 @@ UI_BINARY_NAMES = {
     "usr/local/sbin/libreecho-ledd",
     "usr/local/sbin/libreecho-btd",
     "usr/local/sbin/libreecho-airplayd",
+    "usr/local/sbin/libreecho-wyomingd",
 }
 UI_INIT_NAMES = {
     "etc/init.d/libreecho-web.init",
@@ -78,6 +79,10 @@ UI_INIT_NAMES = {
     "etc/init.d/libreecho-btd.init",
     "etc/init.d/libreecho-airplayd.init",
     "etc/init.d/libreecho-ttsd.init",
+    "etc/init.d/libreecho-waked.init",
+    "etc/init.d/libreecho-sttd.init",
+    "etc/init.d/libreecho-agentd.init",
+    "etc/init.d/libreecho-wyomingd.init",
 }
 UI_FIXED_NAMES = UI_BINARY_NAMES | UI_INIT_NAMES | {
     "etc/libreecho/web-config.json",
@@ -949,6 +954,12 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                        expected_airplay_payload_size: int | None,
                        expected_tts_payload_sha256: str | None,
                        expected_tts_payload_size: int | None,
+                       expected_wakeword_payload_sha256: str | None,
+                       expected_wakeword_payload_size: int | None,
+                       expected_stt_payload_sha256: str | None,
+                       expected_stt_payload_size: int | None,
+                       expected_assistant_payload_sha256: str | None,
+                       expected_assistant_payload_size: int | None,
                        expected_nqptp_sha256: str | None,
                        expected_shairport_sync_sha256: str | None,
                        expected_avahi_daemon_sha256: str | None,
@@ -1048,6 +1059,180 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
             fail("external TTS daemon leaked into the boot ramdisk")
     elif tts.get("enabled"):
         fail("TTS manifest is enabled without an expected external payload")
+    wakeword = manifest.get("wakeword", {"enabled": False})
+    if (not isinstance(wakeword, dict) or
+            not isinstance(wakeword.get("enabled"), bool)):
+        fail("wakeword manifest record is malformed")
+    if (expected_wakeword_payload_sha256 is not None or
+            expected_wakeword_payload_size is not None):
+        payload = wakeword.get("payload")
+        if (expected_wakeword_payload_sha256 is None or
+                expected_wakeword_payload_size is None or
+                not wakeword.get("enabled") or
+                not wakeword.get("external_payload") or
+                wakeword.get("engine") != "openwakeword-onnx" or
+                wakeword.get("wake_word") != "Alexa" or
+                wakeword.get("development_model") is not True or
+                wakeword.get("model_license") != "CC-BY-NC-SA-4.0" or
+                wakeword.get("threads") != 2 or
+                wakeword.get("sample_rate_hz") != 16000 or
+                wakeword.get("block_samples") != 1280 or
+                wakeword.get("continuous_model_input") is not True or
+                not isinstance(payload, dict) or
+                payload.get("format") != "squashfs-lz4" or
+                payload.get("filename") != "wakeword.squashfs" or
+                payload.get("sha256") != expected_wakeword_payload_sha256 or
+                payload.get("size") != expected_wakeword_payload_size):
+            fail("external wakeword payload manifest is incomplete or mismatched")
+        files = payload.get("files")
+        if not isinstance(files, dict) or not files:
+            fail("external wakeword payload file manifest is missing")
+        for required in (
+            "usr/local/sbin/libreecho-waked",
+            "usr/local/share/libreecho/openwakeword/melspectrogram.onnx",
+            "usr/local/share/libreecho/openwakeword/embedding_model.onnx",
+            "usr/local/share/libreecho/openwakeword/alexa_v0.1.onnx",
+            "usr/local/share/licenses/libreecho-openwakeword/MODEL-LICENSE.txt",
+        ):
+            if required not in files:
+                fail(f"external wakeword payload member missing: {required}")
+        for relative, record in files.items():
+            if (not isinstance(relative, str) or not relative or
+                    relative.startswith("/") or "//" in relative or
+                    "/../" in f"/{relative}/" or not isinstance(record, dict) or
+                    not re.fullmatch(r"[0-9a-f]{64}",
+                                     str(record.get("sha256", "")))):
+                fail(
+                    "external wakeword payload contains an unsafe file "
+                    f"record: {relative!r}"
+                )
+        if "usr/local/sbin/libreecho-waked" in entries:
+            fail("external wakeword daemon leaked into the boot ramdisk")
+    elif wakeword.get("enabled"):
+        fail("wakeword manifest is enabled without an expected external payload")
+    stt = manifest.get("stt", {"enabled": False})
+    if not isinstance(stt, dict) or not isinstance(stt.get("enabled"), bool):
+        fail("STT manifest record is malformed")
+    if expected_stt_payload_sha256 is not None or expected_stt_payload_size is not None:
+        payload = stt.get("payload")
+        if (expected_stt_payload_sha256 is None or
+                expected_stt_payload_size is None or
+                not stt.get("enabled") or not stt.get("external_payload") or
+                stt.get("engine") != "sherpa-onnx-streaming-zipformer" or
+                stt.get("language") != "en" or
+                stt.get("quantization") != "int8" or
+                stt.get("threads") != 2 or
+                stt.get("sample_rate_hz") != 16000 or
+                stt.get("endpoint_trailing_silence_ms") != 500 or
+                stt.get("streaming") is not True or
+                stt.get("model_license") != "Apache-2.0" or
+                not isinstance(payload, dict) or
+                payload.get("format") != "squashfs-lz4" or
+                payload.get("filename") != "stt.squashfs" or
+                payload.get("sha256") != expected_stt_payload_sha256 or
+                payload.get("size") != expected_stt_payload_size):
+            fail("external STT payload manifest is incomplete or mismatched")
+        files = payload.get("files")
+        expected_stt_files = {
+            "usr/local/sbin/libreecho-sttd": None,
+            "usr/local/share/libreecho/stt/encoder-epoch-99-avg-1.int8.onnx":
+                "3810755ce7c3ab26b42a8bcf39d191308fa27fb0f53358823ba46141d03b7eb3",
+            "usr/local/share/libreecho/stt/decoder-epoch-99-avg-1.int8.onnx":
+                "21e2a2acd961b3ac72f55be2f10f1a285e1b0b0ba010d7c0b6eab141411b163c",
+            "usr/local/share/libreecho/stt/joiner-epoch-99-avg-1.int8.onnx":
+                "e085d73b593cf9b0707f370dbd656d58327d3fe36d80d849202ef81df02cb01e",
+            "usr/local/share/libreecho/stt/tokens.txt":
+                "49e3c2646595fd907228b3c6787069658f67b17377c60aeb8619c4551b2316fb",
+            "usr/local/share/licenses/libreecho-stt-model/MODEL-LICENSE.md":
+                "505f6b0e8a39f066a0794c4fb0b5689533d3bcd9d1dc5e5f47ccffeef1af9877",
+        }
+        if not isinstance(files, dict) or not files:
+            fail("external STT payload file manifest is missing")
+        for required, expected_hash in expected_stt_files.items():
+            record = files.get(required)
+            if not isinstance(record, dict):
+                fail(f"external STT payload member missing: {required}")
+            if expected_hash is not None and record.get("sha256") != expected_hash:
+                fail(f"external STT payload member hash changed: {required}")
+        for relative, record in files.items():
+            if (not isinstance(relative, str) or not relative or
+                    relative.startswith("/") or "//" in relative or
+                    "/../" in f"/{relative}/" or not isinstance(record, dict) or
+                    not re.fullmatch(r"[0-9a-f]{64}",
+                                     str(record.get("sha256", "")))):
+                fail(f"external STT payload has unsafe file record: {relative!r}")
+        if "usr/local/sbin/libreecho-sttd" in entries:
+            fail("external STT daemon leaked into the boot ramdisk")
+    elif stt.get("enabled"):
+        fail("STT manifest is enabled without an expected external payload")
+    assistant = manifest.get("assistant", {"enabled": False})
+    if (not isinstance(assistant, dict) or
+            not isinstance(assistant.get("enabled"), bool)):
+        fail("assistant manifest record is malformed")
+    if (expected_assistant_payload_sha256 is not None or
+            expected_assistant_payload_size is not None):
+        payload = assistant.get("payload")
+        if (expected_assistant_payload_sha256 is None or
+                expected_assistant_payload_size is None or
+                not assistant.get("enabled") or
+                not assistant.get("external_payload") or
+                assistant.get("provider") != "openai-codex" or
+                assistant.get("provider_neutral_boundary") is not True or
+                assistant.get("subscription_device_auth") is not True or
+                assistant.get("metered_api_key_auth") is not False or
+                assistant.get("text_streaming") is not True or
+                assistant.get("sentence_streaming_to_tts") is not True or
+                assistant.get("latency_target_ms") != 3000 or
+                assistant.get("credential_storage") != "private-persistent-0600" or
+                not isinstance(payload, dict) or
+                payload.get("format") != "squashfs-lz4" or
+                payload.get("filename") != "assistant.squashfs" or
+                payload.get("sha256") != expected_assistant_payload_sha256 or
+                payload.get("size") != expected_assistant_payload_size):
+            fail(
+                "external assistant payload manifest is incomplete or mismatched"
+            )
+        files = payload.get("files")
+        expected_assistant_files = {
+            "usr/local/sbin/libreecho-agentd": None,
+            "usr/local/libexec/libreecho-curl": None,
+            "usr/local/share/libreecho/cacert.pem":
+                "c0c940a0e30d859783f7f130868d8082e79936ff0b41a0b1098ac7f98909263b",
+            "usr/local/share/licenses/curl/COPYING": None,
+            "usr/local/share/licenses/ca-certificates/copyright": None,
+        }
+        if not isinstance(files, dict) or not files:
+            fail("external assistant payload file manifest is missing")
+        for required, expected_hash in expected_assistant_files.items():
+            record = files.get(required)
+            if not isinstance(record, dict):
+                fail(f"external assistant payload member missing: {required}")
+            if expected_hash is not None and record.get("sha256") != expected_hash:
+                fail(f"external assistant payload member hash changed: {required}")
+        for relative, record in files.items():
+            if (not isinstance(relative, str) or not relative or
+                    relative.startswith("/") or "//" in relative or
+                    "/../" in f"/{relative}/" or not isinstance(record, dict) or
+                    not re.fullmatch(r"[0-9a-f]{64}",
+                                     str(record.get("sha256", "")))):
+                fail(
+                    "external assistant payload has unsafe file record: "
+                    f"{relative!r}"
+                )
+            if ("credential" in relative.lower() or
+                    "openai-codex.json" in relative.lower() or
+                    "api-key" in relative.lower()):
+                fail("assistant payload contains credential material")
+        if "usr/local/sbin/libreecho-agentd" in entries:
+            fail("external assistant daemon leaked into the boot ramdisk")
+        if any(
+                "openai-codex.json" in name.lower() or "api-key" in name.lower()
+                for name in entries):
+            fail("assistant credentials leaked into the boot ramdisk")
+    elif assistant.get("enabled"):
+        fail(
+            "assistant manifest is enabled without an expected external payload"
+        )
     airplay = manifest.get("airplay", {"enabled": False})
     if not isinstance(airplay, dict) or not isinstance(airplay.get("enabled"), bool):
         fail("AirPlay manifest record is malformed")
@@ -1475,6 +1660,18 @@ def main() -> None:
                         help="require this external two-voice TTS SquashFS payload")
     parser.add_argument("--expected-tts-payload-size", type=int,
                         help="require this external two-voice TTS payload size")
+    parser.add_argument("--expected-wakeword-payload-sha256",
+                        help="require this external openWakeWord SquashFS payload")
+    parser.add_argument("--expected-wakeword-payload-size", type=int,
+                        help="require this external openWakeWord payload size")
+    parser.add_argument("--expected-stt-payload-sha256",
+                        help="require this external English STT SquashFS payload")
+    parser.add_argument("--expected-stt-payload-size", type=int,
+                        help="require this external English STT payload size")
+    parser.add_argument("--expected-assistant-payload-sha256",
+                        help="require this external streamed assistant SquashFS payload")
+    parser.add_argument("--expected-assistant-payload-size", type=int,
+                        help="require this external assistant payload size")
     parser.add_argument("--expected-dtb-sha256")
     parser.add_argument(
         "--expected-connectivity-bundle",
@@ -1592,6 +1789,11 @@ def main() -> None:
         args.expected_ui_diff_sha256,
         args.expected_airplay_payload_sha256, args.expected_airplay_payload_size,
         args.expected_tts_payload_sha256, args.expected_tts_payload_size,
+        args.expected_wakeword_payload_sha256,
+        args.expected_wakeword_payload_size,
+        args.expected_stt_payload_sha256, args.expected_stt_payload_size,
+        args.expected_assistant_payload_sha256,
+        args.expected_assistant_payload_size,
         args.expected_nqptp_sha256, args.expected_shairport_sync_sha256,
         args.expected_avahi_daemon_sha256, args.expected_dbus_daemon_sha256,
     )
@@ -1615,6 +1817,9 @@ def main() -> None:
         f"audio_tools={'yes' if args.expected_tinyplay_sha256 and args.expected_tinycap_sha256 and args.expected_tinymix_sha256 else 'no'} "
         f"airplay={'yes' if args.expected_airplay_payload_sha256 or (args.expected_nqptp_sha256 and args.expected_shairport_sync_sha256 and args.expected_avahi_daemon_sha256 and args.expected_dbus_daemon_sha256) else 'no'} "
         f"tts={'yes' if args.expected_tts_payload_sha256 else 'no'} "
+        f"wakeword={'yes' if args.expected_wakeword_payload_sha256 else 'no'} "
+        f"stt={'yes' if args.expected_stt_payload_sha256 else 'no'} "
+        f"assistant={'yes' if args.expected_assistant_payload_sha256 else 'no'} "
         f"network_activation={network_activation} status=PREPARED_NOT_FLASHED"
     )
 
