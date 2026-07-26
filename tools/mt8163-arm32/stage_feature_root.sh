@@ -96,6 +96,7 @@ $BB mkdir -p "$DEST/staging"
 $BB cp "$PAYLOAD_FILE" "$DEST/staging/payload.squashfs.new" || exit 1
 staged=$($BB sha256sum "$DEST/staging/payload.squashfs.new" | $BB awk '{print $1}')
 [ "$staged" = "$PAYLOAD_SHA256" ] || { echo FEATURE_STAGE_COPY_HASH_MISMATCH; exit 1; }
+$BB rm -f "$DEST/payload.squashfs.previous"
 if [ -f "$DEST/payload.squashfs" ]; then
     $BB mv "$DEST/payload.squashfs" "$DEST/payload.squashfs.previous"
 fi
