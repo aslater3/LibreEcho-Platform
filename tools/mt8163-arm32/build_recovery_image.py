@@ -37,7 +37,7 @@ SOURCE_BOOT_SHA256 = "c0f52a3b079d214495cd3dd22f92fd85695d1b868c58b491a2edb933bc
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
 BUSYBOX_SHA256 = "d4c8fd2aea01abd851c703f39b29c0de748b2751e4e1a85cae570fa53ad8f4fb"
 MUSL_LOADER_SHA256 = "1063871174f1bd4f08f4d330e20b07aeb0820327ee739a4d8d1b644df842cb6b"
-RECOVERY_INIT_SHA256 = "db0c684595b4221e5e8b74c4df280d26931931c113b408adc220b456a76b011f"
+RECOVERY_INIT_SHA256 = "c686b92e527524be0dc182f2f175e780afe187c54da6f1d71945280496a5b458"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
 CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
@@ -700,7 +700,8 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
     for script in (
         "libreecho-web.init", "libreecho-logd.init", "libreecho-networkd.init",
         "libreecho-audiod.init", "libreecho-micd.init", "libreecho-ledd.init", "libreecho-btd.init",
-        "libreecho-airplayd.init", "libreecho-ttsd.init",
+        "libreecho-airplayd.init", "libreecho-ttsd.init", "libreecho-waked.init",
+        "libreecho-sttd.init", "libreecho-agentd.init",
     ):
         copy_file(f"etc/init.d/{script}", f"etc/init.d/{script}", 0o755)
     copy_file("etc/libreecho/web-config.json", "etc/libreecho/web-config.json", 0o600)
@@ -992,6 +993,210 @@ def add_tts_external_payload(payload: Path, payload_manifest: Path,
         "streaming": True,
         "in_process": True,
         "cpu_boost_during_synthesis": True,
+        "external_payload": True,
+        "payload": {
+            "filename": payload.name,
+            "sha256": payload_hash,
+            "size": payload_size,
+            "format": "squashfs-lz4",
+            "manifest_sha256": sha256(read(payload_manifest)),
+            "files": feature_files,
+        },
+    }
+
+
+def add_wakeword_external_payload(payload: Path, payload_manifest: Path,
+                                  manifest: dict[str, object]) -> None:
+    """Record the reduced openWakeWord runtime without bloating boot.img."""
+    if payload.is_symlink() or not payload.is_file():
+        raise SystemExit(
+            f"ERROR: wakeword feature payload is not a regular file: {payload}"
+        )
+    if payload_manifest.is_symlink() or not payload_manifest.is_file():
+        raise SystemExit(
+            f"ERROR: wakeword feature manifest is not a regular file: {payload_manifest}"
+        )
+    try:
+        feature = json.loads(payload_manifest.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(
+            f"ERROR: wakeword feature manifest is invalid: {payload_manifest}"
+        ) from exc
+    if (not isinstance(feature, dict) or feature.get("schema_version") != 1 or
+            feature.get("feature_id") != "wakeword" or
+            feature.get("format") != "squashfs-lz4"):
+        raise SystemExit("ERROR: wakeword feature manifest contract changed")
+    feature_payload = feature.get("payload")
+    feature_files = feature.get("files")
+    if not isinstance(feature_payload, dict) or not isinstance(feature_files, dict):
+        raise SystemExit("ERROR: wakeword feature manifest lacks payload/files records")
+    required_files = (
+        "usr/local/sbin/libreecho-waked",
+        "usr/local/share/libreecho/openwakeword/melspectrogram.onnx",
+        "usr/local/share/libreecho/openwakeword/embedding_model.onnx",
+        "usr/local/share/libreecho/openwakeword/alexa_v0.1.onnx",
+        "usr/local/share/licenses/libreecho-openwakeword/MODEL-LICENSE.txt",
+    )
+    for required in required_files:
+        if required not in feature_files:
+            raise SystemExit(f"ERROR: wakeword feature member missing: {required}")
+    payload_hash = sha256(read(payload))
+    payload_size = payload.stat().st_size
+    if (feature_payload.get("filename") != payload.name or
+            feature_payload.get("sha256") != payload_hash or
+            feature_payload.get("size") != payload_size):
+        raise SystemExit("ERROR: wakeword feature payload does not match its manifest")
+    for relative, record in feature_files.items():
+        if (not isinstance(relative, str) or not relative or relative.startswith("/") or
+                "//" in relative or "/../" in f"/{relative}/" or
+                not isinstance(record, dict) or
+                not re.fullmatch(r"[0-9a-f]{64}", str(record.get("sha256", "")))):
+            raise SystemExit(f"ERROR: unsafe wakeword feature file record: {relative!r}")
+    manifest["wakeword"] = {
+        "enabled": True,
+        "activation": "automatic-after-microphone",
+        "autostart": True,
+        "engine": "openwakeword-onnx",
+        "wake_word": "Alexa",
+        "development_model": True,
+        "model_license": "CC-BY-NC-SA-4.0",
+        "threads": 2,
+        "sample_rate_hz": 16000,
+        "block_samples": 1280,
+        "continuous_model_input": True,
+        "vad": "native-energy-decision-gate",
+        "aec": "speexdsp-fixed-10ms-200ms-tail",
+        "microphone_calibration": "idme-q14",
+        "external_payload": True,
+        "payload": {
+            "filename": payload.name,
+            "sha256": payload_hash,
+            "size": payload_size,
+            "format": "squashfs-lz4",
+            "manifest_sha256": sha256(read(payload_manifest)),
+            "files": feature_files,
+        },
+    }
+
+
+def read_external_feature(
+        feature_id: str, payload: Path, payload_manifest: Path,
+        required_files: tuple[str, ...]) -> tuple[str, int, dict[str, object]]:
+    """Validate a generic external feature and return its recorded contents."""
+    if payload.is_symlink() or not payload.is_file():
+        raise SystemExit(
+            f"ERROR: {feature_id} feature payload is not a regular file: {payload}"
+        )
+    if payload_manifest.is_symlink() or not payload_manifest.is_file():
+        raise SystemExit(
+            f"ERROR: {feature_id} feature manifest is not a regular file: "
+            f"{payload_manifest}"
+        )
+    try:
+        feature = json.loads(payload_manifest.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(
+            f"ERROR: {feature_id} feature manifest is invalid: {payload_manifest}"
+        ) from exc
+    if (not isinstance(feature, dict) or feature.get("schema_version") != 1 or
+            feature.get("feature_id") != feature_id or
+            feature.get("format") != "squashfs-lz4"):
+        raise SystemExit(f"ERROR: {feature_id} feature manifest contract changed")
+    feature_payload = feature.get("payload")
+    feature_files = feature.get("files")
+    if not isinstance(feature_payload, dict) or not isinstance(feature_files, dict):
+        raise SystemExit(
+            f"ERROR: {feature_id} feature manifest lacks payload/files records"
+        )
+    for required in required_files:
+        if required not in feature_files:
+            raise SystemExit(
+                f"ERROR: {feature_id} feature member missing: {required}"
+            )
+    payload_hash = sha256(read(payload))
+    payload_size = payload.stat().st_size
+    if (feature_payload.get("filename") != payload.name or
+            feature_payload.get("sha256") != payload_hash or
+            feature_payload.get("size") != payload_size):
+        raise SystemExit(
+            f"ERROR: {feature_id} feature payload does not match its manifest"
+        )
+    for relative, record in feature_files.items():
+        if (not isinstance(relative, str) or not relative or
+                relative.startswith("/") or "//" in relative or
+                "/../" in f"/{relative}/" or not isinstance(record, dict) or
+                not re.fullmatch(r"[0-9a-f]{64}",
+                                 str(record.get("sha256", "")))):
+            raise SystemExit(
+                f"ERROR: unsafe {feature_id} feature file record: {relative!r}"
+            )
+    return payload_hash, payload_size, feature_files
+
+
+def add_stt_external_payload(payload: Path, payload_manifest: Path,
+                             manifest: dict[str, object]) -> None:
+    """Record the persistent English streaming STT runtime."""
+    required_files = (
+        "usr/local/sbin/libreecho-sttd",
+        "usr/local/share/libreecho/stt/encoder-epoch-99-avg-1.int8.onnx",
+        "usr/local/share/libreecho/stt/decoder-epoch-99-avg-1.int8.onnx",
+        "usr/local/share/libreecho/stt/joiner-epoch-99-avg-1.int8.onnx",
+        "usr/local/share/libreecho/stt/tokens.txt",
+        "usr/local/share/licenses/libreecho-stt-model/MODEL-LICENSE.md",
+    )
+    payload_hash, payload_size, feature_files = read_external_feature(
+        "stt", payload, payload_manifest, required_files
+    )
+    manifest["stt"] = {
+        "enabled": True,
+        "activation": "automatic-before-assistant",
+        "autostart": True,
+        "engine": "sherpa-onnx-streaming-zipformer",
+        "language": "en",
+        "quantization": "int8",
+        "threads": 2,
+        "sample_rate_hz": 16000,
+        "endpoint_trailing_silence_ms": 500,
+        "streaming": True,
+        "model_license": "Apache-2.0",
+        "external_payload": True,
+        "payload": {
+            "filename": payload.name,
+            "sha256": payload_hash,
+            "size": payload_size,
+            "format": "squashfs-lz4",
+            "manifest_sha256": sha256(read(payload_manifest)),
+            "files": feature_files,
+        },
+    }
+
+
+def add_assistant_external_payload(payload: Path, payload_manifest: Path,
+                                   manifest: dict[str, object]) -> None:
+    """Record the provider-neutral streamed voice-assistant runtime."""
+    required_files = (
+        "usr/local/sbin/libreecho-agentd",
+        "usr/local/libexec/libreecho-curl",
+        "usr/local/share/libreecho/cacert.pem",
+        "usr/local/share/licenses/curl/COPYING",
+        "usr/local/share/licenses/ca-certificates/copyright",
+    )
+    payload_hash, payload_size, feature_files = read_external_feature(
+        "assistant", payload, payload_manifest, required_files
+    )
+    manifest["assistant"] = {
+        "enabled": True,
+        "activation": "automatic-after-wake-stt-and-tts",
+        "autostart": True,
+        "provider": "openai-codex",
+        "provider_neutral_boundary": True,
+        "subscription_device_auth": True,
+        "metered_api_key_auth": False,
+        "text_streaming": True,
+        "sentence_streaming_to_tts": True,
+        "default_model": "gpt-5.4",
+        "latency_target_ms": 3000,
+        "credential_storage": "private-persistent-0600",
         "external_payload": True,
         "payload": {
             "filename": payload.name,
@@ -1517,6 +1722,18 @@ def main() -> None:
                         help="external SquashFS two-voice TTS feature payload")
     parser.add_argument("--tts-payload-manifest", type=Path,
                         help="manifest for the external two-voice TTS feature payload")
+    parser.add_argument("--wakeword-payload", type=Path,
+                        help="external SquashFS openWakeWord feature payload")
+    parser.add_argument("--wakeword-payload-manifest", type=Path,
+                        help="manifest for the external openWakeWord feature payload")
+    parser.add_argument("--stt-payload", type=Path,
+                        help="external SquashFS English streaming STT feature payload")
+    parser.add_argument("--stt-payload-manifest", type=Path,
+                        help="manifest for the external English STT feature payload")
+    parser.add_argument("--assistant-payload", type=Path,
+                        help="external SquashFS streamed assistant feature payload")
+    parser.add_argument("--assistant-payload-manifest", type=Path,
+                        help="manifest for the external assistant feature payload")
     parser.add_argument("--startup-audio", type=Path,
                         help="stereo 48kHz PCM16 WAV to play once after successful init")
     parser.add_argument("--ssh-enabled", action="store_true",
@@ -1668,6 +1885,55 @@ def main() -> None:
             for name, value in tts_payload_options.items() if value is None
         )
         raise SystemExit(f"ERROR: TTS payload inputs are all-or-nothing; missing {missing}")
+    wakeword_payload_options = {
+        "wakeword_payload": args.wakeword_payload,
+        "wakeword_payload_manifest": args.wakeword_payload_manifest,
+    }
+    wakeword_payload_enabled = all(
+        value is not None for value in wakeword_payload_options.values()
+    )
+    if (any(value is not None for value in wakeword_payload_options.values()) and
+            not wakeword_payload_enabled):
+        missing = ", ".join(
+            "--" + name.replace("_", "-")
+            for name, value in wakeword_payload_options.items() if value is None
+        )
+        raise SystemExit(
+            f"ERROR: wakeword payload inputs are all-or-nothing; missing {missing}"
+        )
+    stt_payload_options = {
+        "stt_payload": args.stt_payload,
+        "stt_payload_manifest": args.stt_payload_manifest,
+    }
+    stt_payload_enabled = all(
+        value is not None for value in stt_payload_options.values()
+    )
+    if (any(value is not None for value in stt_payload_options.values()) and
+            not stt_payload_enabled):
+        missing = ", ".join(
+            "--" + name.replace("_", "-")
+            for name, value in stt_payload_options.items() if value is None
+        )
+        raise SystemExit(
+            f"ERROR: STT payload inputs are all-or-nothing; missing {missing}"
+        )
+    assistant_payload_options = {
+        "assistant_payload": args.assistant_payload,
+        "assistant_payload_manifest": args.assistant_payload_manifest,
+    }
+    assistant_payload_enabled = all(
+        value is not None for value in assistant_payload_options.values()
+    )
+    if (any(value is not None for value in assistant_payload_options.values()) and
+            not assistant_payload_enabled):
+        missing = ", ".join(
+            "--" + name.replace("_", "-")
+            for name, value in assistant_payload_options.items() if value is None
+        )
+        raise SystemExit(
+            "ERROR: assistant payload inputs are all-or-nothing; "
+            f"missing {missing}"
+        )
 
     source = read(args.source_boot)
     require_hash("source boot envelope", source, SOURCE_BOOT_SHA256)
@@ -1759,6 +2025,21 @@ def main() -> None:
             "activation": "manual-only",
             "autostart": False,
         },
+        "wakeword": {
+            "enabled": False,
+            "activation": "manual-only",
+            "autostart": False,
+        },
+        "stt": {
+            "enabled": False,
+            "activation": "manual-only",
+            "autostart": False,
+        },
+        "assistant": {
+            "enabled": False,
+            "activation": "manual-only",
+            "autostart": False,
+        },
     }
     overlay = Path(__file__).resolve().parent / "initramfs"
     with tempfile.TemporaryDirectory(prefix="libreecho-arm32-initramfs-") as temporary:
@@ -1795,6 +2076,24 @@ def main() -> None:
         if tts_payload_enabled:
             add_tts_external_payload(
                 args.tts_payload.resolve(), args.tts_payload_manifest.resolve(), manifest,
+            )
+        if wakeword_payload_enabled:
+            add_wakeword_external_payload(
+                args.wakeword_payload.resolve(),
+                args.wakeword_payload_manifest.resolve(),
+                manifest,
+            )
+        if stt_payload_enabled:
+            add_stt_external_payload(
+                args.stt_payload.resolve(),
+                args.stt_payload_manifest.resolve(),
+                manifest,
+            )
+        if assistant_payload_enabled:
+            add_assistant_external_payload(
+                args.assistant_payload.resolve(),
+                args.assistant_payload_manifest.resolve(),
+                manifest,
             )
         if args.startup_audio is not None:
             add_startup_audio(stage, args.startup_audio.resolve(), manifest)

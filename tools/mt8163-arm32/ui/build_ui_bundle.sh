@@ -47,7 +47,21 @@ fi
 
 UI_SOURCE=$(cd -- "$UI_SOURCE" && pwd -P)
 ui_commit=$(git -C "$UI_SOURCE" rev-parse HEAD)
-ui_diff_sha256=$(git -C "$UI_SOURCE" diff --binary HEAD | sha256sum | awk '{print $1}')
+source_state_sha256() {
+    local repository=$1
+
+    {
+        git -C "$repository" diff --binary HEAD
+        while IFS= read -r -d '' relative; do
+            printf '\0untracked:%s\0' "$relative"
+            sha256sum "$repository/$relative"
+        done < <(
+            git -C "$repository" ls-files --others --exclude-standard -z |
+                LC_ALL=C sort -z
+        )
+    } | sha256sum | awk '{print $1}'
+}
+ui_diff_sha256=$(source_state_sha256 "$UI_SOURCE")
 
 "$MAKE_BIN" -C "$UI_SOURCE" clean
 "$MAKE_BIN" -C "$UI_SOURCE" \
@@ -85,7 +99,8 @@ done
 for script in \
     libreecho-web.init libreecho-logd.init libreecho-networkd.init \
     libreecho-audiod.init libreecho-micd.init libreecho-ledd.init \
-    libreecho-btd.init libreecho-airplayd.init libreecho-ttsd.init
+    libreecho-btd.init libreecho-airplayd.init libreecho-ttsd.init \
+    libreecho-waked.init libreecho-sttd.init libreecho-agentd.init
 do
     install -m 0755 "$UI_SOURCE/init/$script" "$OUTPUT/etc/init.d/$script"
 done

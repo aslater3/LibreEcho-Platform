@@ -175,13 +175,22 @@ class SourceTests(unittest.TestCase):
         source = engine.read_text()
         self.assertIn("#define PERIOD_SIZE 2048U", source)
         self.assertIn(".start_threshold = 1U", source)
-        first_write = source.index("pcm_writei(pcm, output, PERIOD_SIZE)")
+        first_write = source.index(
+            "write_period(pcm, output, &reference, first_activity)"
+        )
         second_write = source.index(
-            "pcm_writei(pcm, second, PERIOD_SIZE)"
+            "write_period(pcm, second, &reference, second_activity)"
         )
         amp_enable = source.index("enable_output_controls(card)")
         self.assertLess(first_write, amp_enable)
         self.assertLess(second_write, amp_enable)
+        self.assertIn(
+            "pcm_writei(pcm, samples, PERIOD_SIZE)", source
+        )
+        self.assertIn(
+            "le_aec_reference_publish(reference, samples, PERIOD_SIZE",
+            source,
+        )
         self.assertIn("(void)disable_output_controls(card,", source)
 
     def test_shared_audio_engine_builds_puffin_priority_bus(self) -> None:
@@ -383,6 +392,17 @@ class PolicyTests(unittest.TestCase):
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
         self.assertNotIn("startup_audio_worker", init_script)
         self.assertIn("log audio-startup-disabled", init_script)
+
+    def test_streaming_voice_services_start_warm_in_dependency_order(self) -> None:
+        init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        service_line = (
+            "for service in logd networkd audiod micd waked sttd ledd btd "
+            "airplayd ttsd agentd web"
+        )
+        self.assertIn(service_line, init_script)
+        self.assertLess(service_line.index("waked"), service_line.index("sttd"))
+        self.assertLess(service_line.index("sttd"), service_line.index("agentd"))
+        self.assertLess(service_line.index("ttsd"), service_line.index("agentd"))
 
     def test_hostname_is_derived_from_audited_idme_serial(self) -> None:
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
