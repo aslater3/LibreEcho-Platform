@@ -67,6 +67,7 @@ UI_BINARY_NAMES = {
     "usr/local/sbin/libreecho-ledd",
     "usr/local/sbin/libreecho-btd",
     "usr/local/sbin/libreecho-airplayd",
+    "usr/local/sbin/libreecho-wyomingd",
 }
 UI_INIT_NAMES = {
     "etc/init.d/libreecho-web.init",
@@ -81,6 +82,7 @@ UI_INIT_NAMES = {
     "etc/init.d/libreecho-waked.init",
     "etc/init.d/libreecho-sttd.init",
     "etc/init.d/libreecho-agentd.init",
+    "etc/init.d/libreecho-wyomingd.init",
 }
 UI_FIXED_NAMES = UI_BINARY_NAMES | UI_INIT_NAMES | {
     "etc/libreecho/web-config.json",
