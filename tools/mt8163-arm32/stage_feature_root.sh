@@ -67,6 +67,9 @@ actual_size=$($BB stat -c %s "$PAYLOAD_FILE" 2>/dev/null)
 if [ "$FEATURE_ID" = airplay2 ] && [ -x /etc/init.d/libreecho-airplayd.init ]; then
     /etc/init.d/libreecho-airplayd.init stop >/tmp/airplay-feature-stop.log 2>&1 || true
 fi
+if [ "$FEATURE_ID" = tts ] && [ -x /etc/init.d/libreecho-ttsd.init ]; then
+    /etc/init.d/libreecho-ttsd.init stop >/tmp/tts-feature-stop.log 2>&1 || true
+fi
 
 DEST=/data/libreecho/features/$FEATURE_ID
 $BB mkdir -p "$DEST/staging"
@@ -82,6 +85,9 @@ $BB sync
 
 if [ "$FEATURE_ID" = airplay2 ] && [ -x /etc/init.d/libreecho-airplayd.init ]; then
     /etc/init.d/libreecho-airplayd.init start >/tmp/airplay-feature-start.log 2>&1 || true
+fi
+if [ "$FEATURE_ID" = tts ] && [ -x /etc/init.d/libreecho-ttsd.init ]; then
+    /etc/init.d/libreecho-ttsd.init start >/tmp/tts-feature-start.log 2>&1 || true
 fi
 $BB rm -f "$CONFIG" "$PAYLOAD_FILE" "$MANIFEST_FILE"
 echo "FEATURE_STAGE_OK:$FEATURE_ID"

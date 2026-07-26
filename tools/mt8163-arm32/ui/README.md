@@ -13,6 +13,7 @@ initramfs control plane:
 
 - `networkd` attaches to the existing `wpa_supplicant` control socket.
 - `audiod` uses the existing ALSA device and mixer controls.
+- `micd` owns on-demand microphone capture and starts with capture idle.
 - `ledd` uses the existing LED sysfs/I2C controls.
 - `libreecho-web` exposes those adapters over the local HTTP API.
 
@@ -22,6 +23,7 @@ bundle installs it as `/etc/libreecho/users` with mode `0600`; the boot service
 then enables local-user authentication automatically. Passwords are never
 stored in this repository.
 
-The image init script starts `logd`, `networkd`, `audiod`, `ledd`, and `web` in
-that order. Each service is idempotent and can still be restarted through its
-init script for development.
+The image init script starts `logd`, `networkd`, `audiod`, `micd`, `ledd`, and
+`web` in that order (with any additional integration daemons between the
+hardware adapters and web). Each service is idempotent and can still be
+restarted through its init script for development.
