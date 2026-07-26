@@ -694,14 +694,14 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
     for binary in (
         "libreecho-web", "libreecho-logd", "libreecho-networkd",
         "libreecho-audiod", "libreecho-micd", "libreecho-ledd", "libreecho-btd",
-        "libreecho-airplayd",
+        "libreecho-airplayd", "libreecho-wyomingd",
     ):
         copy_file(f"sbin/{binary}", f"usr/local/sbin/{binary}", 0o755, True)
     for script in (
         "libreecho-web.init", "libreecho-logd.init", "libreecho-networkd.init",
         "libreecho-audiod.init", "libreecho-micd.init", "libreecho-ledd.init", "libreecho-btd.init",
         "libreecho-airplayd.init", "libreecho-ttsd.init", "libreecho-waked.init",
-        "libreecho-sttd.init", "libreecho-agentd.init",
+        "libreecho-sttd.init", "libreecho-agentd.init", "libreecho-wyomingd.init",
     ):
         copy_file(f"etc/init.d/{script}", f"etc/init.d/{script}", 0o755)
     copy_file("etc/libreecho/web-config.json", "etc/libreecho/web-config.json", 0o600)
