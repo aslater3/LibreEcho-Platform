@@ -1,0 +1,289 @@
+#!/bin/busybox sh
+# Signed A/B updater for the Amonet Biscuit layout.
+
+BB=/bin/busybox
+UPDATE_ROOT=/data/libreecho/update
+INCOMING=$UPDATE_ROOT/incoming
+STAGING=$UPDATE_ROOT/staging
+STATE=$UPDATE_ROOT/state
+PENDING=$UPDATE_ROOT/pending
+LOCK=$UPDATE_ROOT/install.lock
+VERIFY=/usr/local/libexec/libreecho-update-verify
+BOOTCTL=/usr/local/sbin/libreecho-bootctl
+PUBLIC_KEY=/etc/libreecho/ota-public-key.hex
+BOOT_SIZE=16777216
+
+die()
+{
+    echo "ERROR:$1" >&2
+    exit 1
+}
+
+require_userdata()
+{
+    [ -b /dev/mmcblk0p16 ] &&
+        $BB grep -qx 'PARTNAME=userdata' \
+            /sys/class/block/mmcblk0p16/uevent 2>/dev/null &&
+        [ "$($BB cat /sys/class/block/mmcblk0p16/size 2>/dev/null)" = 2137088 ] &&
+        $BB grep -q ' /data ' /proc/mounts 2>/dev/null ||
+        die userdata_identity_or_mount_failed
+    $BB mkdir -p "$INCOMING" "$UPDATE_ROOT" || die update_directory_failed
+    $BB chmod 0700 /data/libreecho "$UPDATE_ROOT" "$INCOMING" 2>/dev/null
+}
+
+state_write()
+{
+    state_name=$1
+    progress=$2
+    detail=$3
+    {
+        echo schema=1
+        echo "state=$state_name"
+        echo "progress=$progress"
+        echo "detail=$detail"
+    } > "$STATE.tmp" || die state_write_failed
+    $BB mv "$STATE.tmp" "$STATE" || die state_commit_failed
+    $BB sync
+}
+
+lock_take()
+{
+    if ! $BB mkdir "$LOCK" 2>/dev/null; then
+        die update_busy
+    fi
+    trap '$BB rmdir "$LOCK" 2>/dev/null' EXIT
+}
+
+manifest_value()
+{
+    key=$1
+    $BB sed -n "s/^${key}=//p" "$STAGING/manifest"
+}
+
+verify_manifest()
+{
+    expected_keys='format manifest_version board soc architecture version boot_filename boot_size boot_sha256 feature_policy image_profile'
+    seen=
+    while IFS='=' read -r key value; do
+        [ -n "$key" ] && [ -n "$value" ] || die manifest_syntax
+        case " $expected_keys " in
+            *" $key "*) ;;
+            *) die manifest_unknown_key ;;
+        esac
+        case " $seen " in
+            *" $key "*) die manifest_duplicate_key ;;
+        esac
+        seen="$seen $key"
+        case "$value" in
+            *[!A-Za-z0-9._+~:/-]*) die manifest_value_characters ;;
+        esac
+    done < "$STAGING/manifest"
+    for key in $expected_keys; do
+        case " $seen " in
+            *" $key "*) ;;
+            *) die manifest_missing_key ;;
+        esac
+    done
+
+    [ "$(manifest_value format)" = libreecho-ota-v1 ] ||
+        die manifest_format
+    [ "$(manifest_value manifest_version)" = 1 ] ||
+        die manifest_version
+    [ "$(manifest_value board)" = radar_puffin ] || die manifest_board
+    [ "$(manifest_value soc)" = mt8163 ] || die manifest_soc
+    [ "$(manifest_value architecture)" = armv7 ] ||
+        die manifest_architecture
+    [ "$(manifest_value boot_filename)" = boot.img ] ||
+        die manifest_boot_filename
+    [ "$(manifest_value boot_size)" = "$BOOT_SIZE" ] ||
+        die manifest_boot_size
+    [ "$(manifest_value feature_policy)" = preserve ] ||
+        die manifest_feature_policy
+    [ "$(manifest_value image_profile)" = ota ] ||
+        die manifest_image_profile
+    version=$(manifest_value version)
+    case "$version" in
+        ''|*[!A-Za-z0-9._+~-]*) die manifest_version_value ;;
+    esac
+    boot_sha=$(manifest_value boot_sha256)
+    case "$boot_sha" in
+        ''|*[!0-9a-f]*) die manifest_boot_hash ;;
+    esac
+    [ "${#boot_sha}" -eq 64 ] || die manifest_boot_hash
+}
+
+extract_and_verify()
+{
+    package=$1
+    [ -f "$package" ] && [ ! -L "$package" ] || die package_not_regular
+    [ "$($BB stat -c %s "$package" 2>/dev/null)" -le 33554432 ] ||
+        die package_too_large
+    members=$($BB tar -tf "$package" 2>/dev/null) || die package_tar_invalid
+    [ "$members" = "manifest
+manifest.sig
+boot.img" ] || die package_member_contract
+
+    $BB rm -rf "$STAGING"
+    $BB mkdir -p "$STAGING" || die staging_create_failed
+    $BB tar -xf "$package" -C "$STAGING" manifest manifest.sig boot.img \
+        2>/dev/null || die package_extract_failed
+    [ -f "$STAGING/manifest" ] && [ ! -L "$STAGING/manifest" ] &&
+        [ -f "$STAGING/manifest.sig" ] &&
+        [ ! -L "$STAGING/manifest.sig" ] &&
+        [ -f "$STAGING/boot.img" ] && [ ! -L "$STAGING/boot.img" ] ||
+        die package_extracted_type
+    [ "$($BB stat -c %h "$STAGING/manifest" 2>/dev/null)" = 1 ] &&
+        [ "$($BB stat -c %h "$STAGING/manifest.sig" 2>/dev/null)" = 1 ] &&
+        [ "$($BB stat -c %h "$STAGING/boot.img" 2>/dev/null)" = 1 ] ||
+        die package_extracted_links
+    "$VERIFY" "$PUBLIC_KEY" "$STAGING/manifest" "$STAGING/manifest.sig" ||
+        die package_signature
+    verify_manifest
+    [ "$($BB stat -c %s "$STAGING/boot.img" 2>/dev/null)" = "$BOOT_SIZE" ] ||
+        die boot_size
+    header=$($BB dd if="$STAGING/boot.img" bs=8 count=1 2>/dev/null |
+        $BB od -An -tx1 -v | $BB tr -d ' \n')
+    [ "$header" = 414e44524f494421 ] || die boot_android_magic
+    actual=$($BB sha256sum "$STAGING/boot.img" | $BB awk '{print $1}')
+    [ "$actual" = "$boot_sha" ] || die boot_package_hash
+}
+
+bootctl_status()
+{
+    "$BOOTCTL" status > "$STAGING/bootctl.status" ||
+        die boot_control_status
+    selected=$($BB sed -n 's/^selected_slot=//p' "$STAGING/bootctl.status")
+    inactive=$($BB sed -n 's/^inactive_slot=//p' "$STAGING/bootctl.status")
+    case "$selected:$inactive" in
+        a:b|b:a) ;;
+        *) die boot_control_slots ;;
+    esac
+    selected_success=$($BB sed -n \
+        "s/^slot_${selected}_success=//p" "$STAGING/bootctl.status")
+    [ "$selected_success" = 1 ] || die current_slot_not_confirmed
+    target=$inactive
+    case "$target" in
+        a) target_device=/dev/mmcblk0p10 ;;
+        b) target_device=/dev/mmcblk0p11 ;;
+        *) die boot_control_target ;;
+    esac
+}
+
+clear_exact_development_marker()
+{
+    expdb=/dev/mmcblk0p7
+    expdb_sys=/sys/class/block/mmcblk0p7
+    [ -b "$expdb" ] &&
+        $BB grep -qx 'PARTNAME=expdb' "$expdb_sys/uevent" 2>/dev/null &&
+        [ "$($BB cat "$expdb_sys/size" 2>/dev/null)" = 20480 ] ||
+        die expdb_identity
+    marker=$($BB dd if="$expdb" bs=15 count=1 2>/dev/null)
+    [ "$marker" = FASTBOOT_PLEASE ] || return 0
+    $BB dd if="$expdb" of="$STAGING/expdb-sector.before" bs=512 count=1 \
+        2>/dev/null || die expdb_read
+    $BB cp "$STAGING/expdb-sector.before" "$STAGING/expdb-sector.after" ||
+        die expdb_copy
+    $BB dd if=/dev/zero of="$STAGING/expdb-sector.after" bs=15 count=1 \
+        conv=notrunc 2>/dev/null || die expdb_marker_clear_prepare
+    $BB dd if="$STAGING/expdb-sector.after" of="$expdb" bs=512 count=1 \
+        conv=fsync 2>/dev/null || die expdb_marker_clear_write
+    $BB dd if="$expdb" of="$STAGING/expdb-sector.readback" bs=512 count=1 \
+        2>/dev/null || die expdb_marker_clear_read
+    $BB cmp "$STAGING/expdb-sector.after" "$STAGING/expdb-sector.readback" ||
+        die expdb_marker_clear_readback
+}
+
+install_package()
+{
+    package=$1
+    require_userdata
+    lock_take
+    state_write verifying 5 package
+    extract_and_verify "$package"
+    state_write verified 20 "$version"
+    bootctl_status
+
+    state_write writing 30 "$target"
+    $BB dd if="$STAGING/boot.img" of="$target_device" bs=4096 \
+        conv=fsync 2>"$STAGING/boot-write.log" || die boot_write
+    state_write verifying-write 75 "$target"
+    written=$($BB dd if="$target_device" bs=4096 count=4096 2>/dev/null |
+        $BB sha256sum | $BB awk '{print $1}')
+    [ "$written" = "$boot_sha" ] || die boot_write_hash
+
+    {
+        echo schema=1
+        echo "version=$version"
+        echo "slot=$target"
+        echo "boot_sha256=$boot_sha"
+        echo feature_policy=preserve
+    } > "$PENDING.tmp" || die pending_write
+    $BB mv "$PENDING.tmp" "$PENDING" || die pending_commit
+    $BB sync
+
+    # Old development images leave this marker armed. Clear only its exact
+    # prefix before the BCB commit; OTA-profile kernels do not recreate it.
+    clear_exact_development_marker
+    state_write activating 90 "$target"
+    "$BOOTCTL" activate "$target" > "$STAGING/bootctl.activate" ||
+        die boot_control_activate
+    state_write reboot-pending 100 "$target"
+    echo "UPDATE_READY slot=$target version=$version"
+}
+
+confirm_pending()
+{
+    require_userdata
+    lock_take
+    [ -r "$PENDING" ] || die no_pending_update
+    slot=$($BB sed -n 's/^slot=//p' "$PENDING")
+    version=$($BB sed -n 's/^version=//p' "$PENDING")
+    expected=$($BB sed -n 's/^boot_sha256=//p' "$PENDING")
+    case "$slot" in
+        a) device=/dev/mmcblk0p10 ;;
+        b) device=/dev/mmcblk0p11 ;;
+        *) die pending_slot ;;
+    esac
+    actual=$($BB dd if="$device" bs=4096 count=4096 2>/dev/null |
+        $BB sha256sum | $BB awk '{print $1}')
+    [ "$actual" = "$expected" ] || die pending_boot_hash
+    "$BOOTCTL" confirm "$slot" > "$UPDATE_ROOT/bootctl.confirm" ||
+        die boot_control_confirm
+    $BB mv "$PENDING" "$UPDATE_ROOT/installed"
+    state_write installed 100 "$version"
+    echo "UPDATE_CONFIRMED slot=$slot version=$version"
+}
+
+inspect_package()
+{
+    package=$1
+    require_userdata
+    lock_take
+    extract_and_verify "$package"
+    echo "UPDATE_VALID version=$version"
+}
+
+case "${1:-}" in
+    status)
+        require_userdata
+        "$BOOTCTL" status
+        [ ! -r "$STATE" ] || $BB cat "$STATE"
+        [ ! -r "$PENDING" ] || $BB cat "$PENDING"
+        ;;
+    install)
+        [ "$#" -eq 2 ] || die usage
+        install_package "$2"
+        ;;
+    inspect)
+        [ "$#" -eq 2 ] || die usage
+        inspect_package "$2"
+        ;;
+    confirm)
+        [ "$#" -eq 1 ] || die usage
+        confirm_pending
+        ;;
+    *)
+        echo "Usage: libreecho-update status | inspect PACKAGE.tar | install PACKAGE.tar | confirm" >&2
+        exit 2
+        ;;
+esac

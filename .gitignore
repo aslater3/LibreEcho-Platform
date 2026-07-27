@@ -52,6 +52,7 @@ cscope.*
 tags
 TAGS
 tools/mt8163-arm32/__pycache__/
+__pycache__/
 
 # Generated firmware / logo / initramfs
 firmware/*.gen.S

@@ -396,8 +396,8 @@ class PolicyTests(unittest.TestCase):
     def test_streaming_voice_services_start_warm_in_dependency_order(self) -> None:
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
         service_line = (
-            "for service in logd networkd audiod micd waked sttd ledd btd "
-            "airplayd ttsd agentd web"
+            'services="logd networkd timed audiod micd waked sttd ledd btd '
+            'airplayd ttsd agentd web"'
         )
         self.assertIn(service_line, init_script)
         self.assertLess(service_line.index("waked"), service_line.index("sttd"))
@@ -465,6 +465,30 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("userdata-mount-failed", source)
         self.assertNotIn("mkfs", source)
         self.assertLess(source.index("userdata-mounted"), source.index("start_ui_services"))
+
+    def test_time_service_is_packaged_and_started(self) -> None:
+        builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        bundle_source = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        init_source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        for expected in (
+            "libreecho-timed", "libreecho-timed.init", "etc/libreecho/ntp.conf",
+        ):
+            self.assertIn(expected, builder_source)
+            self.assertIn(expected, bundle_source)
+        self.assertIn(
+            'services="logd networkd timed audiod', init_source
+        )
+
+    def test_ota_fetch_failure_cannot_become_empty_rollback_hold(self) -> None:
+        fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
+        self.assertIn("version=$(download_and_inspect) || return 1", fetcher)
+        self.assertIn(
+            'if [ -n "$rolled_back" ] && [ "$version" = "$rolled_back" ]; then',
+            fetcher,
+        )
+        self.assertIn("check_status_write error", fetcher)
+        self.assertIn("404) die asset_missing true", fetcher)
+        self.assertNotIn("state_write update-held-after-rollback", fetcher)
 
     def test_schema2_disabled_record_is_exact(self) -> None:
         record = {

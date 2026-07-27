@@ -10,6 +10,7 @@ OUTPUT=${2:-}
 MAKE_BIN=${MAKE:-make}
 CROSS_COMPILE=${LIBREECHO_UI_CROSS_COMPILE:-/usr/bin/arm-linux-gnueabihf-}
 CC_BIN=${LIBREECHO_UI_CC:-gcc}
+STRIP_BIN=${LIBREECHO_UI_STRIP:-${CROSS_COMPILE}strip}
 GC_LDFLAGS=${LIBREECHO_UI_GC_LDFLAGS:--static -Wl,--gc-sections}
 USERS_SOURCE=${LIBREECHO_WEB_USERS_FILE:-}
 
@@ -31,6 +32,10 @@ command -v "$MAKE_BIN" >/dev/null 2>&1 || {
 }
 [[ -x "${CROSS_COMPILE}gcc" ]] || {
     echo "ERROR: UI ARM32 compiler not found: ${CROSS_COMPILE}gcc" >&2
+    exit 1
+}
+[[ -x "$STRIP_BIN" ]] || {
+    echo "ERROR: UI ARM32 strip tool not found: $STRIP_BIN" >&2
     exit 1
 }
 if [[ -n "$USERS_SOURCE" ]]; then
@@ -69,7 +74,9 @@ ui_diff_sha256=$(source_state_sha256 "$UI_SOURCE")
     GC_LDFLAGS="$GC_LDFLAGS" release
 
 for binary in \
-    libreecho-web libreecho-logd libreecho-networkd libreecho-audiod libreecho-micd libreecho-ledd libreecho-btd libreecho-airplayd libreecho-wyomingd
+    libreecho-web libreecho-logd libreecho-networkd libreecho-timed \
+    libreecho-audiod libreecho-micd libreecho-ledd libreecho-btd \
+    libreecho-airplayd libreecho-wyomingd
 do
     path="$UI_SOURCE/build/$binary"
     [[ -f "$path" && ! -L "$path" ]] || {
@@ -91,13 +98,16 @@ mkdir -p "$OUTPUT/sbin" "$OUTPUT/share/libreecho/web" \
     "$OUTPUT/etc/init.d" "$OUTPUT/etc/libreecho"
 
 for binary in \
-    libreecho-web libreecho-logd libreecho-networkd libreecho-audiod libreecho-micd libreecho-ledd libreecho-btd libreecho-airplayd libreecho-wyomingd
+    libreecho-web libreecho-logd libreecho-networkd libreecho-timed \
+    libreecho-audiod libreecho-micd libreecho-ledd libreecho-btd \
+    libreecho-airplayd libreecho-wyomingd
 do
     install -m 0755 "$UI_SOURCE/build/$binary" "$OUTPUT/sbin/$binary"
+    "$STRIP_BIN" --strip-unneeded "$OUTPUT/sbin/$binary"
 done
 
 for script in \
-    libreecho-web.init libreecho-logd.init libreecho-networkd.init \
+    libreecho-web.init libreecho-logd.init libreecho-networkd.init libreecho-timed.init \
     libreecho-audiod.init libreecho-micd.init libreecho-ledd.init \
     libreecho-btd.init libreecho-airplayd.init libreecho-ttsd.init \
     libreecho-waked.init libreecho-sttd.init libreecho-agentd.init \
@@ -111,6 +121,8 @@ install -m 0600 "$UI_SOURCE/config/defaults.json" \
     "$OUTPUT/etc/libreecho/web-config.json"
 install -m 0644 "$UI_SOURCE/config/airplay2.conf" \
     "$OUTPUT/etc/libreecho/airplay2.conf"
+install -m 0644 "$UI_SOURCE/config/ntp.conf" \
+    "$OUTPUT/etc/libreecho/ntp.conf"
 if [[ -n "$USERS_SOURCE" ]]; then
     install -m 0600 "$USERS_SOURCE" "$OUTPUT/etc/libreecho/users"
 fi

@@ -1,0 +1,244 @@
+#!/bin/busybox sh
+# GitHub Releases transport for the signed LibreEcho OTA installer.
+
+BB=/bin/busybox
+UPDATE=/usr/local/sbin/libreecho-update
+CONFIG=/etc/libreecho/ota-source.conf
+PROFILE=/etc/libreecho/image-profile
+ROOT=/data/libreecho/update
+INCOMING=$ROOT/incoming
+PACKAGE=$INCOMING/github-stable.ota.tar
+PART=$PACKAGE.part
+LOCK=$ROOT/fetch.lock
+CHECK_STATUS=$ROOT/check-status
+ASSISTANT_PAYLOAD=/data/libreecho/features/assistant/payload.squashfs
+ASSISTANT_MANIFEST=/data/libreecho/features/assistant/manifest.json
+CLIENT_ROOT=/run/libreecho/ota-client
+MAX_BYTES=33554432
+
+check_value()
+{
+    $BB sed -n "s/^$1=//p" "$CHECK_STATUS" 2>/dev/null
+}
+
+check_status_write()
+{
+    status=$1
+    latest=$2
+    error=$3
+    reachable=$4
+    now=$($BB date +%s 2>/dev/null)
+    case "$now" in
+        ''|*[!0-9]*) now=0 ;;
+    esac
+    last_success=$(check_value last_success_epoch)
+    case "$last_success" in
+        ''|*[!0-9]*) last_success=0 ;;
+    esac
+    case "$status" in
+        up-to-date|update-available|update-held-after-rollback|reboot-pending)
+            last_success=$now
+            ;;
+    esac
+    channel=$(config_value channel)
+    [ -n "$channel" ] || channel=stable
+    {
+        echo schema=1
+        echo source=github-releases
+        echo "channel=$channel"
+        echo "status=$status"
+        echo "source_reachable=$reachable"
+        echo "latest_version=$latest"
+        echo "last_check_epoch=$now"
+        echo "last_success_epoch=$last_success"
+        echo "error=$error"
+    } > "$CHECK_STATUS.tmp" &&
+        $BB mv "$CHECK_STATUS.tmp" "$CHECK_STATUS"
+}
+
+die()
+{
+    reason=$1
+    reachable=${2:-unknown}
+    check_status_write error "" "$reason" "$reachable"
+    echo "ERROR:$1" >&2
+    exit 1
+}
+
+require_environment()
+{
+    [ "$($BB cat "$PROFILE" 2>/dev/null)" = ota ] || die ota_profile_required
+    [ -x "$UPDATE" ] || die installer_missing
+    $BB grep -q ' /data ' /proc/mounts 2>/dev/null || die userdata_not_mounted
+    $BB mkdir -p "$INCOMING" /run/libreecho || die update_directory_failed
+    $BB chmod 0700 /data/libreecho "$ROOT" "$INCOMING" 2>/dev/null
+}
+
+config_value()
+{
+    $BB sed -n "s/^$1=//p" "$CONFIG"
+}
+
+validate_source()
+{
+    [ "$(config_value schema)" = 1 ] || die source_schema
+    url=$(config_value url)
+    [ "$url" = "https://github.com/aslater3/LibreEcho-Kernel/releases/latest/download/libreecho-radar-puffin-stable.ota.tar" ] ||
+        die source_url
+}
+
+manifest_payload_value()
+{
+    field=$1
+    $BB awk -v field="\"$field\"" '
+        /"payload"[[:space:]]*:/ { payload = 1; next }
+        payload && index($0, field) {
+            value = $0
+            sub(/^[^:]*:[[:space:]]*"?/, "", value)
+            sub(/"?,?[[:space:]]*$/, "", value)
+            print value
+            exit
+        }
+    ' "$ASSISTANT_MANIFEST"
+}
+
+prepare_https_client()
+{
+    [ -f "$ASSISTANT_PAYLOAD" ] && [ ! -L "$ASSISTANT_PAYLOAD" ] &&
+        [ -f "$ASSISTANT_MANIFEST" ] && [ ! -L "$ASSISTANT_MANIFEST" ] ||
+        die https_payload_missing
+    [ "$($BB stat -c %u "$ASSISTANT_PAYLOAD" 2>/dev/null)" = 0 ] &&
+        [ "$($BB stat -c %u "$ASSISTANT_MANIFEST" 2>/dev/null)" = 0 ] ||
+        die https_payload_owner
+    manifest_mode=$($BB stat -c %a "$ASSISTANT_MANIFEST" 2>/dev/null)
+    case "$manifest_mode" in
+        600|640|644) ;;
+        *) die https_payload_manifest_mode ;;
+    esac
+    expected_size=$(manifest_payload_value size)
+    expected_sha=$(manifest_payload_value sha256)
+    case "$expected_size" in
+        ''|*[!0-9]*) die https_payload_manifest ;;
+    esac
+    case "$expected_sha" in
+        ''|*[!0-9a-f]*) die https_payload_manifest ;;
+    esac
+    [ "${#expected_sha}" -eq 64 ] || die https_payload_manifest
+    [ "$($BB stat -c %s "$ASSISTANT_PAYLOAD" 2>/dev/null)" = "$expected_size" ] ||
+        die https_payload_size
+    actual_sha=$($BB sha256sum "$ASSISTANT_PAYLOAD" | $BB awk '{print $1}')
+    [ "$actual_sha" = "$expected_sha" ] || die https_payload_hash
+
+    $BB mkdir -p "$CLIENT_ROOT" || die https_mount_directory
+    if ! $BB grep -q " $CLIENT_ROOT " /proc/mounts 2>/dev/null; then
+        $BB mount -t squashfs -o loop,ro,nosuid,nodev,noatime \
+            "$ASSISTANT_PAYLOAD" "$CLIENT_ROOT" || die https_payload_mount
+    fi
+    CURL=$CLIENT_ROOT/usr/local/libexec/libreecho-curl
+    CA=$CLIENT_ROOT/usr/local/share/libreecho/cacert.pem
+    [ -x "$CURL" ] && [ -f "$CA" ] && [ ! -L "$CURL" ] && [ ! -L "$CA" ] ||
+        die https_client_missing
+}
+
+fetch_lock()
+{
+    $BB mkdir "$LOCK" 2>/dev/null || die download_busy
+    trap '$BB rmdir "$LOCK" 2>/dev/null' EXIT
+}
+
+download_and_inspect()
+{
+    [ ! -r "$ROOT/pending" ] || die update_already_pending
+    check_status_write checking "" "" unknown
+    prepare_https_client
+    check_status_write downloading "" "" true
+    $BB rm -f "$PART"
+    http_code=$("$CURL" --fail --location --silent --show-error \
+        --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --cacert "$CA" --connect-timeout 20 --max-time 1800 \
+        --max-filesize "$MAX_BYTES" --output "$PART" \
+        --write-out '%{http_code}' "$url")
+    curl_rc=$?
+    if [ "$curl_rc" -ne 0 ]; then
+        case "$http_code" in
+            404) die asset_missing true ;;
+            401|403) die asset_access_denied true ;;
+            *) die download_transport false ;;
+        esac
+    fi
+    [ -f "$PART" ] && [ ! -L "$PART" ] || die download_type
+    size=$($BB stat -c %s "$PART" 2>/dev/null)
+    [ "$size" -gt 0 ] && [ "$size" -le "$MAX_BYTES" ] || die download_size
+    $BB mv "$PART" "$PACKAGE" || die download_commit
+    inspection=$("$UPDATE" inspect "$PACKAGE") ||
+        die downloaded_package_invalid true
+    version=$(printf '%s\n' "$inspection" |
+        $BB sed -n 's/^UPDATE_VALID version=//p')
+    case "$version" in
+        ''|*[!A-Za-z0-9._+~-]*) die downloaded_version ;;
+    esac
+    echo "$version"
+}
+
+check_or_install()
+{
+    action=$1
+    require_environment
+    validate_source
+    fetch_lock
+    version=$(download_and_inspect) || return 1
+    installed=$($BB sed -n 's/^version=//p' "$ROOT/installed" 2>/dev/null)
+    rolled_back=$($BB sed -n 's/^version=//p' "$ROOT/rolled-back" 2>/dev/null)
+    if [ "$version" = "$installed" ]; then
+        check_status_write up-to-date "$version" "" true
+        echo "UPDATE_CURRENT version=$version"
+        return 0
+    fi
+    if [ -n "$rolled_back" ] && [ "$version" = "$rolled_back" ]; then
+        check_status_write update-held-after-rollback "$version" "" true
+        echo "UPDATE_HELD version=$version"
+        return 0
+    fi
+    if [ "$action" = check ]; then
+        check_status_write update-available "$version" "" true
+        echo "UPDATE_AVAILABLE version=$version"
+        return 0
+    fi
+    "$UPDATE" install "$PACKAGE" || {
+        check_status_write error "$version" install_failed true
+        return 1
+    }
+    check_status_write reboot-pending "$version" "" true
+}
+
+watch_updates()
+{
+    [ "$($BB cat "$PROFILE" 2>/dev/null)" = ota ] || exit 0
+    interval=$(config_value check_interval_seconds)
+    case "$interval" in
+        ''|*[!0-9]*) interval=86400 ;;
+    esac
+    [ "$interval" -ge 3600 ] || interval=3600
+    $BB sleep 300
+    while true; do
+        if [ ! -r "$ROOT/pending" ]; then
+            "$0" install >/tmp/ota-fetch.log 2>&1 || true
+        fi
+        $BB sleep "$interval"
+    done
+}
+
+case "${1:-}" in
+    check|install)
+        [ "$#" -eq 1 ] || die usage
+        check_or_install "$1"
+        ;;
+    watch)
+        [ "$#" -eq 1 ] || die usage
+        watch_updates
+        ;;
+    *)
+        echo "Usage: libreecho-update-fetch check | install | watch" >&2
+        exit 2
+        ;;
+esac

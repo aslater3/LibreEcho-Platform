@@ -130,6 +130,14 @@ source "drivers/misc/mediatek/videocodec/Kconfig"
 source "drivers/misc/mediatek/m4u/Kconfig"
 source "drivers/misc/mediatek/i2c/Kconfig"
 source "drivers/misc/mediatek/leds/Kconfig"
+config LIBREECHO_DEV_RECOVERY_MARKER
+	bool "LibreEcho development fastboot and BCB recovery marker"
+	default n
+	help
+	  Write FASTBOOT_PLEASE to expdb and reset both Amazon BCB slots early
+	  during development-image boot. This defeats normal A/B retry and
+	  rollback semantics and must remain disabled in OTA/release images.
+
 source "drivers/misc/mediatek/vibrator/Kconfig"
 source "drivers/misc/mediatek/jpeg/Kconfig"
 source "drivers/misc/mediatek/power/Kconfig"
