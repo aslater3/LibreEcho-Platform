@@ -14,13 +14,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  source-checks:
+  source_checks:
     name: Full source checks
     runs-on: ubuntu-24.04
     outputs:
-      ui_sha: ${{ steps.ui-identity.outputs.sha }}
-      version: ${{ steps.release-input.outputs.version }}
-      release_tag: ${{ steps.release-input.outputs.tag }}
+      ui_sha: ${{ steps.ui_identity.outputs.sha }}
+      version: ${{ steps.release_input.outputs.version }}
+      release_tag: ${{ steps.release_input.outputs.tag }}
     steps:
       - name: Check out Kernel source
         uses: actions/checkout@v4
@@ -67,7 +67,7 @@ jobs:
             "$RUNNER_TEMP/speexdsp/lib/libspeexdsp.a"
 
       - name: Validate release input
-        id: release-input
+        id: release_input
         shell: bash
         run: |
           set -euo pipefail
@@ -77,7 +77,7 @@ jobs:
           printf 'tag=v%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Record immutable UI identity
-        id: ui-identity
+        id: ui_identity
         shell: bash
         run: |
           set -euo pipefail
@@ -112,17 +112,17 @@ jobs:
           make SPEEX_PREFIX="$RUNNER_TEMP/speexdsp" test
           git diff --check
 
-  verified-build:
+  verified_build:
     name: Verified OTA image build
-    needs: source-checks
+    needs: source_checks
     if: ${{ github.ref == 'refs/heads/main' }}
     runs-on: [self-hosted, linux, x64, libreecho-ota-builder]
     env:
       PIPELINE_ROOT: ${{ vars.LIBREECHO_PIPELINE_ROOT }}
       LIBREECHO_KERNEL_SRC: ${{ github.workspace }}/LibreEcho-Kernel
       LIBREECHO_UI_SRC: ${{ github.workspace }}/LibreEcho-UI
-      EXPECTED_UI_SHA: ${{ needs.source-checks.outputs.ui_sha }}
-      VERSION: ${{ needs.source-checks.outputs.version }}
+      EXPECTED_UI_SHA: ${{ needs.source_checks.outputs.ui_sha }}
+      VERSION: ${{ needs.source_checks.outputs.version }}
       UNSIGNED_DIR: ${{ runner.temp }}/libreecho-ota-unsigned-${{ github.run_id }}-${{ github.run_attempt }}
     outputs:
       boot_sha256: ${{ steps.build.outputs.boot_sha256 }}
@@ -137,7 +137,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: aslater3/LibreEcho-UI
-          ref: ${{ needs.source-checks.outputs.ui_sha }}
+          ref: ${{ needs.source_checks.outputs.ui_sha }}
           path: LibreEcho-UI
 
       - name: Validate provisioned builder
@@ -202,20 +202,20 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  sign-and-release:
+  sign_and_release:
     name: Protected signing and release
-    needs: [source-checks, verified-build]
+    needs: [source_checks, verified_build]
     runs-on: ubuntu-24.04
     environment: production-signing
     permissions:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
-      RELEASE_TAG: ${{ needs.source-checks.outputs.release_tag }}
-      EXPECTED_BOOT_SHA256: ${{ needs.verified-build.outputs.boot_sha256 }}
-      EXPECTED_UI_SHA: ${{ needs.source-checks.outputs.ui_sha }}
-      EXPECTED_RUN_ID: ${{ needs.verified-build.outputs.run_id }}
-      VERSION: ${{ needs.source-checks.outputs.version }}
+      RELEASE_TAG: ${{ needs.source_checks.outputs.release_tag }}
+      EXPECTED_BOOT_SHA256: ${{ needs.verified_build.outputs.boot_sha256 }}
+      EXPECTED_UI_SHA: ${{ needs.source_checks.outputs.ui_sha }}
+      EXPECTED_RUN_ID: ${{ needs.verified_build.outputs.run_id }}
+      VERSION: ${{ needs.source_checks.outputs.version }}
     steps:
       - name: Check out reviewed signing source
         uses: actions/checkout@v4
