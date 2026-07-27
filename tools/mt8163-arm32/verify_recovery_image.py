@@ -787,8 +787,17 @@ def validate_ui(entries: dict[str, Entry], manifest: dict[str, object],
         if name == "etc/libreecho/users" and not member.data.strip():
             fail("UI users file is empty")
         if name in UI_BINARY_NAMES:
-            if elf_info(member.data) != (1, 40, 0x05000400, None, (), False):
-                fail(f"UI binary is not static ARM32 hard-float: {name}")
+            if name in {
+                    "usr/local/sbin/libreecho-sttd-wyoming",
+                    "usr/local/sbin/libreecho-ttsd-wyoming"}:
+                expected_elf = (
+                    1, 40, 0x05000400, "/lib/ld-musl-armhf.so.1",
+                    ("libc.musl-armv7.so.1",), True,
+                )
+            else:
+                expected_elf = (1, 40, 0x05000400, None, (), False)
+            if elf_info(member.data) != expected_elf:
+                fail(f"UI binary ARM32 ABI contract changed: {name}")
 
     return True
 

@@ -482,6 +482,16 @@ class PolicyTests(unittest.TestCase):
             'services="logd networkd timed audiod', init_source
         )
 
+    def test_remote_wyoming_clients_use_pinned_musl_runtime(self) -> None:
+        bundle_source = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        for source in (bundle_source, builder_source, verifier_source):
+            self.assertIn("libreecho-sttd-wyoming", source)
+            self.assertIn("libreecho-ttsd-wyoming", source)
+            self.assertIn("/lib/ld-musl-armhf.so.1", source)
+            self.assertIn("libc.musl-armv7.so.1", source)
+
     def test_ota_fetch_failure_cannot_become_empty_rollback_hold(self) -> None:
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
         self.assertIn("version=$(download_and_inspect) || return 1", fetcher)

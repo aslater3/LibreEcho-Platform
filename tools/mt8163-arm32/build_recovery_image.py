@@ -742,7 +742,16 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
             "mode": f"{mode:04o}",
         }
         if elf:
-            record["elf"] = require_elf_contract(target, 0x05000400, None, (), False)
+            if target.name in {
+                    "libreecho-sttd-wyoming", "libreecho-ttsd-wyoming"}:
+                record["elf"] = require_elf_contract(
+                    target, 0x05000400, "/lib/ld-musl-armhf.so.1",
+                    ("libc.musl-armv7.so.1",), True,
+                )
+            else:
+                record["elf"] = require_elf_contract(
+                    target, 0x05000400, None, (), False,
+                )
         files[target_name] = record
 
     for binary in (
