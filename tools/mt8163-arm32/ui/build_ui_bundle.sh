@@ -76,7 +76,8 @@ ui_diff_sha256=$(source_state_sha256 "$UI_SOURCE")
 for binary in \
     libreecho-web libreecho-logd libreecho-networkd libreecho-timed \
     libreecho-audiod libreecho-micd libreecho-ledd libreecho-btd \
-    libreecho-airplayd libreecho-wyomingd
+    libreecho-airplayd libreecho-wyomingd \
+    libreecho-sttd-wyoming libreecho-ttsd-wyoming
 do
     path="$UI_SOURCE/build/$binary"
     [[ -f "$path" && ! -L "$path" ]] || {
@@ -100,7 +101,8 @@ mkdir -p "$OUTPUT/sbin" "$OUTPUT/share/libreecho/web" \
 for binary in \
     libreecho-web libreecho-logd libreecho-networkd libreecho-timed \
     libreecho-audiod libreecho-micd libreecho-ledd libreecho-btd \
-    libreecho-airplayd libreecho-wyomingd
+    libreecho-airplayd libreecho-wyomingd \
+    libreecho-sttd-wyoming libreecho-ttsd-wyoming
 do
     install -m 0755 "$UI_SOURCE/build/$binary" "$OUTPUT/sbin/$binary"
     "$STRIP_BIN" --strip-unneeded "$OUTPUT/sbin/$binary"

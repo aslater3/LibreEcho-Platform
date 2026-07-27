@@ -750,6 +750,7 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
         "libreecho-timed", "libreecho-audiod", "libreecho-micd",
         "libreecho-ledd", "libreecho-btd",
         "libreecho-airplayd", "libreecho-wyomingd",
+        "libreecho-sttd-wyoming", "libreecho-ttsd-wyoming",
     ):
         copy_file(f"sbin/{binary}", f"usr/local/sbin/{binary}", 0o755, True)
     for script in (
