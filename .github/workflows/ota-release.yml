@@ -17,23 +17,11 @@ jobs:
   source_checks:
     name: Full source checks
     runs-on: ubuntu-24.04
-    outputs:
-      ui_sha: ${{ steps.ui_identity.outputs.sha }}
-      version: ${{ steps.release_input.outputs.version }}
-      release_tag: ${{ steps.release_input.outputs.tag }}
     steps:
       - name: Check out Kernel source
         uses: actions/checkout@v4
         with:
           path: LibreEcho-Kernel
-
-      - name: Check out UI source
-        uses: actions/checkout@v4
-        with:
-          repository: aslater3/LibreEcho-UI
-          ref: main
-          path: LibreEcho-UI
-          token: ${{ secrets.UI_REPOSITORY_TOKEN }}
 
       - name: Require a merged pull request for main releases
         if: ${{ github.ref == 'refs/heads/main' }}
@@ -56,33 +44,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
-            build-essential curl jq libspeexdsp-dev nodejs python3 shellcheck
-
-      - name: Stage UI host dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/speexdsp/include" "$RUNNER_TEMP/speexdsp/lib"
-          cp -a /usr/include/speex "$RUNNER_TEMP/speexdsp/include/"
-          cp "$(gcc -print-file-name=libspeexdsp.a)" \
-            "$RUNNER_TEMP/speexdsp/lib/libspeexdsp.a"
-
-      - name: Validate release input
-        id: release_input
-        shell: bash
-        run: |
-          set -euo pipefail
-          VERSION="$(tr -d '\r\n' < LibreEcho-UI/VERSION)"
-          [[ "$VERSION" =~ ^[0-9]+[.][0-9]+[.][0-9]+([._+~-][A-Za-z0-9._+~-]+)?$ ]]
-          printf 'version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
-          printf 'tag=v%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Record immutable UI identity
-        id: ui_identity
-        shell: bash
-        run: |
-          set -euo pipefail
-          printf 'sha=%s\n' "$(git -C LibreEcho-UI rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            python3 shellcheck
 
       - name: Validate Kernel recovery and OTA contracts
         shell: bash
@@ -103,31 +65,22 @@ jobs:
             tools/mt8163-arm32/initramfs/libreecho-update-fetch
           git diff --check
 
-      - name: Run complete UI test suite
-        shell: bash
-        working-directory: LibreEcho-UI
-        run: |
-          set -euo pipefail
-          node --check web/js/app.js
-          jq -e . web/openapi.json >/dev/null
-          make SPEEX_PREFIX="$RUNNER_TEMP/speexdsp" test
-          git diff --check
-
   verified_build:
     name: Verified OTA image build
     needs: source_checks
-    if: ${{ github.ref == 'refs/heads/main' }}
+    if: ${{ github.ref == 'refs/heads/main' && vars.ENABLE_SELF_HOSTED_OTA == 'true' }}
     runs-on: [self-hosted, linux, x64, libreecho-ota-builder]
     env:
       PIPELINE_ROOT: ${{ vars.LIBREECHO_PIPELINE_ROOT }}
       LIBREECHO_KERNEL_SRC: ${{ github.workspace }}/LibreEcho-Kernel
       LIBREECHO_UI_SRC: ${{ github.workspace }}/LibreEcho-UI
-      EXPECTED_UI_SHA: ${{ needs.source_checks.outputs.ui_sha }}
-      VERSION: ${{ needs.source_checks.outputs.version }}
       UNSIGNED_DIR: ${{ github.workspace }}/libreecho-ota-unsigned-${{ github.run_id }}-${{ github.run_attempt }}
     outputs:
       boot_sha256: ${{ steps.build.outputs.boot_sha256 }}
+      release_tag: ${{ steps.release_input.outputs.tag }}
       run_id: ${{ steps.build.outputs.run_id }}
+      ui_sha: ${{ steps.ui_identity.outputs.sha }}
+      version: ${{ steps.release_input.outputs.version }}
     steps:
       - name: Check out exact Kernel source
         uses: actions/checkout@v4
@@ -138,12 +91,32 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: aslater3/LibreEcho-UI
-          ref: ${{ needs.source_checks.outputs.ui_sha }}
+          ref: main
           path: LibreEcho-UI
           token: ${{ secrets.UI_REPOSITORY_TOKEN }}
 
+      - name: Validate release input
+        id: release_input
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d '\r\n' < LibreEcho-UI/VERSION)"
+          [[ "$VERSION" =~ ^[0-9]+[.][0-9]+[.][0-9]+([._+~-][A-Za-z0-9._+~-]+)?$ ]]
+          printf 'version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+          printf 'tag=v%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Record immutable UI identity
+        id: ui_identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'sha=%s\n' "$(git -C LibreEcho-UI rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Validate provisioned builder
         shell: bash
+        env:
+          EXPECTED_UI_SHA: ${{ steps.ui_identity.outputs.sha }}
+          VERSION: ${{ steps.release_input.outputs.version }}
         run: |
           set -euo pipefail
           [[ -n "$PIPELINE_ROOT" ]]
@@ -156,6 +129,9 @@ jobs:
       - name: Build and independently verify OTA profile
         id: build
         shell: bash
+        env:
+          EXPECTED_UI_SHA: ${{ steps.ui_identity.outputs.sha }}
+          VERSION: ${{ steps.release_input.outputs.version }}
         run: |
           set -euo pipefail
           LIBREECHO_OTA_SIGNING_MODE=github "$PIPELINE_ROOT/build.sh" --profile ota
@@ -213,11 +189,11 @@ jobs:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
-      RELEASE_TAG: ${{ needs.source_checks.outputs.release_tag }}
+      RELEASE_TAG: ${{ needs.verified_build.outputs.release_tag }}
       EXPECTED_BOOT_SHA256: ${{ needs.verified_build.outputs.boot_sha256 }}
-      EXPECTED_UI_SHA: ${{ needs.source_checks.outputs.ui_sha }}
+      EXPECTED_UI_SHA: ${{ needs.verified_build.outputs.ui_sha }}
       EXPECTED_RUN_ID: ${{ needs.verified_build.outputs.run_id }}
-      VERSION: ${{ needs.source_checks.outputs.version }}
+      VERSION: ${{ needs.verified_build.outputs.version }}
     steps:
       - name: Check out reviewed signing source
         uses: actions/checkout@v4

@@ -104,6 +104,11 @@ access to the private `aslater3/LibreEcho-UI` repository. The build always
 forces GitHub signing mode and never reads a local signing key; only the
 protected hosted signing job receives `OTA_SIGNING_KEY_HEX`.
 
+The self-hosted build and protected release jobs are disabled unless the
+repository variable `ENABLE_SELF_HOSTED_OTA` is exactly `true`. Until a
+dedicated runner is provisioned, Kernel and UI branch checks run independently
+in their respective private repositories and main merges do not queue a build.
+
 ## Development marker
 
 The current development image writes `FASTBOOT_PLEASE` to `expdb` and resets
