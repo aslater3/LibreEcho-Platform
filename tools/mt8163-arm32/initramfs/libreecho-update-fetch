@@ -111,7 +111,7 @@ validate_source()
 {
     [ "$(config_value schema)" = 1 ] || die source_schema
     url=$(config_value url)
-    [ "$url" = "https://github.com/aslater3/LibreEcho-Kernel/releases/latest/download/libreecho-radar-puffin-stable.ota.tar" ] ||
+    [ "$url" = "https://github.com/aslater3/LibreEcho/releases/latest/download/libreecho-radar-puffin-stable.ota.tar" ] ||
         die source_url
 }
 

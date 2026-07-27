@@ -72,7 +72,8 @@ persistent feature squashfs payloads and all configuration remain unchanged.
 
 Manual browser upload streams the tar to `/data/libreecho/update/incoming` and
 invokes the target installer. OTA-profile images also check the stable public
-GitHub Release asset configured in `/etc/libreecho/ota-source.conf`. The
+GitHub Release asset in `aslater3/LibreEcho`, configured in
+`/etc/libreecho/ota-source.conf`. The
 fetcher mounts the root-owned assistant feature payload read-only, verifies it
 against its staged manifest, and uses its pinned curl and CA bundle. It then
 passes the downloaded tar to the same installer; it never implements a second
@@ -98,7 +99,8 @@ revalidates the artifact digest, manifest, source identities, and public-key
 pin before environment approval exposes `OTA_SIGNING_KEY_HEX`. It constructs
 the deterministic tar, independently verifies its exact members and Ed25519
 signature, and uploads the image, manifest, verification log, provenance,
-signed stable asset, and checksum to a draft release. Publishing is a separate
+signed stable asset, and checksum to a draft release in `aslater3/LibreEcho`.
+Publishing is a separate
 step that runs only after a push to protected `main` passes every preceding
 job and receives production-signing approval. Branch pushes run source checks
 only. The repository variable `LIBREECHO_PIPELINE_ROOT` must point at the
@@ -106,7 +108,10 @@ canonical pipeline on the labeled builder. The repository secret
 `UI_REPOSITORY_TOKEN` must be a fine-grained token with read-only Contents
 access to the private `aslater3/LibreEcho-UI` repository. The build always
 forces GitHub signing mode and never reads a local signing key; only the
-protected hosted signing job receives `OTA_SIGNING_KEY_HEX`.
+protected hosted signing job receives `OTA_SIGNING_KEY_HEX`. The
+`RELEASE_REPOSITORY_TOKEN` secret must be a fine-grained token with Contents
+read/write access to `aslater3/LibreEcho`; it is used only to create and publish
+the release there.
 
 The self-hosted build and protected release jobs are disabled unless the
 repository variable `ENABLE_SELF_HOSTED_OTA` is exactly `true`. Until a
