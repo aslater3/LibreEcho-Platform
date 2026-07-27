@@ -98,9 +98,11 @@ signed stable asset, and checksum to a draft release. Publishing is a separate
 step that runs only after a push to protected `main` passes every preceding
 job and receives production-signing approval. Branch pushes run source checks
 only. The repository variable `LIBREECHO_PIPELINE_ROOT` must point at the
-canonical pipeline on the labeled builder. The build always forces GitHub
-signing mode and never reads a local signing key; only the protected hosted
-signing job receives `OTA_SIGNING_KEY_HEX`.
+canonical pipeline on the labeled builder. The repository secret
+`UI_REPOSITORY_TOKEN` must be a fine-grained token with read-only Contents
+access to the private `aslater3/LibreEcho-UI` repository. The build always
+forces GitHub signing mode and never reads a local signing key; only the
+protected hosted signing job receives `OTA_SIGNING_KEY_HEX`.
 
 ## Development marker
 

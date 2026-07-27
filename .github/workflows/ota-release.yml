@@ -33,6 +33,7 @@ jobs:
           repository: aslater3/LibreEcho-UI
           ref: main
           path: LibreEcho-UI
+          token: ${{ secrets.UI_REPOSITORY_TOKEN }}
 
       - name: Require a merged pull request for main releases
         if: ${{ github.ref == 'refs/heads/main' }}
@@ -139,6 +140,7 @@ jobs:
           repository: aslater3/LibreEcho-UI
           ref: ${{ needs.source_checks.outputs.ui_sha }}
           path: LibreEcho-UI
+          token: ${{ secrets.UI_REPOSITORY_TOKEN }}
 
       - name: Validate provisioned builder
         shell: bash
