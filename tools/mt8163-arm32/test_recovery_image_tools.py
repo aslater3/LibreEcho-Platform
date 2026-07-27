@@ -502,6 +502,17 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("set_automatic_updates 0", fetcher)
         self.assertNotIn('"$0" install >/tmp/ota-fetch.log 2>&1 || true\n        fi', fetcher)
 
+    def test_ota_source_uses_product_release_repository(self) -> None:
+        expected = (
+            "https://github.com/aslater3/LibreEcho/releases/latest/download/"
+            "libreecho-radar-puffin-stable.ota.tar"
+        )
+        source = (TOOLS_DIR / "initramfs/ota-source.conf").read_text()
+        fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
+        self.assertIn(expected, source)
+        self.assertIn(expected, fetcher)
+        self.assertNotIn("LibreEcho-Kernel/releases", source + fetcher)
+
     def test_schema2_disabled_record_is_exact(self) -> None:
         record = {
             "id": verifier.CONNECTIVITY_BUNDLE_ID,

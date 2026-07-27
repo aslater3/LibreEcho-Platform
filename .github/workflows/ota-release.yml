@@ -189,6 +189,8 @@ jobs:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
+      RELEASE_REPOSITORY: aslater3/LibreEcho
+      RELEASE_TOKEN: ${{ secrets.RELEASE_REPOSITORY_TOKEN }}
       RELEASE_TAG: ${{ needs.verified_build.outputs.release_tag }}
       EXPECTED_BOOT_SHA256: ${{ needs.verified_build.outputs.boot_sha256 }}
       EXPECTED_UI_SHA: ${{ needs.verified_build.outputs.ui_sha }}
@@ -294,15 +296,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+          [[ -n "$RELEASE_TOKEN" ]]
+          export GH_TOKEN="$RELEASE_TOKEN"
+          if gh release view "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" \
               --json isDraft --jq .isDraft >/tmp/release-draft 2>/dev/null; then
             [[ "$(cat /tmp/release-draft)" == true ]]
           else
-            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            gh release create "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" \
               --draft --title "LibreEcho OS $VERSION" \
               --notes "Verified A/B OTA build $EXPECTED_RUN_ID"
           fi
-          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+          gh release upload "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" \
             unsigned/boot.img unsigned/manifest.json unsigned/verify.log \
             unsigned/provenance libreecho-radar-puffin-stable.ota.tar \
             libreecho-radar-puffin-stable.ota.tar.sha256 --clobber
@@ -311,5 +315,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+          [[ -n "$RELEASE_TOKEN" ]]
+          export GH_TOKEN="$RELEASE_TOKEN"
+          gh release edit "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" \
             --draft=false --latest
