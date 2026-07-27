@@ -17,6 +17,17 @@ from pathlib import Path
 TOOLS_DIR = Path(__file__).resolve().parent
 
 
+def pipeline_text(name: str) -> str:
+    root = Path(os.environ.get(
+        "LIBREECHO_PIPELINE_ROOT",
+        "/home/andy/workspace/mt8163-arm32-wifi-candidate/pipeline",
+    ))
+    path = root / name
+    if not path.is_file():
+        raise unittest.SkipTest(f"canonical pipeline unavailable: {path}")
+    return path.read_text()
+
+
 def load_tool(name: str):
     path = TOOLS_DIR / f"{name}.py"
     spec = importlib.util.spec_from_file_location(f"mt8163_{name}", path)
@@ -146,13 +157,9 @@ class SourceTests(unittest.TestCase):
         self.assertTrue((tools / "tinyplay").is_file())
         self.assertTrue((tools / "tinycap").is_file())
         self.assertTrue((tools / "tinymix").is_file())
-        pipeline_root = Path(os.environ.get(
-            "LIBREECHO_PIPELINE_ROOT",
-            "/home/andy/workspace/mt8163-arm32-wifi-candidate/pipeline",
-        ))
-        pipeline_build = pipeline_root / "build.sh"
-        self.assertIn("--tinyplay", pipeline_build.read_text())
-        self.assertIn("--tinymix", pipeline_build.read_text())
+        pipeline_build = pipeline_text("build.sh")
+        self.assertIn("--tinyplay", pipeline_build)
+        self.assertIn("--tinymix", pipeline_build)
         gpufreq = (
             TOOLS_DIR.parent.parent
             / "drivers/misc/mediatek/base/power/mt8163/mt_gpufreq.c"
@@ -303,13 +310,9 @@ class SourceTests(unittest.TestCase):
         builder_script = TOOLS_DIR / "network-tools/build_wireless_tools.sh"
         self.assertTrue(builder_script.is_file())
         self.assertTrue(os.access(builder_script, os.X_OK))
-        pipeline_root = Path(os.environ.get(
-            "LIBREECHO_PIPELINE_ROOT",
-            "/home/andy/workspace/mt8163-arm32-wifi-candidate/pipeline",
-        ))
-        pipeline_build = (pipeline_root / "build.sh").read_text()
-        pipeline_status = (pipeline_root / "status.sh").read_text()
-        pipeline_flash = (pipeline_root / "flash.sh").read_text()
+        pipeline_build = pipeline_text("build.sh")
+        pipeline_status = pipeline_text("status.sh")
+        pipeline_flash = pipeline_text("flash.sh")
         self.assertIn("build_wireless_tools.sh", pipeline_build)
         self.assertIn("--iwconfig", pipeline_build)
         self.assertIn("--expected-iwconfig-sha256", pipeline_status)
