@@ -37,7 +37,7 @@ SOURCE_BOOT_SHA256 = "c0f52a3b079d214495cd3dd22f92fd85695d1b868c58b491a2edb933bc
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
 BUSYBOX_SHA256 = "d4c8fd2aea01abd851c703f39b29c0de748b2751e4e1a85cae570fa53ad8f4fb"
 MUSL_LOADER_SHA256 = "1063871174f1bd4f08f4d330e20b07aeb0820327ee739a4d8d1b644df842cb6b"
-RECOVERY_INIT_SHA256 = "49f215e7a82c65ea8dcd13065fa1eb1cd14ef8cab2695f66b4273feda1fcb9ac"
+RECOVERY_INIT_SHA256 = "33e1326be258cc7466b9feaad0ce0a2772b866780297c2b797ef78477b5ab834"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
 CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
@@ -447,6 +447,9 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         "init.rc": ("init.rc", 0o644),
         "init.recovery.mt8163.rc": ("init.recovery.mt8163.rc", 0o644),
         "libreecho-init": ("libreecho-init", 0o755),
+        "libreecho-update": ("usr/local/sbin/libreecho-update", 0o755),
+        "libreecho-update-fetch": ("usr/local/sbin/libreecho-update-fetch", 0o755),
+        "ota-source.conf": ("etc/libreecho/ota-source.conf", 0o644),
         "libreecho-wifi": ("sbin/libreecho-wifi", 0o755),
         "udhcpc.script": ("etc/udhcpc.script", 0o755),
         "wpa_supplicant.conf.example": (
@@ -517,6 +520,57 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
     manifest["musl_loader"] = {"sha256": MUSL_LOADER_SHA256, "size": len(loader_data)}
     manifest["symlinks"] = fixed_links
     manifest["busybox_applets"] = {"count": len(applets), "names": applets}
+
+
+def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
+                  image_profile: str, manifest: dict[str, object]) -> None:
+    sources = (
+        ("bootctl", bootctl, "usr/local/sbin/libreecho-bootctl",
+         "/lib/ld-musl-armhf.so.1", ("libc.musl-armv7.so.1",), True),
+        ("verifier", verifier, "usr/local/libexec/libreecho-update-verify",
+         None, (), False),
+    )
+    records: dict[str, object] = {}
+    for name, source, relative, interpreter, needed, dynamic in sources:
+        if source.is_symlink() or not source.is_file():
+            raise SystemExit(f"ERROR: OTA {name} is not a regular file: {source}")
+        data = read(source)
+        target = stage / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        target.chmod(0o755)
+        records[name] = {
+            "sha256": sha256(data),
+            "size": len(data),
+            "path": "/" + relative,
+            "elf": require_elf_contract(
+                target, 0x05000400, interpreter, needed, dynamic,
+            ),
+        }
+
+    key_data = read(public_key)
+    if not re.fullmatch(rb"[0-9a-f]{64}\n", key_data):
+        raise SystemExit("ERROR: OTA Ed25519 public key must be 32-byte lowercase hex")
+    key_target = stage / "etc/libreecho/ota-public-key.hex"
+    key_target.parent.mkdir(parents=True, exist_ok=True)
+    key_target.write_bytes(key_data)
+    key_target.chmod(0o644)
+
+    profile_target = stage / "etc/libreecho/image-profile"
+    profile_target.write_text(image_profile + "\n")
+    profile_target.chmod(0o644)
+    manifest["image_profile"] = image_profile
+    manifest["ota"] = {
+        "enabled": True,
+        "format": "libreecho-ota-v1",
+        "board": "radar_puffin",
+        "payload_slots": {"a": "mmcblk0p10", "b": "mmcblk0p11"},
+        "wrapper_partitions": ["mmcblk0p17", "mmcblk0p18"],
+        "bcb": {"partition": "mmcblk0p8", "offset": 0x360, "record_size": 7},
+        "persistent_configuration": "/data/libreecho/config",
+        "public_key_sha256": sha256(key_data),
+        "tools": records,
+    }
 
 
 def add_audio_probe(stage: Path, audio_probe: Path,
@@ -693,19 +747,22 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
 
     for binary in (
         "libreecho-web", "libreecho-logd", "libreecho-networkd",
-        "libreecho-audiod", "libreecho-micd", "libreecho-ledd", "libreecho-btd",
+        "libreecho-timed", "libreecho-audiod", "libreecho-micd",
+        "libreecho-ledd", "libreecho-btd",
         "libreecho-airplayd", "libreecho-wyomingd",
     ):
         copy_file(f"sbin/{binary}", f"usr/local/sbin/{binary}", 0o755, True)
     for script in (
         "libreecho-web.init", "libreecho-logd.init", "libreecho-networkd.init",
-        "libreecho-audiod.init", "libreecho-micd.init", "libreecho-ledd.init", "libreecho-btd.init",
+        "libreecho-timed.init", "libreecho-audiod.init",
+        "libreecho-micd.init", "libreecho-ledd.init", "libreecho-btd.init",
         "libreecho-airplayd.init", "libreecho-ttsd.init", "libreecho-waked.init",
         "libreecho-sttd.init", "libreecho-agentd.init", "libreecho-wyomingd.init",
     ):
         copy_file(f"etc/init.d/{script}", f"etc/init.d/{script}", 0o755)
     copy_file("etc/libreecho/web-config.json", "etc/libreecho/web-config.json", 0o600)
     copy_file("etc/libreecho/airplay2.conf", "etc/libreecho/airplay2.conf", 0o644)
+    copy_file("etc/libreecho/ntp.conf", "etc/libreecho/ntp.conf", 0o644)
     if "etc/libreecho/users" in bundled_files:
         users_file = pinned_source(bundle, "etc/libreecho/users", "UI users file")
         if users_file.stat().st_mode & 0o077 or not read(users_file).strip():
@@ -1397,6 +1454,11 @@ def validate_stage(stage: Path) -> None:
         "lib/ld-musl-armhf.so.1", "lib/libc.musl-armv7.so.1",
         "sbin/adbd", "sbin/ueventd", "sbin/sh", "system/bin/sh",
         "sepolicy", "file_contexts.bin", "property_contexts",
+        "usr/local/sbin/libreecho-update", "usr/local/sbin/libreecho-bootctl",
+        "usr/local/sbin/libreecho-update-fetch",
+        "usr/local/libexec/libreecho-update-verify",
+        "etc/libreecho/ota-public-key.hex", "etc/libreecho/ota-source.conf",
+        "etc/libreecho/image-profile",
     )
     for relative in required:
         if not (stage / relative).exists():
@@ -1686,6 +1748,10 @@ def main() -> None:
                         help="extracted v184 ARM32 root-adb ramdisk")
     parser.add_argument("--busybox", type=Path, required=True)
     parser.add_argument("--musl-loader", type=Path, required=True)
+    parser.add_argument("--image-profile", choices=("development", "ota"), required=True)
+    parser.add_argument("--bootctl", type=Path, required=True)
+    parser.add_argument("--update-verifier", type=Path, required=True)
+    parser.add_argument("--ota-public-key", type=Path, required=True)
     parser.add_argument("--audio-probe", type=Path,
                         help="static ARM32 ALSA capability probe to add to the initramfs")
     parser.add_argument("--tinyplay", type=Path,
@@ -2048,6 +2114,10 @@ def main() -> None:
         add_overlay(
             stage, overlay, args.busybox.resolve(), args.musl_loader.resolve(),
             qemu_arm, manifest,
+        )
+        add_ota_tools(
+            stage, args.bootctl.resolve(), args.update_verifier.resolve(),
+            args.ota_public_key.resolve(), args.image_profile, manifest,
         )
         if args.audio_probe is not None:
             add_audio_probe(stage, args.audio_probe.resolve(), manifest)

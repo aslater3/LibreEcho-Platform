@@ -160,4 +160,4 @@ obj-$(CONFIG_MTK_MTD_NAND) += nand/
 obj-$(CONFIG_MTK_DUM_CHAR) += nand/
 obj-$(CONFIG_MTK_ICE_DEUBG) += ice_debug/
 obj-$(CONFIG_MTK_DYNAMIC_BOOST) += dynamic_boost/
-obj-y += echo_fastboot_marker.o
+obj-$(CONFIG_LIBREECHO_DEV_RECOVERY_MARKER) += echo_fastboot_marker.o

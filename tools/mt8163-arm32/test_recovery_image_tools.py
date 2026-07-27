@@ -17,6 +17,17 @@ from pathlib import Path
 TOOLS_DIR = Path(__file__).resolve().parent
 
 
+def pipeline_text(name: str) -> str:
+    root = Path(os.environ.get(
+        "LIBREECHO_PIPELINE_ROOT",
+        "/home/andy/workspace/mt8163-arm32-wifi-candidate/pipeline",
+    ))
+    path = root / name
+    if not path.is_file():
+        raise unittest.SkipTest(f"canonical pipeline unavailable: {path}")
+    return path.read_text()
+
+
 def load_tool(name: str):
     path = TOOLS_DIR / f"{name}.py"
     spec = importlib.util.spec_from_file_location(f"mt8163_{name}", path)
@@ -146,13 +157,9 @@ class SourceTests(unittest.TestCase):
         self.assertTrue((tools / "tinyplay").is_file())
         self.assertTrue((tools / "tinycap").is_file())
         self.assertTrue((tools / "tinymix").is_file())
-        pipeline_root = Path(os.environ.get(
-            "LIBREECHO_PIPELINE_ROOT",
-            "/home/andy/workspace/mt8163-arm32-wifi-candidate/pipeline",
-        ))
-        pipeline_build = pipeline_root / "build.sh"
-        self.assertIn("--tinyplay", pipeline_build.read_text())
-        self.assertIn("--tinymix", pipeline_build.read_text())
+        pipeline_build = pipeline_text("build.sh")
+        self.assertIn("--tinyplay", pipeline_build)
+        self.assertIn("--tinymix", pipeline_build)
         gpufreq = (
             TOOLS_DIR.parent.parent
             / "drivers/misc/mediatek/base/power/mt8163/mt_gpufreq.c"
@@ -303,13 +310,9 @@ class SourceTests(unittest.TestCase):
         builder_script = TOOLS_DIR / "network-tools/build_wireless_tools.sh"
         self.assertTrue(builder_script.is_file())
         self.assertTrue(os.access(builder_script, os.X_OK))
-        pipeline_root = Path(os.environ.get(
-            "LIBREECHO_PIPELINE_ROOT",
-            "/home/andy/workspace/mt8163-arm32-wifi-candidate/pipeline",
-        ))
-        pipeline_build = (pipeline_root / "build.sh").read_text()
-        pipeline_status = (pipeline_root / "status.sh").read_text()
-        pipeline_flash = (pipeline_root / "flash.sh").read_text()
+        pipeline_build = pipeline_text("build.sh")
+        pipeline_status = pipeline_text("status.sh")
+        pipeline_flash = pipeline_text("flash.sh")
         self.assertIn("build_wireless_tools.sh", pipeline_build)
         self.assertIn("--iwconfig", pipeline_build)
         self.assertIn("--expected-iwconfig-sha256", pipeline_status)
@@ -396,8 +399,8 @@ class PolicyTests(unittest.TestCase):
     def test_streaming_voice_services_start_warm_in_dependency_order(self) -> None:
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
         service_line = (
-            "for service in logd networkd audiod micd waked sttd ledd btd "
-            "airplayd ttsd agentd web"
+            'services="logd networkd timed audiod micd waked sttd ledd btd '
+            'airplayd ttsd agentd web"'
         )
         self.assertIn(service_line, init_script)
         self.assertLess(service_line.index("waked"), service_line.index("sttd"))
@@ -465,6 +468,30 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("userdata-mount-failed", source)
         self.assertNotIn("mkfs", source)
         self.assertLess(source.index("userdata-mounted"), source.index("start_ui_services"))
+
+    def test_time_service_is_packaged_and_started(self) -> None:
+        builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        bundle_source = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        init_source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        for expected in (
+            "libreecho-timed", "libreecho-timed.init", "etc/libreecho/ntp.conf",
+        ):
+            self.assertIn(expected, builder_source)
+            self.assertIn(expected, bundle_source)
+        self.assertIn(
+            'services="logd networkd timed audiod', init_source
+        )
+
+    def test_ota_fetch_failure_cannot_become_empty_rollback_hold(self) -> None:
+        fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
+        self.assertIn("version=$(download_and_inspect) || return 1", fetcher)
+        self.assertIn(
+            'if [ -n "$rolled_back" ] && [ "$version" = "$rolled_back" ]; then',
+            fetcher,
+        )
+        self.assertIn("check_status_write error", fetcher)
+        self.assertIn("404) die asset_missing true", fetcher)
+        self.assertNotIn("state_write update-held-after-rollback", fetcher)
 
     def test_schema2_disabled_record_is_exact(self) -> None:
         record = {

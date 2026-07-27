@@ -283,36 +283,44 @@ case "$expdb_devno" in
     *:*) expected_rdev=$($BB printf '%x:%x' "$expdb_major" "$expdb_minor") ;;
 esac
 
-# This is the first persistent state change.  LK consumes the marker on the
-# next reset and enters fastboot, preserving the rapid recovery loop.  Refuse
-# the write unless sysfs proves the target is the expected 0x5000-sector expdb
-# block partition; this prevents shell redirection from creating a regular file.
-# Do not continue into optional driver or USB work without a verified marker
-# target. Retry forever so a slow devtmpfs/eMMC never loses recovery.
-marker_written=0
-marker_attempt=0
-while [ "$marker_written" -eq 0 ]; do
-    marker_attempt=$((marker_attempt + 1))
-    if [ -b "$EXPDB" ] && [ -n "$expected_rdev" ] &&
-       [ "$($BB stat -c '%t:%T' "$EXPDB" 2>/dev/null)" = "$expected_rdev" ] &&
-       $BB grep -qx 'PARTNAME=expdb' "$EXPDB_SYS/uevent" 2>/dev/null &&
-       [ "$($BB cat "$EXPDB_SYS/size" 2>/dev/null)" = 20480 ]; then
-        if printf FASTBOOT_PLEASE > "$EXPDB" 2>/tmp/expdb-marker.err; then
-            $BB sync
-            marker=$($BB dd if="$EXPDB" bs=15 count=1 2>/dev/null)
-            [ "$marker" = FASTBOOT_PLEASE ] && marker_written=1
-        fi
-    elif [ $((marker_attempt % 10)) -eq 1 ]; then
-        log expdb-identity-rejected
-    fi
-    if [ "$marker_written" -eq 0 ]; then
-        if [ $((marker_attempt % 10)) -eq 0 ]; then
-            log fastboot-please-retry
-        fi
-        $BB sleep 1
-    fi
-done
-log fastboot-please-written
+IMAGE_PROFILE=$($BB cat /etc/libreecho/image-profile 2>/dev/null)
+case "$IMAGE_PROFILE" in
+    development)
+        # Development images arm the next-reset fastboot escape. OTA images
+        # must not do this because A/B retry and rollback require normal boots.
+        marker_written=0
+        marker_attempt=0
+        while [ "$marker_written" -eq 0 ]; do
+            marker_attempt=$((marker_attempt + 1))
+            if [ -b "$EXPDB" ] && [ -n "$expected_rdev" ] &&
+               [ "$($BB stat -c '%t:%T' "$EXPDB" 2>/dev/null)" = "$expected_rdev" ] &&
+               $BB grep -qx 'PARTNAME=expdb' "$EXPDB_SYS/uevent" 2>/dev/null &&
+               [ "$($BB cat "$EXPDB_SYS/size" 2>/dev/null)" = 20480 ]; then
+                if printf FASTBOOT_PLEASE > "$EXPDB" 2>/tmp/expdb-marker.err; then
+                    $BB sync
+                    marker=$($BB dd if="$EXPDB" bs=15 count=1 2>/dev/null)
+                    [ "$marker" = FASTBOOT_PLEASE ] && marker_written=1
+                fi
+            elif [ $((marker_attempt % 10)) -eq 1 ]; then
+                log expdb-identity-rejected
+            fi
+            if [ "$marker_written" -eq 0 ]; then
+                if [ $((marker_attempt % 10)) -eq 0 ]; then
+                    log fastboot-please-retry
+                fi
+                $BB sleep 1
+            fi
+        done
+        log fastboot-please-written
+        ;;
+    ota)
+        log automatic-fastboot-marker-disabled
+        ;;
+    *)
+        log image-profile-invalid
+        IMAGE_PROFILE=invalid
+        ;;
+esac
 
 # Independent recovery supervisor.  This loop is intentionally separate from
 # runme_loop: a blocked experiment must never prevent an operator or host
@@ -639,9 +647,9 @@ start_ui_services()
     fi
     if [ "$ha_enabled" -eq 1 ]; then
         log ui-home-assistant-mode-enabled
-        services="logd networkd audiod micd waked ledd btd airplayd wyomingd web"
+        services="logd networkd timed audiod micd waked ledd btd airplayd wyomingd web"
     else
-        services="logd networkd audiod micd waked sttd ledd btd airplayd ttsd agentd web"
+        services="logd networkd timed audiod micd waked sttd ledd btd airplayd ttsd agentd web"
     fi
     for service in $services; do
         script="/etc/init.d/libreecho-$service.init"
@@ -656,6 +664,84 @@ start_ui_services()
 }
 start_ui_services &
 log ui-services-autostart-started
+
+ota_health_confirm_worker()
+{
+    [ "$IMAGE_PROFILE" = ota ] || return 0
+    [ -r /data/libreecho/update/pending ] || return 0
+    log ota-health-confirm-pending
+    pending_slot=$($BB sed -n 's/^slot=//p' /data/libreecho/update/pending)
+    selected_slot=$(/usr/local/sbin/libreecho-bootctl status 2>/dev/null |
+        $BB sed -n 's/^selected_slot=//p')
+    case "$pending_slot:$selected_slot" in
+        a:a|b:b) ;;
+        a:b|b:a)
+            $BB mv /data/libreecho/update/pending \
+                /data/libreecho/update/rolled-back
+            {
+                echo schema=1
+                echo state=rolled-back
+                echo progress=100
+                echo "detail=$pending_slot"
+            } > /data/libreecho/update/state.tmp &&
+                $BB mv /data/libreecho/update/state.tmp \
+                    /data/libreecho/update/state
+            $BB sync
+            log "ota-rollback-complete:$pending_slot:$selected_slot"
+            return 0
+            ;;
+        *)
+            log "ota-health-slot-state-invalid:$pending_slot:$selected_slot"
+            return 0
+            ;;
+    esac
+    {
+        echo schema=1
+        echo state=boot-validating
+        echo progress=95
+        echo detail=health-checks
+    } > /data/libreecho/update/state.tmp &&
+        $BB mv /data/libreecho/update/state.tmp /data/libreecho/update/state
+    $BB sync
+
+    # Require the persistent filesystem, ADB control plane, and web service to
+    # remain healthy across three probes before making the slot permanent.
+    $BB sleep 45
+    attempt=0
+    passed=0
+    while [ "$attempt" -lt 6 ] && [ "$passed" -lt 3 ]; do
+        attempt=$((attempt + 1))
+        if ! $BB grep -q ' /data ' /proc/mounts 2>/dev/null ||
+           [ "${ffs_ready:-0}" -ne 1 ] ||
+           ! /etc/init.d/libreecho-web.init status >/dev/null 2>&1; then
+            passed=0
+            log "ota-health-probe-failed:$attempt"
+            $BB sleep 30
+            continue
+        fi
+        passed=$((passed + 1))
+        log "ota-health-probe-passed:$passed"
+        [ "$passed" -lt 3 ] && $BB sleep 15
+    done
+
+    if [ "$passed" -eq 3 ] &&
+       /usr/local/sbin/libreecho-update confirm >/tmp/ota-confirm.log 2>&1; then
+        log ota-slot-confirmed
+        return 0
+    fi
+    log ota-health-confirm-failed-rebooting
+    $BB sync
+    $BB sleep 2
+    $BB reboot -f
+}
+ota_health_confirm_worker &
+log ota-health-confirm-worker-started
+
+if [ "$IMAGE_PROFILE" = ota ] &&
+   [ -x /usr/local/sbin/libreecho-update-fetch ]; then
+    /usr/local/sbin/libreecho-update-fetch watch >/tmp/ota-fetch-worker.log 2>&1 &
+    log ota-fetch-worker-started
+fi
 
 # Audio playback is always user-initiated.  In particular, boot must never
 # touch the codec, amplifier, or TinyALSA playback device.  This is a hard

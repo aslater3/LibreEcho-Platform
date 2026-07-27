@@ -11,10 +11,10 @@
  * Both writes happen from a single kernel thread so they complete even
  * if a later initcall panics before userspace starts.
  *
- * BCB layout (misc partition, sector 1, offset 0x160, 13 bytes):
- *   slot_suffix=0  magic='BCb'  version=1
- *   slot0: priority=15  tries=7  successful=0  reserved=0
- *   slot1: priority=14  tries=7  successful=0  reserved=0
+ * BCB layout (misc partition, sector 1, offset 0x160, 7 bytes):
+ *   zero=0  magic='ABB'  version=1
+ *   slot0: priority=15  tries=7  successful=0
+ *   slot1: priority=14  tries=7  successful=0
  */
 #include <linux/init.h>
 #include <linux/kernel.h>
@@ -33,13 +33,13 @@
 
 /* BCB at misc sector 1 (offset 512) + 0x160 = 0x360 */
 #define BCB_OFFSET	(512 + 0x160)
-#define BCB_SIZE	13
+#define BCB_SIZE	7
 static const u8 bcb_reset[BCB_SIZE] = {
-	0x00,			/* slot_suffix = 0 (slot A) */
-	0x42, 0x43, 0x62,	/* magic = "BCb" */
+	0x00,			/* required leading zero */
+	0x41, 0x42, 0x42,	/* magic = "ABB" */
 	0x01,			/* version = 1 */
-	0x0f, 0x07, 0x00, 0x00,	/* slot0: priority=15 tries=7 success=0 rsvd=0 */
-	0x0e, 0x07, 0x00, 0x00,	/* slot1: priority=14 tries=7 success=0 rsvd=0 */
+	0x7f,			/* slot0: priority=15 tries=7 success=0 */
+	0x7e,			/* slot1: priority=14 tries=7 success=0 */
 };
 
 static int write_file(const char *path, const void *buf, size_t len, loff_t pos)
