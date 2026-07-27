@@ -123,7 +123,7 @@ jobs:
       LIBREECHO_UI_SRC: ${{ github.workspace }}/LibreEcho-UI
       EXPECTED_UI_SHA: ${{ needs.source_checks.outputs.ui_sha }}
       VERSION: ${{ needs.source_checks.outputs.version }}
-      UNSIGNED_DIR: ${{ runner.temp }}/libreecho-ota-unsigned-${{ github.run_id }}-${{ github.run_attempt }}
+      UNSIGNED_DIR: ${{ github.workspace }}/libreecho-ota-unsigned-${{ github.run_id }}-${{ github.run_attempt }}
     outputs:
       boot_sha256: ${{ steps.build.outputs.boot_sha256 }}
       run_id: ${{ steps.build.outputs.run_id }}
