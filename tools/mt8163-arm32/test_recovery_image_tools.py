@@ -493,6 +493,15 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("404) die asset_missing true", fetcher)
         self.assertNotIn("state_write update-held-after-rollback", fetcher)
 
+    def test_ota_watcher_checks_and_requires_automatic_update_opt_in(self) -> None:
+        fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
+        self.assertIn('"$0" check >/tmp/ota-check.log 2>&1', fetcher)
+        self.assertIn("automatic_updates_enabled", fetcher)
+        self.assertIn('[ "$(check_value status)" = update-available ]', fetcher)
+        self.assertIn("set_automatic_updates 1", fetcher)
+        self.assertIn("set_automatic_updates 0", fetcher)
+        self.assertNotIn('"$0" install >/tmp/ota-fetch.log 2>&1 || true\n        fi', fetcher)
+
     def test_schema2_disabled_record_is_exact(self) -> None:
         record = {
             "id": verifier.CONNECTIVITY_BUNDLE_ID,

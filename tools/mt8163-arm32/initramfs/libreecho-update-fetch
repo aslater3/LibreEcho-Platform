@@ -11,6 +11,7 @@ PACKAGE=$INCOMING/github-stable.ota.tar
 PART=$PACKAGE.part
 LOCK=$ROOT/fetch.lock
 CHECK_STATUS=$ROOT/check-status
+AUTOMATIC=$ROOT/automatic-updates
 ASSISTANT_PAYLOAD=/data/libreecho/features/assistant/payload.squashfs
 ASSISTANT_MANIFEST=/data/libreecho/features/assistant/manifest.json
 CLIENT_ROOT=/run/libreecho/ota-client
@@ -54,6 +55,33 @@ check_status_write()
         echo "error=$error"
     } > "$CHECK_STATUS.tmp" &&
         $BB mv "$CHECK_STATUS.tmp" "$CHECK_STATUS"
+}
+
+automatic_updates_enabled()
+{
+    [ "$(check_value_from_file "$AUTOMATIC" enabled)" = 1 ]
+}
+
+check_value_from_file()
+{
+    file=$1
+    key=$2
+    $BB sed -n "s/^$key=//p" "$file" 2>/dev/null
+}
+
+set_automatic_updates()
+{
+    enabled=$1
+    [ "$($BB cat "$PROFILE" 2>/dev/null)" = ota ] || die ota_profile_required
+    $BB mkdir -p "$ROOT" || die update_directory_failed
+    $BB chmod 0700 /data/libreecho "$ROOT" 2>/dev/null
+    {
+        echo schema=1
+        echo "enabled=$enabled"
+    } > "$AUTOMATIC.tmp" &&
+        $BB chmod 0600 "$AUTOMATIC.tmp" &&
+        $BB mv "$AUTOMATIC.tmp" "$AUTOMATIC" ||
+        die automatic_setting_failed
 }
 
 die()
@@ -222,7 +250,11 @@ watch_updates()
     $BB sleep 300
     while true; do
         if [ ! -r "$ROOT/pending" ]; then
-            "$0" install >/tmp/ota-fetch.log 2>&1 || true
+            if "$0" check >/tmp/ota-check.log 2>&1 &&
+                automatic_updates_enabled &&
+                [ "$(check_value status)" = update-available ]; then
+                "$0" install >/tmp/ota-fetch.log 2>&1 || true
+            fi
         fi
         $BB sleep "$interval"
     done
@@ -237,8 +269,16 @@ case "${1:-}" in
         [ "$#" -eq 1 ] || die usage
         watch_updates
         ;;
+    enable-automatic)
+        [ "$#" -eq 1 ] || die usage
+        set_automatic_updates 1
+        ;;
+    disable-automatic)
+        [ "$#" -eq 1 ] || die usage
+        set_automatic_updates 0
+        ;;
     *)
-        echo "Usage: libreecho-update-fetch check | install | watch" >&2
+        echo "Usage: libreecho-update-fetch check | install | watch | enable-automatic | disable-automatic" >&2
         exit 2
         ;;
 esac

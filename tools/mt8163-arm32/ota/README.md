@@ -76,8 +76,12 @@ GitHub Release asset configured in `/etc/libreecho/ota-source.conf`. The
 fetcher mounts the root-owned assistant feature payload read-only, verifies it
 against its staged manifest, and uses its pinned curl and CA bundle. It then
 passes the downloaded tar to the same installer; it never implements a second
-flashing path. An automatic check may prepare the inactive slot, but does not
-force an unattended reboot. No transport is allowed to bypass
+flashing path. The background watcher checks for a release but does not install
+it by default. Users can install an available release explicitly in the system
+UI or opt in to automatic installation; automatic installation never forces an
+unattended reboot. The opt-in is stored as
+`/data/libreecho/update/automatic-updates` and is disabled when that file is
+absent. No transport is allowed to bypass
 signature, member-list, image-format, partition-identity, inactive-slot,
 copy-hash, or BCB readback checks.
 
