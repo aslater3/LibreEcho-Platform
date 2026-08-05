@@ -39,7 +39,7 @@ STOCK_DTB_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57
 PADDED_STOCK_DTB_SHA256 = "08b16ec39554d644d8cbdf8f5816559f85414ab45bc1901de46a7cd43dc286ed"
 BUSYBOX_SHA256 = "d4c8fd2aea01abd851c703f39b29c0de748b2751e4e1a85cae570fa53ad8f4fb"
 LOADER_SHA256 = "1063871174f1bd4f08f4d330e20b07aeb0820327ee739a4d8d1b644df842cb6b"
-INIT_SHA256 = "15f03656b6b8829b75ad18d404650e9c68f9b6b3d2405c2f0148aaf042eacad5"
+INIT_SHA256 = "476d726951a1ff713ee4cf15bed121cc910d9c6e2fde93d01e5cff944777b004"
 ADBD_SHA256 = "1c0d14afb1ce19494ee1da935e1076f49ff57e359d348262a28bb3d56abeb930"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -47,15 +47,21 @@ OVERLAY_FILES = {
     "init.rc": 0o644,
     "init.recovery.mt8163.rc": 0o644,
     "libreecho-init": 0o755,
+    "libreecho-data-cleanup": 0o755,
     "libreecho-update": 0o755,
     "libreecho-update-fetch": 0o755,
     "ota-source.conf": 0o644,
+    "regulatory.db": 0o644,
+    "regulatory.db.p7s": 0o644,
 }
 OVERLAY_TARGETS = {
     "profile": "etc/profile",
+    "libreecho-data-cleanup": "usr/local/sbin/libreecho-data-cleanup",
     "libreecho-update": "usr/local/sbin/libreecho-update",
     "libreecho-update-fetch": "usr/local/sbin/libreecho-update-fetch",
     "ota-source.conf": "etc/libreecho/ota-source.conf",
+    "regulatory.db": "lib/firmware/regulatory.db",
+    "regulatory.db.p7s": "lib/firmware/regulatory.db.p7s",
 }
 SSH_PASSWORD_HASH_RE = re.compile(
     rb"\$(?:1|5|6|2[abxy]?|y|gy)\$[^$:\r\n]{1,64}\$[^:\r\n]{1,512}\Z"
@@ -1047,7 +1053,7 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     network = cast(dict[str, object], network)
     network_names = {"sbin/wpa_supplicant", "etc/wifi/wpa_supplicant.conf"}
     if network.get("enabled"):
-        if network.get("activation") != "automatic-after-adb-if-profile-present":
+        if network.get("activation") != "manual-single-shot-after-adb":
             fail("network activation policy changed")
         raw_wpa_record = network.get("wpa_supplicant")
         raw_profile_record = network.get("wifi_profile")
@@ -1644,7 +1650,7 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         if line.lstrip().startswith(b"/sbin/adbd ")
     )
     if adbd_launches != (
-        b"/sbin/adbd --root_seclabel=u:r:su:s0 --device_banner=device </dev/null >/tmp/adbd.log 2>&1 &",
+        b"/sbin/adbd --device_banner=device </dev/null >/tmp/adbd.log 2>&1 &",
     ):
         fail(f"unexpected ARM32 adbd launch contract: {adbd_launches!r}")
     for forbidden in (b"/proc/hps/enabled", b"scaling_governor", b"cpuidle"):

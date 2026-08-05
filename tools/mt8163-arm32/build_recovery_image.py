@@ -37,7 +37,7 @@ SOURCE_BOOT_SHA256 = "c0f52a3b079d214495cd3dd22f92fd85695d1b868c58b491a2edb933bc
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
 BUSYBOX_SHA256 = "d4c8fd2aea01abd851c703f39b29c0de748b2751e4e1a85cae570fa53ad8f4fb"
 MUSL_LOADER_SHA256 = "1063871174f1bd4f08f4d330e20b07aeb0820327ee739a4d8d1b644df842cb6b"
-RECOVERY_INIT_SHA256 = "15f03656b6b8829b75ad18d404650e9c68f9b6b3d2405c2f0148aaf042eacad5"
+RECOVERY_INIT_SHA256 = "476d726951a1ff713ee4cf15bed121cc910d9c6e2fde93d01e5cff944777b004"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
 CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
@@ -447,6 +447,9 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         "init.rc": ("init.rc", 0o644),
         "init.recovery.mt8163.rc": ("init.recovery.mt8163.rc", 0o644),
         "libreecho-init": ("libreecho-init", 0o755),
+        "libreecho-data-cleanup": (
+            "usr/local/sbin/libreecho-data-cleanup", 0o755,
+        ),
         "libreecho-update": ("usr/local/sbin/libreecho-update", 0o755),
         "libreecho-update-fetch": ("usr/local/sbin/libreecho-update-fetch", 0o755),
         "ota-source.conf": ("etc/libreecho/ota-source.conf", 0o644),
@@ -455,6 +458,8 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         "wpa_supplicant.conf.example": (
             "etc/wifi/wpa_supplicant.conf.example", 0o600,
         ),
+        "regulatory.db": ("lib/firmware/regulatory.db", 0o644),
+        "regulatory.db.p7s": ("lib/firmware/regulatory.db.p7s", 0o644),
     }
     overlay_manifest: dict[str, object] = {}
     for relative, (target_relative, mode) in overlay_files.items():
@@ -1444,7 +1449,7 @@ def add_network_bundle(stage: Path, wpa_supplicant: Path, wifi_config: Path,
     config_target.chmod(0o600)
     manifest["network"] = {
         "enabled": True,
-        "activation": "automatic-after-adb-if-profile-present",
+        "activation": "manual-single-shot-after-adb",
         "wpa_supplicant": {
             "version": WPA_SUPPLICANT_VERSION,
             "sha256": sha256(wpa_data),
@@ -1470,6 +1475,7 @@ def validate_stage(stage: Path) -> None:
         "sbin/adbd", "sbin/ueventd", "sbin/sh", "system/bin/sh",
         "sepolicy", "file_contexts.bin", "property_contexts",
         "usr/local/sbin/libreecho-update", "usr/local/sbin/libreecho-bootctl",
+        "usr/local/sbin/libreecho-data-cleanup",
         "usr/local/sbin/libreecho-update-fetch",
         "usr/local/libexec/libreecho-update-verify",
         "etc/libreecho/ota-public-key.hex", "etc/libreecho/ota-source.conf",
@@ -1543,7 +1549,7 @@ def validate_stage(stage: Path) -> None:
         if line.lstrip().startswith(b"/sbin/adbd ")
     )
     if adbd_launches != (
-        b"/sbin/adbd --root_seclabel=u:r:su:s0 --device_banner=device </dev/null >/tmp/adbd.log 2>&1 &",
+        b"/sbin/adbd --device_banner=device </dev/null >/tmp/adbd.log 2>&1 &",
     ):
         raise SystemExit(f"ERROR: unexpected ARM32 adbd launch contract: {adbd_launches!r}")
     for forbidden in (b"/proc/hps/enabled", b"scaling_governor", b"cpuidle"):
