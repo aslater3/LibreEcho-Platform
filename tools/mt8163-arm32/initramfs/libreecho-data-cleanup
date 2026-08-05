@@ -29,6 +29,53 @@ fi
     exit 2
 }
 
+# Never follow a symlink in the userdata path.  The cleanup helper is allowed to
+# remove known residue symlinks, but all production directories and files it
+# creates or traverses must remain below the mounted userdata root.
+assert_no_symlink_components() {
+    path=$1
+    [ "$path" = "$DATA_ROOT" ] && {
+        [ ! -L "$path" ] || {
+            printf 'DATA_CLEANUP_SYMLINK_PATH=%s\n' "$path" >&2
+            exit 2
+        }
+        return 0
+    }
+    case "$path" in
+        "$DATA_ROOT"/*) relative=${path#"$DATA_ROOT"/} ;;
+        *)
+            printf 'DATA_CLEANUP_PATH_OUTSIDE_ROOT=%s\n' "$path" >&2
+            exit 2
+            ;;
+    esac
+    current=$DATA_ROOT
+    old_ifs=$IFS
+    IFS=/
+    set -f
+    set -- $relative
+    set +f
+    IFS=$old_ifs
+    for component do
+        current=$current/$component
+        [ ! -L "$current" ] || {
+            printf 'DATA_CLEANUP_SYMLINK_PATH=%s\n' "$current" >&2
+            exit 2
+        }
+    done
+}
+
+assert_no_symlink_components "$DATA_ROOT"
+for path in \
+    "$DATA_ROOT/libreecho" \
+    "$DATA_ROOT/libreecho/config" \
+    "$DATA_ROOT/libreecho/secrets" \
+    "$DATA_ROOT/libreecho/features" \
+    "$DATA_ROOT/libreecho/update" \
+    "$DATA_ROOT/libreecho/update/incoming" \
+    "$DATA_ROOT/libreecho/update/staging"; do
+    assert_no_symlink_components "$path"
+done
+
 # First-install migration is limited to the production directory skeleton.  It
 # does not copy host artifacts.  The image default is copied only when the
 # persistent Web UI config is absent; all later boots preserve the user's file.
@@ -119,6 +166,7 @@ check_children() {
     [ -d "$directory" ] || return 0
     for child in "$directory"/* "$directory"/.[!.]*; do
         [ -e "$child" ] || [ -L "$child" ] || continue
+        [ ! -L "$child" ] || { unknown_item "$child"; continue; }
         name=${child##*/}
         allowed=0
         for expected in "$@"; do
@@ -140,7 +188,9 @@ check_children "$DATA_ROOT/libreecho/update" \
 
 if [ -d "$DATA_ROOT/libreecho/features" ]; then
     for feature_dir in "$DATA_ROOT/libreecho/features"/*; do
-        [ -d "$feature_dir" ] || { [ -e "$feature_dir" ] || [ -L "$feature_dir" ] || continue; unknown_item "$feature_dir"; continue; }
+        [ -e "$feature_dir" ] || [ -L "$feature_dir" ] || continue
+        [ ! -L "$feature_dir" ] || { unknown_item "$feature_dir"; continue; }
+        [ -d "$feature_dir" ] || { unknown_item "$feature_dir"; continue; }
         feature=${feature_dir##*/}
         case "$feature" in
             ''|*[!a-z0-9._-]*) unknown_item "$feature_dir"; continue ;;
