@@ -7,6 +7,23 @@ PATH=/bin:/sbin:/system/bin
 export PATH
 umask 022
 
+# Service profile is immutable image policy, never userdata policy.  Missing or
+# invalid content falls back to the bounded diagnostic graph.
+SERVICE_PROFILE_VALUE=$($BB cat /etc/libreecho/service-profile 2>/dev/null)
+SERVICE_PROFILE=diagnostic
+SERVICE_PROFILE_INVALID=0
+case "$SERVICE_PROFILE_VALUE" in
+    diagnostic)
+        SERVICE_PROFILE=diagnostic
+        ;;
+    production)
+        SERVICE_PROFILE=production
+        ;;
+    *)
+        SERVICE_PROFILE_INVALID=1
+        ;;
+esac
+
 $BB mkdir -p /dev/pts /dev/usb-ffs/adb /dev/socket /proc /sys /tmp
 $BB chmod 0777 /tmp
 
@@ -51,6 +68,12 @@ log()
 	printf '<6>%s\n' "$msg" > /dev/kmsg 2>/dev/null
 	printf '%s\n' "$msg" > /dev/console 2>/dev/null
 }
+
+if [ "$SERVICE_PROFILE_INVALID" -eq 1 ]; then
+    log service-profile-invalid-fallback-diagnostic
+else
+    log "service-profile:$SERVICE_PROFILE"
+fi
 
 create_audio_nodes()
 {
@@ -634,27 +657,44 @@ start_ui_services()
         return 0
     }
     $BB mkdir -p /var/run /var/log /var/log/libreecho /run/libreecho
-    ha_enabled=0
-    config=/data/libreecho/config/web-config.json
-    if [ -r "$config" ]; then
-        integrations=$($BB sed -n \
-            's/^[[:space:]]*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*$/\1/p' \
-            "$config" 2>/dev/null | $BB head -n 1)
-        case "$integrations" in
-            ''|*[!0-9]*) ;;
-            *) [ $((integrations & 1)) -ne 0 ] && ha_enabled=1 ;;
-        esac
-    fi
-    if [ "$ha_enabled" -eq 1 ]; then
-        log ui-home-assistant-mode-enabled
-        services="logd networkd timed audiod micd waked ledd btd airplayd wyomingd web"
+    if [ "$SERVICE_PROFILE" = diagnostic ]; then
+        services="logd timed web"
+        log ui-connectivity-services-disabled-for-diagnostic-profile
     else
-        services="logd networkd timed audiod micd waked sttd ledd btd airplayd ttsd agentd web"
+        ha_enabled=0
+        config=/data/libreecho/config/web-config.json
+        if [ -r "$config" ]; then
+            integrations=$($BB sed -n \
+                's/^[[:space:]]*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*$/\1/p' \
+                "$config" 2>/dev/null | $BB head -n 1)
+            case "$integrations" in
+                ''|*[!0-9]*) ;;
+                *) [ $((integrations & 1)) -ne 0 ] && ha_enabled=1 ;;
+            esac
+        fi
+        if [ "$ha_enabled" -eq 1 ]; then
+            log ui-home-assistant-mode-enabled
+            services="logd networkd timed audiod micd waked ledd btd airplayd wyomingd web"
+        else
+            services="logd networkd timed audiod micd waked sttd ledd btd airplayd ttsd agentd web"
+        fi
     fi
     for service in $services; do
         script="/etc/init.d/libreecho-$service.init"
         if [ -x "$script" ]; then
-            "$script" start >/tmp/libreecho-"$service".init.log 2>&1
+            if [ "$service" = web ] && [ "$SERVICE_PROFILE" = production ]; then
+                web_listen=127.0.0.1:8080
+                if [ -r /data/libreecho/config/users ]; then
+                    web_listen=0.0.0.0:8080
+                    log ui-web-production-authenticated-lan
+                else
+                    log ui-web-production-loopback-fallback
+                fi
+                ARGS="--backend linux --config /data/libreecho/config/web-config.json --web-root /usr/local/share/libreecho/web --listen $web_listen" \
+                    "$script" start >/tmp/libreecho-"$service".init.log 2>&1
+            else
+                "$script" start >/tmp/libreecho-"$service".init.log 2>&1
+            fi
             rc=$?
             log "ui-service-start:$service:$rc"
         else
@@ -753,7 +793,9 @@ log audio-startup-disabled
 # plane is ready.  A profile-bearing development image performs one bounded
 # Wi-Fi activation; a failed activation is recorded but never takes PID 1 or
 # the recovery runner down.
-if [ "${ffs_ready:-0}" -eq 1 ]; then
+if [ "$SERVICE_PROFILE" = diagnostic ]; then
+    log wifi-network-policy-manual-single-shot
+elif [ "${ffs_ready:-0}" -eq 1 ]; then
     start_wifi_network &
     log wifi-network-worker-started-after-adb
 else

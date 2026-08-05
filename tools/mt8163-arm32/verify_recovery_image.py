@@ -39,7 +39,7 @@ STOCK_DTB_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57
 PADDED_STOCK_DTB_SHA256 = "08b16ec39554d644d8cbdf8f5816559f85414ab45bc1901de46a7cd43dc286ed"
 BUSYBOX_SHA256 = "d4c8fd2aea01abd851c703f39b29c0de748b2751e4e1a85cae570fa53ad8f4fb"
 LOADER_SHA256 = "1063871174f1bd4f08f4d330e20b07aeb0820327ee739a4d8d1b644df842cb6b"
-INIT_SHA256 = "33e1326be258cc7466b9feaad0ce0a2772b866780297c2b797ef78477b5ab834"
+INIT_SHA256 = "15f03656b6b8829b75ad18d404650e9c68f9b6b3d2405c2f0148aaf042eacad5"
 ADBD_SHA256 = "1c0d14afb1ce19494ee1da935e1076f49ff57e359d348262a28bb3d56abeb930"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -960,6 +960,7 @@ def validate_connectivity(entries: dict[str, Entry], manifest: dict[str, object]
 def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                        schema_version: int,
                        expected_image_profile: str,
+                       expected_service_profile: str,
                        expected_bootctl_sha256: str,
                        expected_update_verifier_sha256: str,
                        expected_ota_public_key_sha256: str,
@@ -1000,9 +1001,15 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     validate_no_connectivity_autostart(entries)
     if manifest.get("image_profile") != expected_image_profile:
         fail("image profile manifest mismatch")
+    if manifest.get("service_profile") != expected_service_profile:
+        fail("service profile manifest mismatch")
     require_member(
         entries, "etc/libreecho/image-profile",
         sha256((expected_image_profile + "\n").encode()), 0o644,
+    )
+    require_member(
+        entries, "etc/libreecho/service-profile",
+        sha256((expected_service_profile + "\n").encode()), 0o644,
     )
     ota = manifest.get("ota")
     if not isinstance(ota, dict) or ota.get("format") != "libreecho-ota-v1":
@@ -1695,6 +1702,8 @@ def main() -> None:
     parser.add_argument("--expected-iwconfig-sha256",
                         help="require this static ARM32 wireless-tools iwconfig utility")
     parser.add_argument("--expected-image-profile", choices=("development", "ota"), required=True)
+    parser.add_argument("--expected-service-profile", choices=("diagnostic", "production"),
+                        required=True)
     parser.add_argument("--expected-bootctl-sha256", required=True)
     parser.add_argument("--expected-update-verifier-sha256", required=True)
     parser.add_argument("--expected-ota-public-key-sha256", required=True)
@@ -1845,6 +1854,7 @@ def main() -> None:
 
     connectivity_enabled = validate_initramfs(
         ramdisk, manifest, schema_version, args.expected_image_profile,
+        args.expected_service_profile,
         args.expected_bootctl_sha256, args.expected_update_verifier_sha256,
         args.expected_ota_public_key_sha256, args.expected_audio_probe_sha256,
         args.expected_tinyplay_sha256, args.expected_tinycap_sha256,
@@ -1879,7 +1889,7 @@ def main() -> None:
         "arm32_recovery_image_contract=PASS android_v0=yes mtk_wrapper=yes "
         "zimage=yes evt_dtb=yes initramfs_arm32=yes "
         f"fastboot_marker={'automatic' if args.expected_image_profile == 'development' else 'explicit-only'} "
-        f"image_profile={args.expected_image_profile} ota=yes "
+        f"image_profile={args.expected_image_profile} service_profile={args.expected_service_profile} ota=yes "
         "root_adb_staged=yes runme=yes memory_disjoint=yes "
         f"connectivity_bundle={'yes' if connectivity_enabled else 'no'} "
         f"audio_tools={'yes' if args.expected_tinyplay_sha256 and args.expected_tinycap_sha256 and args.expected_tinymix_sha256 else 'no'} "

@@ -391,6 +391,33 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("LibreEcho Development OS", profile)
         self.assertIn("PS1='libreecho# '", profile)
 
+    def test_service_profile_is_immutable_and_selects_graph(self) -> None:
+        init_source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        pipeline_build = pipeline_text("build.sh")
+        pipeline_readme = pipeline_text("README.md")
+
+        self.assertIn("/etc/libreecho/service-profile", init_source)
+        self.assertIn("case \"$SERVICE_PROFILE_VALUE\" in", init_source)
+        self.assertIn("diagnostic)", init_source)
+        self.assertIn("production)", init_source)
+        self.assertIn('services="logd timed web"', init_source)
+        self.assertIn(
+            'services="logd networkd timed audiod micd waked sttd ledd btd airplayd ttsd agentd web"',
+            init_source,
+        )
+        self.assertIn("--service-profile", builder_source)
+        self.assertIn('"service_profile"] = service_profile', builder_source)
+        self.assertIn('"etc/libreecho/image-profile", "etc/libreecho/service-profile"', builder_source)
+        self.assertIn("--expected-service-profile", verifier_source)
+        self.assertIn("etc/libreecho/service-profile", verifier_source)
+        self.assertIn("LIBREECHO_SERVICE_PROFILE", pipeline_build)
+        self.assertIn("--service-profile", pipeline_build)
+        self.assertIn("--expected-service-profile", pipeline_build)
+        self.assertIn("service_profile=$SERVICE_PROFILE", pipeline_build)
+        self.assertIn("--profile ota --service-profile production", pipeline_readme)
+
     def test_startup_audio_is_disabled_by_default(self) -> None:
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
         self.assertNotIn("startup_audio_worker", init_script)

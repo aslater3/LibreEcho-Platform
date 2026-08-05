@@ -39,6 +39,8 @@ def main() -> None:
     parser.add_argument("--version", required=True)
     parser.add_argument("--signing-key", type=Path, required=True)
     parser.add_argument("--public-key", type=Path, required=True)
+    parser.add_argument("--service-profile", choices=("diagnostic", "production"),
+                        default="diagnostic")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -63,6 +65,7 @@ def main() -> None:
         f"boot_sha256={digest}\n"
         "feature_policy=preserve\n"
         "image_profile=ota\n"
+        f"service_profile={args.service_profile}\n"
     ).encode("ascii")
     signing_key = read_signing_key(args.signing_key)
     public_key = args.public_key.read_text(encoding="ascii").strip()
