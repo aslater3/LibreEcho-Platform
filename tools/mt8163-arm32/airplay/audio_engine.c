@@ -38,7 +38,8 @@
 #define DEFAULT_CARD 0U
 #define DEFAULT_DEVICE 23U
 #define DEFAULT_RATE 48000U
-#define DEFAULT_CHANNELS 2U
+#define INPUT_CHANNELS 2U
+#define OUTPUT_CHANNELS 1U
 #define PERIOD_SIZE 2048U
 #define PERIOD_COUNT 2U
 #define AMP_SETTLE_US 30000U
@@ -370,7 +371,7 @@ static void process_music_visualizer(struct music_visualizer *visualizer,
 	}
 
 	audio_visualizer_process(&visualizer->analyzer, rendered, PERIOD_SIZE,
-				 DEFAULT_CHANNELS, visualizer->levels);
+				 OUTPUT_CHANNELS, visualizer->levels);
 	for (band = 0; band < AUDIO_VISUALIZER_BANDS; ++band)
 		if (visualizer->levels[band] != 0) {
 			audible = 1;
@@ -478,18 +479,23 @@ static int airplay_volume_to_mixer(const char *root)
 
 	if (snprintf(path, sizeof(path), "%s/%s", root,
 		     AIRPLAY_VOLUME_FILE) < 0)
-		return 127;
+		return -1;
 	fd = open(path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0)
-		return 127;
+		return -1;
 	n = read(fd, buffer, sizeof(buffer) - 1);
 	close(fd);
 	if (n <= 0)
-		return 127;
+		return -1;
 	buffer[n] = '\0';
+	errno = 0;
 	db = strtod(buffer, &end);
-	if (end == buffer || !isfinite(db))
-		return 127;
+	if (end == buffer || errno == ERANGE || !isfinite(db))
+		return -1;
+	while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')
+		end++;
+	if (*end != '\0')
+		return -1;
 	if (db <= -63.5)
 		return 0;
 	if (db >= 0.0)
@@ -543,7 +549,7 @@ static int setup_sources(struct source_bus *sources, const char *root)
 		"media", "system", "announcement", "alarm"
 	};
 	unsigned int i;
-	const size_t bytes = PERIOD_SIZE * DEFAULT_CHANNELS * sizeof(int16_t);
+	const size_t bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
 
 	if (mkdir(root, 0770) < 0 && errno != EEXIST)
 		return -1;
@@ -600,7 +606,7 @@ static int poll_sources(struct source_bus *sources, int timeout_ms)
 
 static int read_sources(struct source_bus *sources, const char *root)
 {
-	const size_t bytes = PERIOD_SIZE * DEFAULT_CHANNELS * sizeof(int16_t);
+	const size_t bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
 	unsigned int i;
 	int received_any = 0;
 
@@ -665,7 +671,7 @@ static void render_period(struct source_bus *sources, int16_t *output,
 
 		for (source = 0; source < SOURCE_COUNT; ++source) {
 			size_t available_frames = sources[source].received /
-				(DEFAULT_CHANNELS * sizeof(int16_t));
+				(INPUT_CHANNELS * sizeof(int16_t));
 			int32_t mono;
 			int32_t gain;
 
@@ -681,8 +687,7 @@ static void render_period(struct source_bus *sources, int16_t *output,
 				gain = (gain * MEDIA_DUCK_Q15) >> 15;
 			mixed += (int32_t)(((int64_t)mono * gain) >> 15);
 		}
-		output[frame * 2] = puffin_render_mono(dynamics, mixed);
-		output[frame * 2 + 1] = output[frame * 2];
+		output[frame] = puffin_render_mono(dynamics, mixed);
 	}
 }
 
@@ -697,14 +702,14 @@ static int write_period(struct pcm *pcm, const int16_t *samples,
 	 * consumer must never delay the sole owner of the speaker PCM.
 	 */
 	(void)le_aec_reference_publish(reference, samples, PERIOD_SIZE,
-				       DEFAULT_CHANNELS, activity_mask);
+				       OUTPUT_CHANNELS, activity_mask);
 	return 0;
 }
 
 static int run_engine(const char *root, unsigned int card, unsigned int device)
 {
 	struct pcm_config config = {
-		.channels = DEFAULT_CHANNELS,
+		.channels = OUTPUT_CHANNELS,
 		.rate = DEFAULT_RATE,
 		.period_size = PERIOD_SIZE,
 		.period_count = PERIOD_COUNT,
@@ -715,7 +720,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		.silence_size = 0,
 		.avail_min = 0,
 	};
-	const size_t bytes = PERIOD_SIZE * DEFAULT_CHANNELS * sizeof(int16_t);
+	const size_t bytes = PERIOD_SIZE * OUTPUT_CHANNELS * sizeof(int16_t);
 	struct source_bus sources[SOURCE_COUNT];
 	struct puffin_dynamics dynamics;
 	struct music_visualizer visualizer;
@@ -758,9 +763,10 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	output = malloc(bytes * 2);
 	if (!output)
 		goto out;
-	second = output + PERIOD_SIZE * DEFAULT_CHANNELS;
+	second = output + PERIOD_SIZE * OUTPUT_CHANNELS;
 	fprintf(stderr,
-		"audio-engine: ready (root=%s, S16_LE/48000/stereo, PCM %u,%u)\n",
+		"audio-engine: ready (root=%s, input=S16_LE/48000/stereo, "
+		"output=S16_LE/48000/mono MonoRight, PCM %u,%u)\n",
 		root, card, device);
 
 	while (!stopping) {
@@ -830,7 +836,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			if (airplay_session && airplay_is_active(root)) {
 				int requested = airplay_volume_to_mixer(root);
 
-				if (requested != airplay_volume &&
+				if (requested >= 0 && requested != airplay_volume &&
 				    set_pcm_volume(card, requested) == 0)
 					airplay_volume = requested;
 			}
