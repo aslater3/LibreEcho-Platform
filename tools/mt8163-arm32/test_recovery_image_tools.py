@@ -522,6 +522,25 @@ class PolicyTests(unittest.TestCase):
             "require_config LEDS_CLASS_MULTICOLOR y",
             "require_config LEDS_IS31FL32XX y",
             "require_config MTK_MT8163_BLUEZ_HCI y",
+            "require_config MFD_MT6397 y",
+            "require_config REGULATOR_MT6323 y",
+            "require_config POWER_RESET_MT6323 y",
+            "require_config RTC_DRV_MT6397 y",
+            "require_config KEYBOARD_MTK_PMIC y",
+            "require_config PWM_MEDIATEK y",
+            "require_config NVMEM_MTK_EFUSE y",
+            "require_config IIO_ST_LSM6DSX y",
+            "require_config AMZ_PRIVACY y",
+            "require_config SND_SOC_TLV320AIC32X4 y",
+            "require_config SND_SOC_TLV320AIC32X4_I2C y",
+            "require_config SND_SOC_AMZN_MT8163_SPI_AUDIO y",
+            "require_config SND_SOC_MT8163_RADAR_PUFFIN y",
+            "require_config LEDS_MT6323 y",
+            "require_config FILE_LOCKING y",
+            "require_config INOTIFY_USER y",
+            "require_config IP_MULTICAST y",
+            "require_config BLK_DEV_LOOP y",
+            "require_config SQUASHFS_LZ4 y",
         )
         for required in required_lines:
             with self.subTest(required=required):
@@ -532,6 +551,11 @@ class PolicyTests(unittest.TestCase):
             pipeline_build,
         )
         self.assertIn('cp -- "$KERNEL_DTB" "$RUN/libreecho-radar-puffin.dtb"', pipeline_build)
+        self.assertIn('DTB_VERIFIER="$TOOLS_DIR/verify_radar_puffin_dtb.py"', pipeline_build)
+        self.assertIn('python3 -B "$DTB_VERIFIER" --dtb "$KERNEL_DTB"', pipeline_build)
+        self.assertIn("RADAR_PUFFIN_DAC_PROCESSING_BLOCK", pipeline_build)
+        self.assertIn("AFE_APLL2_DIV0_SEL_4", pipeline_build)
+        self.assertIn("AFE_I05_TO_O03", pipeline_build)
         self.assertNotIn("WIFI_DTB_SHA256=", pipeline_build)
         self.assertEqual(
             pipeline_build.count('ui_diff_sha="$(source_state_sha256 "$UI_SOURCE")"'),
