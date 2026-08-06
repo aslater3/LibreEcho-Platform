@@ -67,7 +67,7 @@ source_state_sha256() {
         git -C "$repository" diff --binary HEAD
         while IFS= read -r -d '' relative; do
             printf '\0untracked:%s\0' "$relative"
-            sha256sum "$repository/$relative"
+            sha256sum "$repository/$relative" | awk '{print $1}'
         done < <(
             git -C "$repository" ls-files --others --exclude-standard -z |
                 LC_ALL=C sort -z

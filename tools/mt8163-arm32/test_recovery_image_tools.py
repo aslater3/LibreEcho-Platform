@@ -508,6 +508,42 @@ class PolicyTests(unittest.TestCase):
         self.assertLess(adbd, endpoints)
         self.assertLess(endpoints, bind)
 
+    def test_production_pipeline_requires_full_mt8163_hardware_closure(self) -> None:
+        """Regression: a generic FunctionFS kernel must not pass as MT8163-ready."""
+        pipeline_build = pipeline_text("build.sh")
+        required_lines = (
+            "require_config USB_MUSB_MEDIATEK y",
+            "require_config USB_CONFIGFS y",
+            "require_config USB_CONFIGFS_F_FS y",
+            "require_config USB_CONFIGFS_RNDIS y",
+            "require_config PINCTRL_MT8163 y",
+            "require_config MTK_MT8163_CONSYS y",
+            "require_config MTK_COMBO_WIFI y",
+            "require_config LEDS_CLASS_MULTICOLOR y",
+            "require_config LEDS_IS31FL32XX y",
+            "require_config MTK_MT8163_BLUEZ_HCI y",
+        )
+        for required in required_lines:
+            with self.subTest(required=required):
+                self.assertIn(required, pipeline_build)
+        self.assertNotIn("require_config USB_FUNCTIONFS y", pipeline_build)
+        self.assertIn(
+            'KERNEL_DTB="$KERNEL_OUT/arch/arm/boot/dts/libreecho-radar-puffin.dtb"',
+            pipeline_build,
+        )
+        self.assertIn('cp -- "$KERNEL_DTB" "$RUN/libreecho-radar-puffin.dtb"', pipeline_build)
+        self.assertNotIn("WIFI_DTB_SHA256=", pipeline_build)
+        self.assertEqual(
+            pipeline_build.count('ui_diff_sha="$(source_state_sha256 "$UI_SOURCE")"'),
+            1,
+        )
+        ui_builder = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        stable_untracked_hash = (
+            'sha256sum "$repository/$relative" | awk \'{print $1}\''
+        )
+        self.assertIn(stable_untracked_hash, pipeline_build)
+        self.assertIn(stable_untracked_hash, ui_builder)
+
     def test_usb_diagnostic_boot_keeps_connectivity_manual(self) -> None:
         source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
         defconfig = (TOOLS_DIR.parent.parent / "arch/arm/configs/mt8163_arm32_defconfig").read_text()
