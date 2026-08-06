@@ -556,6 +556,10 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("RADAR_PUFFIN_DAC_PROCESSING_BLOCK", pipeline_build)
         self.assertIn("AFE_APLL2_DIV0_SEL_4", pipeline_build)
         self.assertIn("AFE_I05_TO_O03", pipeline_build)
+        self.assertIn('cp -- "$KERNEL_OUT/.config" "$RUN/kernel.config"', pipeline_build)
+        self.assertIn('kernel_config_sha="$(sha256sum "$RUN/kernel.config"', pipeline_build)
+        self.assertIn("kernel_config=$RUN/kernel.config", pipeline_build)
+        self.assertIn("kernel_config_sha256=$kernel_config_sha", pipeline_build)
         self.assertNotIn("WIFI_DTB_SHA256=", pipeline_build)
         self.assertEqual(
             pipeline_build.count('ui_diff_sha="$(source_state_sha256 "$UI_SOURCE")"'),

@@ -23,6 +23,7 @@ AFE = "/soc/mt_soc_dl1_pcm@11220000"
 AUDIOSYS = "/soc/audiosys@11220000"
 AUDIO_24M_ID = 3
 AUDIO_POWER_DOMAIN_ID = 5
+CODEC_MCLK_HZ = 9_600_000
 
 AFE_CLOCK_NAMES = (
     "aud_infra_clk",
@@ -125,6 +126,22 @@ def _phandle(dtb: Path, node: str) -> int:
         if len(values) == 1:
             return values[0]
     raise ContractError(f"missing phandle on {node}")
+
+
+def _node_for_phandle(dtb: Path, phandle: int) -> str:
+    matches: list[str] = []
+    for path in _walk(dtb):
+        for prop in ("phandle", "linux,phandle"):
+            if prop not in _properties(dtb, path):
+                continue
+            if _cells(dtb, path, prop) == (phandle,):
+                matches.append(path)
+                break
+    if len(matches) != 1:
+        raise ContractError(
+            f"codec MCLK phandle 0x{phandle:x} resolves to {len(matches)} nodes"
+        )
+    return matches[0]
 
 
 def _walk(dtb: Path) -> tuple[str, ...]:
@@ -234,7 +251,22 @@ def verify_dtb(dtb: Path) -> None:
     )
 
     _require_enabled_compatible(dtb, "mediatek,mt8163-soc-pcm-dl1", "AFE")
-    _require_enabled_compatible(dtb, "ti,tlv320aic32x4", "speaker codec")
+    codec = _require_enabled_compatible(dtb, "ti,tlv320aic32x4", "speaker codec")
+    codec_properties = _properties(dtb, codec)
+    if "clock-names" not in codec_properties or "clocks" not in codec_properties:
+        raise ContractError("codec MCLK binding requires clocks and clock-names")
+    if _strings(dtb, codec, "clock-names") != ("mclk",):
+        raise ContractError("codec MCLK clock-names must contain exactly mclk")
+    codec_clocks = _cells(dtb, codec, "clocks")
+    if len(codec_clocks) != 1:
+        raise ContractError("codec MCLK must reference exactly one zero-cell provider")
+    codec_mclk = _node_for_phandle(dtb, codec_clocks[0])
+    if _strings(dtb, codec_mclk, "compatible") != ("fixed-clock",):
+        raise ContractError("codec MCLK provider must be a fixed-clock")
+    if _cells(dtb, codec_mclk, "#clock-cells") != (0,):
+        raise ContractError("codec MCLK provider must have #clock-cells = 0")
+    if _cells(dtb, codec_mclk, "clock-frequency") != (CODEC_MCLK_HZ,):
+        raise ContractError("codec MCLK must model the physical 9.6 MHz clock")
     _require_enabled_compatible(dtb, "amzn-mtk,spi-audio-pltfm", "microphone FPGA")
     _require_enabled_compatible(dtb, "mediatek,mt8163-consys", "Wi-Fi/CONSYS")
     usb = _require_enabled_compatible(dtb, "mediatek,mt8163-usb20", "USB gadget")

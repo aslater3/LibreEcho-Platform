@@ -19,6 +19,12 @@ VALID_DTS = r'''
     #address-cells = <1>;
     #size-cells = <1>;
 
+    codec_mclk: puffin-codec-mclk {
+        compatible = "fixed-clock";
+        #clock-cells = <0>;
+        clock-frequency = <9600000>;
+    };
+
     soc {
         #address-cells = <1>;
         #size-cells = <1>;
@@ -89,6 +95,8 @@ VALID_DTS = r'''
         codec@18 {
             compatible = "ti,tlv320aic32x4";
             reg = <0x18 0x1>;
+            clocks = <&codec_mclk>;
+            clock-names = "mclk";
             status = "okay";
         };
         spi-audio@0 {
@@ -176,6 +184,24 @@ class RadarPuffinDtbTests(unittest.TestCase):
             VALID_DTS.replace('"aud_24m_clk";', '"bad_clock";')
         )
         with self.assertRaisesRegex(verifier.ContractError, "aud_24m"):
+            verifier.verify_dtb(dtb)
+
+    def test_rejects_codec_without_physical_mclk_binding(self) -> None:
+        dtb = self.compile_dts(
+            VALID_DTS.replace(
+                '            clocks = <&codec_mclk>;\n'
+                '            clock-names = "mclk";\n',
+                "",
+            )
+        )
+        with self.assertRaisesRegex(verifier.ContractError, "codec MCLK"):
+            verifier.verify_dtb(dtb)
+
+    def test_rejects_wrong_physical_codec_mclk_rate(self) -> None:
+        dtb = self.compile_dts(
+            VALID_DTS.replace("clock-frequency = <9600000>;", "clock-frequency = <26000000>;")
+        )
+        with self.assertRaisesRegex(verifier.ContractError, "9.6 MHz"):
             verifier.verify_dtb(dtb)
 
     def test_rejects_wrong_external_amp_pin(self) -> None:
