@@ -153,9 +153,10 @@ this image.
 `build_wifi_dtb.py` instead extracts the pinned 51,317-byte stock EVT DTB,
 retains its verified resource-2 base at `0x10001000` (so the driver's `+0x320`
 EMI-remap access reaches `0x10001320`), and adds only the named
-`CLK_INFRA_PMIC_CONN` `bus` clock.  The resulting raw DTB is 51,353 bytes and
-has pinned SHA-256
-`d5e8b62e14956fb6402c510bfbc784e2e82479daa3183c32cac1e7bc139e9f04`.
+`CLK_INFRA_PMIC_CONN` `bus` clock, enables the 6.1 image-clock provider, and
+adds the TLV320 regulator links.  The resulting raw DTB is 51,405 bytes and has pinned
+SHA-256
+`21bda31ad6acadcbe3df7439f1ba53976f2e7b9f553a46bef753d26448dda18b`.
 See [WIFI_DTB.md](WIFI_DTB.md) for the reproducible command and the complete
 fail-closed contract.
 
@@ -209,7 +210,7 @@ The reviewed inputs are:
 | ARM32 zImage | 7,011,040 | `fa6717058fa25337dfbd63be52bafda18552ecd7361fe3df9a78c3715e3e6718` |
 | System.map | 2,820,781 | `1700f451d7931269974153749a9ab860906ffd3a86fc28a2f67e0b257b16c9d2` |
 | kernel `.config` | - | `9cf3ca49533904b41423308bf3309cbe1ff4244df895bd03563813d6d48cd8c8` |
-| pinned Wi-Fi DTB | 51,353 | `d5e8b62e14956fb6402c510bfbc784e2e82479daa3183c32cac1e7bc139e9f04` |
+| pinned Wi-Fi/audio DTB | 51,405 | `21bda31ad6acadcbe3df7439f1ba53976f2e7b9f553a46bef753d26448dda18b` |
 | stock v181 `system_a` provenance | - | `56540b3a9ac4437901a5510d9fb5e09b1a8d0cc229548f0b08bb5c22d78684fe` |
 | extracted evidence manifest | - | `d1eedd04efe0dbc78853f2b0f9357c092b4ca66242648908c0369956538441eb` |
 

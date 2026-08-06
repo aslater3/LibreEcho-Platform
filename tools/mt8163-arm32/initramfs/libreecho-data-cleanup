@@ -72,7 +72,9 @@ for path in \
     "$DATA_ROOT/libreecho/features" \
     "$DATA_ROOT/libreecho/update" \
     "$DATA_ROOT/libreecho/update/incoming" \
-    "$DATA_ROOT/libreecho/update/staging"; do
+    "$DATA_ROOT/libreecho/update/staging" \
+    "$DATA_ROOT/libreecho/libreecho-agentd.hotstage.bak" \
+    "$DATA_ROOT/libreecho/payloads"; do
     assert_no_symlink_components "$path"
 done
 
@@ -124,7 +126,9 @@ for path in \
     "$DATA_ROOT/libreecho/test" \
     "$DATA_ROOT/libreecho/testing" \
     "$DATA_ROOT/libreecho/tts-stage" \
-    "$DATA_ROOT/libreecho/hotstage"; do
+    "$DATA_ROOT/libreecho/hotstage" \
+    "$DATA_ROOT/libreecho/libreecho-agentd.hotstage.bak" \
+    "$DATA_ROOT/libreecho/payloads"; do
     remove_path "$path"
 done
 
@@ -181,10 +185,12 @@ check_children() {
 check_children "$DATA_ROOT" libreecho lost+found
 check_children "$DATA_ROOT/libreecho" config secrets features update data-manifest.json
 check_children "$DATA_ROOT/libreecho/config" \
-    web-config.json users wpa_supplicant.conf ntp.conf agent.json tts-voice vad-floor-rms
+    web-config.json web-config.json.bak users wpa_supplicant.conf ntp.conf \
+    agent.json agent.json.bak tts-voice vad-floor-rms
 check_children "$DATA_ROOT/libreecho/secrets" openai-codex.json
 check_children "$DATA_ROOT/libreecho/update" \
-    incoming staging state pending installed rolled-back check-status automatic-updates install.lock
+    incoming staging state pending installed rolled-back check-status \
+    automatic-updates install.lock bootctl.confirm
 
 if [ -d "$DATA_ROOT/libreecho/features" ]; then
     for feature_dir in "$DATA_ROOT/libreecho/features"/*; do

@@ -125,6 +125,7 @@ static int forward_stream(const char *input_path, const char *output_path)
 	unsigned char buffer[BUFFER_SIZE];
 	int input = -1;
 	int output = -1;
+	int active = 0;
 	int result = -1;
 
 	if (ensure_fifo(input_path) < 0)
@@ -135,6 +136,11 @@ static int forward_stream(const char *input_path, const char *output_path)
 	output = open(output_path, O_WRONLY | O_CLOEXEC);
 	if (output < 0)
 		goto out;
+	/* A producer process can outlive a real AirPlay connection.  Publish the
+	 * session only after both ends of the bridge are actually connected. */
+	if (set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 1) != 0)
+		goto out;
+	active = 1;
 	while (!stopping) {
 		ssize_t n = read(input, buffer, sizeof(buffer));
 
@@ -153,6 +159,8 @@ static int forward_stream(const char *input_path, const char *output_path)
 	if (stopping)
 		result = 0;
 out:
+	if (active)
+		(void)set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 0);
 	if (output >= 0)
 		close(output);
 	if (input >= 0)
@@ -168,11 +176,14 @@ int main(int argc, char **argv)
 
 	if (argc == 2 && (!strcmp(argv[1], "--start") ||
 			 !strcmp(argv[1], "--stop"))) {
-		int active = !strcmp(argv[1], "--start");
-
-		if (active && access(DEFAULT_MEDIA_FIFO, F_OK) != 0)
-			return 1;
-		return set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, active);
+		/*
+		 * These hooks are retained for compatibility with older
+		 * Shairport configurations, but they must not publish session
+		 * state.  The hook runs before the first PCM bytes are available
+		 * and can therefore leave a stale marker behind.  The bridge owns
+		 * the marker and publishes it only after both FIFOs are connected.
+		 */
+		return set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 0);
 	}
 	if (argc == 3 && !strcmp(argv[1], "--set-volume")) {
 		if (set_volume(DEFAULT_VOLUME_FILE, argv[2]) != 0)
@@ -194,8 +205,6 @@ int main(int argc, char **argv)
 	(void)sigaction(SIGTERM, &action, NULL);
 	(void)sigaction(SIGINT, &action, NULL);
 	signal(SIGPIPE, SIG_IGN);
-	if (set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 1) != 0)
-		return 1;
 
 	while (!stopping) {
 		if (forward_stream(input_path, output_path) < 0 && !stopping)

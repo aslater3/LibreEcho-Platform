@@ -851,8 +851,36 @@ ota_health_confirm_worker()
         $BB mv /data/libreecho/update/state.tmp /data/libreecho/update/state
     $BB sync
 
-    # Require the persistent filesystem, ADB control plane, and web service to
-    # remain healthy across three probes before making the slot permanent.
+    ota_health_services_ready()
+    {
+        [ "$SERVICE_PROFILE" = production ] || return 0
+        for required_socket in \
+            /run/libreecho/network.sock \
+            /run/libreecho/audio.sock \
+            /run/libreecho/mic.sock \
+            /run/libreecho/led.sock \
+            /run/libreecho/bluetooth.sock \
+            /run/libreecho/airplay.sock; do
+            [ -S "$required_socket" ] || {
+                log "ota-health-services-not-ready:$required_socket"
+                return 1
+            }
+        done
+        if [ -S /run/libreecho/stt.sock ] &&
+           [ -S /run/libreecho/tts.sock ] &&
+           [ -S /run/libreecho/agent.sock ]; then
+            return 0
+        fi
+        if [ -S /run/libreecho/wyoming.sock ]; then
+            return 0
+        fi
+        log ota-health-services-not-ready:voice-sockets
+        return 1
+    }
+
+    # Require the persistent filesystem, ADB control plane, web service, and
+    # complete selected service graph to remain healthy across three probes
+    # before making the slot permanent.
     $BB sleep 45
     attempt=0
     passed=0
@@ -860,7 +888,8 @@ ota_health_confirm_worker()
         attempt=$((attempt + 1))
         if ! $BB grep -q ' /data ' /proc/mounts 2>/dev/null ||
            [ "${ffs_ready:-0}" -ne 1 ] ||
-           ! /etc/init.d/libreecho-web.init status >/dev/null 2>&1; then
+           ! /etc/init.d/libreecho-web.init status >/dev/null 2>&1 ||
+           ! ota_health_services_ready; then
             passed=0
             log "ota-health-probe-failed:$attempt"
             $BB sleep 30
@@ -881,9 +910,14 @@ ota_health_confirm_worker()
     $BB sleep 2
     $BB reboot -f
 }
-# Keep the diagnostic slot pending and unconfirmed.  The operator can inspect
-# and recover it through the guarded OTA flow after collecting UART evidence.
-log ota-background-workers-disabled-for-usb-diagnostics
+if [ "$IMAGE_PROFILE" = ota ] && [ "$SERVICE_PROFILE" = production ]; then
+    ota_health_confirm_worker &
+    log ota-background-worker-started
+else
+    # Keep diagnostic slots pending and unconfirmed.  The operator can inspect
+    # and recover them through the guarded OTA flow after collecting evidence.
+    log ota-background-workers-disabled-for-diagnostic-profile
+fi
 
 # Audio playback is always user-initiated.  In particular, boot must never
 # touch the codec, amplifier, or TinyALSA playback device.  This is a hard

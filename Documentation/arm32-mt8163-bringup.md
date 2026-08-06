@@ -126,9 +126,9 @@ the active driver's AXI offsets to `0x220/0x228`, while EMI remapping uses
 resource 2 plus `0x320` (`0x10001320`).  The only DTB additions are
 `clocks = <5 3>` and `clock-names = "bus"` for `CLK_INFRA_PMIC_CONN`.
 
-The reproducible raw DTB is 51,353 bytes, below LK's 64 KiB appended-FDT
+The reproducible raw DTB is 51,652 bytes, below LK's 64 KiB appended-FDT
 limit, with SHA-256
-`d5e8b62e14956fb6402c510bfbc784e2e82479daa3183c32cac1e7bc139e9f04`.
+`0da56af63b5835a825e6524f1c7ca28635ee020eb77e68f7425753ba5a3ae156`.
 Its exact resource tuple, clock mutation, and boot envelope are checked by
 the [Wi-Fi DTB contract](../tools/mt8163-arm32/WIFI_DTB.md).
 

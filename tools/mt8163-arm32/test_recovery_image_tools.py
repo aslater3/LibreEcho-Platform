@@ -610,9 +610,12 @@ class PolicyTests(unittest.TestCase):
         self.assertNotIn("--allow-insecure-lan", source)
         self.assertIn("ui-web-production-loopback-fallback", source)
         self.assertIn("ui-web-production-authenticated-lan", source)
-        self.assertNotIn("ota_health_confirm_worker &", source)
         self.assertNotIn("libreecho-update-fetch watch", source)
-        self.assertIn("ota-background-workers-disabled-for-usb-diagnostics", source)
+        self.assertIn(
+            'if [ "$IMAGE_PROFILE" = ota ] && [ "$SERVICE_PROFILE" = production ]; then',
+            source,
+        )
+        self.assertIn("ota-background-workers-disabled-for-diagnostic-profile", source)
         builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
         verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
         self.assertIn('"activation": "manual-single-shot-after-adb"', builder)
@@ -632,6 +635,25 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("/sbin/libreecho-wifi", source)
         self.assertIn("/etc/udhcpc.script", (TOOLS_DIR / "initramfs/libreecho-wifi").read_text())
         self.assertNotIn("/system/vendor/bin/wmt_loader >/tmp/wifi-wmt-loader.log", source)
+
+    def test_production_ota_health_worker_checks_full_service_graph(self) -> None:
+        source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertIn('ota_health_confirm_worker &', source)
+        self.assertIn('[ "$SERVICE_PROFILE" = production ]', source)
+        for socket_path in (
+            "/run/libreecho/network.sock",
+            "/run/libreecho/audio.sock",
+            "/run/libreecho/mic.sock",
+            "/run/libreecho/led.sock",
+            "/run/libreecho/bluetooth.sock",
+            "/run/libreecho/stt.sock",
+            "/run/libreecho/tts.sock",
+            "/run/libreecho/agent.sock",
+            "/run/libreecho/airplay.sock",
+        ):
+            self.assertIn(socket_path, source)
+        self.assertIn("ota-health-services-not-ready", source)
+        self.assertIn("ota-background-workers-disabled-for-diagnostic-profile", source)
 
     def test_userdata_mount_is_identity_checked_and_non_destructive(self) -> None:
         source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
