@@ -13,8 +13,8 @@ CC_BIN=${LIBREECHO_UI_CC:-gcc}
 STRIP_BIN=${LIBREECHO_UI_STRIP:-${CROSS_COMPILE}strip}
 GC_LDFLAGS=${LIBREECHO_UI_GC_LDFLAGS:--static -Wl,--gc-sections}
 USERS_SOURCE=${LIBREECHO_WEB_USERS_FILE:-}
-MUSL_NATIVE_ROOT=${LIBREECHO_UI_MUSL_NATIVE_ROOT:-/home/andy/.local/var/pmbootstrap/chroot_native}
-MUSL_SYSROOT=${LIBREECHO_UI_MUSL_SYSROOT:-/home/andy/.local/var/pmbootstrap/chroot_buildroot_armv7}
+MUSL_NATIVE_ROOT=${LIBREECHO_UI_MUSL_NATIVE_ROOT:-/path/to/musl-native-root}
+MUSL_SYSROOT=${LIBREECHO_UI_MUSL_SYSROOT:-/path/to/musl-arm32-sysroot}
 MUSL_CC=${LIBREECHO_UI_MUSL_CC:-$MUSL_NATIVE_ROOT/usr/bin/armv7-alpine-linux-musleabihf-gcc}
 MUSL_NATIVE_LIB=${LIBREECHO_UI_MUSL_NATIVE_LIB:-$MUSL_NATIVE_ROOT/usr/lib}
 

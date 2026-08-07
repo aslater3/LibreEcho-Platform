@@ -7,7 +7,7 @@ usage() {
 Usage: adb-run-root.sh SCRIPT [TIMEOUT_SECONDS]
 
 Environment:
-  ADB_SERIAL   target serial (default: G2A0RF0485020316)
+  ADB_SERIAL   target serial (must be supplied by the operator)
   ADB_BIN      adb executable (default: adb)
 
 The development OS intentionally does not depend on an interactive adb shell.
@@ -21,7 +21,8 @@ EOF
 
 script=$1
 timeout=${2:-30}
-serial=${ADB_SERIAL:-G2A0RF0485020316}
+serial=${ADB_SERIAL:-}
+[[ -n "$serial" ]] || { echo "ERROR: ADB_SERIAL must be supplied" >&2; exit 2; }
 adb_bin=${ADB_BIN:-adb}
 [[ -f "$script" ]] || { echo "ERROR: script not found: $script" >&2; exit 2; }
 [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: timeout must be a positive integer" >&2; exit 2; }

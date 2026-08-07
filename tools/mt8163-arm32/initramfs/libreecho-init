@@ -635,7 +635,7 @@ if $BB grep -q ' /sys/kernel/config ' /proc/mounts 2>/dev/null; then
     echo 0xd001 > "$G/idProduct"
     echo 0x0200 > "$G/bcdUSB"
     serial=$($BB sed -n 's/.*androidboot.serialno=\([^ ]*\).*/\1/p' /proc/cmdline)
-    echo "${serial:-G2A0RF0485020316}" > "$G/strings/0x409/serialnumber"
+    echo "${serial:-libreecho}" > "$G/strings/0x409/serialnumber"
     echo LibreEcho > "$G/strings/0x409/manufacturer"
     echo MT8163-ARM32-ADB > "$G/strings/0x409/product"
     echo adb > "$G/configs/c.1/strings/0x409/configuration"

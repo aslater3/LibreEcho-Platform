@@ -18,14 +18,24 @@ TOOLS_DIR = Path(__file__).resolve().parent
 
 
 def pipeline_text(name: str) -> str:
-    root = Path(os.environ.get(
-        "LIBREECHO_PIPELINE_ROOT",
-        "/home/andy/workspace/mt8163-arm32-wifi-candidate/pipeline",
-    ))
+    pipeline_root = os.environ.get("LIBREECHO_PIPELINE_ROOT")
+    if not pipeline_root:
+        raise unittest.SkipTest("set LIBREECHO_PIPELINE_ROOT for pipeline contract tests")
+    root = Path(pipeline_root)
     path = root / name
     if not path.is_file():
         raise unittest.SkipTest(f"canonical pipeline unavailable: {path}")
     return path.read_text()
+
+
+def pipeline_file(name: str) -> Path:
+    pipeline_root = os.environ.get("LIBREECHO_PIPELINE_ROOT")
+    if not pipeline_root:
+        raise unittest.SkipTest("set LIBREECHO_PIPELINE_ROOT for pipeline contract tests")
+    path = Path(pipeline_root) / name
+    if not path.is_file():
+        raise unittest.SkipTest(f"canonical pipeline unavailable: {path}")
+    return path
 
 
 def load_tool(name: str):
@@ -715,15 +725,15 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("die manifest_service_profile", updater)
 
     def test_host_ota_path_is_explicit_and_uses_guarded_updater(self) -> None:
-        host = (TOOLS_DIR.parent.parent.parent / "pipeline/ota.sh").read_text()
-        preflight = (TOOLS_DIR.parent.parent.parent / "pipeline/ota-preflight-root.sh").read_text()
-        install = (TOOLS_DIR.parent.parent.parent / "pipeline/ota-install-root.sh").read_text()
+        host = pipeline_file("ota.sh").read_text()
+        preflight = pipeline_file("ota-preflight-root.sh").read_text()
+        install = pipeline_file("ota-install-root.sh").read_text()
         self.assertIn("mode=preflight", host)
         self.assertIn("--install", host)
         self.assertIn("--current", host)
         self.assertIn('CURRENT="${LIBREECHO_CURRENT:-$PIPELINE/out/CURRENT}"', host)
         self.assertIn('LIBREECHO_CURRENT="$CURRENT" "$PIPELINE/status.sh"', host)
-        status = (TOOLS_DIR.parent.parent.parent / "pipeline/status.sh").read_text()
+        status = pipeline_file("status.sh").read_text()
         self.assertIn('CURRENT="${LIBREECHO_CURRENT:-$OUT/CURRENT}"', status)
         self.assertIn("ota_bundle_sha256", host)
         self.assertIn("ota-preflight-root.sh", host)
@@ -731,7 +741,7 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("--check-current", host)
         self.assertIn("--confirm-current", host)
         self.assertIn("ota-confirm-current-root.sh", host)
-        confirm = (TOOLS_DIR.parent.parent.parent / "pipeline/ota-confirm-current-root.sh").read_text()
+        confirm = pipeline_file("ota-confirm-current-root.sh").read_text()
         self.assertIn("CONFIRM_CURRENT=YES", confirm)
         self.assertIn("OTA_CURRENT_SLOT_CONFIRM_READY", confirm)
         self.assertIn("ALLOW_UNCONFIRMED=1", confirm)
@@ -804,7 +814,7 @@ class PolicyTests(unittest.TestCase):
 
     def test_host_ota_reboot_waits_for_published_root_result(self) -> None:
         """Do not let the reboot supervisor race /tmp/result publication."""
-        host = (TOOLS_DIR.parent.parent.parent / "pipeline/ota.sh").read_text()
+        host = pipeline_file("ota.sh").read_text()
         install_run = host.rindex(
             'ADB_SERIAL="$ADB_SERIAL" "$ROOT_RUNNER" "$PIPELINE/ota-install-root.sh"'
         )
