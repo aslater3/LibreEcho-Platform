@@ -37,7 +37,7 @@ SOURCE_BOOT_SHA256 = "c0f52a3b079d214495cd3dd22f92fd85695d1b868c58b491a2edb933bc
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
 BUSYBOX_SHA256 = "d4c8fd2aea01abd851c703f39b29c0de748b2751e4e1a85cae570fa53ad8f4fb"
 MUSL_LOADER_SHA256 = "1063871174f1bd4f08f4d330e20b07aeb0820327ee739a4d8d1b644df842cb6b"
-RECOVERY_INIT_SHA256 = "33e1326be258cc7466b9feaad0ce0a2772b866780297c2b797ef78477b5ab834"
+RECOVERY_INIT_SHA256 = "84d9110f96e3333ca3839228358635407e799f064d04f6b9a68cb37709b119c5"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
 CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
@@ -447,6 +447,9 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         "init.rc": ("init.rc", 0o644),
         "init.recovery.mt8163.rc": ("init.recovery.mt8163.rc", 0o644),
         "libreecho-init": ("libreecho-init", 0o755),
+        "libreecho-data-cleanup": (
+            "usr/local/sbin/libreecho-data-cleanup", 0o755,
+        ),
         "libreecho-update": ("usr/local/sbin/libreecho-update", 0o755),
         "libreecho-update-fetch": ("usr/local/sbin/libreecho-update-fetch", 0o755),
         "ota-source.conf": ("etc/libreecho/ota-source.conf", 0o644),
@@ -455,6 +458,8 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         "wpa_supplicant.conf.example": (
             "etc/wifi/wpa_supplicant.conf.example", 0o600,
         ),
+        "regulatory.db": ("lib/firmware/regulatory.db", 0o644),
+        "regulatory.db.p7s": ("lib/firmware/regulatory.db.p7s", 0o644),
     }
     overlay_manifest: dict[str, object] = {}
     for relative, (target_relative, mode) in overlay_files.items():
@@ -523,7 +528,8 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
 
 
 def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
-                  image_profile: str, manifest: dict[str, object]) -> None:
+                  image_profile: str, service_profile: str,
+                  manifest: dict[str, object]) -> None:
     sources = (
         ("bootctl", bootctl, "usr/local/sbin/libreecho-bootctl",
          "/lib/ld-musl-armhf.so.1", ("libc.musl-armv7.so.1",), True),
@@ -559,7 +565,11 @@ def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
     profile_target = stage / "etc/libreecho/image-profile"
     profile_target.write_text(image_profile + "\n")
     profile_target.chmod(0o644)
+    service_profile_target = stage / "etc/libreecho/service-profile"
+    service_profile_target.write_text(service_profile + "\n")
+    service_profile_target.chmod(0o644)
     manifest["image_profile"] = image_profile
+    manifest["service_profile"] = service_profile
     manifest["ota"] = {
         "enabled": True,
         "format": "libreecho-ota-v1",
@@ -742,7 +752,16 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
             "mode": f"{mode:04o}",
         }
         if elf:
-            record["elf"] = require_elf_contract(target, 0x05000400, None, (), False)
+            if target.name in {
+                    "libreecho-sttd-wyoming", "libreecho-ttsd-wyoming"}:
+                record["elf"] = require_elf_contract(
+                    target, 0x05000400, "/lib/ld-musl-armhf.so.1",
+                    ("libc.musl-armv7.so.1",), True,
+                )
+            else:
+                record["elf"] = require_elf_contract(
+                    target, 0x05000400, None, (), False,
+                )
         files[target_name] = record
 
     for binary in (
@@ -750,6 +769,7 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
         "libreecho-timed", "libreecho-audiod", "libreecho-micd",
         "libreecho-ledd", "libreecho-btd",
         "libreecho-airplayd", "libreecho-wyomingd",
+        "libreecho-sttd-wyoming", "libreecho-ttsd-wyoming",
     ):
         copy_file(f"sbin/{binary}", f"usr/local/sbin/{binary}", 0o755, True)
     for script in (
@@ -1429,7 +1449,7 @@ def add_network_bundle(stage: Path, wpa_supplicant: Path, wifi_config: Path,
     config_target.chmod(0o600)
     manifest["network"] = {
         "enabled": True,
-        "activation": "automatic-after-adb-if-profile-present",
+        "activation": "manual-single-shot-after-adb",
         "wpa_supplicant": {
             "version": WPA_SUPPLICANT_VERSION,
             "sha256": sha256(wpa_data),
@@ -1455,10 +1475,11 @@ def validate_stage(stage: Path) -> None:
         "sbin/adbd", "sbin/ueventd", "sbin/sh", "system/bin/sh",
         "sepolicy", "file_contexts.bin", "property_contexts",
         "usr/local/sbin/libreecho-update", "usr/local/sbin/libreecho-bootctl",
+        "usr/local/sbin/libreecho-data-cleanup",
         "usr/local/sbin/libreecho-update-fetch",
         "usr/local/libexec/libreecho-update-verify",
         "etc/libreecho/ota-public-key.hex", "etc/libreecho/ota-source.conf",
-        "etc/libreecho/image-profile",
+        "etc/libreecho/image-profile", "etc/libreecho/service-profile",
     )
     for relative in required:
         if not (stage / relative).exists():
@@ -1528,7 +1549,7 @@ def validate_stage(stage: Path) -> None:
         if line.lstrip().startswith(b"/sbin/adbd ")
     )
     if adbd_launches != (
-        b"/sbin/adbd --root_seclabel=u:r:su:s0 --device_banner=device </dev/null >/tmp/adbd.log 2>&1 &",
+        b"/sbin/adbd --device_banner=device </dev/null >/tmp/adbd.log 2>&1 &",
     ):
         raise SystemExit(f"ERROR: unexpected ARM32 adbd launch contract: {adbd_launches!r}")
     for forbidden in (b"/proc/hps/enabled", b"scaling_governor", b"cpuidle"):
@@ -1749,6 +1770,8 @@ def main() -> None:
     parser.add_argument("--busybox", type=Path, required=True)
     parser.add_argument("--musl-loader", type=Path, required=True)
     parser.add_argument("--image-profile", choices=("development", "ota"), required=True)
+    parser.add_argument("--service-profile", choices=("diagnostic", "production"),
+                        default="diagnostic")
     parser.add_argument("--bootctl", type=Path, required=True)
     parser.add_argument("--update-verifier", type=Path, required=True)
     parser.add_argument("--ota-public-key", type=Path, required=True)
@@ -2117,7 +2140,8 @@ def main() -> None:
         )
         add_ota_tools(
             stage, args.bootctl.resolve(), args.update_verifier.resolve(),
-            args.ota_public_key.resolve(), args.image_profile, manifest,
+            args.ota_public_key.resolve(), args.image_profile, args.service_profile,
+            manifest,
         )
         if args.audio_probe is not None:
             add_audio_probe(stage, args.audio_probe.resolve(), manifest)

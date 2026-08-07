@@ -7,6 +7,23 @@ PATH=/bin:/sbin:/system/bin
 export PATH
 umask 022
 
+# Service profile is immutable image policy, never userdata policy.  Missing or
+# invalid content falls back to the bounded diagnostic graph.
+SERVICE_PROFILE_VALUE=$($BB cat /etc/libreecho/service-profile 2>/dev/null)
+SERVICE_PROFILE=diagnostic
+SERVICE_PROFILE_INVALID=0
+case "$SERVICE_PROFILE_VALUE" in
+    diagnostic)
+        SERVICE_PROFILE=diagnostic
+        ;;
+    production)
+        SERVICE_PROFILE=production
+        ;;
+    *)
+        SERVICE_PROFILE_INVALID=1
+        ;;
+esac
+
 $BB mkdir -p /dev/pts /dev/usb-ffs/adb /dev/socket /proc /sys /tmp
 $BB chmod 0777 /tmp
 
@@ -51,6 +68,12 @@ log()
 	printf '<6>%s\n' "$msg" > /dev/kmsg 2>/dev/null
 	printf '%s\n' "$msg" > /dev/console 2>/dev/null
 }
+
+if [ "$SERVICE_PROFILE_INVALID" -eq 1 ]; then
+    log service-profile-invalid-fallback-diagnostic
+else
+    log "service-profile:$SERVICE_PROFILE"
+fi
 
 create_audio_nodes()
 {
@@ -272,7 +295,24 @@ userdata_mount()
     log userdata-mount-failed
     return 1
 }
-userdata_mount || true
+if userdata_mount; then
+    if [ -x /usr/local/sbin/libreecho-data-cleanup ]; then
+        if DATA_ROOT=/data /usr/local/sbin/libreecho-data-cleanup \
+                >/tmp/data-cleanup.log 2>&1; then
+            DATA_CLEANUP_OK=1
+            log userdata-cleanup-ok
+        else
+            DATA_CLEANUP_OK=0
+            log userdata-cleanup-contract-failed
+        fi
+    else
+        DATA_CLEANUP_OK=0
+        log userdata-cleanup-missing
+    fi
+else
+    DATA_CLEANUP_OK=0
+    log userdata-unavailable
+fi
 set_boot_hostname || true
 
 expdb_devno=$($BB cat "$EXPDB_SYS/dev" 2>/dev/null)
@@ -372,36 +412,42 @@ log reboot-supervisor-started
 $BB chmod 0666 /dev/wmtWifi /dev/wmtdetect /dev/stpwmt /dev/stpbt 2>/dev/null
 log wmt-nodes-created
 
-# The network stack is build-time opt-in: images without a supplied Wi-Fi
-# profile remain passive, while a profile-bearing image performs exactly one
-# bounded WMT activation and then starts the verified ARM32 client stack.
-start_wifi_network()
+# The network stack is build-time opt-in, but activation remains an explicit
+# operator request after ADB.  This preserves the USB diagnostic control plane
+# across the historical WMT/WLAN failure boundary.
+start_wifi_network_sequence()
 {
-    [ -r /etc/wifi/wpa_supplicant.conf ] || { log wifi-profile-absent; return 0; }
-    log wifi-profile-present
-    wifi_profile=/etc/wifi/wpa_supplicant.conf
+    packaged_wifi=/etc/wifi/wpa_supplicant.conf
     persistent_wifi=/data/libreecho/config/wpa_supplicant.conf
+    wifi_profile=
     if $BB grep -q ' /data ' /proc/mounts 2>/dev/null; then
         $BB mkdir -p /data/libreecho/config
         $BB chmod 0700 /data/libreecho /data/libreecho/config 2>/dev/null
-        if [ ! -r "$persistent_wifi" ]; then
+        if [ -r "$persistent_wifi" ]; then
+            $BB chmod 0600 "$persistent_wifi" 2>/dev/null
+            wifi_profile=$persistent_wifi
+            log wifi-persistent-profile-selected
+        elif [ -r "$packaged_wifi" ]; then
             persistent_wifi_tmp=$persistent_wifi.tmp
             if $BB sed 's/^update_config=.*/update_config=1/' \
-                /etc/wifi/wpa_supplicant.conf > "$persistent_wifi_tmp" &&
+                "$packaged_wifi" > "$persistent_wifi_tmp" &&
                $BB chmod 0600 "$persistent_wifi_tmp" &&
                $BB mv "$persistent_wifi_tmp" "$persistent_wifi"; then
                 log wifi-persistent-profile-created
+                wifi_profile=$persistent_wifi
+                log wifi-persistent-profile-selected
             else
                 $BB rm -f "$persistent_wifi_tmp"
                 log wifi-persistent-profile-create-failed
             fi
         fi
-        if [ -r "$persistent_wifi" ]; then
-            $BB chmod 0600 "$persistent_wifi" 2>/dev/null
-            wifi_profile=$persistent_wifi
-            log wifi-persistent-profile-selected
-        fi
     fi
+    if [ -z "$wifi_profile" ] && [ -r "$packaged_wifi" ]; then
+        wifi_profile=$packaged_wifi
+        log wifi-packaged-profile-selected
+    fi
+    [ -n "$wifi_profile" ] || { log wifi-profile-absent; return 2; }
+    log wifi-profile-present
     # This is the proven manual choreography from session e8c21eb3bbae:
     # stock-compatible configure-only init, stale-launcher cleanup, exactly one
     # one-shot command responder, then one timed Wi-Fi function-on write.  Do
@@ -425,6 +471,8 @@ start_wifi_network()
     $BB sleep 1
     responder_count=$($BB pidof wmt_launcher 2>/dev/null | $BB wc -w)
     [ "$responder_count" -eq 1 ] || {
+        $BB kill -TERM "$responder_pid" 2>/dev/null
+        wait "$responder_pid" 2>/dev/null
         log wifi-launcher-count-failed
         return 1
     }
@@ -433,7 +481,24 @@ start_wifi_network()
         >/tmp/wifi-function-on.log 2>&1
     wifi_on_rc=$?
     log "wifi-function-on-rc:$wifi_on_rc"
+    responder_wait=0
+    while $BB kill -0 "$responder_pid" 2>/dev/null &&
+          [ "$responder_wait" -lt 10 ]; do
+        $BB sleep 1
+        responder_wait=$((responder_wait + 1))
+    done
+    if $BB kill -0 "$responder_pid" 2>/dev/null; then
+        $BB kill -TERM "$responder_pid" 2>/dev/null
+        $BB sleep 1
+        $BB kill -KILL "$responder_pid" 2>/dev/null
+        wait "$responder_pid" 2>/dev/null
+        log wifi-launcher-exit-timeout
+        return 1
+    fi
     wait "$responder_pid" 2>/dev/null
+    responder_rc=$?
+    log "wifi-launcher-rc:$responder_rc"
+    [ "$responder_rc" -eq 0 ] || { log wifi-launcher-failed; return 1; }
     [ "$wifi_on_rc" -eq 0 ] || { log wifi-function-on-failed; return "$wifi_on_rc"; }
     i=0
     while [ "$i" -lt 30 ] && [ ! -e /sys/class/net/wlan0 ]; do
@@ -446,6 +511,55 @@ start_wifi_network()
     client_rc=$?
     log "wifi-client-rc:$client_rc"
     return "$client_rc"
+}
+
+start_wifi_network()
+{
+    # The WMT firmware path is intentionally single-shot per boot.  mkdir is
+    # the atomic claim for the operator-request path.
+    if ! $BB mkdir /tmp/wifi.activation.claim 2>/dev/null; then
+        log wifi-activation-duplicate-rejected
+        return 3
+    fi
+    printf 'LIBREECHO_WIFI_STARTED\n' > /tmp/wifi.status
+    start_wifi_network_sequence
+    wifi_rc=$?
+    printf 'LIBREECHO_WIFI_RC=%s\n' "$wifi_rc" > /tmp/wifi.status
+    log "wifi-activation-complete:$wifi_rc"
+    return "$wifi_rc"
+}
+
+# Preserve the golden manual activation path as a single-shot operator gate.
+# The supervisor is launched only after FunctionFS/ADB is ready below.  A
+# second request in the same boot is refused because retrying a failed WMT
+# activation without a cold reset produced misleading firmware-ready failures.
+wifi_request_loop()
+{
+    while true; do
+        if [ -f /tmp/wifi.request ] && [ ! -e /tmp/wifi.request.active ]; then
+            $BB mv /tmp/wifi.request /tmp/wifi.request.active
+            wifi_request=$($BB sed -n '1p' /tmp/wifi.request.active 2>/dev/null)
+            $BB rm -f /tmp/wifi.request.active
+            case "$wifi_request" in
+                start)
+                    if [ -d /tmp/wifi.activation.claim ]; then
+                        printf 'LIBREECHO_WIFI_REJECTED=already-attempted\n' > /tmp/wifi.status
+                        log wifi-request-duplicate-rejected
+                        continue
+                    fi
+                    log wifi-request-start-accepted
+                    start_wifi_network
+                    wifi_rc=$?
+                    log "wifi-request-complete:$wifi_rc"
+                    ;;
+                *)
+                    printf 'LIBREECHO_WIFI_REJECTED=invalid-request\n' > /tmp/wifi.status
+                    log wifi-request-invalid-rejected
+                    ;;
+            esac
+        fi
+        $BB sleep 1
+    done
 }
 log wifi-network-worker-deferred
 
@@ -499,118 +613,130 @@ runme_loop()
 runme_loop &
 log runme-loop-started
 
-USB=/sys/class/android_usb/android0
-if [ -d "$USB" ]; then
-    log android-usb-found
-    $BB sleep 2
-    log android-usb-settle-complete
+# Linux 6.1 has no Android android_usb class.  Compose an ADB-only gadget with
+# ConfigFS and FunctionFS, and bind the UDC only after adbd publishes endpoints.
+G=/sys/kernel/config/usb_gadget/libreecho
+ffs_ready=0
+$BB mkdir -p /sys/kernel/config
+if ! $BB grep -q ' /sys/kernel/config ' /proc/mounts 2>/dev/null; then
+    if $BB mount -t configfs configfs /sys/kernel/config 2>/tmp/configfs.log; then
+        log configfs-mounted
+    else
+        log configfs-mount-failed
+    fi
+else
+    log configfs-already-mounted
+fi
 
-    echo 0 > "$USB/enable" 2>/dev/null
-    echo 18D1 > "$USB/idVendor" 2>/dev/null
-    echo D001 > "$USB/idProduct" 2>/dev/null
-    echo adb > "$USB/f_ffs/aliases" 2>/dev/null
-	# Isolate the FunctionFS/ADB path first.  RNDIS is an independent composite
-	# function and a bind failure there can hide a healthy ADB transport.
-	echo adb > "$USB/functions" 2>/dev/null
-    echo LibreEcho > "$USB/iManufacturer" 2>/dev/null
-    echo MT8163-ARM32-recovery > "$USB/iProduct" 2>/dev/null
+if $BB grep -q ' /sys/kernel/config ' /proc/mounts 2>/dev/null; then
+    $BB mkdir -p "$G" "$G/strings/0x409" \
+        "$G/configs/c.1/strings/0x409" "$G/functions/ffs.adb"
+    echo 0x18d1 > "$G/idVendor"
+    echo 0xd001 > "$G/idProduct"
+    echo 0x0200 > "$G/bcdUSB"
     serial=$($BB sed -n 's/.*androidboot.serialno=\([^ ]*\).*/\1/p' /proc/cmdline)
-    echo "${serial:-G2A0RF0485020316}" > "$USB/iSerial" 2>/dev/null
-    log android-ffs-composition-set
+    echo "${serial:-libreecho}" > "$G/strings/0x409/serialnumber"
+    echo LibreEcho > "$G/strings/0x409/manufacturer"
+    echo MT8163-ARM32-ADB > "$G/strings/0x409/product"
+    echo adb > "$G/configs/c.1/strings/0x409/configuration"
+    echo 120 > "$G/configs/c.1/MaxPower"
+    [ -e "$G/configs/c.1/ffs.adb" ] || \
+        $BB ln -s "$G/functions/ffs.adb" "$G/configs/c.1/ffs.adb"
+    log configfs-adb-composition-created
 
-	if $BB mount -t functionfs -o uid=2000,gid=2000 adb /dev/usb-ffs/adb 2>/tmp/functionfs.log; then
-		log functionfs-mounted
+    if $BB mount -t functionfs -o uid=2000,gid=2000 adb /dev/usb-ffs/adb 2>/tmp/functionfs.log; then
+        log functionfs-mounted
+        # Linux 6.1 is built with DAC as its security model and has no SELinux
+        # filesystem.  Passing Android's root_seclabel makes this static adbd
+        # exit before opening FunctionFS, so retain only its device banner.
+        # HW18 enables adbd's own bounded trace so UART can distinguish a
+        # missing transport thread from a FunctionFS endpoint failure.
+        export ADB_TRACE=all
+        /sbin/adbd --device_banner=device </dev/null >/tmp/adbd.log 2>&1 &
+        adbd_pid=$!
+        log "adbd-started:$adbd_pid"
 
-		# v97-proven ordering: start adbd FIRST so it writes its FunctionFS
-		# descriptors to /dev/usb-ffs/adb/ep0, THEN enable the gadget.
-		# android.c holds an extra disable_depth reference until FunctionFS
-		# publishes descriptors; enabling before adbd runs leaves the gadget
-		# disconnected forever and adbd exits immediately.
+        i=0
+        while [ "$i" -lt 15 ]; do
+            if [ -e /dev/usb-ffs/adb/ep1 ] && [ -e /dev/usb-ffs/adb/ep2 ]; then
+                ffs_ready=1
+                break
+            fi
+            if ! $BB kill -0 "$adbd_pid" 2>/dev/null; then
+                wait "$adbd_pid" 2>/dev/null
+                log "adbd-exit-status:$?"
+                log adbd-exited-early
+                break
+            fi
+            $BB sleep 1
+            i=$((i + 1))
+        done
 
-		# Diagnose adbd launchability before starting it.
-		if [ ! -x /sbin/adbd ]; then
-			log adbd-binary-missing-or-not-executable
-		fi
-		# Log the ELF interpreter the binary expects.
-		interp=$($BB head -c 512 /sbin/adbd 2>/dev/null | $BB strings 2>/dev/null | $BB grep -m1 '/.*linker' 2>/dev/null)
-		[ -n "$interp" ] && log "adbd-interp:$interp"
-		[ -n "$interp" ] && [ ! -e "$interp" ] && log "adbd-interp-missing:$interp"
-		# Log available shared library paths.
-		for libdir in /system/lib /system/bin /sbin /lib; do
-			[ -d "$libdir" ] && log "libdir:$libdir:$($BB ls "$libdir" 2>/dev/null | $BB head -5 | $BB tr '\n' ',')"
-		done
-
-		/sbin/adbd --root_seclabel=u:r:su:s0 --device_banner=device </dev/null >/tmp/adbd.log 2>&1 &
-		adbd_pid=$!
-		log "adbd-started:$adbd_pid"
-
-		# Give adbd time to open the FunctionFS endpoint and write descriptors.
-		$BB sleep 3
-
-		# Capture exit status if adbd died during the sleep.
-		if ! $BB kill -0 "$adbd_pid" 2>/dev/null; then
-			wait "$adbd_pid" 2>/dev/null
-			log "adbd-exit-status:$?"
-			[ -s /tmp/adbd.log ] && $BB sed 's/^/<3>adbd-log: /' /tmp/adbd.log > /dev/kmsg 2>/dev/null
-			# Check kernel log for segfaults or signals.
-			$BB dmesg 2>/dev/null | $BB grep -i "adbd\|segfault\|sig\|killed" | $BB tail -5 | $BB sed 's/^/<3>kern: /' > /dev/kmsg 2>/dev/null
-			# Check if ep0 exists and is accessible.
-			[ -e /dev/usb-ffs/adb/ep0 ] && log "ep0-exists:yes" || log "ep0-exists:no"
-			$BB ls -la /dev/usb-ffs/adb/ 2>/dev/null | $BB head -5 | $BB sed 's/^/<3>ffs-ls: /' > /dev/kmsg 2>/dev/null
-			# Try running adbd in foreground briefly to capture any output.
-			ADBD_BIN=/sbin/adbd
-			"$ADBD_BIN" --version >/tmp/adbd-version.log 2>&1
-			log "adbd-version-rc:$?"
-			[ -s /tmp/adbd-version.log ] && $BB sed 's/^/<3>adbd-ver: /' /tmp/adbd-version.log > /dev/kmsg 2>/dev/null
-			# Check if /dev/null and /dev/zero exist (adbd needs them).
-			[ -c /dev/null ] && log "dev-null:ok" || log "dev-null:missing"
-			[ -c /dev/zero ] && log "dev-zero:ok" || log "dev-zero:missing"
-		fi
-
-		if echo 1 > "$USB/enable" 2>/tmp/android-usb-enable.err; then
-			log android-usb-enabled
-		else
-			log android-usb-enable-write-failed
-		fi
-
-		# Verify the daemon survived and FunctionFS endpoints appeared.
-		ffs_ready=0
-		i=0
-		while [ "$i" -lt 10 ]; do
-			if [ -e /dev/usb-ffs/adb/ep1 ] && [ -e /dev/usb-ffs/adb/ep2 ]; then
-				ffs_ready=1
-				break
-			fi
-			if ! $BB kill -0 "$adbd_pid" 2>/dev/null; then
-				log adbd-exited-early
-				if [ -s /tmp/adbd.log ]; then
-					$BB sed 's/^/<3>adbd: /' /tmp/adbd.log > /dev/kmsg 2>/dev/null
-				fi
-				break
-			fi
-			$BB sleep 1
-			i=$((i + 1))
-		done
-
-		if [ "$ffs_ready" -eq 1 ]; then
-			log functionfs-ready
-		else
-			log functionfs-not-ready
-			if [ -s /tmp/adbd.log ]; then
-				$BB tail -n 8 /tmp/adbd.log | $BB sed 's/^/<3>adbd: /' > /dev/kmsg 2>/dev/null
-			fi
-			if [ -s /tmp/functionfs.log ]; then
-				$BB tail -n 4 /tmp/functionfs.log > /dev/kmsg 2>/dev/null
-			fi
-		fi
+        if [ "$ffs_ready" -eq 1 ]; then
+            log functionfs-ready
+            udc=
+            for candidate in /sys/class/udc/*; do
+                [ -e "$candidate" ] || continue
+                udc=${candidate##*/}
+                break
+            done
+            if [ -n "$udc" ] && echo "$udc" > "$G/UDC" 2>/tmp/configfs-udc-bind.err; then
+                log "configfs-udc-bound:$udc"
+                # Capture one bounded userspace snapshot after the host has had
+                # time to send CNXN.  Never loop: repeated ADB reconnects would
+                # otherwise flood the authoritative UART record.
+                (
+                    $BB sleep 8
+                    log adbd-diagnostic-begin
+                    if $BB kill -0 "$adbd_pid" 2>/dev/null; then
+                        for fd in /proc/"$adbd_pid"/fd/*; do
+                            [ -e "$fd" ] || continue
+                            target=$($BB readlink "$fd" 2>/dev/null)
+                            log "adbd-fd:${fd##*/}:$target"
+                        done
+                        for task in /proc/"$adbd_pid"/task/*; do
+                            [ -d "$task" ] || continue
+                            tid=${task##*/}
+                            comm=$($BB cat "$task/comm" 2>/dev/null)
+                            state=$($BB sed -n 's/^State:[[:space:]]*//p' "$task/status" 2>/dev/null)
+                            wchan=$($BB cat "$task/wchan" 2>/dev/null)
+                            log "adbd-task:$tid:$comm:$state:$wchan"
+                        done
+                    else
+                        log adbd-diagnostic-process-gone
+                    fi
+                    if [ -s /tmp/adbd.log ]; then
+                        $BB tail -n 40 /tmp/adbd.log | while IFS= read -r line; do
+                            log "adbd-log:$line"
+                        done
+                    else
+                        log adbd-log-empty
+                    fi
+                    log adbd-diagnostic-end
+                ) &
+            else
+                ffs_ready=0
+                log configfs-udc-bind-failed
+            fi
+        else
+            log functionfs-not-ready
+            [ -s /tmp/adbd.log ] && \
+                $BB tail -n 8 /tmp/adbd.log | $BB sed 's/^/<3>adbd: /' > /dev/kmsg 2>/dev/null
+        fi
     else
         log functionfs-mount-failed
     fi
 else
-    log android-usb-missing
+    log configfs-unavailable
 fi
 
 log init-ready-pid1-managed
+
+# Keep the one-shot activation manual even when a profile is packaged.  ADB
+# can create /tmp/wifi.request containing "start" after the operator has
+# captured the passive boot boundary.
+wifi_request_loop &
+log wifi-request-supervisor-started
 
 # The recovery image's minimal userspace does not inherit Android's loopback
 # address.  Bring up IPv4 loopback before manual services such as the web
@@ -634,6 +760,14 @@ start_ui_services()
         return 0
     }
     $BB mkdir -p /var/run /var/log /var/log/libreecho /run/libreecho
+    if [ "$SERVICE_PROFILE" = production ] && [ "${DATA_CLEANUP_OK:-0}" -ne 1 ]; then
+        log ui-services-blocked-by-data-contract
+        return 1
+    fi
+    if [ "$SERVICE_PROFILE" = diagnostic ]; then
+        services="logd timed web"
+        log ui-connectivity-services-disabled-for-diagnostic-profile
+    else
     ha_enabled=0
     config=/data/libreecho/config/web-config.json
     if [ -r "$config" ]; then
@@ -651,10 +785,23 @@ start_ui_services()
     else
         services="logd networkd timed audiod micd waked sttd ledd btd airplayd ttsd agentd web"
     fi
+    fi
     for service in $services; do
         script="/etc/init.d/libreecho-$service.init"
         if [ -x "$script" ]; then
-            "$script" start >/tmp/libreecho-"$service".init.log 2>&1
+            if [ "$service" = web ] && [ "$SERVICE_PROFILE" = production ]; then
+                web_listen=127.0.0.1:8080
+                if [ -r /data/libreecho/config/users ]; then
+                    web_listen=0.0.0.0:8080
+                    log ui-web-production-authenticated-lan
+                else
+                    log ui-web-production-loopback-fallback
+                fi
+                ARGS="--backend linux --config /data/libreecho/config/web-config.json --web-root /usr/local/share/libreecho/web --listen $web_listen" \
+                    "$script" start >/tmp/libreecho-"$service".init.log 2>&1
+            else
+                "$script" start >/tmp/libreecho-"$service".init.log 2>&1
+            fi
             rc=$?
             log "ui-service-start:$service:$rc"
         else
@@ -704,8 +851,36 @@ ota_health_confirm_worker()
         $BB mv /data/libreecho/update/state.tmp /data/libreecho/update/state
     $BB sync
 
-    # Require the persistent filesystem, ADB control plane, and web service to
-    # remain healthy across three probes before making the slot permanent.
+    ota_health_services_ready()
+    {
+        [ "$SERVICE_PROFILE" = production ] || return 0
+        for required_socket in \
+            /run/libreecho/network.sock \
+            /run/libreecho/audio.sock \
+            /run/libreecho/mic.sock \
+            /run/libreecho/led.sock \
+            /run/libreecho/bluetooth.sock \
+            /run/libreecho/airplay.sock; do
+            [ -S "$required_socket" ] || {
+                log "ota-health-services-not-ready:$required_socket"
+                return 1
+            }
+        done
+        if [ -S /run/libreecho/stt.sock ] &&
+           [ -S /run/libreecho/tts.sock ] &&
+           [ -S /run/libreecho/agent.sock ]; then
+            return 0
+        fi
+        if [ -S /run/libreecho/wyoming.sock ]; then
+            return 0
+        fi
+        log ota-health-services-not-ready:voice-sockets
+        return 1
+    }
+
+    # Require the persistent filesystem, ADB control plane, web service, and
+    # complete selected service graph to remain healthy across three probes
+    # before making the slot permanent.
     $BB sleep 45
     attempt=0
     passed=0
@@ -713,7 +888,8 @@ ota_health_confirm_worker()
         attempt=$((attempt + 1))
         if ! $BB grep -q ' /data ' /proc/mounts 2>/dev/null ||
            [ "${ffs_ready:-0}" -ne 1 ] ||
-           ! /etc/init.d/libreecho-web.init status >/dev/null 2>&1; then
+           ! /etc/init.d/libreecho-web.init status >/dev/null 2>&1 ||
+           ! ota_health_services_ready; then
             passed=0
             log "ota-health-probe-failed:$attempt"
             $BB sleep 30
@@ -734,13 +910,13 @@ ota_health_confirm_worker()
     $BB sleep 2
     $BB reboot -f
 }
-ota_health_confirm_worker &
-log ota-health-confirm-worker-started
-
-if [ "$IMAGE_PROFILE" = ota ] &&
-   [ -x /usr/local/sbin/libreecho-update-fetch ]; then
-    /usr/local/sbin/libreecho-update-fetch watch >/tmp/ota-fetch-worker.log 2>&1 &
-    log ota-fetch-worker-started
+if [ "$IMAGE_PROFILE" = ota ] && [ "$SERVICE_PROFILE" = production ]; then
+    ota_health_confirm_worker &
+    log ota-background-worker-started
+else
+    # Keep diagnostic slots pending and unconfirmed.  The operator can inspect
+    # and recover them through the guarded OTA flow after collecting evidence.
+    log ota-background-workers-disabled-for-diagnostic-profile
 fi
 
 # Audio playback is always user-initiated.  In particular, boot must never
@@ -749,11 +925,14 @@ fi
 # an old audio asset is accidentally present in an overlay or persistent store.
 log audio-startup-disabled
 
-# Connectivity is deliberately launched only after the ADB/FunctionFS control
-# plane is ready.  A profile-bearing development image performs one bounded
-# Wi-Fi activation; a failed activation is recorded but never takes PID 1 or
-# the recovery runner down.
-if [ "${ffs_ready:-0}" -eq 1 ]; then
+# Connectivity is launched only after the ADB/FunctionFS control plane is
+# ready (HW61, matching the verified 3.18 baseline).  A profile-bearing image
+# performs one bounded Wi-Fi activation; a failed activation is recorded but
+# never takes PID 1 or the recovery runner down.  When USB diagnostic mode is
+# active, connectivity stays manual/single-shot.
+if [ "$SERVICE_PROFILE" = diagnostic ]; then
+    log wifi-network-policy-manual-single-shot
+elif [ "${ffs_ready:-0}" -eq 1 ]; then
     start_wifi_network &
     log wifi-network-worker-started-after-adb
 else

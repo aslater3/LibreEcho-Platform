@@ -18,14 +18,24 @@ TOOLS_DIR = Path(__file__).resolve().parent
 
 
 def pipeline_text(name: str) -> str:
-    root = Path(os.environ.get(
-        "LIBREECHO_PIPELINE_ROOT",
-        "/home/andy/workspace/mt8163-arm32-wifi-candidate/pipeline",
-    ))
+    pipeline_root = os.environ.get("LIBREECHO_PIPELINE_ROOT")
+    if not pipeline_root:
+        raise unittest.SkipTest("set LIBREECHO_PIPELINE_ROOT for pipeline contract tests")
+    root = Path(pipeline_root)
     path = root / name
     if not path.is_file():
         raise unittest.SkipTest(f"canonical pipeline unavailable: {path}")
     return path.read_text()
+
+
+def pipeline_file(name: str) -> Path:
+    pipeline_root = os.environ.get("LIBREECHO_PIPELINE_ROOT")
+    if not pipeline_root:
+        raise unittest.SkipTest("set LIBREECHO_PIPELINE_ROOT for pipeline contract tests")
+    path = Path(pipeline_root) / name
+    if not path.is_file():
+        raise unittest.SkipTest(f"canonical pipeline unavailable: {path}")
+    return path
 
 
 def load_tool(name: str):
@@ -272,7 +282,8 @@ class SourceTests(unittest.TestCase):
         self.assertIn("set_pcm_volume(card, requested)", engine)
         self.assertIn("disable_output_controls(card,", engine)
         self.assertIn("DEFAULT_AIRPLAY_ACTIVE_FILE", producer)
-        self.assertIn("set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, active)", producer)
+        self.assertIn("These hooks are retained for compatibility", producer)
+        self.assertNotIn("set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, active)", producer)
         self.assertIn("DEFAULT_AIRPLAY_VOLUME_FILE", producer)
         self.assertIn("set_volume(DEFAULT_AIRPLAY_VOLUME_FILE, argv[2])", producer)
         self.assertIn("set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 1)", producer)
@@ -391,6 +402,33 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("LibreEcho Development OS", profile)
         self.assertIn("PS1='libreecho# '", profile)
 
+    def test_service_profile_is_immutable_and_selects_graph(self) -> None:
+        init_source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        pipeline_build = pipeline_text("build.sh")
+        pipeline_readme = pipeline_text("README.md")
+
+        self.assertIn("/etc/libreecho/service-profile", init_source)
+        self.assertIn("case \"$SERVICE_PROFILE_VALUE\" in", init_source)
+        self.assertIn("diagnostic)", init_source)
+        self.assertIn("production)", init_source)
+        self.assertIn('services="logd timed web"', init_source)
+        self.assertIn(
+            'services="logd networkd timed audiod micd waked sttd ledd btd airplayd ttsd agentd web"',
+            init_source,
+        )
+        self.assertIn("--service-profile", builder_source)
+        self.assertIn('"service_profile"] = service_profile', builder_source)
+        self.assertIn('"etc/libreecho/image-profile", "etc/libreecho/service-profile"', builder_source)
+        self.assertIn("--expected-service-profile", verifier_source)
+        self.assertIn("etc/libreecho/service-profile", verifier_source)
+        self.assertIn("LIBREECHO_SERVICE_PROFILE", pipeline_build)
+        self.assertIn("--service-profile", pipeline_build)
+        self.assertIn("--expected-service-profile", pipeline_build)
+        self.assertIn("service_profile=$SERVICE_PROFILE", pipeline_build)
+        self.assertIn("--profile ota --service-profile production", pipeline_readme)
+
     def test_startup_audio_is_disabled_by_default(self) -> None:
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
         self.assertNotIn("startup_audio_worker", init_script)
@@ -426,6 +464,22 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("update_config=1", init_script)
         self.assertIn('WIFI_CONF="$wifi_profile"', init_script)
 
+    def test_wifi_regulatory_database_is_packaged_and_verified(self) -> None:
+        expected = {
+            "regulatory.db": "5560f4f0fdac7d1bb2adf8d4d083f39e3bee5ba55192feadadc091df55a813eb",
+            "regulatory.db.p7s": "5dd27969661bed1e021ce435f535a53f201705bda14c2dba0db6353d1cdc6fff",
+        }
+        for name, digest in expected.items():
+            path = TOOLS_DIR / "initramfs" / name
+            self.assertTrue(path.is_file(), name)
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
+        builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        for name in expected:
+            self.assertIn(f'"{name}": ("lib/firmware/{name}", 0o644)', builder)
+            self.assertIn(f'"{name}": 0o644', verifier_source)
+            self.assertIn(f'"{name}": "lib/firmware/{name}"', verifier_source)
+
     def test_device_node_setup_is_not_activation(self) -> None:
         entries = {
             "libreecho-init": self.control(
@@ -434,18 +488,151 @@ class PolicyTests(unittest.TestCase):
         }
         verifier.validate_no_connectivity_autostart(entries)
 
-    def test_wifi_activation_is_deferred_until_adb_ready(self) -> None:
+    def test_linux61_adb_uses_configfs_functionfs_before_binding_udc(self) -> None:
+        source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertNotIn("/sys/class/android_usb/android0", source)
+        self.assertIn("/sys/kernel/config/usb_gadget/libreecho", source)
+        self.assertIn("mount -t configfs configfs /sys/kernel/config", source)
+        self.assertIn("functions/ffs.adb", source)
+        self.assertIn("configs/c.1/ffs.adb", source)
+        self.assertIn("mount -t functionfs -o uid=2000,gid=2000 adb /dev/usb-ffs/adb", source)
+        self.assertIn("configfs-mounted", source)
+        self.assertIn("functionfs-mounted", source)
+        self.assertIn("adbd-started:", source)
+        self.assertNotIn("--root_seclabel", source)
+        self.assertIn("export ADB_TRACE=all", source)
+        self.assertIn("adbd-diagnostic-begin", source)
+        self.assertIn("adbd-task:", source)
+        self.assertIn("adbd-fd:", source)
+        self.assertIn("adbd-log:", source)
+        self.assertIn("adbd-exit-status:", source)
+        self.assertIn("configfs-udc-bound:", source)
+        self.assertIn("functionfs-ready", source)
+        create = source.index('G=/sys/kernel/config/usb_gadget/libreecho')
+        ffs_mount = source.index("mount -t functionfs", create)
+        adbd = source.index("/sbin/adbd ", ffs_mount)
+        endpoints = source.index("/dev/usb-ffs/adb/ep1", adbd)
+        bind = source.index('> "$G/UDC"', endpoints)
+        self.assertLess(create, ffs_mount)
+        self.assertLess(ffs_mount, adbd)
+        self.assertLess(adbd, endpoints)
+        self.assertLess(endpoints, bind)
+
+    def test_production_pipeline_requires_full_mt8163_hardware_closure(self) -> None:
+        """Regression: a generic FunctionFS kernel must not pass as MT8163-ready."""
+        pipeline_build = pipeline_text("build.sh")
+        required_lines = (
+            "require_config USB_MUSB_MEDIATEK y",
+            "require_config USB_CONFIGFS y",
+            "require_config USB_CONFIGFS_F_FS y",
+            "require_config USB_CONFIGFS_RNDIS y",
+            "require_config PINCTRL_MT8163 y",
+            "require_config MTK_MT8163_CONSYS y",
+            "require_config MTK_COMBO_WIFI y",
+            "require_config LEDS_CLASS_MULTICOLOR y",
+            "require_config LEDS_IS31FL32XX y",
+            "require_config MTK_MT8163_BLUEZ_HCI y",
+            "require_config MFD_MT6397 y",
+            "require_config REGULATOR_MT6323 y",
+            "require_config POWER_RESET_MT6323 y",
+            "require_config RTC_DRV_MT6397 y",
+            "require_config KEYBOARD_MTK_PMIC y",
+            "require_config PWM_MEDIATEK y",
+            "require_config NVMEM_MTK_EFUSE y",
+            "require_config IIO_ST_LSM6DSX y",
+            "require_config AMZ_PRIVACY y",
+            "require_config SND_SOC_TLV320AIC32X4 y",
+            "require_config SND_SOC_TLV320AIC32X4_I2C y",
+            "require_config SND_SOC_AMZN_MT8163_SPI_AUDIO y",
+            "require_config SND_SOC_MT8163_RADAR_PUFFIN y",
+            "require_config LEDS_MT6323 y",
+            "require_config FILE_LOCKING y",
+            "require_config INOTIFY_USER y",
+            "require_config IP_MULTICAST y",
+            "require_config BLK_DEV_LOOP y",
+            "require_config SQUASHFS_LZ4 y",
+        )
+        for required in required_lines:
+            with self.subTest(required=required):
+                self.assertIn(required, pipeline_build)
+        self.assertNotIn("require_config USB_FUNCTIONFS y", pipeline_build)
+        self.assertIn(
+            'KERNEL_DTB="$KERNEL_OUT/arch/arm/boot/dts/libreecho-radar-puffin.dtb"',
+            pipeline_build,
+        )
+        self.assertIn('cp -- "$KERNEL_DTB" "$RUN/libreecho-radar-puffin.dtb"', pipeline_build)
+        self.assertIn('DTB_VERIFIER="$TOOLS_DIR/verify_radar_puffin_dtb.py"', pipeline_build)
+        self.assertIn('python3 -B "$DTB_VERIFIER" --dtb "$KERNEL_DTB"', pipeline_build)
+        self.assertIn("RADAR_PUFFIN_DAC_PROCESSING_BLOCK", pipeline_build)
+        self.assertIn("AFE_APLL2_DIV0_SEL_4", pipeline_build)
+        self.assertIn("AFE_I05_TO_O03", pipeline_build)
+        self.assertIn('cp -- "$KERNEL_OUT/.config" "$RUN/kernel.config"', pipeline_build)
+        self.assertIn('kernel_config_sha="$(sha256sum "$RUN/kernel.config"', pipeline_build)
+        self.assertIn("kernel_config=$RUN/kernel.config", pipeline_build)
+        self.assertIn("kernel_config_sha256=$kernel_config_sha", pipeline_build)
+        self.assertNotIn("WIFI_DTB_SHA256=", pipeline_build)
+        self.assertEqual(
+            pipeline_build.count('ui_diff_sha="$(source_state_sha256 "$UI_SOURCE")"'),
+            1,
+        )
+        ui_builder = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        stable_untracked_hash = (
+            'sha256sum "$repository/$relative" | awk \'{print $1}\''
+        )
+        self.assertIn(stable_untracked_hash, pipeline_build)
+        self.assertIn(stable_untracked_hash, ui_builder)
+
+    def test_usb_diagnostic_boot_keeps_connectivity_manual(self) -> None:
         source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
         defconfig = (TOOLS_DIR.parent.parent / "arch/arm/configs/mt8163_arm32_defconfig").read_text()
         self.assertIn("CONFIG_KEYBOARD_GPIO=y", defconfig)
         self.assertIn("create_input_nodes()", source)
         self.assertIn("/dev/input/$name", source)
         self.assertIn("input-devnodes-created", source)
+        self.assertIn("log init-ready-pid1-managed", source)
+        self.assertIn("start_wifi_network &", source)
+        self.assertIn("wifi-network-worker-started-after-adb", source)
+        self.assertIn("/tmp/wifi.activation.claim", source)
+        self.assertIn('$BB mkdir /tmp/wifi.activation.claim', source)
+        self.assertIn("wifi_request_loop()", source)
+        self.assertIn("/tmp/wifi.request", source)
+        self.assertIn("wifi_request_loop &", source)
+        self.assertIn("wifi-request-supervisor-started", source)
+        self.assertIn("wifi-request-start-accepted", source)
+        self.assertIn("wifi-request-duplicate-rejected", source)
+        self.assertIn("LIBREECHO_WIFI_RC=", source)
         self.assertLess(
             source.index("log init-ready-pid1-managed"),
-            source.index("start_wifi_network &"),
+            source.index("wifi_request_loop &"),
         )
-        self.assertIn("wifi-network-worker-started-after-adb", source)
+        self.assertIn("SERVICE_PROFILE=diagnostic", source)
+        self.assertIn('SERVICE_PROFILE_VALUE=$($BB cat /etc/libreecho/service-profile', source)
+        self.assertIn("service-profile-invalid-fallback-diagnostic", source)
+        policy = source.index('if [ "$SERVICE_PROFILE" = diagnostic ]; then')
+        manual = source.index("log wifi-network-policy-manual-single-shot", policy)
+        automatic = source.index("start_wifi_network &", policy)
+        automatic_log = source.index("log wifi-network-worker-started-after-adb", automatic)
+        self.assertLess(manual, automatic)
+        self.assertLess(automatic, automatic_log)
+        self.assertIn('services="logd timed web"', source)
+        self.assertIn("ui-connectivity-services-disabled-for-diagnostic-profile", source)
+        self.assertNotIn("USB_DIAGNOSTIC_MODE=1", source)
+        self.assertNotIn("--allow-insecure-lan", source)
+        self.assertIn("ui-web-production-loopback-fallback", source)
+        self.assertIn("ui-web-production-authenticated-lan", source)
+        self.assertNotIn("libreecho-update-fetch watch", source)
+        self.assertIn(
+            'if [ "$IMAGE_PROFILE" = ota ] && [ "$SERVICE_PROFILE" = production ]; then',
+            source,
+        )
+        self.assertIn("ota-background-workers-disabled-for-diagnostic-profile", source)
+        builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        self.assertIn('"activation": "manual-single-shot-after-adb"', builder)
+        self.assertIn(
+            'network.get("activation") != "manual-single-shot-after-adb"',
+            verifier_source,
+        )
         self.assertIn("reboot-supervisor-started", source)
         self.assertIn("/tmp/reboot.request", source)
         self.assertIn("runme-timeout", source)
@@ -458,6 +645,25 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("/sbin/libreecho-wifi", source)
         self.assertIn("/etc/udhcpc.script", (TOOLS_DIR / "initramfs/libreecho-wifi").read_text())
         self.assertNotIn("/system/vendor/bin/wmt_loader >/tmp/wifi-wmt-loader.log", source)
+
+    def test_production_ota_health_worker_checks_full_service_graph(self) -> None:
+        source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertIn('ota_health_confirm_worker &', source)
+        self.assertIn('[ "$SERVICE_PROFILE" = production ]', source)
+        for socket_path in (
+            "/run/libreecho/network.sock",
+            "/run/libreecho/audio.sock",
+            "/run/libreecho/mic.sock",
+            "/run/libreecho/led.sock",
+            "/run/libreecho/bluetooth.sock",
+            "/run/libreecho/stt.sock",
+            "/run/libreecho/tts.sock",
+            "/run/libreecho/agent.sock",
+            "/run/libreecho/airplay.sock",
+        ):
+            self.assertIn(socket_path, source)
+        self.assertIn("ota-health-services-not-ready", source)
+        self.assertIn("ota-background-workers-disabled-for-diagnostic-profile", source)
 
     def test_userdata_mount_is_identity_checked_and_non_destructive(self) -> None:
         source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
@@ -481,6 +687,148 @@ class PolicyTests(unittest.TestCase):
         self.assertIn(
             'services="logd networkd timed audiod', init_source
         )
+
+    def test_remote_wyoming_clients_use_pinned_musl_runtime(self) -> None:
+        bundle_source = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        for source in (bundle_source, builder_source, verifier_source):
+            self.assertIn("libreecho-sttd-wyoming", source)
+            self.assertIn("libreecho-ttsd-wyoming", source)
+            self.assertIn("/lib/ld-musl-armhf.so.1", source)
+            self.assertIn("libc.musl-armv7.so.1", source)
+
+    def test_ota_target_slots_are_identity_checked_before_block_io(self) -> None:
+        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
+        self.assertIn("target_device_for_slot()", updater)
+        self.assertIn("target_partname=boot_a_x", updater)
+        self.assertIn("target_partname=boot_b_x", updater)
+        self.assertIn('grep -qx "PARTNAME=$target_partname"', updater)
+        self.assertIn('cat "$target_sys/size"', updater)
+        self.assertIn('= "$BOOT_SECTORS"', updater)
+        self.assertLess(
+            updater.index("target_device_for_slot \"$target\""),
+            updater.index('dd if="$STAGING/boot.img" of="$target_device"'),
+        )
+        self.assertLess(
+            updater.rindex("target_device_for_slot \"$slot\""),
+            updater.rindex('dd if="$target_device" bs=4096 count=4096'),
+        )
+
+    def test_ota_manifest_accepts_and_validates_service_profile(self) -> None:
+        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
+        self.assertIn(
+            "boot_sha256 feature_policy image_profile service_profile'",
+            updater,
+        )
+        self.assertIn("diagnostic|production", updater)
+        self.assertIn("die manifest_service_profile", updater)
+
+    def test_host_ota_path_is_explicit_and_uses_guarded_updater(self) -> None:
+        host = pipeline_file("ota.sh").read_text()
+        preflight = pipeline_file("ota-preflight-root.sh").read_text()
+        install = pipeline_file("ota-install-root.sh").read_text()
+        self.assertIn("mode=preflight", host)
+        self.assertIn("--install", host)
+        self.assertIn("--current", host)
+        self.assertIn('CURRENT="${LIBREECHO_CURRENT:-$PIPELINE/out/CURRENT}"', host)
+        self.assertIn('LIBREECHO_CURRENT="$CURRENT" "$PIPELINE/status.sh"', host)
+        status = pipeline_file("status.sh").read_text()
+        self.assertIn('CURRENT="${LIBREECHO_CURRENT:-$OUT/CURRENT}"', status)
+        self.assertIn("ota_bundle_sha256", host)
+        self.assertIn("ota-preflight-root.sh", host)
+        self.assertIn("ota-install-root.sh", host)
+        self.assertIn("--check-current", host)
+        self.assertIn("--confirm-current", host)
+        self.assertIn("ota-confirm-current-root.sh", host)
+        confirm = pipeline_file("ota-confirm-current-root.sh").read_text()
+        self.assertIn("CONFIRM_CURRENT=YES", confirm)
+        self.assertIn("OTA_CURRENT_SLOT_CONFIRM_READY", confirm)
+        self.assertIn("ALLOW_UNCONFIRMED=1", confirm)
+        self.assertIn("libreecho-web.init status", confirm)
+        self.assertIn("/dev/usb-ffs/adb/ep0", confirm)
+        self.assertIn('confirm "$selected"', confirm)
+        self.assertIn("selected_image_sha256", confirm)
+        self.assertIn("printf 'reboot\\n' > /tmp/reboot.request", install)
+        self.assertNotIn("printf 'ota\\n' > /tmp/reboot.request", install)
+        self.assertNotIn("fastboot flash", host)
+        for expected in ("mmcblk0p10", "boot_a_x", "mmcblk0p11", "boot_b_x", "32768"):
+            self.assertIn(expected, preflight)
+        self.assertIn("BOOTCTL=/usr/local/sbin/libreecho-bootctl", preflight)
+        self.assertIn("$BOOTCTL status", preflight)
+        self.assertIn("ota-preflight-root.sh", install)
+        self.assertIn("libreecho-update-host", install)
+        self.assertIn("sha256sum", install)
+
+    def test_external_publisher_rejects_packaged_feature_drift(self) -> None:
+        """The ramdisk payload identities must match the inherited base CURRENT."""
+        publisher = pipeline_text("publish-external-candidate.sh")
+        self.assertIn("for feature in ('airplay', 'tts', 'wakeword', 'stt', 'assistant')", publisher)
+        self.assertIn("payload.get('sha256')", publisher)
+        self.assertIn("payload.get('size')", publisher)
+        self.assertIn("payload.get('manifest_sha256')", publisher)
+        self.assertIn("check_feature_identity", publisher)
+        for feature in ("airplay", "tts", "wakeword", "stt", "assistant"):
+            self.assertIn(f"check_feature_identity {feature}", publisher)
+        self.assertLess(
+            publisher.index("check_feature_identity assistant"),
+            publisher.index('mkdir -p "$RUN"'),
+        )
+
+    def test_pipeline_supports_distinct_tooling_source_for_legacy_kernel(self) -> None:
+        """A legacy kernel may use canonical image/OTA tooling without copying it."""
+        build = pipeline_text("build.sh")
+        self.assertIn(
+            'TOOLING_SRC_INPUT="${LIBREECHO_TOOLING_SRC:-$KERNEL_SRC}"', build
+        )
+        self.assertIn('TOOLS_DIR="$TOOLING_SRC/tools/mt8163-arm32"', build)
+        self.assertIn('git -C "$TOOLING_SRC" rev-parse --show-toplevel', build)
+        self.assertIn('tooling_source=$TOOLING_SRC', build)
+        self.assertIn('tooling_git_head=$tooling_head', build)
+        self.assertIn('tooling_git_diff_sha256=$tooling_diffsha', build)
+        self.assertNotIn('tooling_source=$KERNEL_SRC', build)
+
+    def test_pipeline_builds_agent_daemon_from_clean_ui_commit(self) -> None:
+        """The UI bundle must not depend on a stale prebuilt agent daemon."""
+        build = pipeline_text("build.sh")
+        ui_bundle = '"$UI_BUILDER" "$UI_SOURCE" "$RUN/ui-bundle"'
+        agent_target = 'build/libreecho-agentd | tee "$RUN/assistant-daemon-build.log"'
+        self.assertIn(agent_target, build)
+        self.assertLess(build.index(ui_bundle), build.index(agent_target))
+        self.assertLess(build.index(agent_target), build.index('AGENT_DAEMON="$UI_SOURCE/build/libreecho-agentd"'))
+
+    def test_pipeline_build_can_preserve_canonical_current(self) -> None:
+        """A diagnostic build must emit a local candidate without republishing."""
+        build = pipeline_text("build.sh")
+        candidate = 'cp -- "$tmp_current" "$RUN/CURRENT.candidate"'
+        publish_gate = "if ((publish_current)); then"
+        canonical_move = 'mv -f -- "$tmp_current" "$OUT/CURRENT"'
+        self.assertIn("--no-publish", build)
+        self.assertIn(candidate, build)
+        self.assertIn(publish_gate, build)
+        self.assertIn(canonical_move, build)
+        self.assertLess(build.index(candidate), build.index(publish_gate))
+        gated = build.split(publish_gate, 1)[1].split("fi", 1)[0]
+        self.assertIn(canonical_move, gated)
+        self.assertIn("candidate_record=$RUN/CURRENT.candidate", build)
+
+    def test_host_ota_reboot_waits_for_published_root_result(self) -> None:
+        """Do not let the reboot supervisor race /tmp/result publication."""
+        host = pipeline_file("ota.sh").read_text()
+        install_run = host.rindex(
+            'ADB_SERIAL="$ADB_SERIAL" "$ROOT_RUNNER" "$PIPELINE/ota-install-root.sh"'
+        )
+        install_tail = host[install_run:]
+        result_marker = "grep -qx 'OTA_INSTALLED_NOT_REBOOTED'"
+        reboot_marker = "printf 'reboot\\\\n' > /tmp/reboot.request"
+        self.assertIn(result_marker, install_tail)
+        self.assertIn(reboot_marker, install_tail)
+        result_gate = host.index(result_marker, install_run)
+        reboot_request = host.index(reboot_marker, result_gate)
+        self.assertIn("REBOOT_AFTER=0", host)
+        self.assertLess(install_run, result_gate)
+        self.assertLess(result_gate, reboot_request)
+        self.assertIn("OTA_REBOOT_REQUEST_STAGED", host)
 
     def test_ota_fetch_failure_cannot_become_empty_rollback_hold(self) -> None:
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()

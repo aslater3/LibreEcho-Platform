@@ -12,6 +12,7 @@ VERIFY=/usr/local/libexec/libreecho-update-verify
 BOOTCTL=/usr/local/sbin/libreecho-bootctl
 PUBLIC_KEY=/etc/libreecho/ota-public-key.hex
 BOOT_SIZE=16777216
+BOOT_SECTORS=32768
 
 die()
 {
@@ -29,6 +30,28 @@ require_userdata()
         die userdata_identity_or_mount_failed
     $BB mkdir -p "$INCOMING" "$UPDATE_ROOT" || die update_directory_failed
     $BB chmod 0700 /data/libreecho "$UPDATE_ROOT" "$INCOMING" 2>/dev/null
+}
+
+target_device_for_slot()
+{
+    slot_name=$1
+    case "$slot_name" in
+        a)
+            target_device=/dev/mmcblk0p10
+            target_sys=/sys/class/block/mmcblk0p10
+            target_partname=boot_a_x
+            ;;
+        b)
+            target_device=/dev/mmcblk0p11
+            target_sys=/sys/class/block/mmcblk0p11
+            target_partname=boot_b_x
+            ;;
+        *) die boot_control_target ;;
+    esac
+    [ -b "$target_device" ] &&
+        $BB grep -qx "PARTNAME=$target_partname" "$target_sys/uevent" 2>/dev/null &&
+        [ "$($BB cat "$target_sys/size" 2>/dev/null)" = "$BOOT_SECTORS" ] ||
+        die boot_target_identity
 }
 
 state_write()
@@ -62,7 +85,7 @@ manifest_value()
 
 verify_manifest()
 {
-    expected_keys='format manifest_version board soc architecture version boot_filename boot_size boot_sha256 feature_policy image_profile'
+    expected_keys='format manifest_version board soc architecture version boot_filename boot_size boot_sha256 feature_policy image_profile service_profile'
     seen=
     while IFS='=' read -r key value; do
         [ -n "$key" ] && [ -n "$value" ] || die manifest_syntax
@@ -101,6 +124,10 @@ verify_manifest()
         die manifest_feature_policy
     [ "$(manifest_value image_profile)" = ota ] ||
         die manifest_image_profile
+    case "$(manifest_value service_profile)" in
+        diagnostic|production) ;;
+        *) die manifest_service_profile ;;
+    esac
     version=$(manifest_value version)
     case "$version" in
         ''|*[!A-Za-z0-9._+~-]*) die manifest_version_value ;;
@@ -162,11 +189,7 @@ bootctl_status()
         "s/^slot_${selected}_success=//p" "$STAGING/bootctl.status")
     [ "$selected_success" = 1 ] || die current_slot_not_confirmed
     target=$inactive
-    case "$target" in
-        a) target_device=/dev/mmcblk0p10 ;;
-        b) target_device=/dev/mmcblk0p11 ;;
-        *) die boot_control_target ;;
-    esac
+    target_device_for_slot "$target"
 }
 
 clear_exact_development_marker()
@@ -239,12 +262,8 @@ confirm_pending()
     slot=$($BB sed -n 's/^slot=//p' "$PENDING")
     version=$($BB sed -n 's/^version=//p' "$PENDING")
     expected=$($BB sed -n 's/^boot_sha256=//p' "$PENDING")
-    case "$slot" in
-        a) device=/dev/mmcblk0p10 ;;
-        b) device=/dev/mmcblk0p11 ;;
-        *) die pending_slot ;;
-    esac
-    actual=$($BB dd if="$device" bs=4096 count=4096 2>/dev/null |
+    target_device_for_slot "$slot"
+    actual=$($BB dd if="$target_device" bs=4096 count=4096 2>/dev/null |
         $BB sha256sum | $BB awk '{print $1}')
     [ "$actual" = "$expected" ] || die pending_boot_hash
     "$BOOTCTL" confirm "$slot" > "$UPDATE_ROOT/bootctl.confirm" ||

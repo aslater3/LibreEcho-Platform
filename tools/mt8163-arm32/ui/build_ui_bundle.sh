@@ -13,6 +13,10 @@ CC_BIN=${LIBREECHO_UI_CC:-gcc}
 STRIP_BIN=${LIBREECHO_UI_STRIP:-${CROSS_COMPILE}strip}
 GC_LDFLAGS=${LIBREECHO_UI_GC_LDFLAGS:--static -Wl,--gc-sections}
 USERS_SOURCE=${LIBREECHO_WEB_USERS_FILE:-}
+MUSL_NATIVE_ROOT=${LIBREECHO_UI_MUSL_NATIVE_ROOT:-/path/to/musl-native-root}
+MUSL_SYSROOT=${LIBREECHO_UI_MUSL_SYSROOT:-/path/to/musl-arm32-sysroot}
+MUSL_CC=${LIBREECHO_UI_MUSL_CC:-$MUSL_NATIVE_ROOT/usr/bin/armv7-alpine-linux-musleabihf-gcc}
+MUSL_NATIVE_LIB=${LIBREECHO_UI_MUSL_NATIVE_LIB:-$MUSL_NATIVE_ROOT/usr/lib}
 
 [[ -n "$UI_SOURCE" && -d "$UI_SOURCE" ]] || {
     echo "ERROR: LibreEcho-UI source checkout is required" >&2
@@ -38,6 +42,10 @@ command -v "$MAKE_BIN" >/dev/null 2>&1 || {
     echo "ERROR: UI ARM32 strip tool not found: $STRIP_BIN" >&2
     exit 1
 }
+[[ -x "$MUSL_CC" && -f "$MUSL_SYSROOT/usr/include/errno.h" ]] || {
+    echo "ERROR: UI ARM32 musl compiler/sysroot is unavailable" >&2
+    exit 1
+}
 if [[ -n "$USERS_SOURCE" ]]; then
     [[ -f "$USERS_SOURCE" && ! -L "$USERS_SOURCE" ]] || {
         echo "ERROR: LibreEcho web users file must be a regular file: $USERS_SOURCE" >&2
@@ -59,7 +67,7 @@ source_state_sha256() {
         git -C "$repository" diff --binary HEAD
         while IFS= read -r -d '' relative; do
             printf '\0untracked:%s\0' "$relative"
-            sha256sum "$repository/$relative"
+            sha256sum "$repository/$relative" | awk '{print $1}'
         done < <(
             git -C "$repository" ls-files --others --exclude-standard -z |
                 LC_ALL=C sort -z
@@ -72,6 +80,16 @@ ui_diff_sha256=$(source_state_sha256 "$UI_SOURCE")
 "$MAKE_BIN" -C "$UI_SOURCE" \
     CROSS_COMPILE="$CROSS_COMPILE" CC="$CC_BIN" \
     GC_LDFLAGS="$GC_LDFLAGS" release
+
+# These clients need only libc and the ramdisk already carries the pinned musl
+# loader. Avoid embedding a separate static glibc copy in each constrained
+# 16 MiB boot image.
+env LD_LIBRARY_PATH="$MUSL_NATIVE_LIB" \
+    "$MAKE_BIN" -B -C "$UI_SOURCE" \
+    CROSS_COMPILE= CC="$MUSL_CC --sysroot=$MUSL_SYSROOT" \
+    CFLAGS="-Os -ffunction-sections -fdata-sections" \
+    LDFLAGS="-Wl,--gc-sections" \
+    build/libreecho-sttd-wyoming build/libreecho-ttsd-wyoming
 
 for binary in \
     libreecho-web libreecho-logd libreecho-networkd libreecho-timed \
@@ -94,13 +112,39 @@ do
     fi
 done
 
+for binary in libreecho-sttd-wyoming libreecho-ttsd-wyoming
+do
+    path="$UI_SOURCE/build/$binary"
+    [[ -f "$path" && ! -L "$path" ]] || {
+        echo "ERROR: missing UI binary: $path" >&2
+        exit 1
+    }
+    description=$(file -b "$path")
+    case "$description" in
+        *"ELF 32-bit"*"ARM"*"dynamically linked"*) ;;
+        *) echo "ERROR: Wyoming client is not dynamic ARM32: $path: $description" >&2; exit 1 ;;
+    esac
+    readelf -l "$path" |
+        grep -q 'Requesting program interpreter: /lib/ld-musl-armhf.so.1' || {
+            echo "ERROR: Wyoming client musl interpreter changed: $path" >&2
+            exit 1
+        }
+    needed=$(readelf -d "$path" |
+        sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p')
+    [[ "$needed" == "libc.musl-armv7.so.1" ]] || {
+        echo "ERROR: Wyoming client dependencies changed: $path: $needed" >&2
+        exit 1
+    }
+done
+
 mkdir -p "$OUTPUT/sbin" "$OUTPUT/share/libreecho/web" \
     "$OUTPUT/etc/init.d" "$OUTPUT/etc/libreecho"
 
 for binary in \
     libreecho-web libreecho-logd libreecho-networkd libreecho-timed \
     libreecho-audiod libreecho-micd libreecho-ledd libreecho-btd \
-    libreecho-airplayd libreecho-wyomingd
+    libreecho-airplayd libreecho-wyomingd \
+    libreecho-sttd-wyoming libreecho-ttsd-wyoming
 do
     install -m 0755 "$UI_SOURCE/build/$binary" "$OUTPUT/sbin/$binary"
     "$STRIP_BIN" --strip-unneeded "$OUTPUT/sbin/$binary"

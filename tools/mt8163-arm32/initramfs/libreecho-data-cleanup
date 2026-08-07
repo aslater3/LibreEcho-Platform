@@ -1,0 +1,212 @@
+#!/bin/sh
+# LibreEcho userdata migration/cleanup helper.
+#
+# This script is deliberately narrower than a factory reset.  It only operates
+# below DATA_ROOT (normally /data), never opens a block device, never mounts or
+# formats anything, and never references persist, IDME, expdb, calibration, or
+# any other partition.  Unknown files are reported and preserved; production
+# callers must not turn this into a recursive deletion of the userdata root.
+set -eu
+
+DATA_ROOT=${DATA_ROOT:-/data}
+TEST_MODE=${LIBREECHO_DATA_TEST_MODE:-0}
+
+if [ "$TEST_MODE" != 1 ]; then
+    [ "$DATA_ROOT" = /data ] || {
+        printf '%s\n' DATA_CLEANUP_DATA_ROOT_REJECTED >&2
+        exit 2
+    }
+    # The initramfs owns identity checking and mounting.  Refuse to run against
+    # an unmounted /data so a path mistake cannot clean the initramfs root.
+    grep -q ' /data ' /proc/mounts 2>/dev/null || {
+        printf '%s\n' DATA_CLEANUP_USERDATA_NOT_MOUNTED >&2
+        exit 2
+    }
+fi
+
+[ -d "$DATA_ROOT" ] || {
+    printf '%s\n' DATA_CLEANUP_DATA_ROOT_MISSING >&2
+    exit 2
+}
+
+# Never follow a symlink in the userdata path.  The cleanup helper is allowed to
+# remove known residue symlinks, but all production directories and files it
+# creates or traverses must remain below the mounted userdata root.
+assert_no_symlink_components() {
+    path=$1
+    [ "$path" = "$DATA_ROOT" ] && {
+        [ ! -L "$path" ] || {
+            printf 'DATA_CLEANUP_SYMLINK_PATH=%s\n' "$path" >&2
+            exit 2
+        }
+        return 0
+    }
+    case "$path" in
+        "$DATA_ROOT"/*) relative=${path#"$DATA_ROOT"/} ;;
+        *)
+            printf 'DATA_CLEANUP_PATH_OUTSIDE_ROOT=%s\n' "$path" >&2
+            exit 2
+            ;;
+    esac
+    current=$DATA_ROOT
+    old_ifs=$IFS
+    IFS=/
+    set -f
+    set -- $relative
+    set +f
+    IFS=$old_ifs
+    for component do
+        current=$current/$component
+        [ ! -L "$current" ] || {
+            printf 'DATA_CLEANUP_SYMLINK_PATH=%s\n' "$current" >&2
+            exit 2
+        }
+    done
+}
+
+assert_no_symlink_components "$DATA_ROOT"
+for path in \
+    "$DATA_ROOT/libreecho" \
+    "$DATA_ROOT/libreecho/config" \
+    "$DATA_ROOT/libreecho/secrets" \
+    "$DATA_ROOT/libreecho/features" \
+    "$DATA_ROOT/libreecho/update" \
+    "$DATA_ROOT/libreecho/update/incoming" \
+    "$DATA_ROOT/libreecho/update/staging" \
+    "$DATA_ROOT/libreecho/libreecho-agentd.hotstage.bak" \
+    "$DATA_ROOT/libreecho/payloads"; do
+    assert_no_symlink_components "$path"
+done
+
+# First-install migration is limited to the production directory skeleton.  It
+# does not copy host artifacts.  The image default is copied only when the
+# persistent Web UI config is absent; all later boots preserve the user's file.
+LIBREECHO_ROOT="$DATA_ROOT/libreecho"
+mkdir -p "$LIBREECHO_ROOT/config" "$LIBREECHO_ROOT/secrets" \
+    "$LIBREECHO_ROOT/features" "$LIBREECHO_ROOT/update/incoming" \
+    "$LIBREECHO_ROOT/update/staging"
+chmod 0700 "$LIBREECHO_ROOT" "$LIBREECHO_ROOT/config" "$LIBREECHO_ROOT/secrets" \
+    "$LIBREECHO_ROOT/update" "$LIBREECHO_ROOT/update/incoming" \
+    "$LIBREECHO_ROOT/update/staging" 2>/dev/null || true
+DEFAULT_CONFIG=${LIBREECHO_DEFAULT_CONFIG:-/etc/libreecho/web-config.json}
+if [ ! -e "$LIBREECHO_ROOT/config/web-config.json" ] &&
+        [ -f "$DEFAULT_CONFIG" ] && [ ! -L "$DEFAULT_CONFIG" ]; then
+    cp "$DEFAULT_CONFIG" "$LIBREECHO_ROOT/config/web-config.json.new"
+    chmod 0600 "$LIBREECHO_ROOT/config/web-config.json.new"
+    mv "$LIBREECHO_ROOT/config/web-config.json.new" \
+        "$LIBREECHO_ROOT/config/web-config.json"
+fi
+
+remove_path() {
+    path=$1
+    if [ -e "$path" ] || [ -L "$path" ]; then
+        rm -rf "$path"
+        printf 'DATA_CLEANUP_REMOVED=%s\n' "${path#"$DATA_ROOT"/}"
+    fi
+}
+
+# These are known development/evidence locations.  They are not user data and
+# are intentionally not made part of the production contract.
+for path in \
+    "$DATA_ROOT/local" \
+    "$DATA_ROOT/tts-stage" \
+    "$DATA_ROOT/logs" \
+    "$DATA_ROOT/evidence" \
+    "$DATA_ROOT/captures" \
+    "$DATA_ROOT/audio-captures" \
+    "$DATA_ROOT/tmp" \
+    "$DATA_ROOT/test" \
+    "$DATA_ROOT/testing" \
+    "$DATA_ROOT/android" \
+    "$DATA_ROOT/libreecho/logs" \
+    "$DATA_ROOT/libreecho/evidence" \
+    "$DATA_ROOT/libreecho/captures" \
+    "$DATA_ROOT/libreecho/audio-captures" \
+    "$DATA_ROOT/libreecho/tmp" \
+    "$DATA_ROOT/libreecho/test" \
+    "$DATA_ROOT/libreecho/testing" \
+    "$DATA_ROOT/libreecho/tts-stage" \
+    "$DATA_ROOT/libreecho/hotstage" \
+    "$DATA_ROOT/libreecho/libreecho-agentd.hotstage.bak" \
+    "$DATA_ROOT/libreecho/payloads"; do
+    remove_path "$path"
+done
+
+# A .previous payload was produced by the old feature stager.  It is not an
+# OTA rollback artifact: A/B rollback is the boot slot, while feature payloads
+# are preserved across slot changes.  Delete only this exact legacy basename,
+# never every file under a feature directory.
+if [ -d "$DATA_ROOT/libreecho/features" ]; then
+    for feature_dir in "$DATA_ROOT/libreecho/features"/*; do
+        [ -d "$feature_dir" ] || continue
+        remove_path "$feature_dir/payload.squashfs.previous"
+        remove_path "$feature_dir/staging"
+    done
+fi
+
+# Uploads and extracted OTA members are transactional.  Once this helper is
+# called at the steady-state boundary they must be empty, but their directory
+# names remain allowed for the next signed update.
+remove_children() {
+    directory=$1
+    [ -d "$directory" ] || return 0
+    for child in "$directory"/* "$directory"/.[!.]*; do
+        [ -e "$child" ] || [ -L "$child" ] || continue
+        remove_path "$child"
+    done
+}
+remove_children "$DATA_ROOT/libreecho/update/incoming"
+remove_children "$DATA_ROOT/libreecho/update/staging"
+
+unknown=0
+unknown_item() {
+    printf 'DATA_CLEANUP_UNKNOWN=%s\n' "${1#"$DATA_ROOT"/}" >&2
+    unknown=1
+}
+
+check_children() {
+    directory=$1
+    shift
+    [ -d "$directory" ] || return 0
+    for child in "$directory"/* "$directory"/.[!.]*; do
+        [ -e "$child" ] || [ -L "$child" ] || continue
+        [ ! -L "$child" ] || { unknown_item "$child"; continue; }
+        name=${child##*/}
+        allowed=0
+        for expected in "$@"; do
+            [ "$name" = "$expected" ] && allowed=1
+        done
+        [ "$allowed" -eq 1 ] || unknown_item "$child"
+    done
+}
+
+# Steady-state allowlist.  Feature IDs are checked separately below because
+# they are extensible; the files inside each feature remain fixed.
+check_children "$DATA_ROOT" libreecho lost+found
+check_children "$DATA_ROOT/libreecho" config secrets features update data-manifest.json
+check_children "$DATA_ROOT/libreecho/config" \
+    web-config.json web-config.json.bak users wpa_supplicant.conf ntp.conf \
+    agent.json agent.json.bak tts-voice vad-floor-rms
+check_children "$DATA_ROOT/libreecho/secrets" openai-codex.json
+check_children "$DATA_ROOT/libreecho/update" \
+    incoming staging state pending installed rolled-back check-status \
+    automatic-updates install.lock bootctl.confirm
+
+if [ -d "$DATA_ROOT/libreecho/features" ]; then
+    for feature_dir in "$DATA_ROOT/libreecho/features"/*; do
+        [ -e "$feature_dir" ] || [ -L "$feature_dir" ] || continue
+        [ ! -L "$feature_dir" ] || { unknown_item "$feature_dir"; continue; }
+        [ -d "$feature_dir" ] || { unknown_item "$feature_dir"; continue; }
+        feature=${feature_dir##*/}
+        case "$feature" in
+            ''|*[!a-z0-9._-]*) unknown_item "$feature_dir"; continue ;;
+        esac
+        check_children "$feature_dir" payload.squashfs manifest.json
+    done
+fi
+
+if [ "$unknown" -ne 0 ]; then
+    printf '%s\n' DATA_CLEANUP_CONTRACT_FAILED >&2
+    exit 2
+fi
+printf '%s\n' DATA_CLEANUP_OK

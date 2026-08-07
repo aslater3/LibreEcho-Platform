@@ -39,7 +39,7 @@ STOCK_DTB_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57
 PADDED_STOCK_DTB_SHA256 = "08b16ec39554d644d8cbdf8f5816559f85414ab45bc1901de46a7cd43dc286ed"
 BUSYBOX_SHA256 = "d4c8fd2aea01abd851c703f39b29c0de748b2751e4e1a85cae570fa53ad8f4fb"
 LOADER_SHA256 = "1063871174f1bd4f08f4d330e20b07aeb0820327ee739a4d8d1b644df842cb6b"
-INIT_SHA256 = "33e1326be258cc7466b9feaad0ce0a2772b866780297c2b797ef78477b5ab834"
+INIT_SHA256 = "84d9110f96e3333ca3839228358635407e799f064d04f6b9a68cb37709b119c5"
 ADBD_SHA256 = "1c0d14afb1ce19494ee1da935e1076f49ff57e359d348262a28bb3d56abeb930"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -47,15 +47,21 @@ OVERLAY_FILES = {
     "init.rc": 0o644,
     "init.recovery.mt8163.rc": 0o644,
     "libreecho-init": 0o755,
+    "libreecho-data-cleanup": 0o755,
     "libreecho-update": 0o755,
     "libreecho-update-fetch": 0o755,
     "ota-source.conf": 0o644,
+    "regulatory.db": 0o644,
+    "regulatory.db.p7s": 0o644,
 }
 OVERLAY_TARGETS = {
     "profile": "etc/profile",
+    "libreecho-data-cleanup": "usr/local/sbin/libreecho-data-cleanup",
     "libreecho-update": "usr/local/sbin/libreecho-update",
     "libreecho-update-fetch": "usr/local/sbin/libreecho-update-fetch",
     "ota-source.conf": "etc/libreecho/ota-source.conf",
+    "regulatory.db": "lib/firmware/regulatory.db",
+    "regulatory.db.p7s": "lib/firmware/regulatory.db.p7s",
 }
 SSH_PASSWORD_HASH_RE = re.compile(
     rb"\$(?:1|5|6|2[abxy]?|y|gy)\$[^$:\r\n]{1,64}\$[^:\r\n]{1,512}\Z"
@@ -75,6 +81,8 @@ UI_BINARY_NAMES = {
     "usr/local/sbin/libreecho-btd",
     "usr/local/sbin/libreecho-airplayd",
     "usr/local/sbin/libreecho-wyomingd",
+    "usr/local/sbin/libreecho-sttd-wyoming",
+    "usr/local/sbin/libreecho-ttsd-wyoming",
 }
 UI_INIT_NAMES = {
     "etc/init.d/libreecho-web.init",
@@ -785,8 +793,17 @@ def validate_ui(entries: dict[str, Entry], manifest: dict[str, object],
         if name == "etc/libreecho/users" and not member.data.strip():
             fail("UI users file is empty")
         if name in UI_BINARY_NAMES:
-            if elf_info(member.data) != (1, 40, 0x05000400, None, (), False):
-                fail(f"UI binary is not static ARM32 hard-float: {name}")
+            if name in {
+                    "usr/local/sbin/libreecho-sttd-wyoming",
+                    "usr/local/sbin/libreecho-ttsd-wyoming"}:
+                expected_elf = (
+                    1, 40, 0x05000400, "/lib/ld-musl-armhf.so.1",
+                    ("libc.musl-armv7.so.1",), True,
+                )
+            else:
+                expected_elf = (1, 40, 0x05000400, None, (), False)
+            if elf_info(member.data) != expected_elf:
+                fail(f"UI binary ARM32 ABI contract changed: {name}")
 
     return True
 
@@ -949,6 +966,7 @@ def validate_connectivity(entries: dict[str, Entry], manifest: dict[str, object]
 def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                        schema_version: int,
                        expected_image_profile: str,
+                       expected_service_profile: str,
                        expected_bootctl_sha256: str,
                        expected_update_verifier_sha256: str,
                        expected_ota_public_key_sha256: str,
@@ -989,9 +1007,15 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     validate_no_connectivity_autostart(entries)
     if manifest.get("image_profile") != expected_image_profile:
         fail("image profile manifest mismatch")
+    if manifest.get("service_profile") != expected_service_profile:
+        fail("service profile manifest mismatch")
     require_member(
         entries, "etc/libreecho/image-profile",
         sha256((expected_image_profile + "\n").encode()), 0o644,
+    )
+    require_member(
+        entries, "etc/libreecho/service-profile",
+        sha256((expected_service_profile + "\n").encode()), 0o644,
     )
     ota = manifest.get("ota")
     if not isinstance(ota, dict) or ota.get("format") != "libreecho-ota-v1":
@@ -1029,7 +1053,7 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     network = cast(dict[str, object], network)
     network_names = {"sbin/wpa_supplicant", "etc/wifi/wpa_supplicant.conf"}
     if network.get("enabled"):
-        if network.get("activation") != "automatic-after-adb-if-profile-present":
+        if network.get("activation") != "manual-single-shot-after-adb":
             fail("network activation policy changed")
         raw_wpa_record = network.get("wpa_supplicant")
         raw_profile_record = network.get("wifi_profile")
@@ -1626,7 +1650,7 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         if line.lstrip().startswith(b"/sbin/adbd ")
     )
     if adbd_launches != (
-        b"/sbin/adbd --root_seclabel=u:r:su:s0 --device_banner=device </dev/null >/tmp/adbd.log 2>&1 &",
+        b"/sbin/adbd --device_banner=device </dev/null >/tmp/adbd.log 2>&1 &",
     ):
         fail(f"unexpected ARM32 adbd launch contract: {adbd_launches!r}")
     for forbidden in (b"/proc/hps/enabled", b"scaling_governor", b"cpuidle"):
@@ -1684,6 +1708,8 @@ def main() -> None:
     parser.add_argument("--expected-iwconfig-sha256",
                         help="require this static ARM32 wireless-tools iwconfig utility")
     parser.add_argument("--expected-image-profile", choices=("development", "ota"), required=True)
+    parser.add_argument("--expected-service-profile", choices=("diagnostic", "production"),
+                        required=True)
     parser.add_argument("--expected-bootctl-sha256", required=True)
     parser.add_argument("--expected-update-verifier-sha256", required=True)
     parser.add_argument("--expected-ota-public-key-sha256", required=True)
@@ -1834,6 +1860,7 @@ def main() -> None:
 
     connectivity_enabled = validate_initramfs(
         ramdisk, manifest, schema_version, args.expected_image_profile,
+        args.expected_service_profile,
         args.expected_bootctl_sha256, args.expected_update_verifier_sha256,
         args.expected_ota_public_key_sha256, args.expected_audio_probe_sha256,
         args.expected_tinyplay_sha256, args.expected_tinycap_sha256,
@@ -1868,7 +1895,7 @@ def main() -> None:
         "arm32_recovery_image_contract=PASS android_v0=yes mtk_wrapper=yes "
         "zimage=yes evt_dtb=yes initramfs_arm32=yes "
         f"fastboot_marker={'automatic' if args.expected_image_profile == 'development' else 'explicit-only'} "
-        f"image_profile={args.expected_image_profile} ota=yes "
+        f"image_profile={args.expected_image_profile} service_profile={args.expected_service_profile} ota=yes "
         "root_adb_staged=yes runme=yes memory_disjoint=yes "
         f"connectivity_bundle={'yes' if connectivity_enabled else 'no'} "
         f"audio_tools={'yes' if args.expected_tinyplay_sha256 and args.expected_tinycap_sha256 and args.expected_tinymix_sha256 else 'no'} "

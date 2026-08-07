@@ -7,7 +7,7 @@ usage() {
 Usage: adb-reboot-fastboot.sh [TIMEOUT_SECONDS]
 
 Environment:
-  ADB_SERIAL    target serial (default: G2A0RF0485020316)
+  ADB_SERIAL    target serial (must be supplied by the operator)
   ADB_BIN       adb executable (default: adb)
   FASTBOOT_BIN  fastboot executable (default: fastboot)
 
@@ -19,7 +19,8 @@ EOF
 [[ ${1:-} == -h || ${1:-} == --help ]] && { usage; exit 0; }
 [[ $# -le 1 ]] || { usage >&2; exit 2; }
 timeout=${1:-60}
-serial=${ADB_SERIAL:-G2A0RF0485020316}
+serial=${ADB_SERIAL:-}
+[[ -n "$serial" ]] || { echo "ERROR: ADB_SERIAL must be supplied" >&2; exit 2; }
 adb_bin=${ADB_BIN:-adb}
 fastboot_bin=${FASTBOOT_BIN:-fastboot}
 [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: timeout must be a positive integer" >&2; exit 2; }
