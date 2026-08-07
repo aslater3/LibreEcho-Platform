@@ -3,9 +3,10 @@
  * This is the sole owner of the MT8163 playback PCM and board amplifier.  All
  * producers write S16_LE/48 kHz/stereo to one of four named buses.  The engine
  * mixes those buses into the mono programme feed expected by Puffin's
- * calibrated tweeter/woofer codec profile, ducks media under higher-priority
- * audio, applies the stock +3 dB trim with linked limiting, and performs the
- * validated mute/amplifier sequence exactly once.
+ * calibrated tweeter/woofer codec profile, duplicates that feed into the
+ * two-channel PCM container required by the left/right DAC paths, ducks media
+ * under higher-priority audio, applies the stock +3 dB trim with linked
+ * limiting, and performs the validated mute/amplifier sequence exactly once.
  */
 #define _GNU_SOURCE
 
@@ -39,7 +40,7 @@
 #define DEFAULT_DEVICE 23U
 #define DEFAULT_RATE 48000U
 #define INPUT_CHANNELS 2U
-#define OUTPUT_CHANNELS 1U
+#define OUTPUT_CHANNELS 2U
 #define PERIOD_SIZE 2048U
 #define PERIOD_COUNT 2U
 #define AMP_SETTLE_US 30000U
@@ -148,6 +149,8 @@ static int arm_output_controls(unsigned int card, int volume,
     if (set_enum_control(mixer, "Ext_Speaker_Amp_Switch", "Off") < 0)
         result = -1;
     if (set_enum_control(mixer, "Audio_DacMux_Setting", "Off") < 0)
+        result = -1;
+    if (set_enum_control(mixer, "Board Channel Config", "Stereo") < 0)
         result = -1;
     if (set_enum_control(mixer, "Right Channel Only", "Off") < 0)
         result = -1;
@@ -687,7 +690,10 @@ static void render_period(struct source_bus *sources, int16_t *output,
 				gain = (gain * MEDIA_DUCK_Q15) >> 15;
 			mixed += (int32_t)(((int64_t)mono * gain) >> 15);
 		}
-		output[frame] = puffin_render_mono(dynamics, mixed);
+		int16_t rendered = puffin_render_mono(dynamics, mixed);
+
+		output[frame * OUTPUT_CHANNELS] = rendered;
+		output[frame * OUTPUT_CHANNELS + 1] = rendered;
 	}
 }
 
@@ -766,7 +772,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	second = output + PERIOD_SIZE * OUTPUT_CHANNELS;
 	fprintf(stderr,
 		"audio-engine: ready (root=%s, input=S16_LE/48000/stereo, "
-		"output=S16_LE/48000/mono MonoRight, PCM %u,%u)\n",
+		"output=S16_LE/48000/duplicated-stereo, PCM %u,%u)\n",
 		root, card, device);
 
 	while (!stopping) {

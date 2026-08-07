@@ -27,12 +27,21 @@ The payload therefore uses Shairport's raw named-pipe backend. The
 S16_LE/48 kHz/stereo PCM to the shared media bus and never opens ALSA.
 `libreecho-audio-engine` is the sole TinyALSA/codec/amplifier owner. It mixes
 media, system, announcement, and alarm buses; ducks media by 12 dB under
-higher-priority audio; averages the result to a mono speaker bus with
-clipping-safe 32-bit arithmetic; and writes PCM `0,23`. The stock Puffin codec
-profile then sends the left/HPL high-pass band to the tweeter and the
-right/HPR low-pass band to the woofer. A linked peak limiter restores the
-stock pipeline's +3 dB output trim without allowing PCM clipping or positive
-codec gain. Active announcement audio also requests a slow green pulse from
+higher-priority audio; and renders one mono programme sample with clipping-safe
+32-bit arithmetic. It then duplicates that sample into both channels of PCM
+`0,23` (`S16_LE`, 48 kHz, 2 channels), selects `Board Channel Config=Stereo`,
+and uses normal codec `DACSETUP=0x14` routing. The stock Puffin profile sends
+the left/HPL high-pass band to the tweeter and the right/HPR low-pass band to
+the woofer. A linked peak limiter restores the stock pipeline's +3 dB output
+trim without allowing PCM clipping or positive codec gain.
+
+This two-channel container is mandatory even though programme semantics remain
+mono. The superseded one-channel `MonoRight` / `DACSETUP=0x24` transport made
+the woofer play while the tweeter carried noise or silence. LO/LOL/LOR are a
+separate line-out branch and must remain Off; enabling them increased tweeter
+noise rather than restoring music. `Audio_DacMux_Setting` remains Off.
+
+Active announcement audio also requests a slow green pulse from
 the LED daemon. The request is best-effort and owner-scoped, so audio continues
 if LED control is unavailable and the previous LED pattern is restored when
 the announcement bus becomes idle.
