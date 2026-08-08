@@ -16,7 +16,7 @@ JOBS="${JOBS:-$(nproc)}"
 ORT_COMMIT=8f0278c77bf44b0cc83c098c6c722b92a36ac4b5
 SPEEX_SHA=d17ca363654556a4ff1d02cc13d9eb1fc5a8642c90b40bd54ce266c3807b91a7
 
-for tool in cmake make python3 autoconf automake libtoolize; do
+for tool in cmake make python3 autoconf automake libtoolize flock; do
   command -v "$tool" >/dev/null || {
     echo "ERROR: required build tool is missing: $tool" >&2
     exit 1
@@ -84,6 +84,10 @@ required_ort_archives=(
   libonnxruntime_mlas.a libonnxruntime_util.a
   libonnxruntime_flatbuffers.a libonnxruntime_lora.a
 )
+mkdir -p "$(dirname -- "$ORT_BUILD")"
+ort_lock_path="${ORT_BUILD}.lock"
+exec {ort_lock_fd}>"$ort_lock_path"
+flock -x "$ort_lock_fd"
 mkdir -p "$ORT_BUILD"
 # ONNX Runtime filters paths matching */ml/* when excluding its own ML
 # provider sources.  Keep the checkout's logical CMake path outside that
