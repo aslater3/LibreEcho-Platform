@@ -1,0 +1,71 @@
+diff --git a/adb/adb.c b/adb/adb.c
+index 07bfbe5d5536be8053f099b655fd981d491a71ca..26924b1d956dfb9dd4cfa2e68c8b196c0de7f180 100644
+--- a/adb/adb.c
++++ b/adb/adb.c
+@@ -1177,12 +1177,6 @@ int adb_main(int is_daemon, int server_port)
+         capset(&header, &cap);
+ 
+         D("Local port disabled\n");
+-    } else {
+-        char local_name[30];
+-        build_local_name(local_name, sizeof(local_name), server_port);
+-        if(install_listener(local_name, "*smartsocket*", NULL)) {
+-            exit(1);
+-        }
+     }
+ 
+     int usb = 0;
+@@ -1192,20 +1186,14 @@ int adb_main(int is_daemon, int server_port)
+         usb = 1;
+     }
+ 
+-    // If one of these properties is set, also listen on that port
+-    // If one of the properties isn't set and we couldn't listen on usb,
+-    // listen on the default port.
+     property_get("service.adb.tcp.port", value, "");
+     if (!value[0]) {
+         property_get("persist.adb.tcp.port", value, "");
+     }
+     if (sscanf(value, "%d", &port) == 1 && port > 0) {
+-        printf("using port=%d\n", port);
+-        // listen on TCP port specified by service.adb.tcp.port property
+-        local_init(port);
++        D("Ignoring target TCP ADB request; USB FunctionFS is the only transport\n");
+     } else if (!usb) {
+-        // listen on default port
+-        local_init(DEFAULT_ADB_LOCAL_TRANSPORT_PORT);
++        D("USB FunctionFS is not mounted; waiting without a TCP listener\n");
+     }
+ 
+     D("adb_main(): pre init_jdwp()\n");
+diff --git a/adb/adb.h b/adb/adb.h
+index 9da8af8bf89f8731ea949d1959c0301e3f9012f4..6ed90b22b3b5ae29f2970cc0532c3db0dc96e116 100644
+--- a/adb/adb.h
++++ b/adb/adb.h
+@@ -477,7 +477,11 @@ extern int SHELL_EXIT_NOTIFY_FD;
+ #if !ADB_HOST
+ #define USB_ADB_PATH     "/dev/android_adb"
+ 
++#ifdef LIBREECHO_TEST_FFS_ROOT
++#define USB_FFS_ADB_PATH  LIBREECHO_TEST_FFS_ROOT
++#else
+ #define USB_FFS_ADB_PATH  "/dev/usb-ffs/adb/"
++#endif
+ #define USB_FFS_ADB_EP(x) USB_FFS_ADB_PATH#x
+ 
+ #define USB_FFS_ADB_EP0   USB_FFS_ADB_EP(ep0)
+diff --git a/adb/usb_linux_client.c b/adb/usb_linux_client.c
+index fb1dad05fe8e7b795a9c2f10939700fd70c916d2..abbaae8ff744c4d9379be34e0bf6fa848c3e0d99 100644
+--- a/adb/usb_linux_client.c
++++ b/adb/usb_linux_client.c
+@@ -34,8 +34,8 @@
+ #define MAX_PACKET_SIZE_FS	64
+ #define MAX_PACKET_SIZE_HS	512
+ 
+-#define cpu_to_le16(x)  htole16(x)
+-#define cpu_to_le32(x)  htole32(x)
++#define cpu_to_le16(x)  (x)
++#define cpu_to_le32(x)  (x)
+ 
+ struct usb_handle
+ {

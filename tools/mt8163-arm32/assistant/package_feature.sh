@@ -8,7 +8,7 @@ CURL_LICENSE="${4:?usage: package_feature.sh <agentd> <curl> <ca-bundle> <curl-l
 CA_COPYRIGHT="${5:?usage: package_feature.sh <agentd> <curl> <ca-bundle> <curl-license> <ca-copyright> <payload> <manifest>}"
 PAYLOAD="${6:?usage: package_feature.sh <agentd> <curl> <ca-bundle> <curl-license> <ca-copyright> <payload> <manifest>}"
 MANIFEST="${7:?usage: package_feature.sh <agentd> <curl> <ca-bundle> <curl-license> <ca-copyright> <payload> <manifest>}"
-PIPELINE_ROOT="$(cd -- "$(dirname -- "$0")/../../../../pipeline" && pwd -P)"
+PIPELINE_ROOT="${LIBREECHO_PIPELINE_ROOT:?ERROR: set LIBREECHO_PIPELINE_ROOT explicitly}"
 PACKAGER="$PIPELINE_ROOT/package_feature_payload.sh"
 CA_SHA256=c0c940a0e30d859783f7f130868d8082e79936ff0b41a0b1098ac7f98909263b
 

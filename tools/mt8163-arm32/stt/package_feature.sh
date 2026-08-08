@@ -9,7 +9,7 @@ TOKENS="${5:?usage: package_feature.sh <sttd> <encoder> <decoder> <joiner> <toke
 MODEL_LICENSE="${6:?usage: package_feature.sh <sttd> <encoder> <decoder> <joiner> <tokens> <model-license> <payload> <manifest>}"
 PAYLOAD="${7:?usage: package_feature.sh <sttd> <encoder> <decoder> <joiner> <tokens> <model-license> <payload> <manifest>}"
 MANIFEST="${8:?usage: package_feature.sh <sttd> <encoder> <decoder> <joiner> <tokens> <model-license> <payload> <manifest>}"
-PIPELINE_ROOT="$(cd -- "$(dirname -- "$0")/../../../../pipeline" && pwd -P)"
+PIPELINE_ROOT="${LIBREECHO_PIPELINE_ROOT:?ERROR: set LIBREECHO_PIPELINE_ROOT explicitly}"
 PACKAGER="$PIPELINE_ROOT/package_feature_payload.sh"
 
 for input in "$STTD" "$ENCODER" "$DECODER" "$JOINER" "$TOKENS" \

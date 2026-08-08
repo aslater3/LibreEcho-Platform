@@ -33,111 +33,39 @@ EVT_RAW_SIZE = 0xC875
 EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
-SOURCE_BOOT_SHA256 = "c0f52a3b079d214495cd3dd22f92fd85695d1b868c58b491a2edb933bc4f6d1a"
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
 BUSYBOX_SHA256 = "d4c8fd2aea01abd851c703f39b29c0de748b2751e4e1a85cae570fa53ad8f4fb"
 MUSL_LOADER_SHA256 = "1063871174f1bd4f08f4d330e20b07aeb0820327ee739a4d8d1b644df842cb6b"
-RECOVERY_INIT_SHA256 = "84d9110f96e3333ca3839228358635407e799f064d04f6b9a68cb37709b119c5"
+RECOVERY_INIT_SHA256 = "a83bd870e174806f3ff0f7f35564b0592f0e8bfa28b3b16b9f4122d851922a22"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
 CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
-CONNECTIVITY_STOCK_SYSTEM_SHA256 = "56540b3a9ac4437901a5510d9fb5e09b1a8d0cc229548f0b08bb5c22d78684fe"
-CONNECTIVITY_EVIDENCE_MANIFEST_SHA256 = "d1eedd04efe0dbc78853f2b0f9357c092b4ca66242648908c0369956538441eb"
+CONNECTIVITY_IMPORTER_SHA256 = "27f20efb39825333838df76eb843e4af537864f326a9648702739286a25e5d3a"
 WPA_SUPPLICANT_VERSION = "2.10"
 SSH_PASSWORD_HASH_RE = re.compile(
     r"\$(?:1|5|6|2[abxy]?|y|gy)\$[^$:\r\n]{1,64}\$[^:\r\n]{1,512}\Z"
 )
 
-STOCK_FILES = {
-    "sbin/adbd": (0o750, "1c0d14afb1ce19494ee1da935e1076f49ff57e359d348262a28bb3d56abeb930"),
-    "sepolicy": (0o644, "c144b15bff55da40125055b3e8aa134d204e0877c1712f15a313bc5555e8113a"),
-    "file_contexts.bin": (0o644, "1bc8fa508de455f391edabe1c44dc4cf230b7a21dab5824f29f0d36b2a6944ac"),
-    "property_contexts": (0o644, "921c3c53f6279bba57a93714504b3300cc96f244e12c7dde17886b564677f9ba"),
-    "service_contexts": (0o644, "3ee92dc3d98b18d0c3e338dec3743ca9591920f51059e3a8279b670127003c3e"),
-    "seapp_contexts": (0o644, "a36f09a131e3b983edf41815e7a2e1afa5807b823c7c5c10bd4a97c08c5e816d"),
-    "selinux_version": (0o644, "fab0d130803f8aca27b4a6ac8aea7ae55f4c8d0f36ec90a2ee32cb13aa581cbe"),
-    "ueventd.rc": (0o644, "f702275ec262b58184e53d2dd3f213e1538fa75985b88f7cb6c5bbde74f88062"),
-    "ueventd.mt8163.rc": (0o644, "b1d212a42d213b4b1412648e7501baf55aa3ee653236cdf10f650050e0ea325c"),
-}
-
-CONNECTIVITY_STOCK_FILES = {
-    "system/bin/linker": {
-        "source": "system/bin/linker", "mode": 0o755, "size": 630460,
-        "sha256": "73dc93e06a9ce0a76b5353f2c282f1ac3dd0dccd0e8e7f06fc20e5433ef4a3dc",
-        "needed": (),
-    },
-    "system/vendor/bin/wmt_loader": {
-        "source": "system/vendor/bin/wmt_loader", "mode": 0o755, "size": 17992,
-        "sha256": "de9ee285a09a7db5b079233f7c9129c5484ecb6701b54da45e2a29f310e74ff9",
-        "needed": ("libcutils.so", "libc++.so", "libdl.so", "libc.so", "libm.so"),
-    },
-    "system/vendor/bin/wmt_launcher": {
-        "source": "system/vendor/bin/wmt_launcher", "mode": 0o755, "size": 31448,
-        "sha256": "1f34425d727ea64524c9edaeac5e6b295df7a6054703dcc79b164021560252e5",
-        "needed": ("libcutils.so", "libc++.so", "libdl.so", "libc.so", "libm.so"),
-    },
-    "lib/firmware/ROMv2_lm_patch_1_0_hdr.bin": {
+CONNECTIVITY_ASSET_REQUIREMENTS = {
+    "ROMv2_lm_patch_1_0_hdr.bin": {
         "source": "system/vendor/firmware/ROMv2_lm_patch_1_0_hdr.bin", "mode": 0o644,
         "size": 128720,
         "sha256": "b4460117f51a43f3284594ec08d8c8861ecc0e42b17820987da03ecabdebac1e",
     },
-    "lib/firmware/ROMv2_lm_patch_1_1_hdr.bin": {
+    "ROMv2_lm_patch_1_1_hdr.bin": {
         "source": "system/vendor/firmware/ROMv2_lm_patch_1_1_hdr.bin", "mode": 0o644,
         "size": 50148,
         "sha256": "10c4ed22a10b8a136bffd7ffce4d552300d76f8e593627d2a9841c3b11a5697e",
     },
-    "lib/firmware/WIFI_RAM_CODE_8163": {
+    "WIFI_RAM_CODE_8163": {
         "source": "system/vendor/firmware/WIFI_RAM_CODE_8163", "mode": 0o644,
         "size": 373840,
         "sha256": "9669cc9b03cfdc5e8fd4fd6e14c4c4050e8c196738ca4707eea12f14a6a8e64c",
     },
-    "lib/firmware/WMT_SOC.cfg": {
+    "WMT_SOC.cfg": {
         "source": "system/vendor/firmware/WMT_SOC.cfg", "mode": 0o644, "size": 119,
         "sha256": "302bd4462de99c028c04092e561c1500d65582ce42a93c4c72ccae6e2c99013d",
     },
-    "system/lib/libcutils.so": {
-        "source": "system/lib/libcutils.so", "mode": 0o644, "size": 104436,
-        "sha256": "dcf249ceed2c84ab45454ff8fd3fa0624248b410962c4ea9e9e799610192542b",
-        "needed": ("liblog.so", "libc++.so", "libdl.so", "libc.so", "libm.so"),
-    },
-    "system/lib/libc++.so": {
-        "source": "system/lib/libc++.so", "mode": 0o644, "size": 575068,
-        "sha256": "38f15c7897307e65c9b9a13174782e7b79146e453b8b80e09128aae8b6ab1df5",
-        "needed": ("libdl.so", "libc.so", "libm.so"),
-    },
-    "system/lib/libdl.so": {
-        "source": "system/lib/libdl.so", "mode": 0o644, "size": 13640,
-        "sha256": "efb8d634212b215b53f8c95f2b8372e9139ee13dc74717b7d25999de97d5b1cc",
-        "needed": (),
-    },
-    "system/lib/libc.so": {
-        "source": "system/lib/libc.so", "mode": 0o644, "size": 780476,
-        "sha256": "1254edac10625b1e7e123c20ea8d8f3175ad07014c9ddcca7bb3ea74db555357",
-        "needed": ("libdl.so",),
-    },
-    "system/lib/libm.so": {
-        "source": "system/lib/libm.so", "mode": 0o644, "size": 132820,
-        "sha256": "3703abfae55405f1ca876cfaf5c8e41b0dafdd30d4ecec88cbd1100c5b0341ed",
-        "needed": ("libc.so",),
-    },
-    "system/lib/liblog.so": {
-        "source": "system/lib/liblog.so", "mode": 0o644, "size": 67460,
-        "sha256": "84e34e101618dae346cefca70c8cd866b92e6bcdec64246a130dcd12560410c0",
-        "needed": ("libc.so", "libm.so"),
-    },
-}
-
-CONNECTIVITY_REFERENCE_FILES = {
-    "init.connectivity.rc": (3167, "142c3f2239255dff573196daaf7da00687be9c5c54174dcbecfa309074d9d379"),
-    "ueventd.mt8163.rc": (4255, "b1d212a42d213b4b1412648e7501baf55aa3ee653236cdf10f650050e0ea325c"),
-}
-
-CONNECTIVITY_SYMLINKS = {
-    "vendor": "system/vendor",
-    "system/vendor/firmware": "../../lib/firmware",
-    "system/etc/firmware": "../../lib/firmware",
-    "etc/firmware": "../lib/firmware",
-    "lib/firmware/WIFI_RAM_CODE": "WIFI_RAM_CODE_8163",
 }
 
 CONNECTIVITY_HELPERS = {
@@ -163,15 +91,8 @@ CONNECTIVITY_HELPERS = {
     ),
 }
 
-CONNECTIVITY_PATCH_ROUTES = {
-    "lib/firmware/ROMv2_lm_patch_1_0_hdr.bin": (
-        bytes((0x8A, 0x00)), bytes((0x22, 0x00, 0x06, 0x00)), 2,
-        bytes((0x00, 0x00, 0x06, 0x00)),
-    ),
-    "lib/firmware/ROMv2_lm_patch_1_1_hdr.bin": (
-        bytes((0x8A, 0x00)), bytes((0x21, 0x00, 0x0E, 0xF0)), 1,
-        bytes((0x00, 0x00, 0x0E, 0xF0)),
-    ),
+CONNECTIVITY_RUNTIME_SYMLINKS = {
+    "etc/firmware": "../lib/firmware",
 }
 
 
@@ -285,66 +206,99 @@ def pinned_source(root: Path, relative: str, label: str) -> Path:
     return source
 
 
-def copy_pinned(source_root: Path, stage: Path, manifest: dict[str, object]) -> None:
-    copied: dict[str, object] = {}
-    for relative, (mode, expected) in STOCK_FILES.items():
-        source = pinned_source(source_root, relative, f"stock userspace {relative}")
-        data = read(source)
-        require_hash(f"stock userspace {relative}", data, expected)
+def copy_adbd(adbd: Path, metadata_path: Path, stage: Path,
+              manifest: dict[str, object]) -> None:
+    if adbd.is_symlink() or not adbd.is_file():
+        raise SystemExit(f"ERROR: adbd is not a regular file: {adbd}")
+    if metadata_path.is_symlink() or not metadata_path.is_file():
+        raise SystemExit(f"ERROR: adbd source metadata is not a regular file: {metadata_path}")
+    try:
+        metadata = json.loads(metadata_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"ERROR: invalid adbd source metadata: {exc}") from exc
+    required_metadata = {
+        "source", "source_url", "source_commit", "source_license", "patch_sha256",
+        "compiler", "kernel_headers", "binary_sha256", "binary_size", "transport", "tcp_listener",
+    }
+    if set(metadata) != required_metadata:
+        raise SystemExit("ERROR: adbd source metadata schema mismatch")
+    data = read(adbd)
+    expected = metadata["binary_sha256"]
+    if not isinstance(expected, str) or sha256(data) != expected:
+        raise SystemExit("ERROR: adbd source metadata binary hash mismatch")
+    if metadata["binary_size"] != len(data):
+        raise SystemExit("ERROR: adbd source metadata binary size mismatch")
+    if metadata["source_license"] != "Apache-2.0":
+        raise SystemExit("ERROR: adbd source license is not Apache-2.0")
+    if not isinstance(metadata["kernel_headers"], str) or not metadata["kernel_headers"]:
+        raise SystemExit("ERROR: adbd kernel-header provenance is missing")
+    if metadata["transport"] != "usb-functionfs-only" or metadata["tcp_listener"] is not False:
+        raise SystemExit("ERROR: adbd transport policy is not USB FunctionFS-only")
+    target = stage / "sbin/adbd"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    target.chmod(0o750)
+    manifest["adbd"] = {
+        "path": "/sbin/adbd",
+        "sha256": expected,
+        "size": len(data),
+        "mode": "0750",
+        "source": metadata,
+    }
+
+
+def add_connectivity_runtime_symlinks(stage: Path) -> dict[str, str]:
+    symlinks: dict[str, str] = {}
+    for relative, link_target in CONNECTIVITY_RUNTIME_SYMLINKS.items():
         target = stage / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-        target.chmod(mode)
-        copied[relative] = {"sha256": expected, "size": len(data), "mode": f"{mode:04o}"}
-    manifest["stock_userspace"] = copied
-
-
-def add_connectivity_bundle(source_root: Path, stage: Path,
-                            helpers: dict[str, Path], manifest: dict[str, object]) -> None:
-    references: dict[str, object] = {}
-    for relative, (expected_size, expected_hash) in CONNECTIVITY_REFERENCE_FILES.items():
-        reference = pinned_source(source_root, relative, f"connectivity reference {relative}")
-        data = read(reference)
-        if len(data) != expected_size:
-            raise SystemExit(
-                f"ERROR: connectivity reference {relative} size mismatch: "
-                f"expected={expected_size} actual={len(data)}"
-            )
-        require_hash(f"connectivity reference {relative}", data, expected_hash)
-        references[relative] = {"sha256": expected_hash, "size": expected_size}
-
-    copied: dict[str, object] = {}
-    for target_name, specification in CONNECTIVITY_STOCK_FILES.items():
-        source_name = str(specification["source"])
-        expected_size = int(specification["size"])
-        expected_hash = str(specification["sha256"])
-        mode = int(specification["mode"])
-        source = pinned_source(source_root, source_name, f"connectivity asset {source_name}")
-        data = read(source)
-        if len(data) != expected_size:
-            raise SystemExit(
-                f"ERROR: connectivity asset {source_name} size mismatch: "
-                f"expected={expected_size} actual={len(data)}"
-            )
-        require_hash(f"connectivity asset {source_name}", data, expected_hash)
-        target = stage / target_name
         if target.exists() or target.is_symlink():
-            raise SystemExit(f"ERROR: connectivity asset collides with {target}")
+            raise SystemExit(f"ERROR: connectivity runtime symlink collides with {target}")
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-        target.chmod(mode)
-        record: dict[str, object] = {
+        os.symlink(link_target, target)
+        try:
+            target.resolve(strict=True).relative_to(stage.resolve())
+        except (OSError, ValueError) as exc:
+            raise SystemExit(
+                f"ERROR: connectivity runtime symlink escapes or dangles: "
+                f"{relative} -> {link_target}"
+            ) from exc
+        symlinks[relative] = link_target
+    return symlinks
+
+
+def add_connectivity_bundle(stage: Path, helpers: dict[str, Path],
+                            manifest: dict[str, object]) -> None:
+    specification_path = stage / f"etc/libreecho/vendor-assets/{CONNECTIVITY_BUNDLE_ID}.tsv"
+    importer_path = stage / "usr/local/sbin/libreecho-vendor-import"
+    if not specification_path.is_file() or specification_path.is_symlink():
+        raise SystemExit("ERROR: local vendor-asset specification is missing")
+    if not importer_path.is_file() or importer_path.is_symlink():
+        raise SystemExit("ERROR: local vendor-asset importer is missing")
+    importer_data = read(importer_path)
+    require_hash(
+        "local vendor-asset importer", importer_data, CONNECTIVITY_IMPORTER_SHA256
+    )
+
+    expected_lines = []
+    requirement_records: dict[str, object] = {}
+    for target_name, specification in CONNECTIVITY_ASSET_REQUIREMENTS.items():
+        expected_hash = str(specification["sha256"])
+        expected_size = int(specification["size"])
+        source_name = str(specification["source"])
+        expected_lines.append(
+            f"{expected_hash}|{expected_size}|{source_name}|{target_name}\n"
+        )
+        requirement_records[target_name] = {
             "source": source_name,
             "sha256": expected_hash,
             "size": expected_size,
-            "mode": f"{mode:04o}",
+            "mode": "0600",
+            "persistent_path": f"/data/libreecho/vendor/{CONNECTIVITY_BUNDLE_ID}/{target_name}",
+            "runtime_path": f"/lib/firmware/{target_name}",
         }
-        if "needed" in specification:
-            record["elf"] = require_elf_contract(
-                target, 0x05000200, "/system/bin/linker",
-                tuple(specification["needed"]), True,
-            )
-        copied[target_name] = record
+    specification_data = read(specification_path)
+    if specification_data != "".join(expected_lines).encode():
+        raise SystemExit("ERROR: local vendor-asset specification changed")
 
     helper_records: dict[str, object] = {}
     for target_name, (argument_name, expected_size, expected_hash) in CONNECTIVITY_HELPERS.items():
@@ -371,62 +325,35 @@ def add_connectivity_bundle(source_root: Path, stage: Path,
             "elf": require_elf_contract(target, 0x05000400, None, (), False),
         }
 
-    symlink_records: dict[str, str] = {}
-    for relative, link_target in CONNECTIVITY_SYMLINKS.items():
-        target = stage / relative
-        if target.exists() or target.is_symlink():
-            raise SystemExit(f"ERROR: connectivity symlink collides with {target}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        os.symlink(link_target, target)
-        try:
-            target.resolve(strict=True).relative_to(stage.resolve())
-        except (OSError, ValueError) as exc:
-            raise SystemExit(f"ERROR: connectivity symlink escapes or dangles: {relative} -> {link_target}") from exc
-        symlink_records[relative] = link_target
-
-    patch_routing_records: dict[str, object] = {}
-    for relative, (expected_header, expected_route, expected_seq,
-                   expected_address) in CONNECTIVITY_PATCH_ROUTES.items():
-        data = read(stage / relative)
-        route = data[24:28]
-        patch_count = route[0] >> 4
-        download_seq = route[0] & 0x0F
-        address = b"\0" + route[1:]
-        if (data[22:24] != expected_header or route != expected_route or
-                patch_count != len(CONNECTIVITY_PATCH_ROUTES) or
-                download_seq != expected_seq or address != expected_address):
-            raise SystemExit(f"ERROR: stock patch metadata changed for {relative}")
-        patch_routing_records[relative] = {
-            "header": expected_header.hex(),
-            "route": expected_route.hex(),
-            "patch_count": patch_count,
-            "download_seq": download_seq,
-            "address": address.hex(),
-        }
-
-    if read(stage / "ueventd.mt8163.rc") != read(source_root / "ueventd.mt8163.rc"):
-        raise SystemExit("ERROR: connectivity root and recovery use different ueventd.mt8163.rc files")
-    if (stage / "init.connectivity.rc").exists():
-        raise SystemExit("ERROR: auto-starting init.connectivity.rc entered the recovery stage")
+    runtime_symlinks = add_connectivity_runtime_symlinks(stage)
     manifest["connectivity"] = {
         "id": CONNECTIVITY_BUNDLE_ID,
         "enabled": True,
         "activation": "manual-gates-only",
         "autostart": False,
-        "stock_file_count": len(copied),
+        "vendor_delivery": "owner-device-local-extraction",
+        "source_partition": "system_a-read-only",
+        "embedded_vendor_file_count": 0,
+        "required_vendor_file_count": len(requirement_records),
+        "required_vendor_bytes": 552827,
         "helper_count": len(helper_records),
-        "payload_bytes": sum(record["size"] for record in copied.values())
-                         + sum(record["size"] for record in helper_records.values()),
-        "provenance": {
-            "stock_system_a_sha256": CONNECTIVITY_STOCK_SYSTEM_SHA256,
-            "evidence_manifest_sha256": CONNECTIVITY_EVIDENCE_MANIFEST_SHA256,
+        "payload_bytes": sum(int(record["size"]) for record in helper_records.values()),
+        "files": {},
+        "required_vendor_assets": requirement_records,
+        "importer": {
+            "path": "/usr/local/sbin/libreecho-vendor-import",
+            "sha256": CONNECTIVITY_IMPORTER_SHA256,
+            "size": len(importer_data),
+            "mode": "0755",
         },
-        "stock_root": str(source_root),
-        "reference_files_not_copied": references,
-        "files": copied,
+        "requirements_manifest": {
+            "path": f"/etc/libreecho/vendor-assets/{CONNECTIVITY_BUNDLE_ID}.tsv",
+            "sha256": sha256(specification_data),
+            "size": len(specification_data),
+            "mode": "0644",
+        },
         "helpers": helper_records,
-        "symlinks": symlink_records,
-        "patch_routing": patch_routing_records,
+        "symlinks": runtime_symlinks,
     }
 
 
@@ -449,6 +376,12 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         "libreecho-init": ("libreecho-init", 0o755),
         "libreecho-data-cleanup": (
             "usr/local/sbin/libreecho-data-cleanup", 0o755,
+        ),
+        "libreecho-vendor-import": (
+            "usr/local/sbin/libreecho-vendor-import", 0o755,
+        ),
+        "vendor-assets/mt8163-v181-stock-v1.tsv": (
+            "etc/libreecho/vendor-assets/mt8163-v181-stock-v1.tsv", 0o644,
         ),
         "libreecho-update": ("usr/local/sbin/libreecho-update", 0o755),
         "libreecho-update-fetch": ("usr/local/sbin/libreecho-update-fetch", 0o755),
@@ -1286,57 +1219,6 @@ def add_assistant_external_payload(payload: Path, payload_manifest: Path,
     }
 
 
-def add_startup_audio(stage: Path, startup_audio: Path,
-                      manifest: dict[str, object]) -> None:
-    """Install the bounded post-init HPR confirmation clip."""
-    audio = manifest.get("audio")
-    if not isinstance(audio, dict) or not audio.get("enabled"):
-        raise SystemExit("ERROR: startup audio requires the audio tools")
-    if startup_audio.is_symlink() or not startup_audio.is_file():
-        raise SystemExit(f"ERROR: startup audio is not a regular file: {startup_audio}")
-    data = read(startup_audio)
-    try:
-        import io
-        import wave
-        with wave.open(io.BytesIO(data), "rb") as wav:
-            audio_format = {
-                "channels": wav.getnchannels(),
-                "sample_rate": wav.getframerate(),
-                "sample_width_bits": wav.getsampwidth() * 8,
-                "compression": wav.getcomptype(),
-            }
-    except (EOFError, wave.Error) as exc:
-        raise SystemExit(f"ERROR: startup audio is not a readable WAV: {startup_audio}") from exc
-    if audio_format != {
-        "channels": 2,
-        "sample_rate": 48000,
-        "sample_width_bits": 16,
-        "compression": "NONE",
-    }:
-        raise SystemExit(f"ERROR: startup audio format is not stereo 48kHz PCM16: {audio_format}")
-    target = stage / "etc/audio/windows95-startup.wav"
-    if target.exists() or target.is_symlink():
-        raise SystemExit(f"ERROR: startup audio collides with {target}")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(data)
-    target.chmod(0o644)
-    audio["activation"] = "automatic-after-successful-init"
-    audio["startup_playback"] = {
-        "path": str(startup_audio.resolve()),
-        "sha256": sha256(data),
-        "size": len(data),
-        "mode": "0644",
-        "format": audio_format,
-        "route": "hpr-only",
-        "pcm_volume": "103/103",
-        "pcm_db": "-12.0",
-        "hp_driver_gain": "6/6",
-        "lineout_dac_switches": "off",
-        "playback_device": "0:23",
-        "plays_once": True,
-    }
-
-
 def read_ssh_password_hash(path: Path) -> str:
     """Read one build-local crypt(3) hash without accepting a plaintext secret."""
     if path.is_symlink() or not path.is_file():
@@ -1473,7 +1355,6 @@ def validate_stage(stage: Path) -> None:
         "init", "init.rc", "libreecho-init", "bin/busybox",
         "lib/ld-musl-armhf.so.1", "lib/libc.musl-armv7.so.1",
         "sbin/adbd", "sbin/ueventd", "sbin/sh", "system/bin/sh",
-        "sepolicy", "file_contexts.bin", "property_contexts",
         "usr/local/sbin/libreecho-update", "usr/local/sbin/libreecho-bootctl",
         "usr/local/sbin/libreecho-data-cleanup",
         "usr/local/sbin/libreecho-update-fetch",
@@ -1607,22 +1488,14 @@ def build_cpio(stage: Path, epoch: int) -> bytes:
 
 
 def extract_or_read_dtb(source: bytes, supplied: Path | None, expected: str | None) -> tuple[bytes, str]:
-    fields = struct.unpack_from("<10I", source, 8)
-    old_kernel = source[PAGE_SIZE:PAGE_SIZE + fields[0]]
-    if old_kernel[:4] != MKIMG_MAGIC:
-        raise SystemExit("ERROR: source MediaTek KERNEL header missing")
+    del source
     if supplied is None:
-        payload_size = struct.unpack_from("<I", old_kernel, 4)[0]
-        payload = old_kernel[MKIMG_SIZE:MKIMG_SIZE + payload_size]
-        raw = payload[EVT_SOURCE_OFFSET:EVT_SOURCE_OFFSET + EVT_RAW_SIZE]
-        require_hash("stock EVT DTB", raw, STOCK_EVT_SHA256)
-        origin = "stock-envelope-extraction"
-    else:
-        raw = read(supplied)
-        if expected is None:
-            raise SystemExit("ERROR: --expected-dtb-sha256 is required with --dtb")
-        require_hash("supplied DTB", raw, expected)
-        origin = str(supplied.resolve())
+        raise SystemExit("ERROR: generated boot envelope requires an explicit --dtb")
+    raw = read(supplied)
+    if expected is None:
+        raise SystemExit("ERROR: --expected-dtb-sha256 is required with --dtb")
+    require_hash("supplied DTB", raw, expected)
+    origin = str(supplied.resolve())
     if raw[:4] != FDT_MAGIC or len(raw) < 8:
         raise SystemExit("ERROR: DTB magic missing")
     total = struct.unpack_from(">I", raw, 4)[0]
@@ -1658,32 +1531,31 @@ def system_map_end(path: Path, kernel_addr: int) -> tuple[int, dict[str, str]]:
     }
 
 
-def package_boot(source: bytes, zimage: bytes, ramdisk: bytes, raw_dtb: bytes,
+def package_boot(envelope: bytes, zimage: bytes, ramdisk: bytes, raw_dtb: bytes,
                  ramdisk_addr: int, system_map: Path | None) -> tuple[bytes, dict[str, object]]:
-    if source[:8] != ANDROID_MAGIC or len(source) != IMAGE_SIZE:
-        raise SystemExit("ERROR: source is not the pinned 16 MiB Android boot envelope")
-    fields = list(struct.unpack_from("<10I", source, 8))
+    if envelope[:8] != ANDROID_MAGIC or len(envelope) != IMAGE_SIZE:
+        raise SystemExit("ERROR: generated envelope is not an exact 16 MiB Android boot envelope")
+    fields = list(struct.unpack_from("<10I", envelope, 8))
     old_kernel_size, kernel_addr = fields[0], fields[1]
     old_ramdisk_size, old_ramdisk_addr = fields[2], fields[3]
     second_size, _second_addr, tags_addr, page_size, dt_size, _unused = fields[4:]
     if (kernel_addr, tags_addr, page_size, dt_size) != (KERNEL_ADDR, TAGS_ADDR, PAGE_SIZE, 0):
         raise SystemExit("ERROR: source Android address/page contract changed")
-    if not source[64:576].startswith(b"bootopt=64S3,32N2,32N2"):
-        raise SystemExit("ERROR: source bootopt no longer selects the proven 32-bit path")
+    if old_kernel_size or old_ramdisk_size or second_size or dt_size:
+        raise SystemExit("ERROR: generated envelope contains nonzero payload sections")
+    if not envelope[64:576].startswith(b"bootopt=64S3,32N2,32N2"):
+        raise SystemExit("ERROR: generated bootopt no longer selects the proven 32-bit path")
 
     if len(zimage) < 0x30 or struct.unpack_from("<I", zimage, 0x24)[0] != ZIMAGE_MAGIC:
         raise SystemExit("ERROR: ARM zImage magic missing")
     if struct.unpack_from("<II", zimage, 0x28) != (0, len(zimage)):
         raise SystemExit("ERROR: zImage start/end fields do not match its file size")
 
-    old_kernel = source[PAGE_SIZE:PAGE_SIZE + old_kernel_size]
-    if old_kernel[:4] != MKIMG_MAGIC or old_kernel[8:14] != b"KERNEL":
-        raise SystemExit("ERROR: source MediaTek KERNEL header contract changed")
-    if old_kernel[14] != 0:
-        raise SystemExit("ERROR: source MediaTek KERNEL header name not null-terminated")
     dtb = padded_dtb(raw_dtb)
     payload = zimage + dtb
-    mkimg = bytearray(old_kernel[:MKIMG_SIZE])
+    mkimg = bytearray(MKIMG_SIZE)
+    mkimg[:4] = MKIMG_MAGIC
+    mkimg[8:14] = b"KERNEL"
     struct.pack_into("<I", mkimg, 4, len(payload))
     kernel = bytes(mkimg) + payload
 
@@ -1705,15 +1577,12 @@ def package_boot(source: bytes, zimage: bytes, ramdisk: bytes, raw_dtb: bytes,
             f"{ATF_END:#x}-{RAMDISK_END_LIMIT:#x}"
         )
 
-    header = bytearray(source[:PAGE_SIZE])
+    header = bytearray(envelope[:PAGE_SIZE])
     struct.pack_into("<I", header, 8, len(kernel))
     struct.pack_into("<I", header, 16, len(ramdisk))
     struct.pack_into("<I", header, 20, ramdisk_addr)
-    old_ramdisk_off = align(PAGE_SIZE + old_kernel_size)
-    old_second_off = align(old_ramdisk_off + old_ramdisk_size)
-    old_dt_off = align(old_second_off + second_size)
-    second = source[old_second_off:old_second_off + second_size]
-    outer_dt = source[old_dt_off:old_dt_off + dt_size]
+    second = b""
+    outer_dt = b""
     header[576:608] = android_id(kernel, ramdisk, second, outer_dt)
 
     result = bytearray(header)
@@ -1725,9 +1594,9 @@ def package_boot(source: bytes, zimage: bytes, ramdisk: bytes, raw_dtb: bytes,
     result += second
     result += b"\0" * (align(len(result)) - len(result))
     result += outer_dt
-    if len(result) > len(source):
-        raise SystemExit(f"ERROR: image exceeds the 16 MiB boot envelope by {len(result) - len(source):#x} bytes")
-    result += b"\0" * (len(source) - len(result))
+    if len(result) > IMAGE_SIZE:
+        raise SystemExit(f"ERROR: image exceeds the 16 MiB boot envelope by {len(result) - IMAGE_SIZE:#x} bytes")
+    result += b"\0" * (IMAGE_SIZE - len(result))
 
     record: dict[str, object] = {
         "android": {
@@ -1764,9 +1633,11 @@ def package_boot(source: bytes, zimage: bytes, ramdisk: bytes, raw_dtb: bytes,
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source-boot", type=Path, required=True)
-    parser.add_argument("--stock-root", type=Path, required=True,
-                        help="extracted v184 ARM32 root-adb ramdisk")
+    parser.add_argument("--boot-envelope", type=Path, required=True)
+    parser.add_argument("--adbd", type=Path, required=True,
+                        help="source-built static ARM32 adbd")
+    parser.add_argument("--adbd-source-metadata", type=Path, required=True,
+                        help="source/license metadata emitted by build_adbd.sh")
     parser.add_argument("--busybox", type=Path, required=True)
     parser.add_argument("--musl-loader", type=Path, required=True)
     parser.add_argument("--image-profile", choices=("development", "ota"), required=True)
@@ -1823,8 +1694,7 @@ def main() -> None:
                         help="external SquashFS streamed assistant feature payload")
     parser.add_argument("--assistant-payload-manifest", type=Path,
                         help="manifest for the external assistant feature payload")
-    parser.add_argument("--startup-audio", type=Path,
-                        help="stereo 48kHz PCM16 WAV to play once after successful init")
+
     parser.add_argument("--ssh-enabled", action="store_true",
                         help="explicitly enable the password-only root SSH bundle")
     parser.add_argument("--dropbear", type=Path,
@@ -1833,8 +1703,7 @@ def main() -> None:
                         help="static ARM32 Dropbear host-key utility")
     parser.add_argument("--ssh-root-password-hash", type=Path,
                         help="build-local salted root crypt(3) hash file")
-    parser.add_argument("--connectivity-stock-root", type=Path,
-                        help="pinned v181 ARM32 WMT runtime and firmware root")
+
     parser.add_argument("--wmt-config-helper", type=Path,
                         help="reviewed static ARM32 configure-only WMT helper")
     parser.add_argument("--wmt-responder", type=Path,
@@ -1865,7 +1734,6 @@ def main() -> None:
     args = parser.parse_args()
 
     connectivity_options = {
-        "connectivity_stock_root": args.connectivity_stock_root,
         "wmt_config_helper": args.wmt_config_helper,
         "wmt_responder": args.wmt_responder,
         "wmt_bt_on": args.wmt_bt_on,
@@ -1903,8 +1771,7 @@ def main() -> None:
         raise SystemExit(f"ERROR: audio tools are all-or-nothing; missing {missing}")
     if audio_tools_enabled and args.audio_probe is None:
         raise SystemExit("ERROR: audio tools require --audio-probe")
-    if args.startup_audio is not None and not audio_tools_enabled:
-        raise SystemExit("ERROR: startup audio requires --audio-probe and all audio tools")
+
     ssh_options = {
         "dropbear": args.dropbear,
         "dropbearkey": args.dropbearkey,
@@ -2024,13 +1891,12 @@ def main() -> None:
             f"missing {missing}"
         )
 
-    source = read(args.source_boot)
-    require_hash("source boot envelope", source, SOURCE_BOOT_SHA256)
+    envelope = read(args.boot_envelope)
     zimage = read(args.zimage)
     require_hash("ARM32 zImage", zimage, args.expected_zimage_sha256)
     system_map = read(args.system_map)
     require_hash("ARM32 System.map", system_map, args.expected_system_map_sha256)
-    raw_dtb, dtb_origin = extract_or_read_dtb(source, args.dtb, args.expected_dtb_sha256)
+    raw_dtb, dtb_origin = extract_or_read_dtb(envelope, args.dtb, args.expected_dtb_sha256)
     qemu_arm = shutil.which(args.qemu_arm)
     if qemu_arm is None:
         raise SystemExit(f"ERROR: ARM user-mode emulator not found: {args.qemu_arm}")
@@ -2048,7 +1914,7 @@ def main() -> None:
         "name": "libreecho-mt8163-arm32-v97-recovery",
         "status": "PREPARED_NOT_FLASHED",
         "inputs": {
-            "source_boot": {"path": str(args.source_boot.resolve()), "sha256": SOURCE_BOOT_SHA256},
+            "boot_envelope": {"path": str(args.boot_envelope.resolve()), "sha256": sha256(envelope)},
             "zimage": {"path": str(args.zimage.resolve()), "sha256": args.expected_zimage_sha256},
             "system_map": {
                 "path": str(args.system_map.resolve()),
@@ -2133,7 +1999,7 @@ def main() -> None:
     overlay = Path(__file__).resolve().parent / "initramfs"
     with tempfile.TemporaryDirectory(prefix="libreecho-arm32-initramfs-") as temporary:
         stage = Path(temporary)
-        copy_pinned(args.stock_root.resolve(), stage, manifest)
+        copy_adbd(args.adbd.resolve(), args.adbd_source_metadata.resolve(), stage, manifest)
         add_overlay(
             stage, overlay, args.busybox.resolve(), args.musl_loader.resolve(),
             qemu_arm, manifest,
@@ -2189,8 +2055,7 @@ def main() -> None:
                 args.assistant_payload_manifest.resolve(),
                 manifest,
             )
-        if args.startup_audio is not None:
-            add_startup_audio(stage, args.startup_audio.resolve(), manifest)
+
         if ssh_enabled:
             add_ssh_bundle(
                 stage, args.dropbear.resolve(), args.dropbearkey.resolve(),
@@ -2198,8 +2063,7 @@ def main() -> None:
             )
         if connectivity_enabled:
             add_connectivity_bundle(
-                args.connectivity_stock_root.resolve(), stage,
-                {
+                stage, {
                     "wmt_config_helper": args.wmt_config_helper.absolute(),
                     "wmt_responder": args.wmt_responder.absolute(),
                     "wmt_bt_on": args.wmt_bt_on.absolute(),
@@ -2219,7 +2083,7 @@ def main() -> None:
         raise SystemExit("ERROR: deterministic gzip round trip failed")
 
     boot, package_record = package_boot(
-        source, zimage, ramdisk, raw_dtb, args.ramdisk_address,
+        envelope, zimage, ramdisk, raw_dtb, args.ramdisk_address,
         args.system_map.resolve(),
     )
     ramdisk_output.write_bytes(ramdisk)

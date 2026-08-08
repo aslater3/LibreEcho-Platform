@@ -313,6 +313,19 @@ else
     DATA_CLEANUP_OK=0
     log userdata-unavailable
 fi
+VENDOR_ASSETS_OK=0
+if [ "${DATA_CLEANUP_OK:-0}" -eq 1 ] &&
+        [ -x /usr/local/sbin/libreecho-vendor-import ]; then
+    if DATA_ROOT=/data /usr/local/sbin/libreecho-vendor-import \
+            >/tmp/vendor-import.log 2>&1; then
+        VENDOR_ASSETS_OK=1
+        log vendor-assets-ready
+    else
+        log vendor-assets-unavailable
+    fi
+else
+    log vendor-assets-import-skipped
+fi
 set_boot_hostname || true
 
 expdb_devno=$($BB cat "$EXPDB_SYS/dev" 2>/dev/null)
@@ -515,6 +528,11 @@ start_wifi_network_sequence()
 
 start_wifi_network()
 {
+    if [ "${VENDOR_ASSETS_OK:-0}" -ne 1 ]; then
+        printf 'LIBREECHO_WIFI_REJECTED=vendor-assets-unavailable\n' > /tmp/wifi.status
+        log wifi-vendor-assets-unavailable
+        return 4
+    fi
     # The WMT firmware path is intentionally single-shot per boot.  mkdir is
     # the atomic claim for the operator-request path.
     if ! $BB mkdir /tmp/wifi.activation.claim 2>/dev/null; then
@@ -930,7 +948,9 @@ log audio-startup-disabled
 # performs one bounded Wi-Fi activation; a failed activation is recorded but
 # never takes PID 1 or the recovery runner down.  When USB diagnostic mode is
 # active, connectivity stays manual/single-shot.
-if [ "$SERVICE_PROFILE" = diagnostic ]; then
+if [ "${VENDOR_ASSETS_OK:-0}" -ne 1 ]; then
+    log wifi-network-skipped-vendor-assets-unavailable
+elif [ "$SERVICE_PROFILE" = diagnostic ]; then
     log wifi-network-policy-manual-single-shot
 elif [ "${ffs_ready:-0}" -eq 1 ]; then
     start_wifi_network &

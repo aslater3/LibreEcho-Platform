@@ -8,7 +8,7 @@ WAKE_MODEL="${4:?usage: package_feature.sh <waked> <mel-model> <embedding-model>
 PAYLOAD="${5:?usage: package_feature.sh <waked> <mel-model> <embedding-model> <wake-model> <payload> <manifest>}"
 MANIFEST="${6:?usage: package_feature.sh <waked> <mel-model> <embedding-model> <wake-model> <payload> <manifest>}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd -P)"
-PIPELINE_ROOT="$(cd -- "$SCRIPT_DIR/../../../../pipeline" && pwd -P)"
+PIPELINE_ROOT="${LIBREECHO_PIPELINE_ROOT:?ERROR: set LIBREECHO_PIPELINE_ROOT explicitly}"
 PACKAGER="$PIPELINE_ROOT/package_feature_payload.sh"
 LICENSE_NOTICE="$SCRIPT_DIR/MODEL-LICENSE.txt"
 
