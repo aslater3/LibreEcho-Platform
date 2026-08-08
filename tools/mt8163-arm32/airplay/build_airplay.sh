@@ -8,6 +8,8 @@ TINYALSA_ARCHIVE=${4:?TinyALSA source archive}
 SYSROOT=${5:?pinned ARMHF dependency sysroot}
 OUTPUT=${6:?output directory}
 ALSA_DATA=${LIBREECHO_AIRPLAY_ALSA_DATA:-/usr/share/alsa}
+ALSA_DATA_COPYRIGHT=${LIBREECHO_AIRPLAY_ALSA_DATA_COPYRIGHT:-/usr/share/doc/libasound2-data/copyright}
+ALSA_UCM_COPYRIGHT=${LIBREECHO_AIRPLAY_ALSA_UCM_COPYRIGHT:-/usr/share/doc/alsa-ucm-conf/copyright}
 CROSS_PREFIX=${CROSS_PREFIX:-/usr/bin/arm-linux-gnueabihf-}
 CXX=${CXX:-${CROSS_PREFIX}g++}
 JOBS=${JOBS:-$(nproc)}
@@ -257,6 +259,69 @@ copy_runtime_closure() {
     done
 }
 
+copy_release_notices() {
+    local runtime="$OUTPUT/runtime"
+    local license_root="$runtime/usr/local/share/licenses/libreecho-airplay"
+    local debian_root="$license_root/debian"
+    local source_root="$license_root/source"
+    local copyright package copied=0
+
+    mkdir -p "$debian_root" "$source_root/nqptp" "$source_root/shairport-sync" \
+        "$source_root/ffmpeg" "$source_root/tinyalsa" "$source_root/alsa-data"
+
+    # Every shared object copied from the pinned Debian sysroot must retain the
+    # binary package's exact Debian copyright record.
+    while IFS= read -r -d '' copyright; do
+        package=$(basename "$(dirname "$copyright")")
+        mkdir -p "$debian_root/$package"
+        install -m 0644 "$copyright" "$debian_root/$package/copyright"
+        copied=$((copied + 1))
+    done < <(find "$SYSROOT/usr/share/doc" -mindepth 2 -maxdepth 2 \
+        -type f -name copyright -print0 | sort -z)
+    [[ "$copied" -gt 0 ]] || {
+        echo "ERROR: dependency sysroot contains no Debian copyright records" >&2
+        exit 1
+    }
+
+    for input in "$ALSA_DATA_COPYRIGHT" "$ALSA_UCM_COPYRIGHT"; do
+        [[ -f "$input" ]] || {
+            echo "ERROR: ALSA data copyright record is missing: $input" >&2
+            exit 1
+        }
+        package=$(basename "$(dirname "$input")")
+        mkdir -p "$source_root/alsa-data/$package"
+        install -m 0644 "$input" "$source_root/alsa-data/$package/copyright"
+    done
+
+    for input in "$nqptp_source"/LICENSE*; do
+        [[ -f "$input" ]] && install -m 0644 "$input" "$source_root/nqptp/$(basename "$input")"
+    done
+    for input in "$shairport_source"/LICENSE*; do
+        [[ -f "$input" ]] && install -m 0644 "$input" "$source_root/shairport-sync/$(basename "$input")"
+    done
+    for input in "$ffmpeg_source"/COPYING* "$ffmpeg_source"/LICENSE*; do
+        [[ -f "$input" ]] && install -m 0644 "$input" "$source_root/ffmpeg/$(basename "$input")"
+    done
+    for input in "$tinyalsa_source"/NOTICE* "$tinyalsa_source"/LICENSE*; do
+        [[ -f "$input" ]] && install -m 0644 "$input" "$source_root/tinyalsa/$(basename "$input")"
+    done
+
+    for required in nqptp shairport-sync ffmpeg tinyalsa; do
+        find "$source_root/$required" -type f -maxdepth 1 -print -quit | grep -q . || {
+            echo "ERROR: source license files missing for $required" >&2
+            exit 1
+        }
+    done
+
+    {
+        printf 'component\tversion-or-source\tsha256\n'
+        printf 'nqptp\t%s\t%s\n' "$(basename "$nqptp_source")" "$(sha256sum "$NQPTP_ARCHIVE" | awk '{print $1}')"
+        printf 'shairport-sync\t%s\t%s\n' "$(basename "$shairport_source")" "$(sha256sum "$SHAIRPORT_ARCHIVE" | awk '{print $1}')"
+        printf 'ffmpeg\t%s\t%s\n' "$(basename "$ffmpeg_source")" "$(sha256sum "$FFMPEG_ARCHIVE" | awk '{print $1}')"
+        printf 'tinyalsa\t%s\t%s\n' "$(basename "$tinyalsa_source")" "$(sha256sum "$TINYALSA_ARCHIVE" | awk '{print $1}')"
+    } > "$license_root/COMPONENTS.tsv"
+}
+
 build_ffmpeg
 make_ffmpeg_pkgconfig
 build_nqptp
@@ -300,5 +365,6 @@ else
     echo "ERROR: ALSA runtime data is absent: $ALSA_DATA" >&2
     exit 1
 fi
+copy_release_notices
 file "$OUTPUT/nqptp" "$OUTPUT/shairport-sync"
 readelf -d "$OUTPUT/shairport-sync" | sed -n 's/.*Shared library: \[\([^]]*\)\].*/needed=\1/p'

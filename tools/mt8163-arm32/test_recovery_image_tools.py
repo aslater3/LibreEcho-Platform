@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import json
 import os
 import re
 import stat
@@ -476,6 +477,66 @@ class SourceTests(unittest.TestCase):
             with self.subTest(feature=feature):
                 self.assertIn("LIBREECHO_PIPELINE_ROOT", source)
                 self.assertNotIn("../../../../pipeline", source)
+
+    def test_release_payloads_embed_exact_license_closure(self) -> None:
+        tts = TOOLS_DIR / "tts"
+        self.assertIn("CC-BY-SA-4.0", (tts / "THIRD_PARTY_NOTICES.md").read_text())
+        self.assertIn("OpenSLR SLR83", (tts / "NORTHERN-MALE-MODEL-CARD.md").read_text())
+        self.assertTrue((tts / "CC-BY-SA-4.0.txt").stat().st_size > 10000)
+        tts_packager = (tts / "package_feature.sh").read_text()
+        self.assertIn("northern-male", tts_packager)
+        self.assertNotIn("ALAN_MODEL", tts_packager)
+        for required in (
+            "THIRD_PARTY_NOTICES.md",
+            "NORTHERN-MALE-MODEL-CARD.md",
+            "SOUTHERN-FEMALE-MODEL-CARD.md",
+            "CC-BY-SA-4.0.txt",
+        ):
+            self.assertIn(required, tts_packager)
+
+        wakeword = TOOLS_DIR / "wakeword"
+        wake_notice = (wakeword / "MODEL-LICENSE.txt").read_text()
+        self.assertIn("public payload", wake_notice)
+        self.assertIn("NonCommercial-ShareAlike", wake_notice)
+        self.assertTrue((wakeword / "CC-BY-NC-SA-4.0.txt").stat().st_size > 10000)
+        self.assertIn(
+            "CC-BY-NC-SA-4.0.txt",
+            (wakeword / "package_feature.sh").read_text(),
+        )
+
+        airplay_builder = (TOOLS_DIR / "airplay/build_airplay.sh").read_text()
+        airplay_packager = (TOOLS_DIR / "airplay/package_feature.sh").read_text()
+        for required in ("COMPONENTS.tsv", "debian", "nqptp", "shairport-sync", "ffmpeg", "tinyalsa"):
+            self.assertIn(required, airplay_builder)
+            self.assertIn(required, airplay_packager)
+
+        common = TOOLS_DIR / "third-party-licenses"
+        for required in (
+            "RUNTIME-NOTICES.txt", "ONNX-Runtime-MIT.txt",
+            "sherpa-onnx-Apache-2.0.txt", "SpeexDSP-COPYING.txt",
+            "OpenSSL-copyright", "glibc-copyright", "gcc-runtime-copyright",
+        ):
+            self.assertTrue((common / required).is_file(), required)
+        for feature in ("stt", "tts", "wakeword"):
+            packager = (TOOLS_DIR / feature / "package_feature.sh").read_text()
+            self.assertIn("COMMON_LICENSE_DIR", packager)
+            self.assertIn("runtime_license_root", packager)
+        assistant_packager = (TOOLS_DIR / "assistant/package_feature.sh").read_text()
+        self.assertIn("OpenSSL-copyright", assistant_packager)
+        self.assertIn("THIRD_PARTY_NOTICES.txt", assistant_packager)
+
+        core = TOOLS_DIR / "initramfs/usr/local/share/licenses/libreecho-core"
+        components = json.loads((core / "COMPONENTS.json").read_text())
+        component_ids = {component["id"] for component in components["components"]}
+        self.assertTrue({"busybox", "wpa-supplicant", "musl", "tinyalsa", "libsodium", "mt8163-audio-fpga"}.issubset(component_ids))
+        core_notice = (core / "THIRD_PARTY_NOTICES.md").read_text()
+        self.assertIn("owner's", core_notice)
+        self.assertIn("`system_a`", core_notice)
+        for required in (
+            "GPL-2.0-only.txt", "Apache-2.0.txt", "wpa_supplicant-BSD.txt",
+            "musl-1.2.5-COPYRIGHT.txt", "libsodium-1.0.18-LICENSE.txt",
+        ):
+            self.assertTrue((core / required).is_file(), required)
 
     def test_stock_userspace_is_replaced_by_source_built_adbd(self) -> None:
         builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()

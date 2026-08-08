@@ -409,6 +409,23 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         target.chmod(mode)
         overlay_manifest[relative] = {"sha256": sha256(data), "size": len(data), "mode": f"{mode:04o}"}
 
+    core_license_root = overlay / "usr/local/share/licenses/libreecho-core"
+    core_license_files = sorted(path for path in core_license_root.rglob("*") if path.is_file())
+    if not core_license_files:
+        raise SystemExit("ERROR: LibreEcho core license bundle is empty")
+    for source in core_license_files:
+        if source.is_symlink():
+            raise SystemExit(f"ERROR: core license input is a symlink: {source}")
+        relative = source.relative_to(overlay).as_posix()
+        data = read(source)
+        target = stage / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        target.chmod(0o644)
+        overlay_manifest[relative] = {
+            "sha256": sha256(data), "size": len(data), "mode": "0644",
+        }
+
     # The stock ramdisk's /init is an Android ELF that is incompatible with
     # this ARM32 recovery kernel.  PID 1 must be the audited LibreEcho shell
     # control script, installed at the real runtime path (not merely staged
@@ -917,9 +934,18 @@ def add_airplay_external_payload(payload: Path, payload_manifest: Path,
             "usr/local/sbin/libreecho-airplay-audio",
             "usr/local/sbin/libreecho-audio-engine",
             "usr/local/sbin/shairport-sync",
-            "etc/libreecho/airplay2.conf"):
+            "etc/libreecho/airplay2.conf",
+            "usr/local/share/licenses/libreecho-airplay/COMPONENTS.tsv"):
         if required not in feature_files:
             raise SystemExit(f"ERROR: AirPlay feature member missing: {required}")
+    if not any(str(relative).startswith(
+            "usr/local/share/licenses/libreecho-airplay/debian/") and
+            str(relative).endswith("/copyright") for relative in feature_files):
+        raise SystemExit("ERROR: AirPlay Debian copyright closure is missing")
+    for component in ("nqptp", "shairport-sync", "ffmpeg", "tinyalsa"):
+        prefix = f"usr/local/share/licenses/libreecho-airplay/source/{component}/"
+        if not any(str(relative).startswith(prefix) for relative in feature_files):
+            raise SystemExit(f"ERROR: AirPlay source license closure missing: {component}")
     payload_hash = sha256(read(payload))
     payload_size = payload.stat().st_size
     if (feature_payload.get("filename") != payload.name or
@@ -974,18 +1000,30 @@ def add_tts_external_payload(payload: Path, payload_manifest: Path,
         raise SystemExit("ERROR: TTS feature manifest lacks payload/files records")
     required_files = (
         "usr/local/sbin/libreecho-ttsd",
-        "usr/local/share/libreecho/tts/models/alan/model.onnx",
-        "usr/local/share/libreecho/tts/models/alan/tokens.txt",
+        "usr/local/share/libreecho/tts/models/northern-male/model.onnx",
+        "usr/local/share/libreecho/tts/models/northern-male/tokens.txt",
         "usr/local/share/libreecho/tts/models/southern-female/model.onnx",
         "usr/local/share/libreecho/tts/models/southern-female/tokens.txt",
     )
     for required in required_files:
         if required not in feature_files:
             raise SystemExit(f"ERROR: TTS feature member missing: {required}")
-    for voice in ("alan", "southern-female"):
+    for voice in ("northern-male", "southern-female"):
         prefix = f"usr/local/share/libreecho/tts/models/{voice}/espeak-ng-data/"
         if not any(str(relative).startswith(prefix) for relative in feature_files):
             raise SystemExit(f"ERROR: TTS feature lacks eSpeak English data for {voice}")
+    for required_notice in (
+        "usr/local/share/licenses/libreecho-tts/THIRD_PARTY_NOTICES.md",
+        "usr/local/share/licenses/libreecho-tts/NORTHERN-MALE-MODEL-CARD.md",
+        "usr/local/share/licenses/libreecho-tts/SOUTHERN-FEMALE-MODEL-CARD.md",
+        "usr/local/share/licenses/libreecho-tts/CC-BY-SA-4.0.txt",
+        "usr/local/share/licenses/libreecho-tts/runtime/RUNTIME-NOTICES.txt",
+        "usr/local/share/licenses/libreecho-tts/runtime/ONNX-Runtime-MIT.txt",
+        "usr/local/share/licenses/libreecho-tts/runtime/sherpa-onnx-Apache-2.0.txt",
+        "usr/local/share/licenses/libreecho-tts/runtime/SpeexDSP-COPYING.txt",
+    ):
+        if required_notice not in feature_files:
+            raise SystemExit(f"ERROR: TTS feature notice missing: {required_notice}")
     payload_hash = sha256(read(payload))
     payload_size = payload.stat().st_size
     if (feature_payload.get("filename") != payload.name or
@@ -1003,7 +1041,7 @@ def add_tts_external_payload(payload: Path, payload_manifest: Path,
         "activation": "automatic-after-audio-engine",
         "autostart": True,
         "audio_transport": "audiod-to-streamed-announcement-priority-bus",
-        "voices": ["southern-female", "alan"],
+        "voices": ["southern-female", "northern-male"],
         "default_voice": "southern-female",
         "threads": 4,
         "streaming": True,
@@ -1052,6 +1090,10 @@ def add_wakeword_external_payload(payload: Path, payload_manifest: Path,
         "usr/local/share/libreecho/openwakeword/embedding_model.onnx",
         "usr/local/share/libreecho/openwakeword/alexa_v0.1.onnx",
         "usr/local/share/licenses/libreecho-openwakeword/MODEL-LICENSE.txt",
+        "usr/local/share/licenses/libreecho-openwakeword/CC-BY-NC-SA-4.0.txt",
+        "usr/local/share/licenses/libreecho-openwakeword/runtime/RUNTIME-NOTICES.txt",
+        "usr/local/share/licenses/libreecho-openwakeword/runtime/ONNX-Runtime-MIT.txt",
+        "usr/local/share/licenses/libreecho-openwakeword/runtime/SpeexDSP-COPYING.txt",
     )
     for required in required_files:
         if required not in feature_files:
@@ -1159,6 +1201,10 @@ def add_stt_external_payload(payload: Path, payload_manifest: Path,
         "usr/local/share/libreecho/stt/joiner-epoch-99-avg-1.int8.onnx",
         "usr/local/share/libreecho/stt/tokens.txt",
         "usr/local/share/licenses/libreecho-stt-model/MODEL-LICENSE.md",
+        "usr/local/share/licenses/libreecho-stt-runtime/RUNTIME-NOTICES.txt",
+        "usr/local/share/licenses/libreecho-stt-runtime/ONNX-Runtime-MIT.txt",
+        "usr/local/share/licenses/libreecho-stt-runtime/sherpa-onnx-Apache-2.0.txt",
+        "usr/local/share/licenses/libreecho-stt-runtime/SpeexDSP-COPYING.txt",
     )
     payload_hash, payload_size, feature_files = read_external_feature(
         "stt", payload, payload_manifest, required_files
@@ -1196,6 +1242,10 @@ def add_assistant_external_payload(payload: Path, payload_manifest: Path,
         "usr/local/share/libreecho/cacert.pem",
         "usr/local/share/licenses/curl/COPYING",
         "usr/local/share/licenses/ca-certificates/copyright",
+        "usr/local/share/licenses/libreecho-assistant/THIRD_PARTY_NOTICES.txt",
+        "usr/local/share/licenses/libreecho-assistant/OpenSSL-copyright",
+        "usr/local/share/licenses/libreecho-assistant/glibc-copyright",
+        "usr/local/share/licenses/libreecho-assistant/gcc-runtime-copyright",
     )
     payload_hash, payload_size, feature_files = read_external_feature(
         "assistant", payload, payload_manifest, required_files
@@ -1367,6 +1417,10 @@ def validate_stage(stage: Path) -> None:
         "usr/local/libexec/libreecho-update-verify",
         "etc/libreecho/ota-public-key.hex", "etc/libreecho/ota-source.conf",
         "etc/libreecho/image-profile", "etc/libreecho/service-profile",
+        "usr/local/share/licenses/libreecho-core/THIRD_PARTY_NOTICES.md",
+        "usr/local/share/licenses/libreecho-core/COMPONENTS.json",
+        "usr/local/share/licenses/libreecho-core/GPL-2.0-only.txt",
+        "usr/local/share/licenses/libreecho-core/wpa_supplicant-BSD.txt",
     )
     for relative in required:
         if not (stage / relative).exists():

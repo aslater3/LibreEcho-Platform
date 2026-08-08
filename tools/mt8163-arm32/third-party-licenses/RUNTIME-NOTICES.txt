@@ -1,0 +1,21 @@
+LibreEcho static speech/wake runtime notices
+============================================
+
+The feature daemons are LibreEcho-authored integration code linked with the
+following third-party runtimes. Every component remains under its own license.
+Exact source commits and build commands are recorded in release provenance.
+
+- sherpa-onnx — Apache-2.0
+  https://github.com/k2-fsa/sherpa-onnx
+- ONNX Runtime — MIT
+  https://github.com/microsoft/onnxruntime
+- SpeexDSP 1.2.1 — BSD-3-Clause
+  https://gitlab.xiph.org/xiph/speexdsp
+- GNU C Library runtime — LGPL-2.1-or-later
+  https://sourceware.org/git/glibc.git
+- GCC runtime library — GPL-3.0-or-later WITH GCC-exception-3.1
+  https://gcc.gnu.org/git/gcc.git
+
+TTS additionally carries eSpeak NG phonemizer data under GPL-3.0-or-later.
+Model-specific terms, attribution, hashes, and model cards are stored beside
+this runtime notice in each payload.

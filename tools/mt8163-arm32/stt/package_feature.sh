@@ -9,6 +9,8 @@ TOKENS="${5:?usage: package_feature.sh <sttd> <encoder> <decoder> <joiner> <toke
 MODEL_LICENSE="${6:?usage: package_feature.sh <sttd> <encoder> <decoder> <joiner> <tokens> <model-license> <payload> <manifest>}"
 PAYLOAD="${7:?usage: package_feature.sh <sttd> <encoder> <decoder> <joiner> <tokens> <model-license> <payload> <manifest>}"
 MANIFEST="${8:?usage: package_feature.sh <sttd> <encoder> <decoder> <joiner> <tokens> <model-license> <payload> <manifest>}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd -P)"
+COMMON_LICENSE_DIR="$(dirname "$SCRIPT_DIR")/third-party-licenses"
 PIPELINE_ROOT="${LIBREECHO_PIPELINE_ROOT:?ERROR: set LIBREECHO_PIPELINE_ROOT explicitly}"
 PACKAGER="$PIPELINE_ROOT/package_feature_payload.sh"
 
@@ -19,6 +21,10 @@ for input in "$STTD" "$ENCODER" "$DECODER" "$JOINER" "$TOKENS" \
     exit 1
   }
 done
+[[ -d "$COMMON_LICENSE_DIR" && ! -L "$COMMON_LICENSE_DIR" ]] || {
+  echo "ERROR: common speech runtime license bundle is missing" >&2
+  exit 1
+}
 [[ -x "$PACKAGER" ]] || {
   echo "ERROR: feature packager is missing: $PACKAGER" >&2
   exit 1
@@ -61,7 +67,9 @@ root="$(mktemp -d /tmp/libreecho-stt-feature.XXXXXX)"
 trap 'rm -rf "$root"' EXIT
 model_root="$root/usr/local/share/libreecho/stt"
 license_root="$root/usr/local/share/licenses/libreecho-stt-model"
-install -d "$root/usr/local/sbin" "$model_root" "$license_root"
+runtime_license_root="$root/usr/local/share/licenses/libreecho-stt-runtime"
+install -d "$root/usr/local/sbin" "$model_root" "$license_root" \
+  "$runtime_license_root"
 install -m 0755 "$STTD" "$root/usr/local/sbin/libreecho-sttd"
 install -m 0644 "$ENCODER" \
   "$model_root/encoder-epoch-99-avg-1.int8.onnx"
@@ -71,5 +79,12 @@ install -m 0644 "$JOINER" \
   "$model_root/joiner-epoch-99-avg-1.int8.onnx"
 install -m 0644 "$TOKENS" "$model_root/tokens.txt"
 install -m 0644 "$MODEL_LICENSE" "$license_root/MODEL-LICENSE.md"
+for input in "$COMMON_LICENSE_DIR"/*; do
+  [[ -f "$input" && ! -L "$input" ]] || {
+    echo "ERROR: unsafe common runtime license input: $input" >&2
+    exit 1
+  }
+  install -m 0644 "$input" "$runtime_license_root/$(basename "$input")"
+done
 
 "$PACKAGER" stt "$root" "$PAYLOAD" "$MANIFEST"

@@ -1,0 +1,96 @@
+{
+  "components": [
+    {
+      "id": "linux-6.1",
+      "license": "GPL-2.0-only",
+      "source": "https://github.com/aslater3/LibreEcho-Linux-6.1",
+      "version": "source-commit-in-image-manifest"
+    },
+    {
+      "id": "libreecho-platform",
+      "license": "GPL-2.0-only",
+      "source": "https://github.com/aslater3/LibreEcho-Platform",
+      "version": "source-commit-in-image-manifest"
+    },
+    {
+      "id": "libreecho-ui",
+      "license": "MIT",
+      "source": "https://github.com/aslater3/LibreEcho-UI",
+      "version": "source-commit-in-image-manifest"
+    },
+    {
+      "id": "aosp-adbd",
+      "license": "Apache-2.0",
+      "source": "https://android.googlesource.com/platform/system/core/+/4f247d753a8865cd16292ff0b720b72c28049786",
+      "version": "4f247d753a8865cd16292ff0b720b72c28049786"
+    },
+    {
+      "binary_sha256": "d4c8fd2aea01abd851c703f39b29c0de748b2751e4e1a85cae570fa53ad8f4fb",
+      "id": "busybox",
+      "license": "GPL-2.0-only",
+      "packaging_commit": "1e823a60eb85606954b3a5af5f8e5bbd1ea680cf",
+      "source": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/1e823a60eb85606954b3a5af5f8e5bbd1ea680cf/main/busybox",
+      "version": "1.37.0-r30"
+    },
+    {
+      "binary_sha256": "1063871174f1bd4f08f4d330e20b07aeb0820327ee739a4d8d1b644df842cb6b",
+      "id": "musl",
+      "license": "MIT",
+      "source": "https://musl.libc.org/releases/musl-1.2.5.tar.gz",
+      "version": "1.2.5-r21"
+    },
+    {
+      "binary_sha256": "79149bd547351a7e54c97ecf250d339c6a836bca0b1ae9386ae208153d6fff7c",
+      "id": "wpa-supplicant",
+      "license": "BSD-3-Clause",
+      "source": "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz",
+      "version": "2.10"
+    },
+    {
+      "id": "wireless-tools",
+      "license": "GPL-2.0-only",
+      "source": "https://launchpad.net/ubuntu/+source/wireless-tools/30~pre9-16.1ubuntu2",
+      "version": "30~pre9-16.1ubuntu2"
+    },
+    {
+      "id": "wireless-regdb",
+      "license": "ISC",
+      "source": "https://launchpad.net/ubuntu/+source/wireless-regdb/2025.10.07-0ubuntu1~24.04.1",
+      "version": "2025.10.07-0ubuntu1~24.04.1"
+    },
+    {
+      "id": "tinyalsa",
+      "license": "BSD-3-Clause",
+      "source": "https://github.com/tinyalsa/tinyalsa/tree/e43025bbf702eb7dd8edd48c1eb50530c60f1de8",
+      "source_archive_sha256": "dc75977453304fcce0b91cbfd2b27942641c93479f87898d230cdc440a042d4f",
+      "version": "e43025bbf702eb7dd8edd48c1eb50530c60f1de8"
+    },
+    {
+      "id": "libsodium",
+      "license": "ISC",
+      "source": "https://github.com/jedisct1/libsodium/tree/1.0.18",
+      "static_archive_sha256": "71e1dbf00f5bcf91c685ef6ec20c6b482ade70fab91518ee1ef68cbf835fe5b0",
+      "version": "1.0.18"
+    },
+    {
+      "binary_sha256": "77a558bacdaaf9e343f02f2d74f27a5f2bb2dc8b6d66cc2499b60ed14ef62fe6",
+      "id": "mt8163-audio-fpga",
+      "license": "GPL-2.0-only-kernel-distribution",
+      "source": "https://github.com/carlitros900/karnak_3.18.48/commit/5b48c78b249ed9129fe92d30087de25b20152538",
+      "version": "i2s_to_spi_v34"
+    },
+    {
+      "id": "glibc-runtime",
+      "license": "LGPL-2.1-or-later",
+      "source": "https://sourceware.org/git/glibc.git",
+      "version": "exact-build-toolchain-recorded-in-provenance"
+    },
+    {
+      "id": "gcc-runtime",
+      "license": "GPL-3.0-or-later WITH GCC-exception-3.1",
+      "source": "https://gcc.gnu.org/git/gcc.git",
+      "version": "exact-build-toolchain-recorded-in-provenance"
+    }
+  ],
+  "schema_version": 1
+}

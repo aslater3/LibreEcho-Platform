@@ -1,16 +1,27 @@
-LibreEcho development wake-word model notice
-============================================
+LibreEcho public wake-word model notice
+======================================
 
-The bundled alexa_v0.1.onnx model and the shared openWakeWord preprocessing
-models were obtained from dscripka/openWakeWord v0.5.1:
+The bundled alexa_v0.1.onnx model and shared openWakeWord preprocessing models
+were obtained from dscripka/openWakeWord v0.5.1:
 
     https://github.com/dscripka/openWakeWord
 
-The openWakeWord project distributes its bundled pretrained models under
-Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
-(CC BY-NC-SA 4.0). This notice applies to the model files, not to LibreEcho's
-independently implemented runtime integration.
+Exact reviewed model SHA-256 values are enforced by package_feature.sh and
+recorded in the payload manifest.
 
-This is a development payload for private hardware validation. A permissively
-redistributable LibreEcho release must replace alexa_v0.1.onnx with a model
-trained from appropriately licensed data.
+The openWakeWord project distributes these bundled pretrained model files under
+Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+(CC BY-NC-SA 4.0). The model files remain under that license. LibreEcho's
+independently implemented runtime integration is not relicensed by this notice.
+
+Redistribution conditions
+-------------------------
+
+This public payload is provided only for uses permitted by CC BY-NC-SA 4.0.
+Recipients must preserve attribution, indicate modifications, use the model
+noncommercially, and distribute adaptations under the same license. The wake
+model is kept as a separate SquashFS asset so these terms remain explicit and
+do not obscure the licenses of the rest of LibreEcho.
+
+"Alexa" is a trademark of Amazon.com, Inc. The wake-word identifier describes
+model compatibility and does not imply Amazon sponsorship or endorsement.

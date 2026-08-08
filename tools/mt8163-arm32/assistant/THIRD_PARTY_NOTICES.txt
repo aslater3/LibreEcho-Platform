@@ -1,0 +1,17 @@
+LibreEcho assistant payload runtime notices
+===========================================
+
+The assistant payload contains LibreEcho-authored provider-neutral integration
+code, a minimal static curl 8.21.0 HTTPS client, OpenSSL 3.0.13, the Mozilla CA
+certificate bundle dated 2026-06-01, and compiler/runtime support code.
+
+- curl 8.21.0 — curl license; exact COPYING is embedded.
+- OpenSSL 3.0.13 — Apache-2.0; Debian copyright record is embedded.
+- Mozilla CA certificate material — MPL-2.0 and certificate-specific terms;
+  exact Debian copyright record is embedded.
+- GNU C Library runtime — LGPL-2.1-or-later.
+- GCC runtime library — GPL-3.0-or-later WITH GCC-exception-3.1.
+
+Exact source archives, toolchain versions, build commands, and artifact hashes
+are recorded in release provenance and the SPDX SBOM. No provider credential,
+token, account identifier, or endpoint configuration is included.

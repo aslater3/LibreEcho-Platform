@@ -1063,7 +1063,7 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         payload = tts.get("payload")
         if (expected_tts_payload_sha256 is None or expected_tts_payload_size is None or
                 not tts.get("enabled") or not tts.get("external_payload") or
-                tts.get("voices") != ["southern-female", "alan"] or
+                tts.get("voices") != ["southern-female", "northern-male"] or
                 tts.get("default_voice") != "southern-female" or
                 tts.get("threads") != 4 or tts.get("streaming") is not True or
                 tts.get("in_process") is not True or
@@ -1078,17 +1078,29 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
             fail("external TTS payload file manifest is missing")
         for required in (
             "usr/local/sbin/libreecho-ttsd",
-            "usr/local/share/libreecho/tts/models/alan/model.onnx",
-            "usr/local/share/libreecho/tts/models/alan/tokens.txt",
+            "usr/local/share/libreecho/tts/models/northern-male/model.onnx",
+            "usr/local/share/libreecho/tts/models/northern-male/tokens.txt",
             "usr/local/share/libreecho/tts/models/southern-female/model.onnx",
             "usr/local/share/libreecho/tts/models/southern-female/tokens.txt",
         ):
             if required not in files:
                 fail(f"external TTS payload member missing: {required}")
-        for voice in ("alan", "southern-female"):
+        for voice in ("northern-male", "southern-female"):
             prefix = f"usr/local/share/libreecho/tts/models/{voice}/espeak-ng-data/"
             if not any(str(relative).startswith(prefix) for relative in files):
                 fail(f"external TTS payload lacks eSpeak data for {voice}")
+        for required_notice in (
+            "usr/local/share/licenses/libreecho-tts/THIRD_PARTY_NOTICES.md",
+            "usr/local/share/licenses/libreecho-tts/NORTHERN-MALE-MODEL-CARD.md",
+            "usr/local/share/licenses/libreecho-tts/SOUTHERN-FEMALE-MODEL-CARD.md",
+            "usr/local/share/licenses/libreecho-tts/CC-BY-SA-4.0.txt",
+            "usr/local/share/licenses/libreecho-tts/runtime/RUNTIME-NOTICES.txt",
+            "usr/local/share/licenses/libreecho-tts/runtime/ONNX-Runtime-MIT.txt",
+            "usr/local/share/licenses/libreecho-tts/runtime/sherpa-onnx-Apache-2.0.txt",
+            "usr/local/share/licenses/libreecho-tts/runtime/SpeexDSP-COPYING.txt",
+        ):
+            if required_notice not in files:
+                fail(f"external TTS payload notice missing: {required_notice}")
         for relative, record in files.items():
             if (not isinstance(relative, str) or not relative or relative.startswith("/") or
                     "//" in relative or "/../" in f"/{relative}/" or
@@ -1133,6 +1145,10 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
             "usr/local/share/libreecho/openwakeword/embedding_model.onnx",
             "usr/local/share/libreecho/openwakeword/alexa_v0.1.onnx",
             "usr/local/share/licenses/libreecho-openwakeword/MODEL-LICENSE.txt",
+            "usr/local/share/licenses/libreecho-openwakeword/CC-BY-NC-SA-4.0.txt",
+            "usr/local/share/licenses/libreecho-openwakeword/runtime/RUNTIME-NOTICES.txt",
+            "usr/local/share/licenses/libreecho-openwakeword/runtime/ONNX-Runtime-MIT.txt",
+            "usr/local/share/licenses/libreecho-openwakeword/runtime/SpeexDSP-COPYING.txt",
         ):
             if required not in files:
                 fail(f"external wakeword payload member missing: {required}")
@@ -1185,6 +1201,10 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                 "49e3c2646595fd907228b3c6787069658f67b17377c60aeb8619c4551b2316fb",
             "usr/local/share/licenses/libreecho-stt-model/MODEL-LICENSE.md":
                 "505f6b0e8a39f066a0794c4fb0b5689533d3bcd9d1dc5e5f47ccffeef1af9877",
+            "usr/local/share/licenses/libreecho-stt-runtime/RUNTIME-NOTICES.txt": None,
+            "usr/local/share/licenses/libreecho-stt-runtime/ONNX-Runtime-MIT.txt": None,
+            "usr/local/share/licenses/libreecho-stt-runtime/sherpa-onnx-Apache-2.0.txt": None,
+            "usr/local/share/licenses/libreecho-stt-runtime/SpeexDSP-COPYING.txt": None,
         }
         if not isinstance(files, dict) or not files:
             fail("external STT payload file manifest is missing")
@@ -1240,6 +1260,10 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                 "c0c940a0e30d859783f7f130868d8082e79936ff0b41a0b1098ac7f98909263b",
             "usr/local/share/licenses/curl/COPYING": None,
             "usr/local/share/licenses/ca-certificates/copyright": None,
+            "usr/local/share/licenses/libreecho-assistant/THIRD_PARTY_NOTICES.txt": None,
+            "usr/local/share/licenses/libreecho-assistant/OpenSSL-copyright": None,
+            "usr/local/share/licenses/libreecho-assistant/glibc-copyright": None,
+            "usr/local/share/licenses/libreecho-assistant/gcc-runtime-copyright": None,
         }
         if not isinstance(files, dict) or not files:
             fail("external assistant payload file manifest is missing")
@@ -1304,9 +1328,18 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
             "usr/local/sbin/libreecho-audio-engine",
             "usr/local/sbin/shairport-sync",
             "etc/libreecho/airplay2.conf",
+            "usr/local/share/licenses/libreecho-airplay/COMPONENTS.tsv",
         ):
             if required not in files:
                 fail(f"external AirPlay payload member missing: {required}")
+        if not any(str(relative).startswith(
+                "usr/local/share/licenses/libreecho-airplay/debian/") and
+                str(relative).endswith("/copyright") for relative in files):
+            fail("external AirPlay Debian copyright closure is missing")
+        for component in ("nqptp", "shairport-sync", "ffmpeg", "tinyalsa"):
+            prefix = f"usr/local/share/licenses/libreecho-airplay/source/{component}/"
+            if not any(str(relative).startswith(prefix) for relative in files):
+                fail(f"external AirPlay source license closure missing: {component}")
         for relative, record in files.items():
             if (not isinstance(relative, str) or not relative or relative.startswith("/") or
                     "//" in relative or "/../" in f"/{relative}/" or
@@ -1572,6 +1605,20 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         if record != {"sha256": sha256(expected), "size": len(expected), "mode": f"{mode:04o}"}:
             fail(f"overlay manifest mismatch for {name}")
         verified_overlay[name] = entry
+
+    core_license_root = overlay_dir / "usr/local/share/licenses/libreecho-core"
+    core_license_files = sorted(path for path in core_license_root.rglob("*") if path.is_file())
+    if not core_license_files:
+        fail("LibreEcho core license bundle is empty")
+    for source in core_license_files:
+        if source.is_symlink():
+            fail(f"core license input is a symlink: {source}")
+        name = source.relative_to(overlay_dir).as_posix()
+        expected = read(source)
+        require_member(entries, name, sha256(expected), 0o644)
+        record = overlay_manifest.get(name, {})
+        if record != {"sha256": sha256(expected), "size": len(expected), "mode": "0644"}:
+            fail(f"core license overlay manifest mismatch for {name}")
 
     control = verified_overlay["libreecho-init"]
     if init.data != control.data:
