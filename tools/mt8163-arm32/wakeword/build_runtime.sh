@@ -84,14 +84,51 @@ required_ort_archives=(
   libonnxruntime_mlas.a libonnxruntime_util.a
   libonnxruntime_flatbuffers.a libonnxruntime_lora.a
 )
+mkdir -p "$ORT_BUILD"
+# ONNX Runtime filters paths matching */ml/* when excluding its own ML
+# provider sources.  Keep the checkout's logical CMake path outside that
+# pattern; the real source path may legitimately contain an `ml` directory.
+ort_source_for_cmake="$ORT_BUILD/.onnxruntime-source"
+if [[ -e "$ort_source_for_cmake" || -L "$ort_source_for_cmake" ]]; then
+  [[ -L "$ort_source_for_cmake" ]] || {
+    echo "ERROR: refusing to replace non-symlink $ort_source_for_cmake" >&2
+    exit 1
+  }
+  [[ "$(readlink -f "$ort_source_for_cmake")" == "$(readlink -f "$ORT_SOURCE")" ]] || {
+    echo "ERROR: ONNX Runtime source symlink points at an unexpected checkout" >&2
+    exit 1
+  }
+else
+  ln -s -- "$ORT_SOURCE" "$ort_source_for_cmake"
+fi
+if [[ -x /usr/bin/python3 ]]; then
+  ort_python=/usr/bin/python3
+else
+  ort_python="$(command -v python3)"
+fi
+[[ -n "$ort_python" && -x "$ort_python" ]] || {
+  echo "ERROR: no usable host python3 interpreter" >&2
+  exit 1
+}
 ort_ready=1
 for archive in "${required_ort_archives[@]}"; do
   [[ -f "$ORT_BUILD/$archive" ]] || ort_ready=0
 done
+provider_archive="$ORT_BUILD/libonnxruntime_providers.a"
+if [[ "$ort_ready" == 1 ]]; then
+  "${CROSS}nm" -C "$provider_archive" | grep -q 'CPUExecutionProvider::CPUExecutionProvider' || ort_ready=0
+  "${CROSS}nm" -C "$provider_archive" | grep -q 'OrtApis::CreateCpuMemoryInfo' || ort_ready=0
+fi
 if [[ "$ort_ready" != 1 ]]; then
+  [[ "$ORT_BUILD" == */onnxruntime-wake-reduced ]] || {
+    echo "ERROR: refusing to clean an unexpected ONNX Runtime build directory" >&2
+    exit 1
+  }
+  rm -rf -- "$ORT_BUILD"
   mkdir -p "$ORT_BUILD"
+  ln -s -- "$ORT_SOURCE" "$ort_source_for_cmake"
   PYTHONPATH="$FLATBUFFERS_PYTHON:$ORT_SOURCE/tools/ci_build${PYTHONPATH:+:$PYTHONPATH}" \
-    python3 - "$OPS_CONFIG" "$ORT_BUILD" <<'PY'
+    "$ort_python" - "$OPS_CONFIG" "$ORT_BUILD" <<'PY'
 import sys
 from reduce_op_kernels import reduce_ops
 
@@ -103,7 +140,8 @@ reduce_ops(
     is_extended_minimal_build_or_higher=True,
 )
 PY
-  cmake -S "$ORT_SOURCE/cmake" -B "$ORT_BUILD" \
+  cmake -S "$ort_source_for_cmake/cmake" -B "$ORT_BUILD" \
+    -DPython_EXECUTABLE="$ort_python" \
     -DCMAKE_BUILD_TYPE=MinSizeRel \
     -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=arm \
     -DCMAKE_C_COMPILER="${CROSS}gcc" \
