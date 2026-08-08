@@ -18,6 +18,8 @@ AUDIO_ENGINE_SOURCE=${LIBREECHO_AUDIO_ENGINE_SOURCE:-$SCRIPT_DIR/audio_engine.c}
 AUDIO_VISUALIZER_SOURCE=${LIBREECHO_AUDIO_VISUALIZER_SOURCE:-$SCRIPT_DIR/audio_visualizer.c}
 PLAYBACK_STATUS_SOURCE=${LIBREECHO_PLAYBACK_STATUS_SOURCE:-$SCRIPT_DIR/playback_status.c}
 AEC_REFERENCE_SOURCE=${LIBREECHO_AEC_REFERENCE_SOURCE:-$SCRIPT_DIR/aec_reference.c}
+python3 "$SCRIPT_DIR/test_audio_engine_contract.py"
+python3 "$SCRIPT_DIR/test_airplay_volume_contract.py"
 
 for archive in "$NQPTP_ARCHIVE" "$SHAIRPORT_ARCHIVE" "$FFMPEG_ARCHIVE" "$TINYALSA_ARCHIVE"; do
     [[ -f "$archive" ]] || { echo "ERROR: AirPlay source archive is missing: $archive" >&2; exit 1; }
