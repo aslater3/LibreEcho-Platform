@@ -1,6 +1,8 @@
 # Repository boundary
 
-`LibreEcho-Kernel` is the ARM32 product-tooling repository. It contains the
+`LibreEcho-Platform` is the ARM32 product-tooling repository. The local checkout
+may retain the historical `LibreEcho-Kernel/` directory name during migration.
+It contains the
 initramfs, feature payload packaging, OTA verification, and release workflow.
 Its historical Linux 3.18 tree remains for compatibility and is not the current
 kernel source of truth.
