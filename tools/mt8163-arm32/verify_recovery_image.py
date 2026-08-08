@@ -10,9 +10,14 @@ import json
 import re
 import stat
 import struct
+import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import cast
+
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from generate_boot_envelope import generate as generate_boot_envelope
 
 
 ANDROID_MAGIC = b"ANDROID!"
@@ -40,6 +45,7 @@ CONNECTIVITY_EVIDENCE_MANIFEST_SHA256 = "d1eedd04efe0dbc78853f2b0f9357c092b4ca66
 BUSYBOX_SHA256 = "d4c8fd2aea01abd851c703f39b29c0de748b2751e4e1a85cae570fa53ad8f4fb"
 LOADER_SHA256 = "1063871174f1bd4f08f4d330e20b07aeb0820327ee739a4d8d1b644df842cb6b"
 INIT_SHA256 = "a83bd870e174806f3ff0f7f35564b0592f0e8bfa28b3b16b9f4122d851922a22"
+BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
     "profile": 0o644,
@@ -1707,6 +1713,8 @@ def main() -> None:
     schema_version = manifest_schema(manifest)
     if len(envelope) != IMAGE_SIZE or envelope[:8] != ANDROID_MAGIC:
         fail("generated boot envelope is not an exact 16 MiB Android v0 envelope")
+    if envelope != generate_boot_envelope() or sha256(envelope) != BOOT_ENVELOPE_SHA256:
+        fail("boot envelope is not the canonical generated template")
     if sha256(zimage) != args.expected_zimage_sha256:
         fail("zImage hash mismatch")
     if sha256(system_map) != args.expected_system_map_sha256:

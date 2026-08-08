@@ -12,8 +12,13 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
+
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from generate_boot_envelope import generate as generate_boot_envelope
 
 
 ANDROID_MAGIC = b"ANDROID!"
@@ -37,6 +42,7 @@ STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57
 BUSYBOX_SHA256 = "d4c8fd2aea01abd851c703f39b29c0de748b2751e4e1a85cae570fa53ad8f4fb"
 MUSL_LOADER_SHA256 = "1063871174f1bd4f08f4d330e20b07aeb0820327ee739a4d8d1b644df842cb6b"
 RECOVERY_INIT_SHA256 = "a83bd870e174806f3ff0f7f35564b0592f0e8bfa28b3b16b9f4122d851922a22"
+BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
 CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
@@ -1892,6 +1898,11 @@ def main() -> None:
         )
 
     envelope = read(args.boot_envelope)
+    canonical_envelope = generate_boot_envelope()
+    if envelope != canonical_envelope:
+        raise SystemExit("ERROR: supplied boot envelope is not the canonical generated envelope")
+    if sha256(envelope) != BOOT_ENVELOPE_SHA256:
+        raise SystemExit("ERROR: canonical boot envelope digest changed")
     zimage = read(args.zimage)
     require_hash("ARM32 zImage", zimage, args.expected_zimage_sha256)
     system_map = read(args.system_map)

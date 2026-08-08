@@ -315,7 +315,12 @@ else
 fi
 VENDOR_ASSETS_OK=0
 if [ "${DATA_CLEANUP_OK:-0}" -eq 1 ] &&
-        [ -x /usr/local/sbin/libreecho-vendor-import ]; then
+        [ -x /usr/local/sbin/libreecho-vendor-import ] &&
+        [ -x /sbin/wmt_configure ] &&
+        [ -x /sbin/wmt_responder ] &&
+        [ -x /sbin/wmt_bt_on ] &&
+        [ -x /sbin/wmt_stock_compat ] &&
+        [ -x /sbin/wmt_launcher ]; then
     if DATA_ROOT=/data /usr/local/sbin/libreecho-vendor-import \
             >/tmp/vendor-import.log 2>&1; then
         VENDOR_ASSETS_OK=1

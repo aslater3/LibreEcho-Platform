@@ -43,7 +43,7 @@ expected_commit=$(awk -F= '$1 == "source_commit" {print $2}' "$(dirname "$0")/SO
   printf 'ERROR: adbd source commit mismatch: expected=%s actual=%s\n' "$expected_commit" "$source_commit" >&2
   exit 1
 }
-[[ -z "$(git -C "$SOURCE" status --porcelain -- adb include libmincrypt)" ]] || {
+[[ -z "$(git -C "$SOURCE" status --porcelain -- adb include libcutils libmincrypt)" ]] || {
   printf 'ERROR: adbd source checkout is dirty\n' >&2
   exit 1
 }
