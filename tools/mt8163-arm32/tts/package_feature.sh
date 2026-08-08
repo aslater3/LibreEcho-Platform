@@ -8,7 +8,7 @@ TOKENS="${4:?usage: package_feature.sh <ttsd> <alan-model> <female-model> <token
 ESPEAK_DATA="${5:?usage: package_feature.sh <ttsd> <alan-model> <female-model> <tokens> <espeak-data> <payload> <manifest>}"
 PAYLOAD="${6:?usage: package_feature.sh <ttsd> <alan-model> <female-model> <tokens> <espeak-data> <payload> <manifest>}"
 MANIFEST="${7:?usage: package_feature.sh <ttsd> <alan-model> <female-model> <tokens> <espeak-data> <payload> <manifest>}"
-PIPELINE_ROOT="$(cd -- "$(dirname -- "$0")/../../../../pipeline" && pwd -P)"
+PIPELINE_ROOT="${LIBREECHO_PIPELINE_ROOT:?ERROR: set LIBREECHO_PIPELINE_ROOT explicitly}"
 PACKAGER="$PIPELINE_ROOT/package_feature_payload.sh"
 
 for input in "$TTSD" "$ALAN_MODEL" "$FEMALE_MODEL" "$TOKENS"; do

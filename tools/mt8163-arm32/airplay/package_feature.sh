@@ -5,7 +5,7 @@ AIRPLAY_OUTPUT="${1:?usage: package_feature.sh <airplay-build-output> <ui-bundle
 UI_BUNDLE="${2:?usage: package_feature.sh <airplay-build-output> <ui-bundle> <payload> <manifest>}"
 PAYLOAD="${3:?usage: package_feature.sh <airplay-build-output> <ui-bundle> <payload> <manifest>}"
 MANIFEST="${4:?usage: package_feature.sh <airplay-build-output> <ui-bundle> <payload> <manifest>}"
-PIPELINE_ROOT="$(cd -- "$(dirname -- "$0")/../../../../pipeline" && pwd -P)"
+PIPELINE_ROOT="${LIBREECHO_PIPELINE_ROOT:?ERROR: set LIBREECHO_PIPELINE_ROOT explicitly}"
 PACKAGER="$PIPELINE_ROOT/package_feature_payload.sh"
 
 [[ -x "$PACKAGER" ]] || { echo "ERROR: feature packager is missing: $PACKAGER" >&2; exit 1; }

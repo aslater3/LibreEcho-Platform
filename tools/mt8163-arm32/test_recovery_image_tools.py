@@ -8,6 +8,7 @@ import hashlib
 import os
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -35,6 +36,16 @@ def pipeline_file(name: str) -> Path:
     path = Path(pipeline_root) / name
     if not path.is_file():
         raise unittest.SkipTest(f"canonical pipeline unavailable: {path}")
+    return path
+
+
+def kernel_source_file(relative: str) -> Path:
+    kernel_root = os.environ.get("LIBREECHO_KERNEL_SRC")
+    if not kernel_root:
+        raise unittest.SkipTest("set LIBREECHO_KERNEL_SRC for kernel contract tests")
+    path = Path(kernel_root) / relative
+    if not path.is_file():
+        raise unittest.SkipTest(f"kernel source unavailable: {path}")
     return path
 
 
@@ -140,6 +151,82 @@ class SymlinkTests(unittest.TestCase):
 
 
 class SourceTests(unittest.TestCase):
+    @staticmethod
+    def vendor_import_fixture(
+            root: Path, source_symlink_component: str | None = None
+    ) -> tuple[Path, Path, Path, Path, dict[str, str], tuple[tuple[str, str, bytes], ...]]:
+        importer = TOOLS_DIR / "initramfs/libreecho-vendor-import"
+        data = root / "data"
+        source = root / "system-a"
+        firmware = root / "firmware"
+        data.mkdir()
+        firmware.mkdir()
+        records = (
+            ("system/vendor/firmware/ROMv2_lm_patch_1_0_hdr.bin", "ROMv2_lm_patch_1_0_hdr.bin", b"patch-zero"),
+            ("system/vendor/firmware/ROMv2_lm_patch_1_1_hdr.bin", "ROMv2_lm_patch_1_1_hdr.bin", b"patch-one"),
+            ("system/vendor/firmware/WIFI_RAM_CODE_8163", "WIFI_RAM_CODE_8163", b"wifi-code"),
+            ("system/vendor/firmware/WMT_SOC.cfg", "WMT_SOC.cfg", b"wmt-config"),
+        )
+        if source_symlink_component == "system":
+            outside = root / "outside-system"
+            payload_root = outside / "vendor/firmware"
+            payload_root.mkdir(parents=True)
+            source.mkdir()
+            (source / "system").symlink_to(outside, target_is_directory=True)
+        elif source_symlink_component == "vendor":
+            outside = root / "outside-vendor"
+            payload_root = outside / "firmware"
+            payload_root.mkdir(parents=True)
+            (source / "system").mkdir(parents=True)
+            (source / "system/vendor").symlink_to(outside, target_is_directory=True)
+        elif source_symlink_component == "firmware":
+            outside = root / "outside-firmware"
+            outside.mkdir()
+            (source / "system/vendor").mkdir(parents=True)
+            (source / "system/vendor/firmware").symlink_to(
+                outside, target_is_directory=True
+            )
+            payload_root = outside
+        elif source_symlink_component is None:
+            payload_root = source / "system/vendor/firmware"
+            payload_root.mkdir(parents=True)
+        else:
+            raise ValueError(f"unsupported source symlink component: {source_symlink_component}")
+        lines = []
+        for source_name, target_name, payload in records:
+            (payload_root / Path(source_name).name).write_bytes(payload)
+            lines.append(
+                f"{hashlib.sha256(payload).hexdigest()}|{len(payload)}|"
+                f"{source_name}|{target_name}\n"
+            )
+        specification = root / "assets.tsv"
+        specification.write_text("".join(lines))
+        environment = {
+            **os.environ,
+            "LIBREECHO_VENDOR_TEST_MODE": "1",
+            "DATA_ROOT": str(data),
+            "LIBREECHO_VENDOR_SOURCE_ROOT": str(source),
+            "LIBREECHO_VENDOR_FIRMWARE_ROOT": str(firmware),
+            "LIBREECHO_VENDOR_SPEC": str(specification),
+            "LIBREECHO_VENDOR_STAGE_PARENT": str(root / "vendor-stage"),
+        }
+        return importer, data, source, firmware, environment, records
+
+    def test_release_tools_cannot_bundle_startup_audio(self) -> None:
+        for name in ("build_recovery_image.py", "verify_recovery_image.py"):
+            source = (TOOLS_DIR / name).read_text()
+            with self.subTest(name=name):
+                self.assertNotIn("windows95", source.lower())
+                self.assertNotIn("startup_audio", source)
+                self.assertNotIn("startup_playback", source)
+                self.assertNotIn("--startup-audio", source)
+
+        pipeline_root = pipeline_file("build.sh").parent
+        self.assertFalse((pipeline_root / "inputs/windows95-startup.wav").exists())
+        self.assertNotIn(
+            "windows95", (pipeline_root / "inputs/SHA256SUMS").read_text().lower()
+        )
+
     def test_pinned_source_rejects_symlink_components(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -161,6 +248,318 @@ class SourceTests(unittest.TestCase):
             for relative in ("../file", "/file", "a//file", "a/./file"):
                 with self.subTest(relative=relative), self.assertRaises(SystemExit):
                     builder.pinned_source(root, relative, "test")
+
+    def test_vendor_firmware_is_locally_imported_runtime_only(self) -> None:
+        importer = TOOLS_DIR / "initramfs/libreecho-vendor-import"
+        specification = (
+            TOOLS_DIR / "initramfs/vendor-assets/mt8163-v181-stock-v1.tsv"
+        )
+        self.assertTrue(importer.is_file())
+        self.assertTrue(specification.is_file())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data = root / "data"
+            source = root / "system-a"
+            firmware = root / "firmware"
+            data.mkdir()
+            firmware.mkdir()
+            records = (
+                ("system/vendor/firmware/ROMv2_lm_patch_1_0_hdr.bin", "ROMv2_lm_patch_1_0_hdr.bin", b"patch-zero"),
+                ("system/vendor/firmware/ROMv2_lm_patch_1_1_hdr.bin", "ROMv2_lm_patch_1_1_hdr.bin", b"patch-one"),
+                ("system/vendor/firmware/WIFI_RAM_CODE_8163", "WIFI_RAM_CODE_8163", b"wifi-code"),
+                ("system/vendor/firmware/WMT_SOC.cfg", "WMT_SOC.cfg", b"wmt-config"),
+            )
+            spec = root / "assets.tsv"
+            lines = []
+            for source_name, target_name, payload in records:
+                source_path = source / source_name
+                source_path.parent.mkdir(parents=True, exist_ok=True)
+                source_path.write_bytes(payload)
+                lines.append(
+                    f"{hashlib.sha256(payload).hexdigest()}|{len(payload)}|"
+                    f"{source_name}|{target_name}\n"
+                )
+            spec.write_text("".join(lines))
+            environment = {
+                **os.environ,
+                "LIBREECHO_VENDOR_TEST_MODE": "1",
+                "DATA_ROOT": str(data),
+                "LIBREECHO_VENDOR_SOURCE_ROOT": str(source),
+                "LIBREECHO_VENDOR_FIRMWARE_ROOT": str(firmware),
+                "LIBREECHO_VENDOR_SPEC": str(spec),
+                "LIBREECHO_VENDOR_STAGE_PARENT": str(root / "vendor-stage"),
+            }
+
+            first = subprocess.run(
+                ["/bin/sh", str(importer)], env=environment,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            for _source_name, target_name, payload in records:
+                self.assertEqual((firmware / target_name).read_bytes(), payload)
+                self.assertFalse((firmware / target_name).is_symlink())
+            self.assertEqual((firmware / "WIFI_RAM_CODE").read_bytes(), b"wifi-code")
+            self.assertFalse((firmware / "WIFI_RAM_CODE").is_symlink())
+            for _source_name, target_name, _payload in records:
+                self.assertEqual(stat.S_IMODE((firmware / target_name).stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE((firmware / "WIFI_RAM_CODE").stat().st_mode), 0o600)
+            self.assertFalse((data / "libreecho/vendor").exists())
+            self.assertFalse(Path(environment["LIBREECHO_VENDOR_STAGE_PARENT"]).exists())
+
+            legacy_cache = data / "libreecho/vendor/mt8163-v181-stock-v1"
+            legacy_cache.mkdir(parents=True)
+            (legacy_cache / "WMT_SOC.cfg").write_bytes(b"legacy-generated-cache")
+            cleanup = subprocess.run(
+                ["/bin/sh", str(TOOLS_DIR / "initramfs/libreecho-data-cleanup")],
+                env={**os.environ, "LIBREECHO_DATA_TEST_MODE": "1", "DATA_ROOT": str(data)},
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(cleanup.returncode, 0, cleanup.stdout + cleanup.stderr)
+            self.assertFalse((data / "libreecho/vendor").exists())
+
+            # Runtime-only delivery must depend on the owner's source partition
+            # again after every reboot; no reusable vendor bytes remain in /data.
+            subprocess.run(["rm", "-rf", str(source)], check=True)
+            subprocess.run(["rm", "-rf", str(firmware)], check=True)
+            firmware.mkdir()
+            second = subprocess.run(
+                ["/bin/sh", str(importer)], env=environment,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(second.returncode, 0)
+            self.assertFalse((firmware / "WIFI_RAM_CODE").exists())
+
+    def test_vendor_import_rejects_symlinked_transient_stage_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            importer, _data, _source, firmware, environment, _records = (
+                self.vendor_import_fixture(root)
+            )
+            stage_parent = Path(environment["LIBREECHO_VENDOR_STAGE_PARENT"])
+            outside = root / "outside-stage"
+            outside.mkdir()
+            stage_parent.symlink_to(outside, target_is_directory=True)
+
+            imported = subprocess.run(
+                ["/bin/sh", str(importer)], env=environment,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(imported.returncode, 0)
+            self.assertIn("VENDOR_IMPORT_STAGE_PATH_SYMLINK", imported.stderr)
+            self.assertFalse((firmware / "WIFI_RAM_CODE").exists())
+
+    def test_vendor_import_rejects_symlinked_stock_source_parent(self) -> None:
+        for component in ("system", "vendor", "firmware"):
+            with self.subTest(component=component), tempfile.TemporaryDirectory() as temporary:
+                importer, _data, _source, firmware, environment, _records = (
+                    self.vendor_import_fixture(
+                        Path(temporary), source_symlink_component=component
+                    )
+                )
+                imported = subprocess.run(
+                    ["/bin/sh", str(importer)], env=environment,
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                self.assertNotEqual(imported.returncode, 0)
+                self.assertIn("VENDOR_IMPORT_SOURCE_PATH_SYMLINK", imported.stderr)
+                self.assertFalse((firmware / "WIFI_RAM_CODE").exists())
+
+    def test_vendor_import_rejects_insecure_existing_modes(self) -> None:
+        cases = (
+            ("runtime-file", "runtime-file", 0o644, "VENDOR_IMPORT_RUNTIME_MODE_MISMATCH"),
+            ("runtime-alias", "runtime-alias", 0o644, "VENDOR_IMPORT_RUNTIME_MODE_MISMATCH"),
+        )
+        for label, target_kind, insecure_mode, expected_error in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                importer, _data, _source, firmware, environment, _records = (
+                    self.vendor_import_fixture(root)
+                )
+                first = subprocess.run(
+                    ["/bin/sh", str(importer)], env=environment,
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+                targets = {
+                    "runtime-file": firmware / "WMT_SOC.cfg",
+                    "runtime-alias": firmware / "WIFI_RAM_CODE",
+                }
+                targets[target_kind].chmod(insecure_mode)
+                reused = subprocess.run(
+                    ["/bin/sh", str(importer)], env=environment,
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                self.assertNotEqual(reused.returncode, 0)
+                self.assertIn(expected_error, reused.stderr)
+
+    def test_imported_wifi_firmware_reaches_kernel_literal_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            stage = Path(temporary)
+            (stage / "etc").mkdir()
+            (stage / "lib/firmware").mkdir(parents=True)
+            wifi = stage / "lib/firmware/WIFI_RAM_CODE"
+            wifi.write_bytes(b"wifi-code")
+
+            symlinks = builder.add_connectivity_runtime_symlinks(stage)
+
+            compatibility_root = stage / "etc/firmware"
+            self.assertTrue(compatibility_root.is_symlink())
+            self.assertEqual(os.readlink(compatibility_root), "../lib/firmware")
+            self.assertEqual((compatibility_root / "WIFI_RAM_CODE").read_bytes(), b"wifi-code")
+            self.assertEqual(symlinks, {"etc/firmware": "../lib/firmware"})
+
+    def test_vendor_import_precedes_wmt_and_wifi_activation(self) -> None:
+        source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        userdata = source.index("if userdata_mount; then")
+        vendor_import = source.index("/usr/local/sbin/libreecho-vendor-import", userdata)
+        vendor_ready = source.index("log vendor-assets-ready", vendor_import)
+        wmt_nodes = source.index("log wmt-nodes-created", vendor_ready)
+        activation_definition = source.index("\nstart_wifi_network()\n", wmt_nodes)
+        activation_end = source.index("\n}\n", activation_definition)
+        vendor_gate = source.index(
+            'if [ "${VENDOR_ASSETS_OK:-0}" -ne 1 ]; then', activation_definition
+        )
+        sequence_call = source.index("\n    start_wifi_network_sequence\n", vendor_gate)
+        startup_call = source.index("\n    start_wifi_network &\n", activation_end)
+        self.assertLess(userdata, vendor_import)
+        self.assertLess(vendor_import, vendor_ready)
+        self.assertLess(vendor_ready, wmt_nodes)
+        self.assertLess(wmt_nodes, activation_definition)
+        self.assertLess(activation_definition, vendor_gate)
+        self.assertLess(vendor_gate, sequence_call)
+        self.assertLess(sequence_call, activation_end)
+        self.assertLess(activation_end, startup_call)
+
+    def test_wifi_runtime_contract_matches_kernel_source(self) -> None:
+        driver = kernel_source_file(
+            "drivers/misc/mediatek/mt8163-connectivity/conn_soc/drv_wlan/"
+            "mt_wifi/wlan/os/linux/gl_kal.c"
+        ).read_text()
+        config = kernel_source_file(
+            "drivers/misc/mediatek/mt8163-connectivity/conn_soc/drv_wlan/"
+            "mt_wifi/wlan/include/config.h"
+        ).read_text()
+        wmt = kernel_source_file(
+            "drivers/misc/mediatek/mt8163-connectivity/conn_soc/common/linux/pri/"
+            "wmt_dev.c"
+        ).read_text()
+        importer = (TOOLS_DIR / "initramfs/libreecho-vendor-import").read_text()
+
+        self.assertIn('#define CFG_FW_FILENAME             "WIFI_RAM_CODE"', config)
+        self.assertIn(
+            'filp_open("/etc/firmware/" CFG_FW_FILENAME, O_RDONLY, 0)', driver
+        )
+        self.assertIn("wifi_source=$STAGE/WIFI_RAM_CODE_8163", importer)
+        self.assertIn("alias=$FIRMWARE_ROOT/WIFI_RAM_CODE", importer)
+
+        open_start = wmt.index("static int WMT_open(")
+        open_end = wmt.index("\n}\n", open_start)
+        init_start = wmt.index("static int WMT_init(")
+        init_end = wmt.index("\n}\n", init_start)
+        userspace_start = wmt.index("static INT32 wmt_userspace_init(void)\n{")
+        userspace_end = wmt.index("\n}\n", userspace_start)
+        self.assertIn("wmt_userspace_init();", wmt[open_start:open_end])
+        self.assertNotIn("wmt_lib_init();", wmt[init_start:init_end])
+        self.assertIn("wmt_lib_init();", wmt[userspace_start:userspace_end])
+
+    def test_pipeline_contains_no_stock_connectivity_root(self) -> None:
+        pipeline_root = pipeline_file("build.sh").parent
+        source = (pipeline_root / "build.sh").read_text()
+        self.assertNotIn("stock-root-v181", source)
+        self.assertNotIn("--connectivity-stock-root", source)
+        self.assertFalse((pipeline_root / "inputs/stock-root-v181").exists())
+
+    def test_feature_packagers_require_explicit_pipeline_root(self) -> None:
+        for feature in ("airplay", "assistant", "tts", "wakeword", "stt"):
+            source = (TOOLS_DIR / feature / "package_feature.sh").read_text()
+            with self.subTest(feature=feature):
+                self.assertIn("LIBREECHO_PIPELINE_ROOT", source)
+                self.assertNotIn("../../../../pipeline", source)
+
+    def test_stock_userspace_is_replaced_by_source_built_adbd(self) -> None:
+        builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        for dead_name in (
+            "sepolicy", "file_contexts.bin", "property_contexts",
+            "service_contexts", "seapp_contexts", "selinux_version",
+            "ueventd.rc", "ueventd.mt8163.rc",
+        ):
+            self.assertNotIn(dead_name, builder_source)
+            self.assertNotIn(dead_name, verifier_source)
+        self.assertNotIn("STOCK_FILES", builder_source)
+        self.assertIn("copy_adbd", builder_source)
+        self.assertIn('"source_license"', builder_source)
+        self.assertIn("stock_userspace", verifier_source)
+
+    def test_adbd_is_source_built_and_notice_bound(self) -> None:
+        adbd_dir = TOOLS_DIR / "adbd"
+        builder = adbd_dir / "build_adbd.sh"
+        notice = adbd_dir / "NOTICE"
+        source_lock = adbd_dir / "SOURCE.lock"
+        self.assertTrue(builder.is_file())
+        self.assertTrue(notice.is_file())
+        self.assertTrue(source_lock.is_file())
+        builder_text = builder.read_text()
+        self.assertIn("ADBD_SOURCE", builder_text)
+        self.assertIn("ADBD_SOURCE_COMMIT", builder_text)
+        self.assertIn("-DADB_HOST=0", builder_text)
+        self.assertIn("-DALLOW_ADBD_ROOT=1", builder_text)
+        self.assertIn("-static", builder_text)
+        self.assertIn("-ffile-prefix-map=", builder_text)
+        self.assertIn("-fdebug-prefix-map=", builder_text)
+        self.assertIn("--kernel-headers", builder_text)
+        self.assertIn("--test-ffs-root", builder_text)
+        self.assertIn("libreecho-adbd-compat.h", builder_text)
+        self.assertTrue((adbd_dir / "compat/libreecho-adbd-compat.h").is_file())
+        self.assertNotIn("stock-root", builder_text)
+        self.assertIn("Apache License", notice.read_text())
+        self.assertIn("source_commit=", source_lock.read_text())
+
+    def test_pipeline_builds_adbd_without_stock_root(self) -> None:
+        pipeline_root = pipeline_file("build.sh").parent
+        source = (pipeline_root / "build.sh").read_text()
+        self.assertIn("ADBD_BUILDER", source)
+        self.assertIn("--adbd", source)
+        self.assertIn("LIBREECHO_ADBD_KERNEL_HEADERS", source)
+        self.assertIn("LIBREECHO_KERNEL_ZIMAGE_OVERRIDE", source)
+        self.assertIn("LIBREECHO_AIRPLAY_PAYLOAD_OVERRIDE", source)
+        self.assertIn("adopt_feature_payload", source)
+        self.assertNotIn('"$INPUTS/stock-root-v184"', source)
+        self.assertNotIn("--stock-root", source)
+
+    def test_boot_envelope_is_generated_without_stock_input(self) -> None:
+        generator = TOOLS_DIR / "generate_boot_envelope.py"
+        builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        pipeline = pipeline_text("build.sh")
+        self.assertTrue(generator.is_file())
+        self.assertIn("--boot-envelope", builder)
+        self.assertIn("--boot-envelope", verifier)
+        self.assertIn("generate_boot_envelope.py", pipeline)
+        self.assertNotIn("stock-boot-v184.img", pipeline)
+        self.assertNotIn("--source-boot", builder)
+        self.assertNotIn("--source-boot", verifier)
+
+    def test_connectivity_image_contains_requirements_not_vendor_bytes(self) -> None:
+        builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        init_source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        for source in (builder_source, verifier_source):
+            self.assertNotIn("CONNECTIVITY_STOCK_FILES", source)
+            self.assertNotIn("connectivity-stock-root", source)
+            self.assertNotIn("system/vendor/bin/wmt_loader", source)
+            self.assertNotIn("system/vendor/bin/wmt_launcher", source)
+        self.assertNotIn("system/bin/linker", builder_source)
+        self.assertIn("stock Android connectivity userspace remains embedded", verifier_source)
+        self.assertIn('"vendor_delivery": "owner-device-local-extraction"', builder_source)
+        self.assertIn("embedded_vendor_file_count", builder_source)
+        self.assertIn("libreecho-vendor-import", init_source)
+        self.assertIn("VENDOR_ASSETS_OK", init_source)
+        self.assertLess(
+            init_source.index("libreecho-vendor-import"),
+            init_source.index("start_wifi_network_sequence"),
+        )
 
     def test_audio_tools_are_pinned_and_gpu_input_wait_is_interruptible(self) -> None:
         tools = TOOLS_DIR / "audio-tools"
@@ -352,26 +751,97 @@ class SourceTests(unittest.TestCase):
                 builder.read_ssh_password_hash(valid)
 
 
-class PatchRouteContractTests(unittest.TestCase):
-    def test_stock_route_contract_is_shared_and_decodes_exactly(self) -> None:
+class VendorAssetContractTests(unittest.TestCase):
+    def test_local_asset_contract_is_shared_and_contains_no_payload(self) -> None:
         expected = {
-            "lib/firmware/ROMv2_lm_patch_1_0_hdr.bin": (
-                bytes.fromhex("8a00"), bytes.fromhex("22000600"), 2,
-                bytes.fromhex("00000600"),
+            "ROMv2_lm_patch_1_0_hdr.bin": {
+                "source": "system/vendor/firmware/ROMv2_lm_patch_1_0_hdr.bin",
+                "mode": 0o644, "size": 128720,
+                "sha256": "b4460117f51a43f3284594ec08d8c8861ecc0e42b17820987da03ecabdebac1e",
+            },
+            "ROMv2_lm_patch_1_1_hdr.bin": {
+                "source": "system/vendor/firmware/ROMv2_lm_patch_1_1_hdr.bin",
+                "mode": 0o644, "size": 50148,
+                "sha256": "10c4ed22a10b8a136bffd7ffce4d552300d76f8e593627d2a9841c3b11a5697e",
+            },
+            "WIFI_RAM_CODE_8163": {
+                "source": "system/vendor/firmware/WIFI_RAM_CODE_8163",
+                "mode": 0o644, "size": 373840,
+                "sha256": "9669cc9b03cfdc5e8fd4fd6e14c4c4050e8c196738ca4707eea12f14a6a8e64c",
+            },
+            "WMT_SOC.cfg": {
+                "source": "system/vendor/firmware/WMT_SOC.cfg",
+                "mode": 0o644, "size": 119,
+                "sha256": "302bd4462de99c028c04092e561c1500d65582ce42a93c4c72ccae6e2c99013d",
+            },
+        }
+        verifier_expected = {
+            name: {key: value for key, value in record.items() if key != "mode"}
+            for name, record in expected.items()
+        }
+        self.assertEqual(builder.CONNECTIVITY_ASSET_REQUIREMENTS, expected)
+        self.assertEqual(verifier.CONNECTIVITY_ASSET_REQUIREMENTS, verifier_expected)
+        specification = TOOLS_DIR / "initramfs/vendor-assets/mt8163-v181-stock-v1.tsv"
+        expected_text = "".join(
+            f"{record['sha256']}|{record['size']}|{record['source']}|{name}\n"
+            for name, record in expected.items()
+        )
+        self.assertEqual(specification.read_text(), expected_text)
+
+    def test_vendor_importer_is_externally_pinned(self) -> None:
+        importer = TOOLS_DIR / "initramfs/libreecho-vendor-import"
+        actual = hashlib.sha256(importer.read_bytes()).hexdigest()
+        self.assertEqual(builder.CONNECTIVITY_IMPORTER_SHA256, actual)
+        self.assertEqual(verifier.CONNECTIVITY_IMPORTER_SHA256, actual)
+
+    def test_vendor_firmware_policy_documents_no_redistribution(self) -> None:
+        policy = TOOLS_DIR / "initramfs/vendor-assets/README.md"
+        text = policy.read_text()
+        self.assertIn("not distributed", text)
+        self.assertIn("does not grant redistribution rights", text)
+        self.assertIn("read-only system_a", text)
+
+    def test_verifier_requires_wlan_firmware_compatibility_path(self) -> None:
+        expected = {"etc/firmware": "../lib/firmware"}
+        entries = {
+            "etc": verifier.Entry("etc", stat.S_IFDIR | 0o755, 0, 0, 0, b""),
+            "etc/firmware": verifier.Entry(
+                "etc/firmware", stat.S_IFLNK | 0o777, 0, 0, 0, b"../lib/firmware"
             ),
-            "lib/firmware/ROMv2_lm_patch_1_1_hdr.bin": (
-                bytes.fromhex("8a00"), bytes.fromhex("21000ef0"), 1,
-                bytes.fromhex("00000ef0"),
+            "lib": verifier.Entry("lib", stat.S_IFDIR | 0o755, 0, 0, 0, b""),
+            "lib/firmware": verifier.Entry(
+                "lib/firmware", stat.S_IFDIR | 0o755, 0, 0, 0, b""
             ),
         }
-        self.assertEqual(builder.CONNECTIVITY_PATCH_ROUTES, expected)
-        self.assertEqual(verifier.CONNECTIVITY_PATCH_ROUTES, expected)
-        for _name, (_header, route, sequence, address) in expected.items():
-            self.assertEqual(route[0] >> 4, 2)
-            self.assertEqual(route[0] & 0x0F, sequence)
-            self.assertEqual(b"\0" + route[1:], address)
+        verifier.validate_connectivity_runtime_symlinks(entries, {"symlinks": expected})
 
-    def test_route_manifest_rejects_boolean_sequence(self) -> None:
+        with self.assertRaises(SystemExit):
+            verifier.validate_connectivity_runtime_symlinks(
+                {name: entry for name, entry in entries.items() if name != "etc/firmware"},
+                {"symlinks": expected},
+            )
+        with self.assertRaises(SystemExit):
+            verifier.validate_connectivity_runtime_symlinks(
+                {**entries, "etc/firmware": verifier.Entry(
+                    "etc/firmware", stat.S_IFLNK | 0o777, 0, 0, 0, b"../tmp"
+                )},
+                {"symlinks": expected},
+            )
+        with self.assertRaises(SystemExit):
+            verifier.validate_connectivity_runtime_symlinks(
+                {**entries, "etc/firmware": verifier.Entry(
+                    "etc/firmware", stat.S_IFLNK | 0o755, 0, 0, 0,
+                    b"../lib/firmware"
+                )},
+                {"symlinks": expected},
+            )
+        with self.assertRaises(SystemExit):
+            verifier.validate_connectivity_runtime_symlinks(
+                {name: entry for name, entry in entries.items() if name != "lib/firmware"},
+                {"symlinks": expected},
+            )
+
+    def test_manifest_comparison_rejects_boolean_for_integer(self) -> None:
         expected = {
             "patch": {
                 "header": "8a00",
@@ -775,11 +1245,12 @@ class PolicyTests(unittest.TestCase):
             publisher.index('mkdir -p "$RUN"'),
         )
 
-    def test_pipeline_supports_distinct_tooling_source_for_legacy_kernel(self) -> None:
-        """A legacy kernel may use canonical image/OTA tooling without copying it."""
+    def test_pipeline_requires_distinct_tooling_source_for_legacy_kernel(self) -> None:
+        """Canonical image/OTA tooling must be selected explicitly and independently."""
         build = pipeline_text("build.sh")
         self.assertIn(
-            'TOOLING_SRC_INPUT="${LIBREECHO_TOOLING_SRC:-$KERNEL_SRC}"', build
+            'TOOLING_SRC_INPUT="${LIBREECHO_TOOLING_SRC:?ERROR: set LIBREECHO_TOOLING_SRC explicitly}"',
+            build,
         )
         self.assertIn('TOOLS_DIR="$TOOLING_SRC/tools/mt8163-arm32"', build)
         self.assertIn('git -C "$TOOLING_SRC" rev-parse --show-toplevel', build)
@@ -787,6 +1258,16 @@ class PolicyTests(unittest.TestCase):
         self.assertIn('tooling_git_head=$tooling_head', build)
         self.assertIn('tooling_git_diff_sha256=$tooling_diffsha', build)
         self.assertNotIn('tooling_source=$KERNEL_SRC', build)
+
+    def test_marker_contract_uses_explicit_repository_sources(self) -> None:
+        build = pipeline_text("build.sh")
+        marker = pipeline_text("check_marker_contract.sh")
+        self.assertIn('"$KERNEL_SRC"', build)
+        self.assertIn('"$TOOLING_SRC"', build)
+        self.assertIn('KERNEL_SRC="${3:-}"', marker)
+        self.assertIn('TOOLING_SRC="${4:-}"', marker)
+        self.assertIn('if [[ "$PROFILE" == development ]]', marker)
+        self.assertNotIn('ROOT/LibreEcho-Kernel', marker)
 
     def test_pipeline_builds_agent_daemon_from_clean_ui_commit(self) -> None:
         """The UI bundle must not depend on a stale prebuilt agent daemon."""
@@ -875,6 +1356,36 @@ class PolicyTests(unittest.TestCase):
         changed = {**record, "autostart": True}
         with self.assertRaises(SystemExit):
             verifier.validate_connectivity({}, {"connectivity": changed}, 2)
+
+    def test_disabled_connectivity_rejects_runtime_artifacts(self) -> None:
+        record = {
+            "id": verifier.CONNECTIVITY_BUNDLE_ID,
+            "enabled": False,
+            "activation": "manual-gates-only",
+            "autostart": False,
+            "files": {},
+            "helpers": {},
+            "symlinks": {},
+        }
+        cases = (
+            verifier.Entry(
+                "etc/firmware", stat.S_IFLNK | 0o777, 0, 0, 0,
+                b"../lib/firmware"
+            ),
+            verifier.Entry(
+                "lib/firmware/WIFI_RAM_CODE", stat.S_IFREG | 0o600,
+                0, 0, 0, b"vendor"
+            ),
+            verifier.Entry(
+                "lib/firmware/WIFI_RAM_CODE_8163", stat.S_IFREG | 0o600,
+                0, 0, 0, b"vendor"
+            ),
+        )
+        for entry in cases:
+            with self.subTest(name=entry.name), self.assertRaises(SystemExit):
+                verifier.validate_connectivity(
+                    {entry.name: entry}, {"connectivity": record}, 2
+                )
 
     def test_boolean_manifest_schema_is_rejected(self) -> None:
         with self.assertRaises(SystemExit):

@@ -10,9 +10,14 @@ import json
 import re
 import stat
 import struct
+import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import cast
+
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from generate_boot_envelope import generate as generate_boot_envelope
 
 
 ANDROID_MAGIC = b"ANDROID!"
@@ -29,18 +34,18 @@ ATF_START = 0x43000000
 ATF_END = 0x43030000
 DTB_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
-SOURCE_SHA256 = "c0f52a3b079d214495cd3dd22f92fd85695d1b868c58b491a2edb933bc4f6d1a"
+
 ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
 CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
+CONNECTIVITY_IMPORTER_SHA256 = "27f20efb39825333838df76eb843e4af537864f326a9648702739286a25e5d3a"
 CONNECTIVITY_STOCK_SYSTEM_SHA256 = "56540b3a9ac4437901a5510d9fb5e09b1a8d0cc229548f0b08bb5c22d78684fe"
 CONNECTIVITY_EVIDENCE_MANIFEST_SHA256 = "d1eedd04efe0dbc78853f2b0f9357c092b4ca66242648908c0369956538441eb"
-STOCK_DTB_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-PADDED_STOCK_DTB_SHA256 = "08b16ec39554d644d8cbdf8f5816559f85414ab45bc1901de46a7cd43dc286ed"
+
 BUSYBOX_SHA256 = "d4c8fd2aea01abd851c703f39b29c0de748b2751e4e1a85cae570fa53ad8f4fb"
 LOADER_SHA256 = "1063871174f1bd4f08f4d330e20b07aeb0820327ee739a4d8d1b644df842cb6b"
-INIT_SHA256 = "84d9110f96e3333ca3839228358635407e799f064d04f6b9a68cb37709b119c5"
-ADBD_SHA256 = "1c0d14afb1ce19494ee1da935e1076f49ff57e359d348262a28bb3d56abeb930"
+INIT_SHA256 = "767d32df45cdc1b20cfe4bd7cb681c44140ea396f26c65e86282d7de833381b0"
+BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
     "profile": 0o644,
@@ -48,6 +53,8 @@ OVERLAY_FILES = {
     "init.recovery.mt8163.rc": 0o644,
     "libreecho-init": 0o755,
     "libreecho-data-cleanup": 0o755,
+    "libreecho-vendor-import": 0o755,
+    "vendor-assets/mt8163-v181-stock-v1.tsv": 0o644,
     "libreecho-update": 0o755,
     "libreecho-update-fetch": 0o755,
     "ota-source.conf": 0o644,
@@ -57,6 +64,10 @@ OVERLAY_FILES = {
 OVERLAY_TARGETS = {
     "profile": "etc/profile",
     "libreecho-data-cleanup": "usr/local/sbin/libreecho-data-cleanup",
+    "libreecho-vendor-import": "usr/local/sbin/libreecho-vendor-import",
+    "vendor-assets/mt8163-v181-stock-v1.tsv": (
+        "etc/libreecho/vendor-assets/mt8163-v181-stock-v1.tsv"
+    ),
     "libreecho-update": "usr/local/sbin/libreecho-update",
     "libreecho-update-fetch": "usr/local/sbin/libreecho-update-fetch",
     "ota-source.conf": "etc/libreecho/ota-source.conf",
@@ -114,72 +125,27 @@ AIRPLAY_BINARY_NAMES = {
     "usr/local/sbin/libreecho-audio-engine",
 }
 
-CONNECTIVITY_FILES = {
-    "system/bin/linker": (
-        0o755, 630460, "73dc93e06a9ce0a76b5353f2c282f1ac3dd0dccd0e8e7f06fc20e5433ef4a3dc", (),
-    ),
-    "system/vendor/bin/wmt_loader": (
-        0o755, 17992, "de9ee285a09a7db5b079233f7c9129c5484ecb6701b54da45e2a29f310e74ff9",
-        ("libcutils.so", "libc++.so", "libdl.so", "libc.so", "libm.so"),
-    ),
-    "system/vendor/bin/wmt_launcher": (
-        0o755, 31448, "1f34425d727ea64524c9edaeac5e6b295df7a6054703dcc79b164021560252e5",
-        ("libcutils.so", "libc++.so", "libdl.so", "libc.so", "libm.so"),
-    ),
-    "lib/firmware/ROMv2_lm_patch_1_0_hdr.bin": (
-        0o644, 128720, "b4460117f51a43f3284594ec08d8c8861ecc0e42b17820987da03ecabdebac1e", None,
-    ),
-    "lib/firmware/ROMv2_lm_patch_1_1_hdr.bin": (
-        0o644, 50148, "10c4ed22a10b8a136bffd7ffce4d552300d76f8e593627d2a9841c3b11a5697e", None,
-    ),
-    "lib/firmware/WIFI_RAM_CODE_8163": (
-        0o644, 373840, "9669cc9b03cfdc5e8fd4fd6e14c4c4050e8c196738ca4707eea12f14a6a8e64c", None,
-    ),
-    "lib/firmware/WMT_SOC.cfg": (
-        0o644, 119, "302bd4462de99c028c04092e561c1500d65582ce42a93c4c72ccae6e2c99013d", None,
-    ),
-    "system/lib/libcutils.so": (
-        0o644, 104436, "dcf249ceed2c84ab45454ff8fd3fa0624248b410962c4ea9e9e799610192542b",
-        ("liblog.so", "libc++.so", "libdl.so", "libc.so", "libm.so"),
-    ),
-    "system/lib/libc++.so": (
-        0o644, 575068, "38f15c7897307e65c9b9a13174782e7b79146e453b8b80e09128aae8b6ab1df5",
-        ("libdl.so", "libc.so", "libm.so"),
-    ),
-    "system/lib/libdl.so": (
-        0o644, 13640, "efb8d634212b215b53f8c95f2b8372e9139ee13dc74717b7d25999de97d5b1cc", (),
-    ),
-    "system/lib/libc.so": (
-        0o644, 780476, "1254edac10625b1e7e123c20ea8d8f3175ad07014c9ddcca7bb3ea74db555357",
-        ("libdl.so",),
-    ),
-    "system/lib/libm.so": (
-        0o644, 132820, "3703abfae55405f1ca876cfaf5c8e41b0dafdd30d4ecec88cbd1100c5b0341ed",
-        ("libc.so",),
-    ),
-    "system/lib/liblog.so": (
-        0o644, 67460, "84e34e101618dae346cefca70c8cd866b92e6bcdec64246a130dcd12560410c0",
-        ("libc.so", "libm.so"),
-    ),
-}
-
-CONNECTIVITY_REFERENCE_FILES = {
-    "init.connectivity.rc": {
-        "sha256": "142c3f2239255dff573196daaf7da00687be9c5c54174dcbecfa309074d9d379",
-        "size": 3167,
+CONNECTIVITY_ASSET_REQUIREMENTS = {
+    "ROMv2_lm_patch_1_0_hdr.bin": {
+        "source": "system/vendor/firmware/ROMv2_lm_patch_1_0_hdr.bin",
+        "size": 128720,
+        "sha256": "b4460117f51a43f3284594ec08d8c8861ecc0e42b17820987da03ecabdebac1e",
     },
-    "ueventd.mt8163.rc": {
-        "sha256": "b1d212a42d213b4b1412648e7501baf55aa3ee653236cdf10f650050e0ea325c",
-        "size": 4255,
+    "ROMv2_lm_patch_1_1_hdr.bin": {
+        "source": "system/vendor/firmware/ROMv2_lm_patch_1_1_hdr.bin",
+        "size": 50148,
+        "sha256": "10c4ed22a10b8a136bffd7ffce4d552300d76f8e593627d2a9841c3b11a5697e",
     },
-}
-
-CONNECTIVITY_SYMLINKS = {
-    "vendor": "system/vendor",
-    "system/vendor/firmware": "../../lib/firmware",
-    "system/etc/firmware": "../../lib/firmware",
-    "etc/firmware": "../lib/firmware",
-    "lib/firmware/WIFI_RAM_CODE": "WIFI_RAM_CODE_8163",
+    "WIFI_RAM_CODE_8163": {
+        "source": "system/vendor/firmware/WIFI_RAM_CODE_8163",
+        "size": 373840,
+        "sha256": "9669cc9b03cfdc5e8fd4fd6e14c4c4050e8c196738ca4707eea12f14a6a8e64c",
+    },
+    "WMT_SOC.cfg": {
+        "source": "system/vendor/firmware/WMT_SOC.cfg",
+        "size": 119,
+        "sha256": "302bd4462de99c028c04092e561c1500d65582ce42a93c4c72ccae6e2c99013d",
+    },
 }
 
 CONNECTIVITY_HELPERS = {
@@ -200,15 +166,8 @@ CONNECTIVITY_HELPERS = {
     ),
 }
 
-CONNECTIVITY_PATCH_ROUTES = {
-    "lib/firmware/ROMv2_lm_patch_1_0_hdr.bin": (
-        bytes((0x8A, 0x00)), bytes((0x22, 0x00, 0x06, 0x00)), 2,
-        bytes((0x00, 0x00, 0x06, 0x00)),
-    ),
-    "lib/firmware/ROMv2_lm_patch_1_1_hdr.bin": (
-        bytes((0x8A, 0x00)), bytes((0x21, 0x00, 0x0E, 0xF0)), 1,
-        bytes((0x00, 0x00, 0x0E, 0xF0)),
-    ),
+CONNECTIVITY_RUNTIME_SYMLINKS = {
+    "etc/firmware": "../lib/firmware",
 }
 
 
@@ -808,14 +767,48 @@ def validate_ui(entries: dict[str, Entry], manifest: dict[str, object],
     return True
 
 
+def validate_connectivity_runtime_symlinks(
+        entries: dict[str, Entry], record: object) -> None:
+    if not isinstance(record, dict):
+        fail("connectivity runtime symlink manifest is malformed")
+    assert isinstance(record, dict)
+    if record.get("symlinks") != CONNECTIVITY_RUNTIME_SYMLINKS:
+        fail("connectivity runtime symlink manifest mismatch")
+    for name, target in CONNECTIVITY_RUNTIME_SYMLINKS.items():
+        entry = entries.get(name)
+        if (
+            entry is None
+            or not stat.S_ISLNK(entry.mode)
+            or stat.S_IMODE(entry.mode) != 0o777
+            or entry.data != target.encode()
+        ):
+            fail(f"connectivity runtime symlink contract mismatch for {name}")
+        resolved = resolve_relative_symlink(name, target)
+        resolved_entry = entries.get(resolved)
+        if resolved_entry is None or not stat.S_ISDIR(resolved_entry.mode):
+            fail(f"connectivity runtime symlink dangles: {name} -> {target}")
+
+
 def validate_connectivity(entries: dict[str, Entry], manifest: dict[str, object],
                           schema_version: int) -> bool:
     record = manifest.get("connectivity", {"enabled": False})
     if not isinstance(record, dict) or not isinstance(record.get("enabled"), bool):
         fail("connectivity manifest record is malformed")
-    bundle_names = set(CONNECTIVITY_FILES) | set(CONNECTIVITY_HELPERS) | set(CONNECTIVITY_SYMLINKS)
+    assert isinstance(record, dict)
+
+    embedded_vendor = sorted(
+        name for name in entries
+        if name in {
+            *(f"lib/firmware/{asset}" for asset in CONNECTIVITY_ASSET_REQUIREMENTS),
+            "lib/firmware/WIFI_RAM_CODE",
+        }
+    )
+    if embedded_vendor:
+        fail(f"vendor firmware is embedded in the initramfs: {embedded_vendor}")
+
     if not record["enabled"]:
-        unexpected = sorted(name for name in bundle_names if name in entries)
+        runtime_members = set(CONNECTIVITY_HELPERS) | set(CONNECTIVITY_RUNTIME_SYMLINKS)
+        unexpected = sorted(name for name in runtime_members if name in entries)
         if unexpected:
             fail(f"connectivity bundle is disabled but members are present: {unexpected}")
         if schema_version == 2:
@@ -834,74 +827,80 @@ def validate_connectivity(entries: dict[str, Entry], manifest: dict[str, object]
 
     if schema_version != 2:
         fail("enabled connectivity bundle requires manifest schema 2")
-    if record.get("id") != CONNECTIVITY_BUNDLE_ID:
-        fail("connectivity bundle identity changed")
-    if record.get("activation") != "manual-gates-only":
-        fail("connectivity activation policy changed")
-    if record.get("autostart") is not False:
-        fail("connectivity autostart must remain disabled")
-    expected_payload_bytes = sum(
-        expected_size for _mode, expected_size, _expected_hash, _needed
-        in CONNECTIVITY_FILES.values()
-    ) + sum(expected_size for expected_size, _expected_hash in CONNECTIVITY_HELPERS.values())
-    if record.get("stock_file_count") != len(CONNECTIVITY_FILES):
-        fail("connectivity stock-file count changed")
-    if record.get("helper_count") != len(CONNECTIVITY_HELPERS):
-        fail("connectivity helper count changed")
-    if record.get("payload_bytes") != expected_payload_bytes:
-        fail("connectivity payload byte count changed")
-    if record.get("provenance") != {
-        "stock_system_a_sha256": CONNECTIVITY_STOCK_SYSTEM_SHA256,
-        "evidence_manifest_sha256": CONNECTIVITY_EVIDENCE_MANIFEST_SHA256,
-    }:
-        fail("connectivity provenance changed")
-    stock_root = record.get("stock_root")
-    if not isinstance(stock_root, str) or not Path(stock_root).is_absolute():
-        fail("connectivity stock-root provenance is not absolute")
-    if record.get("reference_files_not_copied") != CONNECTIVITY_REFERENCE_FILES:
-        fail("connectivity reference-file manifest mismatch")
-    file_records = record.get("files")
-    if not isinstance(file_records, dict) or set(file_records) != set(CONNECTIVITY_FILES):
-        fail("connectivity stock-file manifest is incomplete")
-    library_providers = {
-        PurePosixPath(name).name: name
-        for name in CONNECTIVITY_FILES if name.startswith("system/lib/")
+    expected_policy = {
+        "id": CONNECTIVITY_BUNDLE_ID,
+        "activation": "manual-gates-only",
+        "autostart": False,
+        "vendor_delivery": "owner-device-local-extraction",
+        "source_partition": "system_a-read-only",
+        "embedded_vendor_file_count": 0,
+        "required_vendor_file_count": len(CONNECTIVITY_ASSET_REQUIREMENTS),
+        "required_vendor_bytes": 552827,
+        "helper_count": len(CONNECTIVITY_HELPERS),
+        "payload_bytes": sum(size for size, _digest in CONNECTIVITY_HELPERS.values()),
+        "files": {},
+        "symlinks": CONNECTIVITY_RUNTIME_SYMLINKS,
     }
-    for name, (mode, expected_size, expected_hash, needed) in CONNECTIVITY_FILES.items():
-        entry = require_member(entries, name, expected_hash, mode)
-        if len(entry.data) != expected_size:
-            fail(f"connectivity member size mismatch for {name}")
-        source = (
-            "system/vendor/firmware/" + PurePosixPath(name).name
-            if name.startswith("lib/firmware/") else name
+    for key, value in expected_policy.items():
+        if record.get(key) != value:
+            fail(f"connectivity local-extraction policy changed for {key}")
+    validate_connectivity_runtime_symlinks(entries, record)
+
+    expected_requirements: dict[str, object] = {}
+    expected_spec_lines = []
+    for target_name, specification in CONNECTIVITY_ASSET_REQUIREMENTS.items():
+        source_name = str(specification["source"])
+        expected_size = int(specification["size"])
+        expected_hash = str(specification["sha256"])
+        expected_spec_lines.append(
+            f"{expected_hash}|{expected_size}|{source_name}|{target_name}\n"
         )
-        expected_record: dict[str, object] = {
-            "source": source,
+        expected_requirements[target_name] = {
+            "source": source_name,
             "sha256": expected_hash,
             "size": expected_size,
-            "mode": f"{mode:04o}",
+            "mode": "0600",
+            "persistent_path": f"/data/libreecho/vendor/{CONNECTIVITY_BUNDLE_ID}/{target_name}",
+            "runtime_path": f"/lib/firmware/{target_name}",
         }
-        info = elf_info(entry.data)
-        if needed is None:
-            if info is not None:
-                fail(f"connectivity firmware unexpectedly contains ELF: {name}")
-        else:
-            expected_info = (1, 40, 0x05000200, "/system/bin/linker", needed, True)
-            if info != expected_info:
-                fail(f"stock connectivity ELF contract mismatch for {name}: {info}")
-            expected_record["elf"] = {
-                "class": 1,
-                "machine": 40,
-                "flags": "0x05000200",
-                "interpreter": "/system/bin/linker",
-                "needed": list(needed),
-                "dynamic": True,
-            }
-            for dependency in needed:
-                if dependency not in library_providers:
-                    fail(f"no staged provider for {name} dependency {dependency}")
-        if file_records.get(name) != expected_record:
-            fail(f"connectivity manifest record mismatch for {name}")
+    if not strictly_equal(record.get("required_vendor_assets"), expected_requirements):
+        fail("connectivity local vendor requirements changed")
+
+    forbidden = sorted(
+        name for name in entries
+        if name == "system/bin/linker" or name.startswith("system/lib/") or
+           name.startswith("system/vendor/")
+    )
+    if forbidden:
+        fail(f"stock Android connectivity userspace remains embedded: {forbidden}")
+
+    expected_spec = "".join(expected_spec_lines).encode()
+    spec_name = f"etc/libreecho/vendor-assets/{CONNECTIVITY_BUNDLE_ID}.tsv"
+    spec_member = require_member(entries, spec_name, sha256(expected_spec), 0o644)
+    if spec_member.data != expected_spec:
+        fail("local vendor requirements manifest content changed")
+    if record.get("requirements_manifest") != {
+        "path": "/" + spec_name,
+        "sha256": sha256(expected_spec),
+        "size": len(expected_spec),
+        "mode": "0644",
+    }:
+        fail("local vendor requirements manifest record changed")
+
+    raw_importer = record.get("importer")
+    if not isinstance(raw_importer, dict):
+        fail("local vendor importer manifest record is missing")
+    importer = require_member(
+        entries, "usr/local/sbin/libreecho-vendor-import",
+        CONNECTIVITY_IMPORTER_SHA256, 0o755,
+    )
+    if raw_importer != {
+        "path": "/usr/local/sbin/libreecho-vendor-import",
+        "sha256": CONNECTIVITY_IMPORTER_SHA256,
+        "size": len(importer.data),
+        "mode": "0755",
+    }:
+        fail("local vendor importer manifest record changed")
 
     helper_records = record.get("helpers")
     if not isinstance(helper_records, dict) or set(helper_records) != set(CONNECTIVITY_HELPERS):
@@ -928,38 +927,6 @@ def validate_connectivity(entries: dict[str, Entry], manifest: dict[str, object]
         }:
             fail(f"connectivity helper manifest record mismatch for {name}")
 
-    if record.get("symlinks") != CONNECTIVITY_SYMLINKS:
-        fail("connectivity symlink manifest mismatch")
-    for name, target in CONNECTIVITY_SYMLINKS.items():
-        entry = entries.get(name)
-        if entry is None or not stat.S_ISLNK(entry.mode) or entry.data != target.encode():
-            fail(f"connectivity symlink contract mismatch for {name}")
-        resolved = resolve_relative_symlink(name, target)
-        if resolved not in entries:
-            fail(f"connectivity symlink dangles: {name} -> {target}")
-
-    expected_patch_routing: dict[str, object] = {}
-    for name, (expected_header, expected_route, expected_seq,
-               expected_address) in CONNECTIVITY_PATCH_ROUTES.items():
-        data = entries[name].data
-        route = data[24:28]
-        patch_count = route[0] >> 4
-        download_seq = route[0] & 0x0F
-        address = b"\0" + route[1:]
-        if (data[22:24] != expected_header or route != expected_route or
-                patch_count != len(CONNECTIVITY_PATCH_ROUTES) or
-                download_seq != expected_seq or address != expected_address):
-            fail(f"stock patch metadata changed for {name}")
-        expected_patch_routing[name] = {
-            "header": expected_header.hex(),
-            "route": expected_route.hex(),
-            "patch_count": patch_count,
-            "download_seq": download_seq,
-            "address": address.hex(),
-        }
-    if not strictly_equal(record.get("patch_routing"), expected_patch_routing):
-        fail("connectivity patch-routing manifest mismatch")
-
     return True
 
 
@@ -970,11 +937,11 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                        expected_bootctl_sha256: str,
                        expected_update_verifier_sha256: str,
                        expected_ota_public_key_sha256: str,
+                       expected_adbd_sha256: str,
                        expected_audio_probe_sha256: str | None,
                        expected_tinyplay_sha256: str | None,
                        expected_tinycap_sha256: str | None,
                        expected_tinymix_sha256: str | None,
-                       expected_startup_audio_sha256: str | None,
                        expected_iwconfig_sha256: str | None,
                        expected_dropbear_sha256: str | None,
                        expected_dropbearkey_sha256: str | None,
@@ -1448,7 +1415,6 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     audio = cast(dict[str, object], audio)
     audio_names = {
         "sbin/audio_probe", "sbin/tinyplay", "sbin/tinycap", "sbin/tinymix",
-        "etc/audio/windows95-startup.wav",
     }
     expected_audio = (
         expected_audio_probe_sha256,
@@ -1526,58 +1492,38 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                 },
             }:
                 fail(f"{name} manifest record mismatch")
-    elif ((audio.get("enabled") and expected_startup_audio_sha256 is None) or
-          sorted(name for name in audio_names
-                 if name in entries and name != "etc/audio/windows95-startup.wav")):
+    elif audio.get("enabled") or sorted(name for name in audio_names if name in entries):
         fail("audio assets are enabled without expected identities")
-    if expected_startup_audio_sha256 is not None:
-        if not audio.get("enabled"):
-            fail("startup audio is expected but audio manifest is disabled")
-        raw_startup = audio.get("startup_playback")
-        if not isinstance(raw_startup, dict):
-            fail("startup audio manifest record is incomplete")
-        startup_record = cast(dict[str, object], raw_startup)
-        if startup_record.get("sha256") != expected_startup_audio_sha256:
-            fail("startup audio manifest hash mismatch")
-        startup_path = startup_record.get("path")
-        if not isinstance(startup_path, str) or not Path(startup_path).is_absolute():
-            fail("startup audio manifest path is not absolute")
-        startup = require_member(
-            entries, "etc/audio/windows95-startup.wav",
-            expected_startup_audio_sha256, 0o644,
-        )
-        expected_startup_record = {
-            "path": startup_path,
-            "sha256": expected_startup_audio_sha256,
-            "size": len(startup.data),
-            "mode": "0644",
-            "format": {
-                "channels": 2,
-                "sample_rate": 48000,
-                "sample_width_bits": 16,
-                "compression": "NONE",
-            },
-            "route": "hpr-only",
-            "pcm_volume": "103/103",
-            "pcm_db": "-12.0",
-            "hp_driver_gain": "6/6",
-            "lineout_dac_switches": "off",
-            "playback_device": "0:23",
-            "plays_once": True,
-        }
-        if startup_record != expected_startup_record:
-            fail("startup audio manifest record mismatch")
-        if audio.get("activation") != "automatic-after-successful-init":
-            fail("startup audio activation policy changed")
-    elif "etc/audio/windows95-startup.wav" in entries:
-        fail("startup audio is present without an expected identity")
     if sha256(cpio) != manifest["initramfs"]["cpio_sha256"]:
         fail("manifest cpio hash mismatch")
     if any(entry.uid or entry.gid or entry.mtime for entry in entries.values()):
         fail("initramfs ownership or mtime is not normalized")
 
     init = require_member(entries, "init", INIT_SHA256, 0o755)
-    adbd = require_member(entries, "sbin/adbd", ADBD_SHA256, 0o750)
+    adbd = require_member(entries, "sbin/adbd", expected_adbd_sha256, 0o750)
+    adbd_record = manifest.get("adbd")
+    if not isinstance(adbd_record, dict) or adbd_record != {
+        "path": "/sbin/adbd",
+        "sha256": expected_adbd_sha256,
+        "size": len(adbd.data),
+        "mode": "0750",
+        "source": adbd_record.get("source") if isinstance(adbd_record, dict) else None,
+    }:
+        fail("adbd manifest record mismatch")
+    source_record = adbd_record["source"]
+    if (
+        not isinstance(source_record, dict)
+        or source_record.get("source_license") != "Apache-2.0"
+        or source_record.get("transport") != "usb-functionfs-only"
+        or source_record.get("tcp_listener") is not False
+        or not isinstance(source_record.get("kernel_headers"), str)
+        or not source_record.get("kernel_headers")
+        or not re.fullmatch(r"[0-9a-f]{40}", str(source_record.get("source_commit", "")))
+        or not re.fullmatch(r"[0-9a-f]{64}", str(source_record.get("patch_sha256", "")))
+    ):
+        fail("adbd source provenance or transport policy is invalid")
+    if "stock_userspace" in manifest:
+        fail("stock userspace manifest entry is forbidden")
     busybox = require_member(entries, "bin/busybox", BUSYBOX_SHA256, 0o755)
     loader = require_member(entries, "lib/ld-musl-armhf.so.1", LOADER_SHA256, 0o755)
     for name, member, expected_interpreter in (
@@ -1686,7 +1632,7 @@ def system_map_physical_end(path: Path) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source-boot", type=Path, required=True)
+    parser.add_argument("--boot-envelope", type=Path, required=True)
     parser.add_argument("--zimage", type=Path, required=True)
     parser.add_argument("--system-map", type=Path, required=True)
     parser.add_argument("--expected-system-map-sha256", default=SYSTEM_MAP_SHA256)
@@ -1703,8 +1649,7 @@ def main() -> None:
                         help="require this static ARM32 TinyALSA capture utility")
     parser.add_argument("--expected-tinymix-sha256",
                         help="require this static ARM32 TinyALSA mixer utility")
-    parser.add_argument("--expected-startup-audio-sha256",
-                        help="require this pinned stereo 48kHz PCM16 startup WAV")
+
     parser.add_argument("--expected-iwconfig-sha256",
                         help="require this static ARM32 wireless-tools iwconfig utility")
     parser.add_argument("--expected-image-profile", choices=("development", "ota"), required=True)
@@ -1713,6 +1658,7 @@ def main() -> None:
     parser.add_argument("--expected-bootctl-sha256", required=True)
     parser.add_argument("--expected-update-verifier-sha256", required=True)
     parser.add_argument("--expected-ota-public-key-sha256", required=True)
+    parser.add_argument("--expected-adbd-sha256", required=True)
     parser.add_argument("--expected-dropbear-sha256",
                         help="require this static ARM32 Dropbear server in the initramfs")
     parser.add_argument("--expected-dropbearkey-sha256",
@@ -1760,13 +1706,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    source, zimage, system_map, ramdisk, boot = map(
-        read, (args.source_boot, args.zimage, args.system_map, args.ramdisk, args.boot_image)
+    envelope, zimage, system_map, ramdisk, boot = map(
+        read, (args.boot_envelope, args.zimage, args.system_map, args.ramdisk, args.boot_image)
     )
     manifest = json.loads(args.manifest.read_text())
     schema_version = manifest_schema(manifest)
-    if sha256(source) != SOURCE_SHA256:
-        fail("source boot envelope hash mismatch")
+    if len(envelope) != IMAGE_SIZE or envelope[:8] != ANDROID_MAGIC:
+        fail("generated boot envelope is not an exact 16 MiB Android v0 envelope")
+    if envelope != generate_boot_envelope() or sha256(envelope) != BOOT_ENVELOPE_SHA256:
+        fail("boot envelope is not the canonical generated template")
     if sha256(zimage) != args.expected_zimage_sha256:
         fail("zImage hash mismatch")
     if sha256(system_map) != args.expected_system_map_sha256:
@@ -1782,31 +1730,33 @@ def main() -> None:
 
     if len(boot) != IMAGE_SIZE or boot[:8] != ANDROID_MAGIC:
         fail("boot image is not the 16 MiB Android v0 envelope")
-    source_fields = struct.unpack_from("<10I", source, 8)
+    envelope_fields = struct.unpack_from("<10I", envelope, 8)
     fields = struct.unpack_from("<10I", boot, 8)
     kernel_size, kernel_addr, ramdisk_size, ramdisk_addr = fields[:4]
     second_size, second_addr, tags_addr, page_size, dt_size, unused = fields[4:]
     if (kernel_addr, ramdisk_addr, second_size, second_addr, tags_addr, page_size, dt_size, unused) != (
-        KERNEL_ADDR, RAMDISK_ADDR, 0, source_fields[5], TAGS_ADDR, PAGE, 0, source_fields[9]
+        KERNEL_ADDR, RAMDISK_ADDR, 0, envelope_fields[5], TAGS_ADDR, PAGE, 0, envelope_fields[9]
     ):
         fail("Android header address/geometry contract mismatch")
     if not boot[64:576].startswith(b"bootopt=64S3,32N2,32N2"):
         fail("bootopt no longer selects the proven 32-bit path")
-    source_header = bytearray(source[:PAGE])
+    envelope_header = bytearray(envelope[:PAGE])
     output_header = bytearray(boot[:PAGE])
     for start, end in ((8, 12), (16, 24), (576, 608)):
-        source_header[start:end] = b"\0" * (end - start)
+        envelope_header[start:end] = b"\0" * (end - start)
         output_header[start:end] = b"\0" * (end - start)
-    if source_header != output_header:
-        fail("Android header changed outside allowed fields")
+    if envelope_header != output_header:
+        fail("Android header differs from generated envelope outside payload fields")
 
     kernel = boot[PAGE:PAGE + kernel_size]
-    source_kernel = source[PAGE:PAGE + source_fields[0]]
     validate_mkimg_header(kernel)
-    source_mkimg, output_mkimg = bytearray(source_kernel[:MKIMG_SIZE]), bytearray(kernel[:MKIMG_SIZE])
-    source_mkimg[4:8] = output_mkimg[4:8] = b"\0" * 4
-    if source_mkimg != output_mkimg:
-        fail("MediaTek KERNEL header changed outside payload size")
+    output_mkimg = bytearray(kernel[:MKIMG_SIZE])
+    expected_mkimg = bytearray(MKIMG_SIZE)
+    expected_mkimg[:4] = MKIMG_MAGIC
+    expected_mkimg[8:14] = b"KERNEL"
+    output_mkimg[4:8] = b"\0" * 4
+    if expected_mkimg != output_mkimg:
+        fail("MediaTek KERNEL header differs from generated constants")
     payload_size = struct.unpack_from("<I", kernel, 4)[0]
     if kernel_size != MKIMG_SIZE + payload_size:
         fail("Android kernel size disagrees with the MediaTek payload size")
@@ -1820,8 +1770,7 @@ def main() -> None:
     dtb = payload[len(zimage):]
     if len(dtb) != DTB_SIZE or dtb[:4] != FDT_MAGIC or struct.unpack_from(">I", dtb, 4)[0] != DTB_SIZE:
         fail("padded appended DTB contract mismatch")
-    stock_dtb = manifest["inputs"]["dtb_origin"] == "stock-envelope-extraction"
-    expected_dtb = STOCK_DTB_SHA256 if stock_dtb else args.expected_dtb_sha256
+    expected_dtb = args.expected_dtb_sha256
     if expected_dtb is None:
         fail("--expected-dtb-sha256 is required for a supplied DTB")
     raw_size = manifest["inputs"]["dtb_raw_size"]
@@ -1833,8 +1782,7 @@ def main() -> None:
         fail("raw EVT DTB identity mismatch")
     if any(dtb[raw_size:]):
         fail("EVT DTB padding is nonzero")
-    if stock_dtb and sha256(dtb) != PADDED_STOCK_DTB_SHA256:
-        fail("stock EVT padded-DTB identity mismatch")
+
 
     ramdisk_offset = align(PAGE + kernel_size)
     if manifest["package"]["android"]["ramdisk_file_offset"] != f"0x{ramdisk_offset:x}":
@@ -1862,9 +1810,10 @@ def main() -> None:
         ramdisk, manifest, schema_version, args.expected_image_profile,
         args.expected_service_profile,
         args.expected_bootctl_sha256, args.expected_update_verifier_sha256,
-        args.expected_ota_public_key_sha256, args.expected_audio_probe_sha256,
+        args.expected_ota_public_key_sha256, args.expected_adbd_sha256,
+        args.expected_audio_probe_sha256,
         args.expected_tinyplay_sha256, args.expected_tinycap_sha256,
-        args.expected_tinymix_sha256, args.expected_startup_audio_sha256,
+        args.expected_tinymix_sha256,
         args.expected_iwconfig_sha256,
         args.expected_dropbear_sha256, args.expected_dropbearkey_sha256,
         args.expected_ui_manifest_sha256, args.expected_ui_commit,
