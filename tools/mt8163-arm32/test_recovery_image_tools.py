@@ -1340,7 +1340,7 @@ class PolicyTests(unittest.TestCase):
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
         self.assertIn(expected, source)
         self.assertIn(expected, fetcher)
-        self.assertNotIn("LibreEcho-Kernel/releases", source + fetcher)
+        self.assertNotIn("LibreEcho-Platform/releases", source + fetcher)
 
     def test_schema2_disabled_record_is_exact(self) -> None:
         record = {
