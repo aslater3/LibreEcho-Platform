@@ -116,8 +116,10 @@ for archive in "${required_ort_archives[@]}"; do
 done
 provider_archive="$ORT_BUILD/libonnxruntime_providers.a"
 if [[ "$ort_ready" == 1 ]]; then
-  "${CROSS}nm" -C "$provider_archive" | grep -q 'CPUExecutionProvider::CPUExecutionProvider' || ort_ready=0
-  "${CROSS}nm" -C "$provider_archive" | grep -q 'OrtApis::CreateCpuMemoryInfo' || ort_ready=0
+  provider_symbols="$ORT_BUILD/provider-symbols.txt"
+  "${CROSS}nm" -C "$provider_archive" > "$provider_symbols"
+  grep -Fq 'CPUExecutionProvider::CPUExecutionProvider' "$provider_symbols" || ort_ready=0
+  grep -Fq 'OrtApis::CreateCpuMemoryInfo' "$provider_symbols" || ort_ready=0
 fi
 if [[ "$ort_ready" != 1 ]]; then
   [[ "$ORT_BUILD" == */onnxruntime-wake-reduced ]] || {
