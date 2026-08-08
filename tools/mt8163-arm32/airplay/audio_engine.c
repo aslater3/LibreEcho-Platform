@@ -39,6 +39,8 @@
 #define DEFAULT_CARD 0U
 #define DEFAULT_DEVICE 23U
 #define DEFAULT_RATE 48000U
+#define AIRPLAY_VOLUME_WAIT_ATTEMPTS 100U
+#define AIRPLAY_VOLUME_WAIT_US 10000U
 #define INPUT_CHANNELS 2U
 #define OUTPUT_CHANNELS 2U
 #define PERIOD_SIZE 2048U
@@ -506,6 +508,23 @@ static int airplay_volume_to_mixer(const char *root)
 	return (int)lround(127.0 + (db * 2.0));
 }
 
+static int wait_for_airplay_volume(const char *root, int *volume)
+{
+	unsigned int attempt;
+
+	if (!volume)
+		return -1;
+	*volume = -1;
+	for (attempt = 0; attempt < AIRPLAY_VOLUME_WAIT_ATTEMPTS && !stopping;
+	     ++attempt) {
+		*volume = airplay_volume_to_mixer(root);
+		if (*volume >= 0)
+			return 0;
+		usleep(AIRPLAY_VOLUME_WAIT_US);
+	}
+	return -1;
+}
+
 static int set_pcm_volume(unsigned int card, int volume)
 {
 	struct mixer *mixer;
@@ -801,8 +820,16 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 
 		saved_volume = -1;
 		airplay_session = airplay_is_active(root);
-		airplay_volume = airplay_session
-			? airplay_volume_to_mixer(root) : -1;
+		airplay_volume = -1;
+		if (airplay_session &&
+		    (wait_for_airplay_volume(root, &airplay_volume) < 0 ||
+		     airplay_volume < 0)) {
+			fprintf(stderr,
+				"audio-engine: airplay volume unavailable; deferring playback\n");
+			clear_source_activity(sources, &announcement_led_active,
+					      &visualizer, &status);
+			continue;
+		}
 		if (arm_output_controls(card, airplay_volume, &saved_volume) < 0) {
 			fprintf(stderr, "audio-engine: output arm failed\n");
 			clear_source_activity(sources, &announcement_led_active,

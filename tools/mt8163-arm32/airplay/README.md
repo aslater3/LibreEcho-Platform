@@ -64,6 +64,10 @@ no track metadata.
 Shairport's pipe must use `ignore_volume_control = "yes"` because the external
 volume hook owns codec attenuation. Otherwise Shairport attenuates the PCM in
 software and the hook applies the same AirPlay attenuation again.
+The bridge clears the previous session's AirPlay volume before publishing a new
+active marker. The shared engine waits for the new session's first valid volume
+callback before arming the PCM; a missing callback therefore cannot fall back
+to the device's current volume.
 The engine reapplies the physical amplifier controls after the codec starts
 DMA. AirPlay dB callbacks update only the media-bus software gain, so an
 announcement can remain audible above quiet media without changing the

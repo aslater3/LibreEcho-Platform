@@ -21,6 +21,8 @@ AUDIO_VISUALIZER_SOURCE=${LIBREECHO_AUDIO_VISUALIZER_SOURCE:-$SCRIPT_DIR/audio_v
 PLAYBACK_STATUS_SOURCE=${LIBREECHO_PLAYBACK_STATUS_SOURCE:-$SCRIPT_DIR/playback_status.c}
 AEC_REFERENCE_SOURCE=${LIBREECHO_AEC_REFERENCE_SOURCE:-$SCRIPT_DIR/aec_reference.c}
 RELINK_OUTPUT=${LIBREECHO_AIRPLAY_RELINK_OUTPUT:-}
+python3 "$SCRIPT_DIR/test_audio_engine_contract.py"
+python3 "$SCRIPT_DIR/test_airplay_volume_contract.py"
 
 for archive in "$NQPTP_ARCHIVE" "$SHAIRPORT_ARCHIVE" "$FFMPEG_ARCHIVE" "$TINYALSA_ARCHIVE"; do
     [[ -f "$archive" ]] || { echo "ERROR: AirPlay source archive is missing: $archive" >&2; exit 1; }
