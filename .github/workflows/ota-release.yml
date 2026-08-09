@@ -1,321 +1,57 @@
-name: Build and release LibreEcho OTA
+name: LibreEcho Platform checks
 
 on:
   push:
     branches:
-      - '**'
+      - main
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
-  pull-requests: read
 
 concurrency:
-  group: ota-${{ github.ref }}
-  cancel-in-progress: false
+  group: platform-checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   source_checks:
-    name: Full source checks
+    name: Platform source checks
     runs-on: ubuntu-24.04
     steps:
-      - name: Check out Kernel source
-        uses: actions/checkout@v4
+      - name: Check out Platform source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          path: LibreEcho-Kernel
+          persist-credentials: false
 
-      - name: Require a merged pull request for main releases
-        if: ${{ github.ref == 'refs/heads/main' }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          merged_pr_count="$(
-            gh api \
-              -H 'Accept: application/vnd.github+json' \
-              "/repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
-              --jq '[.[] | select(.merged_at != null and .base.ref == "main")] | length'
-          )"
-          [[ "$merged_pr_count" -gt 0 ]]
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
 
-      - name: Install source-test dependencies
+      - name: Install test dependencies
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            python3 shellcheck
+          python -m pip install --disable-pip-version-check PyNaCl==1.5.0
 
-      - name: Validate Kernel recovery and OTA contracts
+      - name: Run maintained Platform suites
         shell: bash
-        working-directory: LibreEcho-Kernel
         run: |
           set -euo pipefail
-          python3 -m unittest -q tools/mt8163-arm32/test_recovery_image_tools.py
-          python3 -m py_compile \
+          python -m unittest -q \
+            tools/mt8163-arm32/test_recovery_image_tools.py \
+            tools/mt8163-arm32/test_source_offer_tools.py
+
+      - name: Validate tracked Python and shell source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile \
             tools/mt8163-arm32/build_recovery_image.py \
             tools/mt8163-arm32/verify_recovery_image.py \
             tools/mt8163-arm32/ota/make_ota_bundle.py
-          bash -n \
-            tools/mt8163-arm32/initramfs/libreecho-init \
-            tools/mt8163-arm32/initramfs/libreecho-update \
-            tools/mt8163-arm32/initramfs/libreecho-update-fetch \
-            tools/mt8163-arm32/ui/build_ui_bundle.sh
-          shellcheck --severity=error \
-            tools/mt8163-arm32/initramfs/libreecho-update-fetch
+          while IFS= read -r -d '' script; do
+            bash -n "$script"
+          done < <(git ls-files -z 'tools/mt8163-arm32/*.sh' 'tools/mt8163-arm32/**/*.sh')
           git diff --check
-
-  verified_build:
-    name: Verified OTA image build
-    needs: source_checks
-    if: ${{ github.ref == 'refs/heads/main' && vars.ENABLE_SELF_HOSTED_OTA == 'true' }}
-    runs-on: [self-hosted, linux, x64, libreecho-ota-builder]
-    env:
-      PIPELINE_ROOT: ${{ vars.LIBREECHO_PIPELINE_ROOT }}
-      LIBREECHO_KERNEL_SRC: ${{ github.workspace }}/LibreEcho-Kernel
-      LIBREECHO_UI_SRC: ${{ github.workspace }}/LibreEcho-UI
-      UNSIGNED_DIR: ${{ github.workspace }}/libreecho-ota-unsigned-${{ github.run_id }}-${{ github.run_attempt }}
-    outputs:
-      boot_sha256: ${{ steps.build.outputs.boot_sha256 }}
-      release_tag: ${{ steps.release_input.outputs.tag }}
-      run_id: ${{ steps.build.outputs.run_id }}
-      ui_sha: ${{ steps.ui_identity.outputs.sha }}
-      version: ${{ steps.release_input.outputs.version }}
-    steps:
-      - name: Check out exact Kernel source
-        uses: actions/checkout@v4
-        with:
-          path: LibreEcho-Kernel
-
-      - name: Check out exact UI source
-        uses: actions/checkout@v4
-        with:
-          repository: aslater3/LibreEcho-UI
-          ref: main
-          path: LibreEcho-UI
-          token: ${{ secrets.UI_REPOSITORY_TOKEN }}
-
-      - name: Validate release input
-        id: release_input
-        shell: bash
-        run: |
-          set -euo pipefail
-          VERSION="$(tr -d '\r\n' < LibreEcho-UI/VERSION)"
-          [[ "$VERSION" =~ ^[0-9]+[.][0-9]+[.][0-9]+([._+~-][A-Za-z0-9._+~-]+)?$ ]]
-          printf 'version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
-          printf 'tag=v%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Record immutable UI identity
-        id: ui_identity
-        shell: bash
-        run: |
-          set -euo pipefail
-          printf 'sha=%s\n' "$(git -C LibreEcho-UI rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Validate provisioned builder
-        shell: bash
-        env:
-          EXPECTED_UI_SHA: ${{ steps.ui_identity.outputs.sha }}
-          VERSION: ${{ steps.release_input.outputs.version }}
-        run: |
-          set -euo pipefail
-          [[ -n "$PIPELINE_ROOT" ]]
-          [[ -x "$PIPELINE_ROOT/build.sh" ]]
-          [[ -x "$PIPELINE_ROOT/status.sh" ]]
-          [[ "$(git -C "$LIBREECHO_KERNEL_SRC" rev-parse HEAD)" == "$GITHUB_SHA" ]]
-          [[ "$(git -C "$LIBREECHO_UI_SRC" rev-parse HEAD)" == "$EXPECTED_UI_SHA" ]]
-          [[ "$(tr -d '\r\n' < "$LIBREECHO_UI_SRC/VERSION")" == "$VERSION" ]]
-
-      - name: Build and independently verify OTA profile
-        id: build
-        shell: bash
-        env:
-          EXPECTED_UI_SHA: ${{ steps.ui_identity.outputs.sha }}
-          VERSION: ${{ steps.release_input.outputs.version }}
-        run: |
-          set -euo pipefail
-          LIBREECHO_OTA_SIGNING_MODE=github "$PIPELINE_ROOT/build.sh" --profile ota
-          "$PIPELINE_ROOT/status.sh"
-          current="$PIPELINE_ROOT/out/CURRENT"
-          run_dir="$(sed -n 's/^run_dir=//p' "$current")"
-          boot="$(sed -n 's/^boot_image=//p' "$current")"
-          ramdisk="$(sed -n 's/^ramdisk=//p' "$current")"
-          manifest="$(sed -n 's/^manifest=//p' "$current")"
-          boot_sha="$(sed -n 's/^boot_image_sha256=//p' "$current")"
-          run_id="$(sed -n 's/^run_id=//p' "$current")"
-          [[ -d "$run_dir" && -f "$boot" && -f "$ramdisk" && -f "$manifest" ]]
-          [[ "$(stat -c %s "$boot")" == 16777216 ]]
-          echo "$boot_sha  $boot" | sha256sum -c -
-          jq -e --arg sha "$boot_sha" \
-            '.status == "PREPARED_NOT_FLASHED" and
-             .image_profile == "ota" and
-             .output.size == 16777216 and
-             .output.sha256 == $sha and
-             .ota.enabled == true and
-             .ota.format == "libreecho-ota-v1"' \
-            "$manifest" >/dev/null
-          gzip -dc "$ramdisk" | cpio -it 2>/dev/null |
-            grep -qx 'usr/local/sbin/libreecho-update-fetch'
-          strings "$run_dir/ui-bundle/sbin/libreecho-web" |
-            grep -Fqx "LibreEcho OS $VERSION"
-          mkdir -p "$UNSIGNED_DIR"
-          install -m 0644 "$boot" "$UNSIGNED_DIR/boot.img"
-          install -m 0644 "$manifest" "$UNSIGNED_DIR/manifest.json"
-          install -m 0644 "$run_dir/verify.log" "$UNSIGNED_DIR/verify.log"
-          {
-            echo "kernel_sha=$GITHUB_SHA"
-            echo "ui_sha=$EXPECTED_UI_SHA"
-            echo "version=$VERSION"
-            echo "run_id=$run_id"
-            echo "boot_sha256=$boot_sha"
-          } > "$UNSIGNED_DIR/provenance"
-          printf 'boot_sha256=%s\n' "$boot_sha" >> "$GITHUB_OUTPUT"
-          printf 'run_id=%s\n' "$run_id" >> "$GITHUB_OUTPUT"
-
-      - name: Upload verified unsigned image
-        uses: actions/upload-artifact@v4
-        with:
-          name: libreecho-ota-unsigned
-          path: ${{ env.UNSIGNED_DIR }}
-          if-no-files-found: error
-          retention-days: 7
-
-  sign_and_release:
-    name: Protected signing and release
-    needs: [source_checks, verified_build]
-    runs-on: ubuntu-24.04
-    environment: production-signing
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      RELEASE_REPOSITORY: aslater3/LibreEcho
-      RELEASE_TOKEN: ${{ secrets.RELEASE_REPOSITORY_TOKEN }}
-      RELEASE_TAG: ${{ needs.verified_build.outputs.release_tag }}
-      EXPECTED_BOOT_SHA256: ${{ needs.verified_build.outputs.boot_sha256 }}
-      EXPECTED_UI_SHA: ${{ needs.verified_build.outputs.ui_sha }}
-      EXPECTED_RUN_ID: ${{ needs.verified_build.outputs.run_id }}
-      VERSION: ${{ needs.verified_build.outputs.version }}
-    steps:
-      - name: Check out reviewed signing source
-        uses: actions/checkout@v4
-        with:
-          path: source
-
-      - name: Download verified build
-        uses: actions/download-artifact@v4
-        with:
-          name: libreecho-ota-unsigned
-          path: unsigned
-
-      - name: Revalidate build provenance
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$EXPECTED_BOOT_SHA256" =~ ^[0-9a-f]{64}$ ]]
-          [[ "$(stat -c %s unsigned/boot.img)" == 16777216 ]]
-          [[ "$(head -c 8 unsigned/boot.img)" == "ANDROID!" ]]
-          echo "$EXPECTED_BOOT_SHA256  unsigned/boot.img" | sha256sum -c -
-          grep -Fqx "kernel_sha=$GITHUB_SHA" unsigned/provenance
-          grep -Fqx "ui_sha=$EXPECTED_UI_SHA" unsigned/provenance
-          grep -Fqx "version=$VERSION" unsigned/provenance
-          grep -Fqx "run_id=$EXPECTED_RUN_ID" unsigned/provenance
-          grep -Fqx "boot_sha256=$EXPECTED_BOOT_SHA256" unsigned/provenance
-          public_key_sha256="$(
-            sha256sum source/tools/mt8163-arm32/ota/ota-public-key.hex |
-              awk '{print $1}'
-          )"
-          jq -e \
-            --arg boot_sha "$EXPECTED_BOOT_SHA256" \
-            --arg key_sha "$public_key_sha256" \
-            '.status == "PREPARED_NOT_FLASHED" and
-             .image_profile == "ota" and
-             .output.size == 16777216 and
-             .output.sha256 == $boot_sha and
-             .ota.enabled == true and
-             .ota.format == "libreecho-ota-v1" and
-             .ota.public_key_sha256 == $key_sha' \
-            unsigned/manifest.json >/dev/null
-
-      - name: Install pinned signing dependency
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends python3-venv
-          python3 -m venv signing-venv
-          signing-venv/bin/pip install --disable-pip-version-check \
-            'PyNaCl==1.5.0'
-
-      - name: Sign and independently verify OTA bundle
-        shell: bash
-        env:
-          OTA_SIGNING_KEY_HEX: ${{ secrets.OTA_SIGNING_KEY_HEX }}
-        run: |
-          set -euo pipefail
-          [[ "$OTA_SIGNING_KEY_HEX" =~ ^[0-9a-f]{64}$ ]]
-          umask 077
-          printf '%s\n' "$OTA_SIGNING_KEY_HEX" > signing-key.hex
-          unset OTA_SIGNING_KEY_HEX
-          signing-venv/bin/python \
-            source/tools/mt8163-arm32/ota/make_ota_bundle.py \
-            --boot-image unsigned/boot.img \
-            --version "$VERSION" \
-            --signing-key signing-key.hex \
-            --public-key source/tools/mt8163-arm32/ota/ota-public-key.hex \
-            --output libreecho-radar-puffin-stable.ota.tar
-          signing-venv/bin/python - <<'PY'
-          import hashlib
-          import os
-          import pathlib
-          import tarfile
-          from nacl.signing import VerifyKey
-
-          bundle = pathlib.Path("libreecho-radar-puffin-stable.ota.tar")
-          with tarfile.open(bundle, "r:") as archive:
-              assert archive.getnames() == ["manifest", "manifest.sig", "boot.img"]
-              manifest = archive.extractfile("manifest").read()
-              signature = archive.extractfile("manifest.sig").read().strip()
-              boot = archive.extractfile("boot.img").read()
-          public_key = bytes.fromhex(
-              pathlib.Path(
-                  "source/tools/mt8163-arm32/ota/ota-public-key.hex"
-              ).read_text().strip()
-          )
-          VerifyKey(public_key).verify(manifest, bytes.fromhex(signature.decode()))
-          fields = dict(line.split("=", 1) for line in manifest.decode().splitlines())
-          assert fields["version"] == os.environ["VERSION"]
-          assert fields["image_profile"] == "ota"
-          assert len(boot) == 16 * 1024 * 1024
-          assert hashlib.sha256(boot).hexdigest() == os.environ["EXPECTED_BOOT_SHA256"]
-          PY
-          sha256sum libreecho-radar-puffin-stable.ota.tar \
-            > libreecho-radar-puffin-stable.ota.tar.sha256
-
-      - name: Create or update draft release
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ -n "$RELEASE_TOKEN" ]]
-          export GH_TOKEN="$RELEASE_TOKEN"
-          if gh release view "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" \
-              --json isDraft --jq .isDraft >/tmp/release-draft 2>/dev/null; then
-            [[ "$(cat /tmp/release-draft)" == true ]]
-          else
-            gh release create "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" \
-              --draft --title "LibreEcho OS $VERSION" \
-              --notes "Verified A/B OTA build $EXPECTED_RUN_ID"
-          fi
-          gh release upload "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" \
-            unsigned/boot.img unsigned/manifest.json unsigned/verify.log \
-            unsigned/provenance libreecho-radar-puffin-stable.ota.tar \
-            libreecho-radar-puffin-stable.ota.tar.sha256 --clobber
-
-      - name: Publish release
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ -n "$RELEASE_TOKEN" ]]
-          export GH_TOKEN="$RELEASE_TOKEN"
-          gh release edit "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" \
-            --draft=false --latest
