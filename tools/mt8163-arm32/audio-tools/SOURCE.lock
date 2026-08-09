@@ -1,0 +1,9 @@
+{
+  "name": "tinyalsa",
+  "version": "e43025bbf702eb7dd8edd48c1eb50530c60f1de8",
+  "license": "BSD-3-Clause",
+  "source_url": "https://github.com/tinyalsa/tinyalsa/archive/e43025bbf702eb7dd8edd48c1eb50530c60f1de8.tar.gz",
+  "source_sha256": "dc75977453304fcce0b91cbfd2b27942641c93479f87898d230cdc440a042d4f",
+  "patch": "tinyalsa-mt8163.patch",
+  "patch_sha256": "f63cacae35b0eb5291c8f4fa49c276c7aac3927426e529c50d74ab244c3ba7aa"
+}

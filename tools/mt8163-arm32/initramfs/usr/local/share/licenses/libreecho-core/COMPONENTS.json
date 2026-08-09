@@ -1,0 +1,106 @@
+{
+  "components": [
+    {
+      "id": "linux-6.1",
+      "license": "GPL-2.0-only",
+      "source": "https://github.com/aslater3/LibreEcho-Linux-6.1",
+      "version": "source-commit-in-image-manifest"
+    },
+    {
+      "id": "libreecho-platform",
+      "license": "GPL-2.0-only",
+      "source": "https://github.com/aslater3/LibreEcho-Platform",
+      "version": "source-commit-in-image-manifest"
+    },
+    {
+      "id": "libreecho-ui",
+      "license": "MIT",
+      "source": "https://github.com/aslater3/LibreEcho-UI",
+      "version": "source-commit-in-image-manifest"
+    },
+    {
+      "id": "aosp-adbd",
+      "license": "Apache-2.0",
+      "source": "https://android.googlesource.com/platform/system/core/+/4f247d753a8865cd16292ff0b720b72c28049786",
+      "version": "4f247d753a8865cd16292ff0b720b72c28049786"
+    },
+    {
+      "config": "tools/mt8163-arm32/busybox/busybox-1.37.0.config",
+      "id": "busybox",
+      "license": "GPL-2.0-only",
+      "source": "https://busybox.net/downloads/busybox-1.37.0.tar.bz2",
+      "source_archive_sha256": "3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4",
+      "version": "1.37.0"
+    },
+    {
+      "id": "musl",
+      "license": "MIT",
+      "source": "https://musl.libc.org/releases/musl-1.2.5.tar.gz",
+      "source_archive_sha256": "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4",
+      "version": "1.2.5"
+    },
+    {
+      "config": "tools/mt8163-arm32/wpa-supplicant/wpa_supplicant-2.10.config",
+      "id": "wpa-supplicant",
+      "license": "BSD-3-Clause",
+      "source": "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz",
+      "source_archive_sha256": "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f",
+      "version": "2.10"
+    },
+    {
+      "id": "libreecho-mt8163-connectivity-helpers",
+      "license": "GPL-2.0-only",
+      "source": "https://github.com/aslater3/LibreEcho-Platform/tree/main/tools/mt8163-arm32/connectivity",
+      "version": "source-commit-in-image-manifest"
+    },
+    {
+      "id": "wireless-tools",
+      "license": "GPL-2.0-only",
+      "source": "https://launchpad.net/ubuntu/+source/wireless-tools/30~pre9-16.1ubuntu2",
+      "version": "30~pre9-16.1ubuntu2"
+    },
+    {
+      "id": "wireless-regdb",
+      "license": "ISC",
+      "source": "https://launchpad.net/ubuntu/+source/wireless-regdb/2025.10.07-0ubuntu1~24.04.1",
+      "version": "2025.10.07-0ubuntu1~24.04.1"
+    },
+    {
+      "id": "tinyalsa",
+      "license": "BSD-3-Clause",
+      "source": "https://github.com/tinyalsa/tinyalsa/tree/e43025bbf702eb7dd8edd48c1eb50530c60f1de8",
+      "source_archive_sha256": "dc75977453304fcce0b91cbfd2b27942641c93479f87898d230cdc440a042d4f",
+      "version": "e43025bbf702eb7dd8edd48c1eb50530c60f1de8"
+    },
+    {
+      "id": "libsodium",
+      "license": "ISC",
+      "source": "https://github.com/jedisct1/libsodium/tree/1.0.18",
+      "static_archive_sha256": "71e1dbf00f5bcf91c685ef6ec20c6b482ade70fab91518ee1ef68cbf835fe5b0",
+      "version": "1.0.18"
+    },
+    {
+      "binary_sha256": "77a558bacdaaf9e343f02f2d74f27a5f2bb2dc8b6d66cc2499b60ed14ef62fe6",
+      "id": "mt8163-audio-fpga",
+      "included_in_public_artifact": false,
+      "license": "NOASSERTION",
+      "redistribution_status": "excluded",
+      "reason": "No authoritative redistribution permission or preferred-form FPGA source/generation record",
+      "source": "https://github.com/carlitros900/karnak_3.18.48/commit/5b48c78b249ed9129fe92d30087de25b20152538",
+      "version": "i2s_to_spi_v34"
+    },
+    {
+      "id": "glibc-runtime",
+      "license": "LGPL-2.1-or-later",
+      "source": "https://sourceware.org/git/glibc.git",
+      "version": "exact-build-toolchain-recorded-in-provenance"
+    },
+    {
+      "id": "gcc-runtime",
+      "license": "GPL-3.0-or-later WITH GCC-exception-3.1",
+      "source": "https://gcc.gnu.org/git/gcc.git",
+      "version": "exact-build-toolchain-recorded-in-provenance"
+    }
+  ],
+  "schema_version": 1
+}

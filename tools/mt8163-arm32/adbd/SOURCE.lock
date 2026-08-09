@@ -1,0 +1,8 @@
+source_name=AOSP platform/system/core
+source_url=https://android.googlesource.com/platform/system/core
+source_commit=4f247d753a8865cd16292ff0b720b72c28049786
+source_license=Apache-2.0
+source_subtree=adb,libcutils,libmincrypt,include
+build_target=adbd
+transport=USB FunctionFS only; target TCP listener disabled
+root_policy=LibreEcho property compatibility pins ro.secure=0 and refuses TCP ADB

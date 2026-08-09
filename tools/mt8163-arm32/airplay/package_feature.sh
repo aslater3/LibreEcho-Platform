@@ -5,7 +5,7 @@ AIRPLAY_OUTPUT="${1:?usage: package_feature.sh <airplay-build-output> <ui-bundle
 UI_BUNDLE="${2:?usage: package_feature.sh <airplay-build-output> <ui-bundle> <payload> <manifest>}"
 PAYLOAD="${3:?usage: package_feature.sh <airplay-build-output> <ui-bundle> <payload> <manifest>}"
 MANIFEST="${4:?usage: package_feature.sh <airplay-build-output> <ui-bundle> <payload> <manifest>}"
-PIPELINE_ROOT="$(cd -- "$(dirname -- "$0")/../../../../pipeline" && pwd -P)"
+PIPELINE_ROOT="${LIBREECHO_PIPELINE_ROOT:?ERROR: set LIBREECHO_PIPELINE_ROOT explicitly}"
 PACKAGER="$PIPELINE_ROOT/package_feature_payload.sh"
 
 [[ -x "$PACKAGER" ]] || { echo "ERROR: feature packager is missing: $PACKAGER" >&2; exit 1; }
@@ -17,6 +17,22 @@ PACKAGER="$PIPELINE_ROOT/package_feature_payload.sh"
   echo "ERROR: AirPlay UI configuration is missing from the UI bundle" >&2
   exit 1
 }
+LICENSE_ROOT="$AIRPLAY_OUTPUT/runtime/usr/local/share/licenses/libreecho-airplay"
+[[ -f "$LICENSE_ROOT/COMPONENTS.tsv" ]] || {
+  echo "ERROR: AirPlay component inventory is missing" >&2
+  exit 1
+}
+for component in nqptp shairport-sync ffmpeg tinyalsa; do
+  find "$LICENSE_ROOT/source/$component" -maxdepth 1 -type f -print -quit | grep -q . || {
+    echo "ERROR: AirPlay source license closure is missing for $component" >&2
+    exit 1
+  }
+done
+find "$LICENSE_ROOT/debian" -mindepth 2 -maxdepth 2 -type f -name copyright \
+  -print -quit | grep -q . || {
+    echo "ERROR: AirPlay Debian copyright closure is missing" >&2
+    exit 1
+  }
 
 root="$(mktemp -d /tmp/libreecho-airplay-feature.XXXXXX)"
 trap 'rm -rf "$root"' EXIT

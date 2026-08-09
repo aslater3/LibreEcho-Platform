@@ -1,0 +1,206 @@
+#!/bin/sh
+# Import the minimum MT8163 connectivity firmware from the owner's stock OS.
+# No vendor bytes are distributed or persisted by LibreEcho.
+set -eu
+
+DATA_ROOT=${DATA_ROOT:-/data}
+TEST_MODE=${LIBREECHO_VENDOR_TEST_MODE:-0}
+BUNDLE_ID=mt8163-v181-stock-v1
+SPEC=${LIBREECHO_VENDOR_SPEC:-/etc/libreecho/vendor-assets/$BUNDLE_ID.tsv}
+FIRMWARE_ROOT=${LIBREECHO_VENDOR_FIRMWARE_ROOT:-/lib/firmware}
+SYSTEM_A_DEV=${LIBREECHO_VENDOR_SYSTEM_A_DEV:-/dev/mmcblk0p13}
+SYSTEM_A_SYSFS=${LIBREECHO_VENDOR_SYSTEM_A_SYSFS:-/sys/class/block/mmcblk0p13}
+SOURCE_ROOT=${LIBREECHO_VENDOR_SOURCE_ROOT:-}
+STAGE_PARENT=${LIBREECHO_VENDOR_STAGE_PARENT:-/tmp/libreecho-vendor-import}
+MOUNT_ROOT=/tmp/libreecho-stock-system-a
+STAGE=
+STAGE_PARENT_CREATED=0
+MOUNTED=0
+
+fail()
+{
+    printf '%s\n' "$1" >&2
+    exit 2
+}
+
+cleanup()
+{
+    if [ "$MOUNTED" -eq 1 ]; then
+        umount "$MOUNT_ROOT" 2>/dev/null || true
+    fi
+    if [ -n "$STAGE" ] && { [ -e "$STAGE" ] || [ -L "$STAGE" ]; }; then
+        rm -rf "$STAGE"
+    fi
+    if [ "$STAGE_PARENT_CREATED" -eq 1 ]; then
+        rmdir "$STAGE_PARENT" 2>/dev/null || true
+    fi
+    if [ "$TEST_MODE" != 1 ]; then
+        rmdir "$MOUNT_ROOT" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT HUP INT TERM
+
+validate_spec()
+{
+    [ -f "$SPEC" ] && [ ! -L "$SPEC" ] || fail VENDOR_IMPORT_SPEC_MISSING
+    count=0
+    while IFS='|' read -r expected_hash expected_size source_name target_name; do
+        [ -n "$expected_hash" ] || continue
+        case "$expected_hash" in
+            *[!0-9a-f]*|'') fail VENDOR_IMPORT_SPEC_HASH_INVALID ;;
+        esac
+        [ "${#expected_hash}" -eq 64 ] || fail VENDOR_IMPORT_SPEC_HASH_INVALID
+        case "$expected_size" in
+            ''|*[!0-9]*) fail VENDOR_IMPORT_SPEC_SIZE_INVALID ;;
+        esac
+        case "$source_name" in
+            system/vendor/firmware/*) ;;
+            *) fail VENDOR_IMPORT_SPEC_SOURCE_INVALID ;;
+        esac
+        case "$source_name" in *..*|*//*|*/./*) fail VENDOR_IMPORT_SPEC_SOURCE_INVALID ;; esac
+        case "$target_name" in
+            ''|*[!A-Za-z0-9._-]*|*..*) fail VENDOR_IMPORT_SPEC_TARGET_INVALID ;;
+        esac
+        count=$((count + 1))
+    done < "$SPEC"
+    [ "$count" -eq 4 ] || fail VENDOR_IMPORT_SPEC_COUNT_INVALID
+}
+
+verify_assets()
+{
+    verify_root=$1
+    [ -d "$verify_root" ] && [ ! -L "$verify_root" ] || return 1
+    [ "$(stat -c %a "$verify_root")" = 700 ] || return 1
+    [ -f "$verify_root/ASSETS.tsv" ] && [ ! -L "$verify_root/ASSETS.tsv" ] || return 1
+    [ "$(stat -c %a "$verify_root/ASSETS.tsv")" = 600 ] || return 1
+    cmp -s "$SPEC" "$verify_root/ASSETS.tsv" || return 1
+    count=0
+    while IFS='|' read -r expected_hash expected_size source_name target_name; do
+        [ -n "$expected_hash" ] || continue
+        target=$verify_root/$target_name
+        [ -f "$target" ] && [ ! -L "$target" ] || return 1
+        [ "$(stat -c %a "$target")" = 600 ] || return 1
+        [ "$(stat -c %s "$target")" = "$expected_size" ] || return 1
+        actual_hash=$(sha256sum "$target" | awk '{print $1}')
+        [ "$actual_hash" = "$expected_hash" ] || return 1
+        count=$((count + 1))
+    done < "$SPEC"
+    [ "$count" -eq 4 ] || return 1
+
+    for child in "$verify_root"/* "$verify_root"/.[!.]*; do
+        [ -e "$child" ] || [ -L "$child" ] || continue
+        name=${child##*/}
+        [ "$name" = ASSETS.tsv ] && continue
+        grep -q "|$name$" "$SPEC" || return 1
+    done
+    return 0
+}
+
+install_runtime_files()
+{
+    [ -d "$FIRMWARE_ROOT" ] && [ ! -L "$FIRMWARE_ROOT" ] || fail VENDOR_IMPORT_FIRMWARE_ROOT_INVALID
+    while IFS='|' read -r expected_hash expected_size source_name target_name; do
+        [ -n "$expected_hash" ] || continue
+        source=$STAGE/$target_name
+        target=$FIRMWARE_ROOT/$target_name
+        temp=$FIRMWARE_ROOT/.$target_name.import.$$
+        if [ -e "$target" ] || [ -L "$target" ]; then
+            [ -f "$target" ] && [ ! -L "$target" ] || fail VENDOR_IMPORT_RUNTIME_FILE_COLLISION
+            [ "$(stat -c %a "$target")" = 600 ] || fail VENDOR_IMPORT_RUNTIME_MODE_MISMATCH
+            [ "$(stat -c %s "$target")" = "$expected_size" ] || fail VENDOR_IMPORT_RUNTIME_SIZE_MISMATCH
+            [ "$(sha256sum "$target" | awk '{print $1}')" = "$expected_hash" ] || \
+                fail VENDOR_IMPORT_RUNTIME_HASH_MISMATCH
+            continue
+        fi
+        [ ! -e "$temp" ] && [ ! -L "$temp" ] || fail VENDOR_IMPORT_RUNTIME_FILE_COLLISION
+        cp "$source" "$temp"
+        chmod 0600 "$temp"
+        [ "$(stat -c %s "$temp")" = "$expected_size" ] || fail VENDOR_IMPORT_RUNTIME_SIZE_MISMATCH
+        [ "$(sha256sum "$temp" | awk '{print $1}')" = "$expected_hash" ] || \
+            fail VENDOR_IMPORT_RUNTIME_HASH_MISMATCH
+        mv "$temp" "$target"
+    done < "$SPEC"
+
+    wifi_source=$STAGE/WIFI_RAM_CODE_8163
+    wifi_hash=$(grep '|system/vendor/firmware/WIFI_RAM_CODE_8163|WIFI_RAM_CODE_8163$' "$SPEC" | cut -d '|' -f 1)
+    wifi_size=$(grep '|system/vendor/firmware/WIFI_RAM_CODE_8163|WIFI_RAM_CODE_8163$' "$SPEC" | cut -d '|' -f 2)
+    [ -n "$wifi_hash" ] && [ -n "$wifi_size" ] || fail VENDOR_IMPORT_WIFI_ALIAS_CONTRACT_INVALID
+    alias=$FIRMWARE_ROOT/WIFI_RAM_CODE
+    temp=$FIRMWARE_ROOT/.WIFI_RAM_CODE.import.$$
+    if [ -e "$alias" ] || [ -L "$alias" ]; then
+        [ -f "$alias" ] && [ ! -L "$alias" ] || fail VENDOR_IMPORT_RUNTIME_FILE_COLLISION
+        [ "$(stat -c %a "$alias")" = 600 ] || fail VENDOR_IMPORT_RUNTIME_MODE_MISMATCH
+        [ "$(stat -c %s "$alias")" = "$wifi_size" ] || fail VENDOR_IMPORT_RUNTIME_SIZE_MISMATCH
+        [ "$(sha256sum "$alias" | awk '{print $1}')" = "$wifi_hash" ] || \
+            fail VENDOR_IMPORT_RUNTIME_HASH_MISMATCH
+        return 0
+    fi
+    cp "$wifi_source" "$temp"
+    chmod 0600 "$temp"
+    [ "$(stat -c %s "$temp")" = "$wifi_size" ] || fail VENDOR_IMPORT_RUNTIME_SIZE_MISMATCH
+    [ "$(sha256sum "$temp" | awk '{print $1}')" = "$wifi_hash" ] || \
+        fail VENDOR_IMPORT_RUNTIME_HASH_MISMATCH
+    mv "$temp" "$alias"
+}
+
+validate_spec
+
+[ -d "$DATA_ROOT" ] && [ ! -L "$DATA_ROOT" ] || fail VENDOR_IMPORT_DATA_ROOT_INVALID
+if [ "$TEST_MODE" != 1 ]; then
+    [ "$DATA_ROOT" = /data ] || fail VENDOR_IMPORT_DATA_ROOT_REJECTED
+    grep -q ' /data ' /proc/mounts 2>/dev/null || fail VENDOR_IMPORT_USERDATA_NOT_MOUNTED
+    [ -b "$SYSTEM_A_DEV" ] || fail VENDOR_IMPORT_SYSTEM_A_DEVICE_MISSING
+    [ -f "$SYSTEM_A_SYSFS/uevent" ] || fail VENDOR_IMPORT_SYSTEM_A_IDENTITY_MISSING
+    grep -qx 'DEVTYPE=partition' "$SYSTEM_A_SYSFS/uevent" || fail VENDOR_IMPORT_SYSTEM_A_IDENTITY_INVALID
+    grep -qx 'PARTNAME=system_a' "$SYSTEM_A_SYSFS/uevent" || fail VENDOR_IMPORT_SYSTEM_A_IDENTITY_INVALID
+    [ "$(cat "$SYSTEM_A_SYSFS/size")" = 1572864 ] || fail VENDOR_IMPORT_SYSTEM_A_SIZE_INVALID
+    rm -rf "$MOUNT_ROOT"
+    mkdir -p "$MOUNT_ROOT"
+    mount -t ext4 -o ro,nosuid,nodev,noexec "$SYSTEM_A_DEV" "$MOUNT_ROOT" || \
+        fail VENDOR_IMPORT_SYSTEM_A_MOUNT_FAILED
+    MOUNTED=1
+    SOURCE_ROOT=$MOUNT_ROOT
+else
+    [ -n "$SOURCE_ROOT" ] || fail VENDOR_IMPORT_TEST_SOURCE_MISSING
+fi
+
+[ -d "$SOURCE_ROOT" ] && [ ! -L "$SOURCE_ROOT" ] || fail VENDOR_IMPORT_SOURCE_ROOT_INVALID
+for source_directory in system system/vendor system/vendor/firmware; do
+    [ -d "$SOURCE_ROOT/$source_directory" ] &&
+        [ ! -L "$SOURCE_ROOT/$source_directory" ] ||
+        fail VENDOR_IMPORT_SOURCE_PATH_SYMLINK
+done
+
+[ ! -L "$STAGE_PARENT" ] || fail VENDOR_IMPORT_STAGE_PATH_SYMLINK
+if [ -e "$STAGE_PARENT" ]; then
+    [ -d "$STAGE_PARENT" ] || fail VENDOR_IMPORT_STAGE_PATH_INVALID
+    [ "$(stat -c %a "$STAGE_PARENT")" = 700 ] || fail VENDOR_IMPORT_STAGE_MODE_INVALID
+else
+    mkdir "$STAGE_PARENT"
+    chmod 0700 "$STAGE_PARENT"
+    STAGE_PARENT_CREATED=1
+fi
+STAGE=$STAGE_PARENT/.$BUNDLE_ID.import.$$
+[ ! -e "$STAGE" ] && [ ! -L "$STAGE" ] || fail VENDOR_IMPORT_STAGE_COLLISION
+mkdir "$STAGE"
+chmod 0700 "$STAGE"
+
+while IFS='|' read -r expected_hash expected_size source_name target_name; do
+    [ -n "$expected_hash" ] || continue
+    source=$SOURCE_ROOT/$source_name
+    target=$STAGE/$target_name
+    [ -f "$source" ] && [ ! -L "$source" ] || fail VENDOR_IMPORT_SOURCE_FILE_MISSING
+    [ "$(stat -c %s "$source")" = "$expected_size" ] || fail VENDOR_IMPORT_SOURCE_SIZE_MISMATCH
+    actual_hash=$(sha256sum "$source" | awk '{print $1}')
+    [ "$actual_hash" = "$expected_hash" ] || fail VENDOR_IMPORT_SOURCE_HASH_MISMATCH
+    cp "$source" "$target"
+    chmod 0600 "$target"
+    [ "$(sha256sum "$target" | awk '{print $1}')" = "$expected_hash" ] || \
+        fail VENDOR_IMPORT_COPY_HASH_MISMATCH
+done < "$SPEC"
+cp "$SPEC" "$STAGE/ASSETS.tsv"
+chmod 0600 "$STAGE/ASSETS.tsv"
+verify_assets "$STAGE" || fail VENDOR_IMPORT_STAGE_INVALID
+install_runtime_files
+sync
+printf '%s\n' VENDOR_IMPORT_INSTALLED_RUNTIME_ONLY

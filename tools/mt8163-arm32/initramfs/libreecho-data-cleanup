@@ -127,6 +127,7 @@ for path in \
     "$DATA_ROOT/libreecho/testing" \
     "$DATA_ROOT/libreecho/tts-stage" \
     "$DATA_ROOT/libreecho/hotstage" \
+    "$DATA_ROOT/libreecho/vendor" \
     "$DATA_ROOT/libreecho/libreecho-agentd.hotstage.bak" \
     "$DATA_ROOT/libreecho/payloads"; do
     remove_path "$path"
@@ -188,6 +189,7 @@ check_children "$DATA_ROOT/libreecho/config" \
     web-config.json web-config.json.bak users wpa_supplicant.conf ntp.conf \
     agent.json agent.json.bak tts-voice vad-floor-rms
 check_children "$DATA_ROOT/libreecho/secrets" openai-codex.json
+
 check_children "$DATA_ROOT/libreecho/update" \
     incoming staging state pending installed rolled-back check-status \
     automatic-updates install.lock bootctl.confirm

@@ -10,12 +10,13 @@ SPEEX_PREFIX="${5:?usage: build_runtime.sh <ui-source> <ort-source> <ort-build> 
 OUTPUT="${6:?usage: build_runtime.sh <ui-source> <ort-source> <ort-build> <speex-archive> <speex-prefix> <output>}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd -P)"
 OPS_CONFIG="$SCRIPT_DIR/required_operators.config"
+FLATBUFFERS_PYTHON="${LIBREECHO_WAKE_FLATBUFFERS_PYTHON:?ERROR: set LIBREECHO_WAKE_FLATBUFFERS_PYTHON to the pinned FlatBuffers Python source}"
 CROSS="${LIBREECHO_WAKE_CROSS:-/usr/bin/arm-linux-gnueabihf-}"
 JOBS="${JOBS:-$(nproc)}"
 ORT_COMMIT=8f0278c77bf44b0cc83c098c6c722b92a36ac4b5
 SPEEX_SHA=d17ca363654556a4ff1d02cc13d9eb1fc5a8642c90b40bd54ce266c3807b91a7
 
-for tool in cmake make python3 autoconf automake libtoolize; do
+for tool in cmake make python3 autoconf automake libtoolize flock; do
   command -v "$tool" >/dev/null || {
     echo "ERROR: required build tool is missing: $tool" >&2
     exit 1
@@ -42,6 +43,10 @@ done
 }
 [[ -f "$OPS_CONFIG" ]] || {
   echo "ERROR: reduced operator configuration is missing" >&2
+  exit 1
+}
+[[ -f "$FLATBUFFERS_PYTHON/flatbuffers/__init__.py" ]] || {
+  echo "ERROR: pinned FlatBuffers Python source is unavailable: $FLATBUFFERS_PYTHON" >&2
   exit 1
 }
 [[ ! -e "$OUTPUT" ]] || {
@@ -79,14 +84,57 @@ required_ort_archives=(
   libonnxruntime_mlas.a libonnxruntime_util.a
   libonnxruntime_flatbuffers.a libonnxruntime_lora.a
 )
+mkdir -p "$(dirname -- "$ORT_BUILD")"
+ort_lock_path="${ORT_BUILD}.lock"
+exec {ort_lock_fd}>"$ort_lock_path"
+flock -x "$ort_lock_fd"
+mkdir -p "$ORT_BUILD"
+# ONNX Runtime filters paths matching */ml/* when excluding its own ML
+# provider sources.  Keep the checkout's logical CMake path outside that
+# pattern; the real source path may legitimately contain an `ml` directory.
+ort_source_for_cmake="$ORT_BUILD/.onnxruntime-source"
+if [[ -e "$ort_source_for_cmake" || -L "$ort_source_for_cmake" ]]; then
+  [[ -L "$ort_source_for_cmake" ]] || {
+    echo "ERROR: refusing to replace non-symlink $ort_source_for_cmake" >&2
+    exit 1
+  }
+  [[ "$(readlink -f "$ort_source_for_cmake")" == "$(readlink -f "$ORT_SOURCE")" ]] || {
+    echo "ERROR: ONNX Runtime source symlink points at an unexpected checkout" >&2
+    exit 1
+  }
+else
+  ln -s -- "$ORT_SOURCE" "$ort_source_for_cmake"
+fi
+if [[ -x /usr/bin/python3 ]]; then
+  ort_python=/usr/bin/python3
+else
+  ort_python="$(command -v python3)"
+fi
+[[ -n "$ort_python" && -x "$ort_python" ]] || {
+  echo "ERROR: no usable host python3 interpreter" >&2
+  exit 1
+}
 ort_ready=1
 for archive in "${required_ort_archives[@]}"; do
   [[ -f "$ORT_BUILD/$archive" ]] || ort_ready=0
 done
+provider_archive="$ORT_BUILD/libonnxruntime_providers.a"
+if [[ "$ort_ready" == 1 ]]; then
+  provider_symbols="$ORT_BUILD/provider-symbols.txt"
+  "${CROSS}nm" -C "$provider_archive" > "$provider_symbols"
+  grep -Fq 'CPUExecutionProvider::CPUExecutionProvider' "$provider_symbols" || ort_ready=0
+  grep -Fq 'OrtApis::CreateCpuMemoryInfo' "$provider_symbols" || ort_ready=0
+fi
 if [[ "$ort_ready" != 1 ]]; then
+  [[ "$ORT_BUILD" == */onnxruntime-wake-reduced ]] || {
+    echo "ERROR: refusing to clean an unexpected ONNX Runtime build directory" >&2
+    exit 1
+  }
+  rm -rf -- "$ORT_BUILD"
   mkdir -p "$ORT_BUILD"
-  PYTHONPATH="$ORT_SOURCE/tools/ci_build" \
-    python3 - "$OPS_CONFIG" "$ORT_BUILD" <<'PY'
+  ln -s -- "$ORT_SOURCE" "$ort_source_for_cmake"
+  PYTHONPATH="$FLATBUFFERS_PYTHON:$ORT_SOURCE/tools/ci_build${PYTHONPATH:+:$PYTHONPATH}" \
+    "$ort_python" - "$OPS_CONFIG" "$ORT_BUILD" <<'PY'
 import sys
 from reduce_op_kernels import reduce_ops
 
@@ -98,7 +146,8 @@ reduce_ops(
     is_extended_minimal_build_or_higher=True,
 )
 PY
-  cmake -S "$ORT_SOURCE/cmake" -B "$ORT_BUILD" \
+  cmake -S "$ort_source_for_cmake/cmake" -B "$ORT_BUILD" \
+    -DPython_EXECUTABLE="$ort_python" \
     -DCMAKE_BUILD_TYPE=MinSizeRel \
     -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=arm \
     -DCMAKE_C_COMPILER="${CROSS}gcc" \

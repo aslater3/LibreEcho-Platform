@@ -41,6 +41,8 @@ def main() -> None:
     parser.add_argument("--public-key", type=Path, required=True)
     parser.add_argument("--service-profile", choices=("diagnostic", "production"),
                         default="diagnostic")
+    parser.add_argument("--feature-policy", choices=("exclude", "preserve"),
+                        default="preserve")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -63,7 +65,7 @@ def main() -> None:
         "boot_filename=boot.img\n"
         f"boot_size={len(boot)}\n"
         f"boot_sha256={digest}\n"
-        "feature_policy=preserve\n"
+        f"feature_policy={args.feature_policy}\n"
         "image_profile=ota\n"
         f"service_profile={args.service_profile}\n"
     ).encode("ascii")

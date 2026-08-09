@@ -1,0 +1,10 @@
+{
+  "name": "wpa_supplicant",
+  "version": "2.10",
+  "license": "BSD-3-Clause",
+  "source_url": "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz",
+  "source_sha256": "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f",
+  "config": "wpa_supplicant-2.10.config",
+  "drivers": ["wext"],
+  "crypto": "internal"
+}

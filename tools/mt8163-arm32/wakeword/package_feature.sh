@@ -8,17 +8,23 @@ WAKE_MODEL="${4:?usage: package_feature.sh <waked> <mel-model> <embedding-model>
 PAYLOAD="${5:?usage: package_feature.sh <waked> <mel-model> <embedding-model> <wake-model> <payload> <manifest>}"
 MANIFEST="${6:?usage: package_feature.sh <waked> <mel-model> <embedding-model> <wake-model> <payload> <manifest>}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd -P)"
-PIPELINE_ROOT="$(cd -- "$SCRIPT_DIR/../../../../pipeline" && pwd -P)"
+COMMON_LICENSE_DIR="$(dirname "$SCRIPT_DIR")/third-party-licenses"
+PIPELINE_ROOT="${LIBREECHO_PIPELINE_ROOT:?ERROR: set LIBREECHO_PIPELINE_ROOT explicitly}"
 PACKAGER="$PIPELINE_ROOT/package_feature_payload.sh"
 LICENSE_NOTICE="$SCRIPT_DIR/MODEL-LICENSE.txt"
+LICENSE_TEXT="$SCRIPT_DIR/CC-BY-NC-SA-4.0.txt"
 
 for input in "$WAKED" "$MEL_MODEL" "$EMBEDDING_MODEL" "$WAKE_MODEL" \
-    "$LICENSE_NOTICE"; do
+    "$LICENSE_NOTICE" "$LICENSE_TEXT"; do
   [[ -f "$input" && ! -L "$input" ]] || {
     echo "ERROR: wakeword input is missing or is a symlink: $input" >&2
     exit 1
   }
 done
+[[ -d "$COMMON_LICENSE_DIR" && ! -L "$COMMON_LICENSE_DIR" ]] || {
+  echo "ERROR: common wakeword runtime license bundle is missing" >&2
+  exit 1
+}
 [[ -x "$PACKAGER" ]] || {
   echo "ERROR: feature packager is missing: $PACKAGER" >&2
   exit 1
@@ -58,5 +64,15 @@ install -m 0644 "$MEL_MODEL" "$model_root/melspectrogram.onnx"
 install -m 0644 "$EMBEDDING_MODEL" "$model_root/embedding_model.onnx"
 install -m 0644 "$WAKE_MODEL" "$model_root/alexa_v0.1.onnx"
 install -m 0644 "$LICENSE_NOTICE" "$license_root/MODEL-LICENSE.txt"
+install -m 0644 "$LICENSE_TEXT" "$license_root/CC-BY-NC-SA-4.0.txt"
+runtime_license_root="$license_root/runtime"
+install -d "$runtime_license_root"
+for input in "$COMMON_LICENSE_DIR"/*; do
+  [[ -f "$input" && ! -L "$input" ]] || {
+    echo "ERROR: unsafe common runtime license input: $input" >&2
+    exit 1
+  }
+  install -m 0644 "$input" "$runtime_license_root/$(basename "$input")"
+done
 
 "$PACKAGER" wakeword "$root" "$PAYLOAD" "$MANIFEST"
