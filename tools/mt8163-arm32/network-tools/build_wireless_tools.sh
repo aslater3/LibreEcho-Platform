@@ -111,13 +111,14 @@ PY
 done
 make -C "$src" -j"${LIBREECHO_BUILD_JOBS:-2}" \
   CC="$wrapper_dir/gcc" AR="$wrapper_dir/ar" RANLIB="$wrapper_dir/ranlib" \
-  CFLAGS="${cflags[*]}" LDFLAGS='-static -Wl,--build-id=none' iwconfig >/dev/null
+  CFLAGS="${cflags[*]}" LDFLAGS='-static -no-pie -Wl,--build-id=none' iwconfig >/dev/null
 install -m 0755 "$src/iwconfig" "$OUTPUT/iwconfig"
 install -m 0644 "$src/COPYING" "$OUTPUT/wireless-tools-COPYING"
 
 readelf_output="$(readelf -h -l -d "$OUTPUT/iwconfig")"
 grep -Eq 'Class:[[:space:]]+ELF32' <<< "$readelf_output"
 grep -Eq 'Machine:[[:space:]]+ARM' <<< "$readelf_output"
+grep -Eq 'Type:[[:space:]]+EXEC' <<< "$readelf_output"
 grep -Eq 'Flags:.*0x(05000400|5000400)' <<< "$readelf_output"
 ! grep -q 'Requesting program interpreter' <<< "$readelf_output"
 ! grep -q 'NEEDED' <<< "$readelf_output"

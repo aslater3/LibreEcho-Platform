@@ -947,6 +947,8 @@ class SourceTests(unittest.TestCase):
         self.assertIn("--native-root DIR", builder_source)
         self.assertIn("wireless-tools-source.json", builder_source)
         self.assertIn("wireless-tools-COPYING", builder_source)
+        self.assertIn("-static -no-pie", builder_source)
+        self.assertIn("Type:[[:space:]]+EXEC", builder_source)
         self.assertNotIn("curl --fail", builder_source)
         regdb_builder = TOOLS_DIR / "network-tools/wireless-regdb/build_wireless_regdb.sh"
         self.assertTrue(regdb_builder.is_file())
