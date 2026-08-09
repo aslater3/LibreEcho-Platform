@@ -761,16 +761,28 @@ class SourceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             boot = root / "boot.img"
-            boot.write_bytes(b"ANDROID!" + b"\0" * (16 * 1024 * 1024 - 8))
+            boot_bytes = b"ANDROID!" + bytes((16 * 1024 * 1024) - 8)
+            boot.write_bytes(boot_bytes)
             key = SigningKey.generate()
             private = root / "private.hex"
             public = root / "public.hex"
+            build_manifest = root / "build-manifest.json"
             private.write_text(key.encode().hex() + "\n")
             public.write_text(key.verify_key.encode().hex() + "\n")
+            build_manifest.write_text(json.dumps({
+                "image_profile": "ota",
+                "service_profile": "production",
+                "feature_policy": "redistributable",
+                "output": {
+                    "sha256": hashlib.sha256(boot_bytes).hexdigest(),
+                    "size": len(boot_bytes),
+                },
+            }))
             output = root / "update.ota.tar"
             subprocess.run([
                 sys.executable, str(TOOLS_DIR / "ota/make_ota_bundle.py"),
-                "--boot-image", str(boot), "--version", "test-v1",
+                "--boot-image", str(boot), "--build-manifest", str(build_manifest),
+                "--version", "test-v1",
                 "--signing-key", str(private), "--public-key", str(public),
                 "--service-profile", "production", "--feature-policy",
                 "redistributable", "--output", str(output),
@@ -784,16 +796,28 @@ class SourceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             boot = root / "boot.img"
-            boot.write_bytes(b"ANDROID!" + b"\0" * (16 * 1024 * 1024 - 8))
+            boot_bytes = b"ANDROID!" + bytes((16 * 1024 * 1024) - 8)
+            boot.write_bytes(boot_bytes)
             key = SigningKey.generate()
             private = root / "private.hex"
             public = root / "public.hex"
+            build_manifest = root / "build-manifest.json"
             private.write_text(key.encode().hex() + "\n")
             public.write_text(key.verify_key.encode().hex() + "\n")
+            build_manifest.write_text(json.dumps({
+                "image_profile": "ota",
+                "service_profile": "production",
+                "feature_policy": "community-noncommercial",
+                "output": {
+                    "sha256": hashlib.sha256(boot_bytes).hexdigest(),
+                    "size": len(boot_bytes),
+                },
+            }))
             output = root / "update.ota.tar"
             subprocess.run([
                 sys.executable, str(TOOLS_DIR / "ota/make_ota_bundle.py"),
-                "--boot-image", str(boot), "--version", "test-v1",
+                "--boot-image", str(boot), "--build-manifest", str(build_manifest),
+                "--version", "test-v1",
                 "--signing-key", str(private), "--public-key", str(public),
                 "--service-profile", "production", "--feature-policy",
                 "community-noncommercial", "--output", str(output),
@@ -801,6 +825,71 @@ class SourceTests(unittest.TestCase):
             with tarfile.open(output, "r:") as archive:
                 manifest = archive.extractfile("manifest").read().decode()
             self.assertIn("feature_policy=community-noncommercial\n", manifest)
+
+    def test_ota_bundle_rejects_excluded_features_with_production_services(self) -> None:
+        from nacl.signing import SigningKey
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            boot = root / "boot.img"
+            boot_bytes = b"ANDROID!" + bytes((16 * 1024 * 1024) - 8)
+            boot.write_bytes(boot_bytes)
+            key = SigningKey.generate()
+            private = root / "private.hex"
+            public = root / "public.hex"
+            build_manifest = root / "build-manifest.json"
+            private.write_text(key.encode().hex() + "\n")
+            public.write_text(key.verify_key.encode().hex() + "\n")
+            build_manifest.write_text(json.dumps({
+                "image_profile": "ota",
+                "service_profile": "diagnostic",
+                "feature_policy": "exclude",
+                "output": {
+                    "sha256": hashlib.sha256(boot_bytes).hexdigest(),
+                    "size": len(boot_bytes),
+                },
+            }))
+            result = subprocess.run([
+                sys.executable, str(TOOLS_DIR / "ota/make_ota_bundle.py"),
+                "--boot-image", str(boot), "--build-manifest", str(build_manifest),
+                "--version", "test-v1", "--signing-key", str(private),
+                "--public-key", str(public), "--service-profile", "production",
+                "--feature-policy", "exclude", "--output", str(root / "update.ota.tar"),
+            ], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("feature exclusion requires the diagnostic service profile", result.stderr)
+
+    def test_ota_bundle_rejects_policy_not_bound_to_boot_manifest(self) -> None:
+        from nacl.signing import SigningKey
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            boot = root / "boot.img"
+            boot_bytes = b"ANDROID!" + bytes((16 * 1024 * 1024) - 8)
+            boot.write_bytes(boot_bytes)
+            key = SigningKey.generate()
+            private = root / "private.hex"
+            public = root / "public.hex"
+            build_manifest = root / "build-manifest.json"
+            private.write_text(key.encode().hex() + "\n")
+            public.write_text(key.verify_key.encode().hex() + "\n")
+            build_manifest.write_text(json.dumps({
+                "image_profile": "ota",
+                "service_profile": "production",
+                "feature_policy": "preserve",
+                "output": {
+                    "sha256": hashlib.sha256(boot_bytes).hexdigest(),
+                    "size": len(boot_bytes),
+                },
+            }))
+            result = subprocess.run([
+                sys.executable, str(TOOLS_DIR / "ota/make_ota_bundle.py"),
+                "--boot-image", str(boot), "--build-manifest", str(build_manifest),
+                "--version", "test-v1", "--signing-key", str(private),
+                "--public-key", str(public), "--service-profile", "production",
+                "--feature-policy", "redistributable",
+                "--output", str(root / "update.ota.tar"),
+            ], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("feature policy does not match build manifest", result.stderr)
 
     def test_stock_userspace_is_replaced_by_source_built_adbd(self) -> None:
         builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
