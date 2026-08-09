@@ -66,6 +66,9 @@ pathlib.Path(out).write_text(
 pathlib.Path(out).chmod(0o755)
 PY
 done
+# The target wrappers restore the pmbootstrap runtime privately. Do not let a
+# caller's target-side library path contaminate BusyBox host tools such as fixdep.
+unset LD_LIBRARY_PATH
 export SOURCE_DATE_EPOCH=0
 export TZ=UTC
 export KBUILD_BUILD_USER=libreecho

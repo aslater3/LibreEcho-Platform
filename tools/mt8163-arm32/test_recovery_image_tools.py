@@ -627,6 +627,12 @@ class SourceTests(unittest.TestCase):
         ).read_text()
         self.assertIn("export TZ=UTC", builder)
 
+    def test_busybox_builder_sanitizes_host_linker_environment(self) -> None:
+        builder = (
+            TOOLS_DIR / "busybox" / "build_busybox.sh"
+        ).read_text()
+        self.assertIn("unset LD_LIBRARY_PATH", builder)
+
     def test_feature_policy_is_immutable_and_fail_closed(self) -> None:
         builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
         verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
