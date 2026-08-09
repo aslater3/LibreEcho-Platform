@@ -122,7 +122,7 @@ verify_manifest()
         die manifest_boot_size
     FEATURE_POLICY=$(manifest_value feature_policy)
     case "$FEATURE_POLICY" in
-        preserve|exclude) ;;
+        preserve|redistributable|exclude) ;;
         *) die manifest_feature_policy ;;
     esac
     [ "$(manifest_value image_profile)" = ota ] ||

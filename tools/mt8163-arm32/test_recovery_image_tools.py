@@ -11,6 +11,7 @@ import re
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -711,6 +712,44 @@ class SourceTests(unittest.TestCase):
         self.assertIn("/etc/libreecho/feature-policy", init)
         self.assertIn("feature exclusion requires --service-profile diagnostic", pipeline)
         self.assertIn('FEATURE_POLICY="${LIBREECHO_FEATURE_POLICY:-preserve}"', pipeline)
+
+    def test_redistributable_policy_is_four_payloads_without_wakeword(self) -> None:
+        builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
+        ota = (TOOLS_DIR / "ota/make_ota_bundle.py").read_text()
+        for source in (builder, verifier, updater, ota):
+            self.assertIn("redistributable", source)
+        self.assertIn("redistributable policy requires external AirPlay, TTS, STT, and assistant payloads", builder)
+        self.assertIn("wakeword payload inputs are forbidden by feature_policy=redistributable", builder)
+        self.assertIn("redistributable feature policy manifest mismatch", verifier)
+        self.assertIn("preserve|redistributable|exclude", init)
+        self.assertIn('if [ "$FEATURE_POLICY" = preserve ]; then', init)
+        self.assertIn("ui-services-redistributable-without-wakeword", init)
+
+    def test_ota_bundle_signs_redistributable_policy(self) -> None:
+        from nacl.signing import SigningKey
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            boot = root / "boot.img"
+            boot.write_bytes(b"ANDROID!" + b"\0" * (16 * 1024 * 1024 - 8))
+            key = SigningKey.generate()
+            private = root / "private.hex"
+            public = root / "public.hex"
+            private.write_text(key.encode().hex() + "\n")
+            public.write_text(key.verify_key.encode().hex() + "\n")
+            output = root / "update.ota.tar"
+            subprocess.run([
+                sys.executable, str(TOOLS_DIR / "ota/make_ota_bundle.py"),
+                "--boot-image", str(boot), "--version", "test-v1",
+                "--signing-key", str(private), "--public-key", str(public),
+                "--service-profile", "production", "--feature-policy",
+                "redistributable", "--output", str(output),
+            ], check=True, capture_output=True, text=True)
+            with tarfile.open(output, "r:") as archive:
+                manifest = archive.extractfile("manifest").read().decode()
+            self.assertIn("feature_policy=redistributable\n", manifest)
 
     def test_stock_userspace_is_replaced_by_source_built_adbd(self) -> None:
         builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()

@@ -1730,6 +1730,18 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                 fail(f"feature exclusion manifest enables {feature}")
         if b"FEATURE_POLICY" not in control.data or b"feature-services-excluded" not in control.data:
             fail("feature exclusion is not enforced by init")
+    elif expected_feature_policy == "redistributable":
+        if expected_service_profile != "production":
+            fail("redistributable feature policy manifest mismatch")
+        for feature in ("airplay", "tts", "stt", "assistant"):
+            record = manifest.get(feature, {"enabled": False})
+            if not isinstance(record, dict) or record.get("enabled") is not True:
+                fail(f"redistributable feature policy manifest mismatch: {feature} disabled")
+        wakeword = manifest.get("wakeword", {"enabled": False})
+        if not isinstance(wakeword, dict) or wakeword.get("enabled") is not False:
+            fail("redistributable feature policy manifest mismatch: wakeword enabled")
+        if b"ui-services-redistributable-without-wakeword" not in control.data:
+            fail("redistributable feature policy manifest mismatch: init graph marker missing")
     for name, entry in entries.items():
         info = elf_info(entry.data)
         if info is not None and info[:2] != (1, 40):
@@ -1777,7 +1789,7 @@ def main() -> None:
     parser.add_argument("--expected-image-profile", choices=("development", "ota"), required=True)
     parser.add_argument("--expected-service-profile", choices=("diagnostic", "production"),
                         required=True)
-    parser.add_argument("--expected-feature-policy", choices=("exclude", "preserve"), required=True)
+    parser.add_argument("--expected-feature-policy", choices=("exclude", "preserve", "redistributable"), required=True)
     parser.add_argument("--expected-busybox-sha256", required=True)
     parser.add_argument("--expected-musl-loader-sha256", required=True)
     parser.add_argument("--expected-bootctl-sha256", required=True)

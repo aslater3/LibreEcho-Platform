@@ -41,7 +41,8 @@ def main() -> None:
     parser.add_argument("--public-key", type=Path, required=True)
     parser.add_argument("--service-profile", choices=("diagnostic", "production"),
                         default="diagnostic")
-    parser.add_argument("--feature-policy", choices=("exclude", "preserve"),
+    parser.add_argument("--feature-policy",
+                        choices=("exclude", "preserve", "redistributable"),
                         default="preserve")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()

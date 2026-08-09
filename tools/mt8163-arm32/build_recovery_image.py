@@ -1776,7 +1776,7 @@ def main() -> None:
     parser.add_argument("--image-profile", choices=("development", "ota"), required=True)
     parser.add_argument("--service-profile", choices=("diagnostic", "production"),
                         default="diagnostic")
-    parser.add_argument("--feature-policy", choices=("exclude", "preserve"),
+    parser.add_argument("--feature-policy", choices=("exclude", "preserve", "redistributable"),
                         default="preserve")
     parser.add_argument("--bootctl", type=Path, required=True)
     parser.add_argument("--update-verifier", type=Path, required=True)
@@ -2042,6 +2042,20 @@ def main() -> None:
             wakeword_payload_enabled, stt_payload_enabled, assistant_payload_enabled,
         )):
             raise SystemExit("ERROR: feature payload inputs are forbidden by feature_policy=exclude")
+    elif args.feature_policy == "redistributable":
+        if args.service_profile != "production":
+            raise SystemExit("ERROR: redistributable policy requires the production service profile")
+        if not all((airplay_payload_enabled, tts_payload_enabled,
+                    stt_payload_enabled, assistant_payload_enabled)):
+            raise SystemExit(
+                "ERROR: redistributable policy requires external AirPlay, TTS, STT, and assistant payloads"
+            )
+        if airplay_legacy_enabled:
+            raise SystemExit("ERROR: embedded AirPlay assets are forbidden by feature_policy=redistributable")
+        if wakeword_payload_enabled:
+            raise SystemExit(
+                "ERROR: wakeword payload inputs are forbidden by feature_policy=redistributable"
+            )
 
     envelope = read(args.boot_envelope)
     canonical_envelope = generate_boot_envelope()

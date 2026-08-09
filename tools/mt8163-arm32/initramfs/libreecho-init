@@ -30,7 +30,7 @@ esac
 FEATURE_POLICY_VALUE=$($BB cat /etc/libreecho/feature-policy 2>/dev/null)
 FEATURE_POLICY=exclude
 case "$FEATURE_POLICY_VALUE" in
-    preserve|exclude)
+    preserve|redistributable|exclude)
         FEATURE_POLICY=$FEATURE_POLICY_VALUE
         ;;
 esac
@@ -817,11 +817,20 @@ start_ui_services()
             *) [ $((integrations & 1)) -ne 0 ] && ha_enabled=1 ;;
         esac
     fi
-    if [ "$ha_enabled" -eq 1 ]; then
-        log ui-home-assistant-mode-enabled
-        services="logd networkd timed audiod micd waked ledd btd airplayd wyomingd web"
+    if [ "$FEATURE_POLICY" = preserve ]; then
+        if [ "$ha_enabled" -eq 1 ]; then
+            log ui-home-assistant-mode-enabled
+            services="logd networkd timed audiod micd waked ledd btd airplayd wyomingd web"
+        else
+            services="logd networkd timed audiod micd waked sttd ledd btd airplayd ttsd agentd web"
+        fi
     else
-        services="logd networkd timed audiod micd waked sttd ledd btd airplayd ttsd agentd web"
+        if [ "$ha_enabled" -eq 1 ]; then
+            services="logd networkd timed audiod micd ledd btd airplayd wyomingd web"
+        else
+            services="logd networkd timed audiod micd sttd ledd btd airplayd ttsd agentd web"
+        fi
+        log ui-services-redistributable-without-wakeword
     fi
     fi
     for service in $services; do
@@ -853,7 +862,7 @@ log ui-services-autostart-started
 ota_health_confirm_worker()
 {
     [ "$IMAGE_PROFILE" = ota ] || return 0
-    [ "$FEATURE_POLICY" = preserve ] || {
+    [ "$FEATURE_POLICY" != exclude ] || {
         log ota-health-feature-validation-skipped-by-exclusion-policy
         return 0
     }
