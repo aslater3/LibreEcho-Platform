@@ -228,6 +228,11 @@ class SourceTests(unittest.TestCase):
             "windows95", (pipeline_root / "inputs/SHA256SUMS").read_text().lower()
         )
 
+    def test_connectivity_helpers_strip_toolchain_debug_paths(self) -> None:
+        source = (TOOLS_DIR / "connectivity/build_connectivity_helpers.sh").read_text()
+        self.assertIn("-Wl,--strip-all", source)
+        self.assertIn("contains a host/build path", source)
+
     def test_wakeword_runtime_uses_explicit_re2_archive(self) -> None:
         source = (TOOLS_DIR / "wakeword/build_runtime.sh").read_text()
         self.assertIn(

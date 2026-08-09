@@ -46,6 +46,7 @@ common=(
   -static -no-pie -Os -std=c11 -Wall -Wextra -Werror
   "--sysroot=$SYSROOT"
   -Wl,--build-id=none
+  -Wl,--strip-all
   "-ffile-prefix-map=$script_dir=/usr/src/libreecho-connectivity"
   "-fdebug-prefix-map=$script_dir=/usr/src/libreecho-connectivity"
   "-fmacro-prefix-map=$script_dir=/usr/src/libreecho-connectivity"
