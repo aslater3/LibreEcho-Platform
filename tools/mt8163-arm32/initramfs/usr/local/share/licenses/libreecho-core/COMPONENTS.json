@@ -77,8 +77,9 @@
     {
       "id": "libsodium",
       "license": "ISC",
-      "source": "https://github.com/jedisct1/libsodium/tree/1.0.18",
-      "static_archive_sha256": "71e1dbf00f5bcf91c685ef6ec20c6b482ade70fab91518ee1ef68cbf835fe5b0",
+      "source": "https://archive.ubuntu.com/ubuntu/pool/main/libs/libsodium/libsodium_1.0.18.orig.tar.gz",
+      "source_archive_sha256": "d59323c6b712a1519a5daf710b68f5e7fde57040845ffec53850911f10a5d4f4",
+      "static_archive_sha256": "c087518c6d309233de1762b464f5b7bf5de895bd45a661011ab212713609bb61",
       "version": "1.0.18"
     },
     {
