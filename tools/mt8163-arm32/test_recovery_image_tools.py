@@ -931,6 +931,36 @@ class SourceTests(unittest.TestCase):
         self.assertIn("AudDrv_GPIO_DACMUX_Select(0)", prepare)
         self.assertNotIn("AudDrv_GPIO_DACMUX_Select(1)", prepare)
 
+    def test_connectivity_helper_pins_match_source_built_outputs(self) -> None:
+        expected = {
+            "sbin/wmt_configure": (
+                25744,
+                "2a57272037a34519e9f6f5dd64ab5a16ad304c81535c4aa7f15a8afae34aadb1",
+            ),
+            "sbin/wmt_responder": (
+                21648,
+                "46170ddc1d1ddf21a85ec16df129aac47a258a439bc9e6ed061d1e5942aa48eb",
+            ),
+            "sbin/wmt_bt_on": (
+                21648,
+                "985320b270149cd27bc59d7f34d0da829817f225a4e712037633517c843cc745",
+            ),
+            "sbin/wmt_stock_compat": (
+                21648,
+                "7e3afe31b706029ebf6e271f5cda6e3880cfc5b184abb052a190662759708c87",
+            ),
+            "sbin/wmt_launcher": (
+                21648,
+                "65cb5c0c49bb61aec657c114cf67269e398bf41ff7b70a4abb8eb0ec36ff2c99",
+            ),
+        }
+        builder_pins = {
+            target: (specification[1], specification[2])
+            for target, specification in builder.CONNECTIVITY_HELPERS.items()
+        }
+        self.assertEqual(builder_pins, expected)
+        self.assertEqual(verifier.CONNECTIVITY_HELPERS, expected)
+
     def test_network_tools_are_pinned_and_manual_only(self) -> None:
         builder_script = TOOLS_DIR / "network-tools/build_wireless_tools.sh"
         self.assertTrue(builder_script.is_file())

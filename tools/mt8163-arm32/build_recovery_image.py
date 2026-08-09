@@ -79,24 +79,24 @@ CONNECTIVITY_ASSET_REQUIREMENTS = {
 
 CONNECTIVITY_HELPERS = {
     "sbin/wmt_configure": (
-        "wmt_config_helper", 184892,
-        "e31f7e508f1f9eccfa999539a4e05665ccc4a994aa2d37698bc71a7e7c3c0f6e",
+        "wmt_config_helper", 25744,
+        "2a57272037a34519e9f6f5dd64ab5a16ad304c81535c4aa7f15a8afae34aadb1",
     ),
     "sbin/wmt_responder": (
-        "wmt_responder", 170092,
-        "808b10a0a0def6d37e7790a223cffa3d409097105eceb0f4ffe38d2af8fe5bde",
+        "wmt_responder", 21648,
+        "46170ddc1d1ddf21a85ec16df129aac47a258a439bc9e6ed061d1e5942aa48eb",
     ),
     "sbin/wmt_bt_on": (
-        "wmt_bt_on", 164436,
-        "46d3dec86d9551c304d6c4e1e5fedeab244a0ffd688baea5fe5af35b1fa7cc08",
+        "wmt_bt_on", 21648,
+        "985320b270149cd27bc59d7f34d0da829817f225a4e712037633517c843cc745",
     ),
     "sbin/wmt_stock_compat": (
-        "wmt_stock_compat", 164808,
-        "c593e6f2a177428632d7a2ef1abdff6bbd4997cca767825e021cdd9b0bf681a8",
+        "wmt_stock_compat", 21648,
+        "7e3afe31b706029ebf6e271f5cda6e3880cfc5b184abb052a190662759708c87",
     ),
     "sbin/wmt_launcher": (
-        "wmt_launcher", 172324,
-        "c126ab1eed0f0499e26b8b8c7e632ea20a7d848a11f5a6c70fa0a5ec87be6967",
+        "wmt_launcher", 21648,
+        "65cb5c0c49bb61aec657c114cf67269e398bf41ff7b70a4abb8eb0ec36ff2c99",
     ),
 }
 
