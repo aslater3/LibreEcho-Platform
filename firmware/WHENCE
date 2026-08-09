@@ -852,3 +852,25 @@ Licence:
 Found in hex form in kernel source.
 
 --------------------------------------------------------------------------
+
+Driver: amzn-mt-spi-pcm -- Amazon MT8163 I2S-to-SPI audio FPGA bridge.
+
+File: firmware/i2s_to_spi_v34.bin
+
+Origin: Amazon Fire HD8 8th-generation source package. The same byte-identical
+blob is present in the established `echo-pmos/amazon-biscuit-kernel`
+postmarketOS community lineage.
+
+Git blob SHA-1: a6eafb423215f1317df7af97822cc20858a8ae46
+Size: 30964 bytes
+SHA-256: 77a558bacdaaf9e343f02f2d74f27a5f2bb2dc8b6d66cc2499b60ed14ef62fe6
+
+License: No firmware-specific licence found.
+Redistribution basis: Documented good-faith decision following established
+community precedent, including postmarketOS `linux-amazon-biscuit`, which
+embeds and publishes kernels containing this exact blob.
+
+Known-good identity: any future replacement MUST match the size and SHA-256
+above unless this record and the release component contract are deliberately
+re-reviewed. Package-level Linux GPL metadata and community precedent are not
+represented as a firmware-specific licence.
