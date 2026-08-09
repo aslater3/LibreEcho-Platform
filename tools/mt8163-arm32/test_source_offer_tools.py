@@ -120,6 +120,14 @@ class SourceOfferTests(unittest.TestCase):
             with self.subTest(path=relative):
                 self.assertIn('--sysroot=$SYSROOT', source)
 
+    def test_audio_tools_consume_exported_uapi_without_dirtying_kernel_source(self) -> None:
+        source = (
+            Path(__file__).resolve().parent / "audio-tools/build_audio_tools.sh"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("headers_install", source)
+        self.assertIn("exported-linux-uapi", source)
+        self.assertIn("kernel_uapi_sha256", source)
+
 
 if __name__ == "__main__":
     unittest.main()

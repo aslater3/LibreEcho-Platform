@@ -25,8 +25,10 @@ done
 [[ -f "$ARCHIVE" && ! -L "$ARCHIVE" ]] || { echo "ERROR: unsafe TinyALSA archive" >&2; exit 1; }
 [[ -x "${CROSS_PREFIX}gcc" ]] || { echo "ERROR: target compiler is unavailable" >&2; exit 1; }
 [[ -f "$SYSROOT/usr/include/errno.h" ]] || { echo "ERROR: target sysroot is unavailable" >&2; exit 1; }
-[[ -f "$KERNEL_HEADERS/include/uapi/linux/ioctl.h" && -f "$KERNEL_HEADERS/Makefile" ]] || {
-  echo "ERROR: Linux ARM UAPI headers are unavailable" >&2
+[[ -f "$KERNEL_HEADERS/linux/ioctl.h" && -f "$KERNEL_HEADERS/asm/ioctl.h" &&
+   -f "$KERNEL_HEADERS/sound/asound.h" &&
+   -d "$KERNEL_HEADERS/asm-generic" ]] || {
+  echo "ERROR: exported Linux ARM UAPI headers are unavailable" >&2
   exit 1
 }
 
@@ -53,7 +55,8 @@ mkdir -p "$src"
 tar -xf "$ARCHIVE" -C "$src" --strip-components=1
 patch --batch --forward --fuzz=0 -p1 -d "$src" < "$patch_file" >/dev/null
 uapi="$work/kernel-uapi"
-make -s -C "$KERNEL_HEADERS" ARCH=arm INSTALL_HDR_PATH="$uapi" headers_install
+mkdir -p "$uapi/include"
+cp -a "$KERNEL_HEADERS/." "$uapi/include/"
 [[ -f "$uapi/include/linux/ioctl.h" && -f "$uapi/include/asm/ioctl.h" ]] || {
   echo "ERROR: Linux ARM UAPI header installation failed" >&2
   exit 1
@@ -108,11 +111,16 @@ for name in tinyplay tinycap tinymix; do
 done
 
 compiler="$("${wrapper_prefix}gcc" --version | sed -n '1p')"
-python3 - "$OUTPUT/tinyalsa-source.json" "$OUTPUT" "$compiler" "$patch_file" <<'PY'
+python3 - "$OUTPUT/tinyalsa-source.json" "$OUTPUT" "$compiler" "$patch_file" "$KERNEL_HEADERS" <<'PY'
 import hashlib, json, pathlib, sys
-out, root, compiler, patch_file = sys.argv[1:]
+out, root, compiler, patch_file, kernel_headers = sys.argv[1:]
 root = pathlib.Path(root)
 sha256 = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+kernel_headers = pathlib.Path(kernel_headers)
+uapi_hash = hashlib.sha256()
+for path in sorted(p for p in kernel_headers.rglob("*") if p.is_file()):
+    uapi_hash.update(path.relative_to(kernel_headers).as_posix().encode() + b"\0")
+    uapi_hash.update(path.read_bytes())
 metadata = {
     "compiler": compiler,
     "license": "BSD-3-Clause",
@@ -122,6 +130,8 @@ metadata = {
     },
     "patch": "tinyalsa-mt8163.patch",
     "patch_sha256": sha256(pathlib.Path(patch_file)),
+    "kernel_headers": "exported-linux-uapi",
+    "kernel_uapi_sha256": uapi_hash.hexdigest(),
     "source_sha256": "dc75977453304fcce0b91cbfd2b27942641c93479f87898d230cdc440a042d4f",
     "source_url": "https://github.com/tinyalsa/tinyalsa/archive/e43025bbf702eb7dd8edd48c1eb50530c60f1de8.tar.gz",
     "version": "e43025bbf702eb7dd8edd48c1eb50530c60f1de8",
