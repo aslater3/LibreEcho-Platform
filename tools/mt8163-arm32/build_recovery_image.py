@@ -39,15 +39,18 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-BUSYBOX_SHA256 = "d4c8fd2aea01abd851c703f39b29c0de748b2751e4e1a85cae570fa53ad8f4fb"
-MUSL_LOADER_SHA256 = "1063871174f1bd4f08f4d330e20b07aeb0820327ee739a4d8d1b644df842cb6b"
-RECOVERY_INIT_SHA256 = "767d32df45cdc1b20cfe4bd7cb681c44140ea396f26c65e86282d7de833381b0"
+RECOVERY_INIT_SHA256 = "61ca87a17a162af4e498cfca95275aeb60dca0e06f64152a1f268e996354bf06"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
 CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
 CONNECTIVITY_IMPORTER_SHA256 = "27f20efb39825333838df76eb843e4af537864f326a9648702739286a25e5d3a"
 WPA_SUPPLICANT_VERSION = "2.10"
+WPA_SOURCE_SHA256 = "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f"
+WPA_SOURCE_URL = "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz"
+WIRELESS_TOOLS_VERSION = "30~pre9"
+WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
+WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 SSH_PASSWORD_HASH_RE = re.compile(
     r"\$(?:1|5|6|2[abxy]?|y|gy)\$[^$:\r\n]{1,64}\$[^:\r\n]{1,512}\Z"
 )
@@ -76,24 +79,24 @@ CONNECTIVITY_ASSET_REQUIREMENTS = {
 
 CONNECTIVITY_HELPERS = {
     "sbin/wmt_configure": (
-        "wmt_config_helper", 428704,
-        "2fa1c78546b3a0d35442ffa196f3eaa13b1ce4609b537332b016bc88ea663be2",
+        "wmt_config_helper", 25744,
+        "2a57272037a34519e9f6f5dd64ab5a16ad304c81535c4aa7f15a8afae34aadb1",
     ),
     "sbin/wmt_responder": (
-        "wmt_responder", 428796,
-        "e20bdaf559165077ff8211c64ed38a10ecee1006641e94302cf14d3be397c350",
+        "wmt_responder", 21648,
+        "46170ddc1d1ddf21a85ec16df129aac47a258a439bc9e6ed061d1e5942aa48eb",
     ),
     "sbin/wmt_bt_on": (
-        "wmt_bt_on", 424540,
-        "4365c1b1046bf2ce1045a3fbd4578ee21d8f1a9900a01cb0cde9cea478821d82",
+        "wmt_bt_on", 21648,
+        "985320b270149cd27bc59d7f34d0da829817f225a4e712037633517c843cc745",
     ),
     "sbin/wmt_stock_compat": (
-        "wmt_stock_compat", 341184,
-        "5be9b801153c79f85260b193c57a5ba5c4155f9fccbad47a794e9445e94d654c",
+        "wmt_stock_compat", 21648,
+        "7e3afe31b706029ebf6e271f5cda6e3880cfc5b184abb052a190662759708c87",
     ),
     "sbin/wmt_launcher": (
-        "wmt_launcher", 428912,
-        "6e65e46536bfea0b44f0887998a4d556338250d42609e13fbe6d7833a08187c3",
+        "wmt_launcher", 21648,
+        "65cb5c0c49bb61aec657c114cf67269e398bf41ff7b70a4abb8eb0ec36ff2c99",
     ),
 }
 
@@ -364,7 +367,9 @@ def add_connectivity_bundle(stage: Path, helpers: dict[str, Path],
 
 
 def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
-                qemu_arm: str, manifest: dict[str, object]) -> None:
+                expected_busybox_sha256: str, expected_loader_sha256: str,
+                qemu_arm: str,
+                manifest: dict[str, object]) -> None:
     directories = (
         "bin", "dev", "dev/pts", "dev/socket", "dev/usb-ffs", "dev/usb-ffs/adb",
         "etc", "etc/wifi", "lib", "lib/firmware", "proc", "sbin", "sys", "system", "system/bin", "tmp",
@@ -409,6 +414,23 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         target.chmod(mode)
         overlay_manifest[relative] = {"sha256": sha256(data), "size": len(data), "mode": f"{mode:04o}"}
 
+    core_license_root = overlay / "usr/local/share/licenses/libreecho-core"
+    core_license_files = sorted(path for path in core_license_root.rglob("*") if path.is_file())
+    if not core_license_files:
+        raise SystemExit("ERROR: LibreEcho core license bundle is empty")
+    for source in core_license_files:
+        if source.is_symlink():
+            raise SystemExit(f"ERROR: core license input is a symlink: {source}")
+        relative = source.relative_to(overlay).as_posix()
+        data = read(source)
+        target = stage / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        target.chmod(0o644)
+        overlay_manifest[relative] = {
+            "sha256": sha256(data), "size": len(data), "mode": "0644",
+        }
+
     # The stock ramdisk's /init is an Android ELF that is incompatible with
     # this ARM32 recovery kernel.  PID 1 must be the audited LibreEcho shell
     # control script, installed at the real runtime path (not merely staged
@@ -427,8 +449,8 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
 
     busybox_data = read(busybox)
     loader_data = read(loader)
-    require_hash("ARM32 BusyBox", busybox_data, BUSYBOX_SHA256)
-    require_hash("ARM32 musl loader", loader_data, MUSL_LOADER_SHA256)
+    require_hash("ARM32 BusyBox", busybox_data, expected_busybox_sha256)
+    require_hash("ARM32 musl loader", loader_data, expected_loader_sha256)
     (stage / "bin/busybox").write_bytes(busybox_data)
     (stage / "bin/busybox").chmod(0o755)
     (stage / "lib/ld-musl-armhf.so.1").write_bytes(loader_data)
@@ -460,14 +482,14 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         os.symlink("busybox", target)
 
     manifest["overlay"] = overlay_manifest
-    manifest["busybox"] = {"sha256": BUSYBOX_SHA256, "size": len(busybox_data)}
-    manifest["musl_loader"] = {"sha256": MUSL_LOADER_SHA256, "size": len(loader_data)}
+    manifest["busybox"] = {"sha256": expected_busybox_sha256, "size": len(busybox_data)}
+    manifest["musl_loader"] = {"sha256": expected_loader_sha256, "size": len(loader_data)}
     manifest["symlinks"] = fixed_links
     manifest["busybox_applets"] = {"count": len(applets), "names": applets}
 
 
 def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
-                  image_profile: str, service_profile: str,
+                  image_profile: str, service_profile: str, feature_policy: str,
                   manifest: dict[str, object]) -> None:
     sources = (
         ("bootctl", bootctl, "usr/local/sbin/libreecho-bootctl",
@@ -507,8 +529,12 @@ def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
     service_profile_target = stage / "etc/libreecho/service-profile"
     service_profile_target.write_text(service_profile + "\n")
     service_profile_target.chmod(0o644)
+    feature_policy_target = stage / "etc/libreecho/feature-policy"
+    feature_policy_target.write_text(feature_policy + "\n")
+    feature_policy_target.chmod(0o644)
     manifest["image_profile"] = image_profile
     manifest["service_profile"] = service_profile
+    manifest["feature_policy"] = feature_policy
     manifest["ota"] = {
         "enabled": True,
         "format": "libreecho-ota-v1",
@@ -577,7 +603,7 @@ def add_audio_tools(stage: Path, tinyplay: Path, tinycap: Path, tinymix: Path,
     audio["tools"] = tools
 
 
-def add_network_tools(stage: Path, iwconfig: Path,
+def add_network_tools(stage: Path, iwconfig: Path, iwconfig_metadata_path: Path,
                       manifest: dict[str, object]) -> None:
     """Install the manual network inspection tools.
 
@@ -595,7 +621,40 @@ def add_network_tools(stage: Path, iwconfig: Path,
 
     if iwconfig.is_symlink() or not iwconfig.is_file():
         raise SystemExit(f"ERROR: iwconfig is not a regular file: {iwconfig}")
+    if iwconfig_metadata_path.is_symlink() or not iwconfig_metadata_path.is_file():
+        raise SystemExit(f"ERROR: wireless-tools source metadata is not a regular file: {iwconfig_metadata_path}")
     iwconfig_data = read(iwconfig)
+    try:
+        iwconfig_metadata = json.loads(iwconfig_metadata_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"ERROR: invalid wireless-tools source metadata: {exc}") from exc
+    required_metadata = {
+        "binary_sha256", "binary_size", "build_epoch", "compiler",
+        "kernel_uapi_sha256", "license", "license_file", "license_sha256",
+        "source_sha256", "source_url", "static", "version",
+    }
+    if not isinstance(iwconfig_metadata, dict) or set(iwconfig_metadata) != required_metadata:
+        raise SystemExit("ERROR: wireless-tools source metadata schema mismatch")
+    if (iwconfig_metadata["binary_sha256"] != sha256(iwconfig_data) or
+            iwconfig_metadata["binary_size"] != len(iwconfig_data)):
+        raise SystemExit("ERROR: wireless-tools source metadata binary identity mismatch")
+    if iwconfig_metadata["license_file"] != "wireless-tools-COPYING":
+        raise SystemExit("ERROR: wireless-tools license file identity is invalid")
+    license_data = read(iwconfig_metadata_path.parent / "wireless-tools-COPYING")
+    if (iwconfig_metadata["license_sha256"] != sha256(license_data) or
+            iwconfig_metadata["source_sha256"] != WIRELESS_TOOLS_SOURCE_SHA256 or
+            iwconfig_metadata["source_url"] != WIRELESS_TOOLS_SOURCE_URL or
+            iwconfig_metadata["license"] != "GPL-2.0-only AND LGPL-2.1-or-later" or
+            iwconfig_metadata["version"] != WIRELESS_TOOLS_VERSION or
+            iwconfig_metadata["static"] is not True or
+            not isinstance(iwconfig_metadata["kernel_uapi_sha256"], str) or
+            not re.fullmatch(r"[0-9a-f]{64}", iwconfig_metadata["kernel_uapi_sha256"])):
+        raise SystemExit("ERROR: wireless-tools source metadata provenance is invalid")
+    license_target = stage / "usr/local/share/licenses/libreecho-core/wireless-tools-COPYING"
+    if license_target.exists() or license_target.is_symlink():
+        raise SystemExit(f"ERROR: wireless-tools license collides with {license_target}")
+    license_target.write_bytes(license_data)
+    license_target.chmod(0o644)
     iwconfig_target = stage / "sbin/iwconfig"
     if iwconfig_target.exists() or iwconfig_target.is_symlink():
         raise SystemExit(f"ERROR: network tool collides with {iwconfig_target}")
@@ -620,6 +679,7 @@ def add_network_tools(stage: Path, iwconfig: Path,
                 "size": len(iwconfig_data),
                 "mode": "0755",
                 "elf": iwconfig_elf,
+                "source": iwconfig_metadata,
             },
         },
     }
@@ -917,9 +977,18 @@ def add_airplay_external_payload(payload: Path, payload_manifest: Path,
             "usr/local/sbin/libreecho-airplay-audio",
             "usr/local/sbin/libreecho-audio-engine",
             "usr/local/sbin/shairport-sync",
-            "etc/libreecho/airplay2.conf"):
+            "etc/libreecho/airplay2.conf",
+            "usr/local/share/licenses/libreecho-airplay/COMPONENTS.tsv"):
         if required not in feature_files:
             raise SystemExit(f"ERROR: AirPlay feature member missing: {required}")
+    if not any(str(relative).startswith(
+            "usr/local/share/licenses/libreecho-airplay/debian/") and
+            str(relative).endswith("/copyright") for relative in feature_files):
+        raise SystemExit("ERROR: AirPlay Debian copyright closure is missing")
+    for component in ("nqptp", "shairport-sync", "ffmpeg", "tinyalsa"):
+        prefix = f"usr/local/share/licenses/libreecho-airplay/source/{component}/"
+        if not any(str(relative).startswith(prefix) for relative in feature_files):
+            raise SystemExit(f"ERROR: AirPlay source license closure missing: {component}")
     payload_hash = sha256(read(payload))
     payload_size = payload.stat().st_size
     if (feature_payload.get("filename") != payload.name or
@@ -974,18 +1043,30 @@ def add_tts_external_payload(payload: Path, payload_manifest: Path,
         raise SystemExit("ERROR: TTS feature manifest lacks payload/files records")
     required_files = (
         "usr/local/sbin/libreecho-ttsd",
-        "usr/local/share/libreecho/tts/models/alan/model.onnx",
-        "usr/local/share/libreecho/tts/models/alan/tokens.txt",
+        "usr/local/share/libreecho/tts/models/northern-male/model.onnx",
+        "usr/local/share/libreecho/tts/models/northern-male/tokens.txt",
         "usr/local/share/libreecho/tts/models/southern-female/model.onnx",
         "usr/local/share/libreecho/tts/models/southern-female/tokens.txt",
     )
     for required in required_files:
         if required not in feature_files:
             raise SystemExit(f"ERROR: TTS feature member missing: {required}")
-    for voice in ("alan", "southern-female"):
+    for voice in ("northern-male", "southern-female"):
         prefix = f"usr/local/share/libreecho/tts/models/{voice}/espeak-ng-data/"
         if not any(str(relative).startswith(prefix) for relative in feature_files):
             raise SystemExit(f"ERROR: TTS feature lacks eSpeak English data for {voice}")
+    for required_notice in (
+        "usr/local/share/licenses/libreecho-tts/THIRD_PARTY_NOTICES.md",
+        "usr/local/share/licenses/libreecho-tts/NORTHERN-MALE-MODEL-CARD.md",
+        "usr/local/share/licenses/libreecho-tts/SOUTHERN-FEMALE-MODEL-CARD.md",
+        "usr/local/share/licenses/libreecho-tts/CC-BY-SA-4.0.txt",
+        "usr/local/share/licenses/libreecho-tts/runtime/RUNTIME-NOTICES.txt",
+        "usr/local/share/licenses/libreecho-tts/runtime/ONNX-Runtime-MIT.txt",
+        "usr/local/share/licenses/libreecho-tts/runtime/sherpa-onnx-Apache-2.0.txt",
+        "usr/local/share/licenses/libreecho-tts/runtime/SpeexDSP-COPYING.txt",
+    ):
+        if required_notice not in feature_files:
+            raise SystemExit(f"ERROR: TTS feature notice missing: {required_notice}")
     payload_hash = sha256(read(payload))
     payload_size = payload.stat().st_size
     if (feature_payload.get("filename") != payload.name or
@@ -1003,7 +1084,7 @@ def add_tts_external_payload(payload: Path, payload_manifest: Path,
         "activation": "automatic-after-audio-engine",
         "autostart": True,
         "audio_transport": "audiod-to-streamed-announcement-priority-bus",
-        "voices": ["southern-female", "alan"],
+        "voices": ["southern-female", "northern-male"],
         "default_voice": "southern-female",
         "threads": 4,
         "streaming": True,
@@ -1052,6 +1133,10 @@ def add_wakeword_external_payload(payload: Path, payload_manifest: Path,
         "usr/local/share/libreecho/openwakeword/embedding_model.onnx",
         "usr/local/share/libreecho/openwakeword/alexa_v0.1.onnx",
         "usr/local/share/licenses/libreecho-openwakeword/MODEL-LICENSE.txt",
+        "usr/local/share/licenses/libreecho-openwakeword/CC-BY-NC-SA-4.0.txt",
+        "usr/local/share/licenses/libreecho-openwakeword/runtime/RUNTIME-NOTICES.txt",
+        "usr/local/share/licenses/libreecho-openwakeword/runtime/ONNX-Runtime-MIT.txt",
+        "usr/local/share/licenses/libreecho-openwakeword/runtime/SpeexDSP-COPYING.txt",
     )
     for required in required_files:
         if required not in feature_files:
@@ -1159,6 +1244,10 @@ def add_stt_external_payload(payload: Path, payload_manifest: Path,
         "usr/local/share/libreecho/stt/joiner-epoch-99-avg-1.int8.onnx",
         "usr/local/share/libreecho/stt/tokens.txt",
         "usr/local/share/licenses/libreecho-stt-model/MODEL-LICENSE.md",
+        "usr/local/share/licenses/libreecho-stt-runtime/RUNTIME-NOTICES.txt",
+        "usr/local/share/licenses/libreecho-stt-runtime/ONNX-Runtime-MIT.txt",
+        "usr/local/share/licenses/libreecho-stt-runtime/sherpa-onnx-Apache-2.0.txt",
+        "usr/local/share/licenses/libreecho-stt-runtime/SpeexDSP-COPYING.txt",
     )
     payload_hash, payload_size, feature_files = read_external_feature(
         "stt", payload, payload_manifest, required_files
@@ -1196,6 +1285,10 @@ def add_assistant_external_payload(payload: Path, payload_manifest: Path,
         "usr/local/share/libreecho/cacert.pem",
         "usr/local/share/licenses/curl/COPYING",
         "usr/local/share/licenses/ca-certificates/copyright",
+        "usr/local/share/licenses/libreecho-assistant/THIRD_PARTY_NOTICES.txt",
+        "usr/local/share/licenses/libreecho-assistant/OpenSSL-copyright",
+        "usr/local/share/licenses/libreecho-assistant/glibc-copyright",
+        "usr/local/share/licenses/libreecho-assistant/gcc-runtime-copyright",
     )
     payload_hash, payload_size, feature_files = read_external_feature(
         "assistant", payload, payload_manifest, required_files
@@ -1313,14 +1406,39 @@ def add_ssh_bundle(stage: Path, dropbear: Path, dropbearkey: Path,
     }
 
 
-def add_network_bundle(stage: Path, wpa_supplicant: Path, wifi_config: Path,
+def add_network_bundle(stage: Path, wpa_supplicant: Path, wpa_metadata_path: Path,
+                       wifi_config: Path,
                        manifest: dict[str, object]) -> None:
     """Add the verified static WPA client and a build-local Wi-Fi profile."""
     if wpa_supplicant.is_symlink() or not wpa_supplicant.is_file():
         raise SystemExit(f"ERROR: wpa_supplicant is not a regular file: {wpa_supplicant}")
+    if wpa_metadata_path.is_symlink() or not wpa_metadata_path.is_file():
+        raise SystemExit(f"ERROR: wpa source metadata is not a regular file: {wpa_metadata_path}")
     if wifi_config.is_symlink() or not wifi_config.is_file():
         raise SystemExit(f"ERROR: Wi-Fi profile is not a regular file: {wifi_config}")
     wpa_data = read(wpa_supplicant)
+    try:
+        wpa_metadata = json.loads(wpa_metadata_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"ERROR: invalid wpa source metadata: {exc}") from exc
+    required_metadata = {
+        "binary_sha256", "binary_size", "build_epoch", "compiler", "config_path",
+        "config_sha256", "crypto", "drivers", "kernel_uapi_sha256", "license",
+        "source_sha256", "source_url", "static", "version",
+    }
+    if not isinstance(wpa_metadata, dict) or set(wpa_metadata) != required_metadata:
+        raise SystemExit("ERROR: wpa source metadata schema mismatch")
+    if (wpa_metadata["binary_sha256"] != sha256(wpa_data) or
+            wpa_metadata["binary_size"] != len(wpa_data)):
+        raise SystemExit("ERROR: wpa source metadata binary identity mismatch")
+    if (wpa_metadata["source_sha256"] != WPA_SOURCE_SHA256 or
+            wpa_metadata["source_url"] != WPA_SOURCE_URL or
+            wpa_metadata["license"] != "BSD-3-Clause" or
+            wpa_metadata["version"] != WPA_SUPPLICANT_VERSION or
+            wpa_metadata["static"] is not True or
+            not isinstance(wpa_metadata["kernel_uapi_sha256"], str) or
+            not re.fullmatch(r"[0-9a-f]{64}", wpa_metadata["kernel_uapi_sha256"])):
+        raise SystemExit("ERROR: wpa source metadata provenance is invalid")
     config_data = read(wifi_config)
     target = stage / "sbin/wpa_supplicant"
     if target.exists() or target.is_symlink():
@@ -1344,6 +1462,7 @@ def add_network_bundle(stage: Path, wpa_supplicant: Path, wifi_config: Path,
             "size": len(wpa_data),
             "mode": "0755",
             "elf": elf,
+            "source": wpa_metadata,
         },
         "wifi_profile": {
             "sha256": sha256(config_data),
@@ -1367,6 +1486,12 @@ def validate_stage(stage: Path) -> None:
         "usr/local/libexec/libreecho-update-verify",
         "etc/libreecho/ota-public-key.hex", "etc/libreecho/ota-source.conf",
         "etc/libreecho/image-profile", "etc/libreecho/service-profile",
+        "etc/libreecho/feature-policy",
+        "usr/local/share/licenses/libreecho-core/THIRD_PARTY_NOTICES.md",
+        "usr/local/share/licenses/libreecho-core/COMPONENTS.json",
+        "usr/local/share/licenses/libreecho-core/GPL-2.0-only.txt",
+        "usr/local/share/licenses/libreecho-core/wpa_supplicant-BSD.txt",
+
     )
     for relative in required:
         if not (stage / relative).exists():
@@ -1645,10 +1770,16 @@ def main() -> None:
     parser.add_argument("--adbd-source-metadata", type=Path, required=True,
                         help="source/license metadata emitted by build_adbd.sh")
     parser.add_argument("--busybox", type=Path, required=True)
+    parser.add_argument("--expected-busybox-sha256", required=True)
     parser.add_argument("--musl-loader", type=Path, required=True)
+    parser.add_argument("--expected-musl-loader-sha256", required=True)
     parser.add_argument("--image-profile", choices=("development", "ota"), required=True)
     parser.add_argument("--service-profile", choices=("diagnostic", "production"),
                         default="diagnostic")
+    parser.add_argument(
+        "--feature-policy",
+        choices=("exclude", "preserve", "redistributable", "community-noncommercial"),
+                        default="preserve")
     parser.add_argument("--bootctl", type=Path, required=True)
     parser.add_argument("--update-verifier", type=Path, required=True)
     parser.add_argument("--ota-public-key", type=Path, required=True)
@@ -1662,6 +1793,8 @@ def main() -> None:
                         help="static ARM32 TinyALSA mixer utility to add to the initramfs")
     parser.add_argument("--iwconfig", type=Path,
                         help="static ARM32 wireless-tools iwconfig utility")
+    parser.add_argument("--iwconfig-source-metadata", type=Path,
+                        help="source/license metadata emitted by build_wireless_tools.sh")
     parser.add_argument("--ui-bundle", type=Path,
                         help="staged static ARM32 LibreEcho-UI bundle")
     parser.add_argument("--ui-source", type=Path,
@@ -1722,6 +1855,8 @@ def main() -> None:
                         help="proven ARM32 one-shot WMT command responder")
     parser.add_argument("--wpa-supplicant", type=Path,
                         help="static ARM32 wpa_supplicant 2.10 client")
+    parser.add_argument("--wpa-source-metadata", type=Path,
+                        help="source/license metadata emitted by build_wpa_supplicant.sh")
     parser.add_argument("--wifi-config", type=Path,
                         help="build-local WPA profile; never committed to source")
     parser.add_argument("--qemu-arm", default="qemu-arm-static",
@@ -1755,7 +1890,11 @@ def main() -> None:
         raise SystemExit(f"ERROR: connectivity bundle is all-or-nothing; missing {missing}")
     if connectivity_enabled and not CONNECTIVITY_HELPERS:
         raise SystemExit("ERROR: connectivity helper identities have not been pinned")
-    network_options = {"wpa_supplicant": args.wpa_supplicant, "wifi_config": args.wifi_config}
+    network_options = {
+        "wpa_supplicant": args.wpa_supplicant,
+        "wpa_source_metadata": args.wpa_source_metadata,
+        "wifi_config": args.wifi_config,
+    }
     network_enabled = all(value is not None for value in network_options.values())
     if any(value is not None for value in network_options.values()) and not network_enabled:
         missing = ", ".join(
@@ -1897,6 +2036,43 @@ def main() -> None:
             f"missing {missing}"
         )
 
+    if args.feature_policy == "exclude":
+        if args.service_profile != "diagnostic":
+            raise SystemExit("ERROR: feature exclusion requires the diagnostic service profile")
+        if any((
+            airplay_legacy_enabled, airplay_payload_enabled, tts_payload_enabled,
+            wakeword_payload_enabled, stt_payload_enabled, assistant_payload_enabled,
+        )):
+            raise SystemExit("ERROR: feature payload inputs are forbidden by feature_policy=exclude")
+    elif args.feature_policy == "redistributable":
+        if args.service_profile != "production":
+            raise SystemExit("ERROR: redistributable policy requires the production service profile")
+        if not all((airplay_payload_enabled, tts_payload_enabled,
+                    stt_payload_enabled, assistant_payload_enabled)):
+            raise SystemExit(
+                "ERROR: redistributable policy requires external AirPlay, TTS, STT, and assistant payloads"
+            )
+        if airplay_legacy_enabled:
+            raise SystemExit("ERROR: embedded AirPlay assets are forbidden by feature_policy=redistributable")
+        if wakeword_payload_enabled:
+            raise SystemExit(
+                "ERROR: wakeword payload inputs are forbidden by feature_policy=redistributable"
+            )
+    elif args.feature_policy == "community-noncommercial":
+        if args.service_profile != "production":
+            raise SystemExit(
+                "ERROR: community-noncommercial policy requires the production service profile"
+            )
+        if not all((airplay_payload_enabled, tts_payload_enabled,
+                    wakeword_payload_enabled, stt_payload_enabled,
+                    assistant_payload_enabled)):
+            raise SystemExit("ERROR: community-noncommercial policy requires external AirPlay, TTS, wakeword, STT, and assistant payloads")
+        if airplay_legacy_enabled:
+            raise SystemExit(
+                "ERROR: embedded AirPlay assets are forbidden by "
+                "feature_policy=community-noncommercial"
+            )
+
     envelope = read(args.boot_envelope)
     canonical_envelope = generate_boot_envelope()
     if envelope != canonical_envelope:
@@ -2013,12 +2189,13 @@ def main() -> None:
         copy_adbd(args.adbd.resolve(), args.adbd_source_metadata.resolve(), stage, manifest)
         add_overlay(
             stage, overlay, args.busybox.resolve(), args.musl_loader.resolve(),
+            args.expected_busybox_sha256, args.expected_musl_loader_sha256,
             qemu_arm, manifest,
         )
         add_ota_tools(
             stage, args.bootctl.resolve(), args.update_verifier.resolve(),
-            args.ota_public_key.resolve(), args.image_profile, args.service_profile,
-            manifest,
+            args.ota_public_key.resolve(), args.image_profile,
+            args.service_profile, args.feature_policy, manifest,
         )
         if args.audio_probe is not None:
             add_audio_probe(stage, args.audio_probe.resolve(), manifest)
@@ -2028,7 +2205,12 @@ def main() -> None:
                 args.tinymix.resolve(), manifest,
             )
         if args.iwconfig is not None:
-            add_network_tools(stage, args.iwconfig.resolve(), manifest)
+            if args.iwconfig_source_metadata is None:
+                raise SystemExit("ERROR: iwconfig source metadata is required")
+            add_network_tools(
+                stage, args.iwconfig.resolve(),
+                args.iwconfig_source_metadata.resolve(), manifest,
+            )
         if ui_enabled:
             add_ui_bundle(
                 stage, args.ui_bundle.resolve(), args.ui_source.resolve(),
@@ -2085,7 +2267,8 @@ def main() -> None:
             )
         if network_enabled:
             add_network_bundle(
-                stage, args.wpa_supplicant.resolve(), args.wifi_config.resolve(), manifest,
+                stage, args.wpa_supplicant.resolve(), args.wpa_source_metadata.resolve(),
+                args.wifi_config.resolve(), manifest,
             )
         validate_stage(stage)
         cpio = build_cpio(stage, 0)

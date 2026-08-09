@@ -120,14 +120,21 @@ verify_manifest()
         die manifest_boot_filename
     [ "$(manifest_value boot_size)" = "$BOOT_SIZE" ] ||
         die manifest_boot_size
-    [ "$(manifest_value feature_policy)" = preserve ] ||
-        die manifest_feature_policy
+    FEATURE_POLICY=$(manifest_value feature_policy)
+    case "$FEATURE_POLICY" in
+        preserve|redistributable|community-noncommercial|exclude) ;;
+        *) die manifest_feature_policy ;;
+    esac
     [ "$(manifest_value image_profile)" = ota ] ||
         die manifest_image_profile
-    case "$(manifest_value service_profile)" in
+    SERVICE_PROFILE=$(manifest_value service_profile)
+    case "$SERVICE_PROFILE" in
         diagnostic|production) ;;
         *) die manifest_service_profile ;;
     esac
+    if [ "$FEATURE_POLICY" = exclude ] && [ "$SERVICE_PROFILE" != diagnostic ]; then
+        die manifest_excluded_features_require_diagnostic_profile
+    fi
     version=$(manifest_value version)
     case "$version" in
         ''|*[!A-Za-z0-9._+~-]*) die manifest_version_value ;;
@@ -239,7 +246,7 @@ install_package()
         echo "version=$version"
         echo "slot=$target"
         echo "boot_sha256=$boot_sha"
-        echo feature_policy=preserve
+        echo "feature_policy=$FEATURE_POLICY"
     } > "$PENDING.tmp" || die pending_write
     $BB mv "$PENDING.tmp" "$PENDING" || die pending_commit
     $BB sync

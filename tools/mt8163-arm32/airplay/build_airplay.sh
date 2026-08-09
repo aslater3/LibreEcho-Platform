@@ -8,6 +8,8 @@ TINYALSA_ARCHIVE=${4:?TinyALSA source archive}
 SYSROOT=${5:?pinned ARMHF dependency sysroot}
 OUTPUT=${6:?output directory}
 ALSA_DATA=${LIBREECHO_AIRPLAY_ALSA_DATA:-/usr/share/alsa}
+ALSA_DATA_COPYRIGHT=${LIBREECHO_AIRPLAY_ALSA_DATA_COPYRIGHT:-/usr/share/doc/libasound2-data/copyright}
+ALSA_UCM_COPYRIGHT=${LIBREECHO_AIRPLAY_ALSA_UCM_COPYRIGHT:-/usr/share/doc/alsa-ucm-conf/copyright}
 CROSS_PREFIX=${CROSS_PREFIX:-/usr/bin/arm-linux-gnueabihf-}
 CXX=${CXX:-${CROSS_PREFIX}g++}
 JOBS=${JOBS:-$(nproc)}
@@ -18,6 +20,7 @@ AUDIO_ENGINE_SOURCE=${LIBREECHO_AUDIO_ENGINE_SOURCE:-$SCRIPT_DIR/audio_engine.c}
 AUDIO_VISUALIZER_SOURCE=${LIBREECHO_AUDIO_VISUALIZER_SOURCE:-$SCRIPT_DIR/audio_visualizer.c}
 PLAYBACK_STATUS_SOURCE=${LIBREECHO_PLAYBACK_STATUS_SOURCE:-$SCRIPT_DIR/playback_status.c}
 AEC_REFERENCE_SOURCE=${LIBREECHO_AEC_REFERENCE_SOURCE:-$SCRIPT_DIR/aec_reference.c}
+RELINK_OUTPUT=${LIBREECHO_AIRPLAY_RELINK_OUTPUT:-}
 
 for archive in "$NQPTP_ARCHIVE" "$SHAIRPORT_ARCHIVE" "$FFMPEG_ARCHIVE" "$TINYALSA_ARCHIVE"; do
     [[ -f "$archive" ]] || { echo "ERROR: AirPlay source archive is missing: $archive" >&2; exit 1; }
@@ -82,6 +85,7 @@ tinyalsa_source=$(find "$work" -mindepth 1 -maxdepth 1 -type d -name 'tinyalsa-*
     echo "ERROR: source archive layout is not recognised" >&2
     exit 1
 }
+reproducible_path_flags="-ffile-prefix-map=$work=/usr/src/libreecho-airplay -fdebug-prefix-map=$work=/usr/src/libreecho-airplay"
 
 export CC="${CROSS_PREFIX}gcc"
 export AR="${CROSS_PREFIX}ar"
@@ -91,9 +95,9 @@ export PKG_CONFIG_SYSROOT_DIR="$SYSROOT"
 export PKG_CONFIG_PATH="$SYSROOT/usr/lib/arm-linux-gnueabihf/pkgconfig:$SYSROOT/usr/share/pkgconfig"
 unset PKG_CONFIG_LIBDIR
 export CPPFLAGS="${CPPFLAGS:--I$SYSROOT/usr/include -I$SYSROOT/usr/include/arm-linux-gnueabihf}"
-export CFLAGS="${CFLAGS:--O2 $CPPFLAGS}"
-export CXXFLAGS="${CXXFLAGS:--O2 $CPPFLAGS}"
-export LDFLAGS="${LDFLAGS:--L$SYSROOT/usr/lib/arm-linux-gnueabihf -Wl,-rpath-link,$SYSROOT/usr/lib/arm-linux-gnueabihf -L$SYSROOT/usr/lib -Wl,-rpath-link,$SYSROOT/usr/lib -Wl,--allow-shlib-undefined}"
+export CFLAGS="${CFLAGS:---sysroot=$SYSROOT -O2 $CPPFLAGS} $reproducible_path_flags"
+export CXXFLAGS="${CXXFLAGS:---sysroot=$SYSROOT -O2 $CPPFLAGS} $reproducible_path_flags"
+export LDFLAGS="${LDFLAGS:---sysroot=$SYSROOT -L$SYSROOT/usr/lib/arm-linux-gnueabihf -Wl,-rpath-link,$SYSROOT/usr/lib/arm-linux-gnueabihf -L$SYSROOT/usr/lib -Wl,-rpath-link,$SYSROOT/usr/lib -Wl,--allow-shlib-undefined}"
 
 build_ffmpeg() {
     pushd "$ffmpeg_source" >/dev/null
@@ -106,7 +110,22 @@ build_ffmpeg() {
         --enable-avcodec --enable-avformat --enable-avutil --enable-swresample \
         --enable-decoder=aac --enable-decoder=alac --enable-parser=aac \
         --enable-demuxer=aac --enable-demuxer=mov --enable-protocol=file \
-        --enable-pic --enable-static --disable-shared --extra-cflags=-O2
+        --enable-pic --enable-static --disable-shared --sysroot="$SYSROOT" \
+        --extra-cflags="-O2 $reproducible_path_flags"
+    python3 - "$ffmpeg_source/config.h" "$work" <<'PY'
+from pathlib import Path
+import sys
+
+config = Path(sys.argv[1])
+work = sys.argv[2]
+before = config.read_text()
+if work not in before:
+    raise SystemExit("ERROR: FFmpeg configuration did not record its build root")
+after = before.replace(work, "/usr/src/libreecho-airplay")
+config.write_text(after)
+if work in config.read_text():
+    raise SystemExit("ERROR: FFmpeg configuration still contains its build root")
+PY
     make -j"$JOBS"
     make DESTDIR="$SYSROOT" install
     popd >/dev/null
@@ -150,7 +169,7 @@ EOF
 build_nqptp() {
     pushd "$nqptp_source" >/dev/null
     autoreconf -fi
-    LDFLAGS="-static -L$SYSROOT/usr/lib/arm-linux-gnueabihf" \
+    LDFLAGS="--sysroot=$SYSROOT -static -L$SYSROOT/usr/lib/arm-linux-gnueabihf" \
         ./configure --host=arm-linux-gnueabihf --disable-systemd-startup
     make -j"$JOBS"
     popd >/dev/null
@@ -161,7 +180,7 @@ build_tinyalsa() {
     # an informational user-space-header warning from linux/types.h; the
     # upstream TinyALSA Makefile promotes warnings to errors, so suppress only
     # that known diagnostic rather than weakening the rest of the build.
-    local tiny_cflags="-O2 -Wno-cpp"
+    local tiny_cflags="--sysroot=$SYSROOT -O2 -Wno-cpp $reproducible_path_flags"
     if [[ -n "$KERNEL_HEADERS" ]]; then
         tiny_cflags+=" -I$KERNEL_HEADERS/include/uapi -I$KERNEL_HEADERS/include"
     fi
@@ -173,19 +192,30 @@ build_tinyalsa() {
 }
 
 build_audio_components() {
-    local bridge_cflags="-O2 -std=c99 -Wall -Wextra -Wpedantic"
+    local bridge_cflags="--sysroot=$SYSROOT -O2 -std=c99 -Wall -Wextra -Wpedantic $reproducible_path_flags"
+    local objects="$work/libreecho-objects"
     bridge_cflags+=" -I$tinyalsa_source/include"
     if [[ -n "$KERNEL_HEADERS" ]]; then
         bridge_cflags+=" -I$KERNEL_HEADERS/include/uapi -I$KERNEL_HEADERS/include"
     fi
     bridge_cflags+=" -I$SYSROOT/usr/include/arm-linux-gnueabihf -I$SYSROOT/usr/include"
-    mkdir -p "$OUTPUT"
-    "$CC" $bridge_cflags "$AIRPLAY_AUDIO_SOURCE" -lm \
+    mkdir -p "$OUTPUT" "$objects"
+    "$CC" $bridge_cflags -c "$AIRPLAY_AUDIO_SOURCE" \
+        -o "$objects/airplay_audio.o"
+    "$CC" $bridge_cflags "$objects/airplay_audio.o" -lm \
         -o "$OUTPUT/libreecho-airplay-audio"
-    "$CC" $bridge_cflags "$AUDIO_ENGINE_SOURCE" "$AUDIO_VISUALIZER_SOURCE" \
-        "$PLAYBACK_STATUS_SOURCE" "$AEC_REFERENCE_SOURCE" \
-        "$tinyalsa_source/src/libtinyalsa.a" -ldl -lm \
-        -o "$OUTPUT/libreecho-audio-engine"
+    "$CC" $bridge_cflags -c "$AUDIO_ENGINE_SOURCE" \
+        -o "$objects/audio_engine.o"
+    "$CC" $bridge_cflags -c "$AUDIO_VISUALIZER_SOURCE" \
+        -o "$objects/audio_visualizer.o"
+    "$CC" $bridge_cflags -c "$PLAYBACK_STATUS_SOURCE" \
+        -o "$objects/playback_status.o"
+    "$CC" $bridge_cflags -c "$AEC_REFERENCE_SOURCE" \
+        -o "$objects/aec_reference.o"
+    "$CC" $bridge_cflags "$objects/audio_engine.o" \
+        "$objects/audio_visualizer.o" "$objects/playback_status.o" \
+        "$objects/aec_reference.o" "$tinyalsa_source/src/libtinyalsa.a" \
+        -ldl -lm -o "$OUTPUT/libreecho-audio-engine"
 }
 
 build_shairport() {
@@ -257,12 +287,106 @@ copy_runtime_closure() {
     done
 }
 
+copy_release_notices() {
+    local runtime="$OUTPUT/runtime"
+    local license_root="$runtime/usr/local/share/licenses/libreecho-airplay"
+    local debian_root="$license_root/debian"
+    local source_root="$license_root/source"
+    local copyright package copied=0
+
+    mkdir -p "$debian_root" "$source_root/nqptp" "$source_root/shairport-sync" \
+        "$source_root/ffmpeg" "$source_root/tinyalsa" "$source_root/alsa-data"
+
+    # Every shared object copied from the pinned Debian sysroot must retain the
+    # binary package's exact Debian copyright record.
+    while IFS= read -r -d '' copyright; do
+        package=$(basename "$(dirname "$copyright")")
+        mkdir -p "$debian_root/$package"
+        install -m 0644 "$copyright" "$debian_root/$package/copyright"
+        copied=$((copied + 1))
+    done < <(find "$SYSROOT/usr/share/doc" -mindepth 2 -maxdepth 2 \
+        -type f -name copyright -print0 | sort -z)
+    [[ "$copied" -gt 0 ]] || {
+        echo "ERROR: dependency sysroot contains no Debian copyright records" >&2
+        exit 1
+    }
+
+    for input in "$ALSA_DATA_COPYRIGHT" "$ALSA_UCM_COPYRIGHT"; do
+        [[ -f "$input" ]] || {
+            echo "ERROR: ALSA data copyright record is missing: $input" >&2
+            exit 1
+        }
+        package=$(basename "$(dirname "$input")")
+        mkdir -p "$source_root/alsa-data/$package"
+        install -m 0644 "$input" "$source_root/alsa-data/$package/copyright"
+    done
+
+    for input in "$nqptp_source"/LICENSE*; do
+        [[ -f "$input" ]] && install -m 0644 "$input" "$source_root/nqptp/$(basename "$input")"
+    done
+    for input in "$shairport_source"/LICENSE*; do
+        [[ -f "$input" ]] && install -m 0644 "$input" "$source_root/shairport-sync/$(basename "$input")"
+    done
+    for input in "$ffmpeg_source"/COPYING* "$ffmpeg_source"/LICENSE*; do
+        [[ -f "$input" ]] && install -m 0644 "$input" "$source_root/ffmpeg/$(basename "$input")"
+    done
+    for input in "$tinyalsa_source"/NOTICE* "$tinyalsa_source"/LICENSE*; do
+        [[ -f "$input" ]] && install -m 0644 "$input" "$source_root/tinyalsa/$(basename "$input")"
+    done
+
+    for required in nqptp shairport-sync ffmpeg tinyalsa; do
+        find "$source_root/$required" -type f -maxdepth 1 -print -quit | grep -q . || {
+            echo "ERROR: source license files missing for $required" >&2
+            exit 1
+        }
+    done
+
+    {
+        printf 'component\tversion-or-source\tsha256\n'
+        printf 'nqptp\t%s\t%s\n' "$(basename "$nqptp_source")" "$(sha256sum "$NQPTP_ARCHIVE" | awk '{print $1}')"
+        printf 'shairport-sync\t%s\t%s\n' "$(basename "$shairport_source")" "$(sha256sum "$SHAIRPORT_ARCHIVE" | awk '{print $1}')"
+        printf 'ffmpeg\t%s\t%s\n' "$(basename "$ffmpeg_source")" "$(sha256sum "$FFMPEG_ARCHIVE" | awk '{print $1}')"
+        printf 'tinyalsa\t%s\t%s\n' "$(basename "$tinyalsa_source")" "$(sha256sum "$TINYALSA_ARCHIVE" | awk '{print $1}')"
+    } > "$license_root/COMPONENTS.tsv"
+}
+
+preserve_relink_objects() {
+    [[ -n "$RELINK_OUTPUT" ]] || return 0
+    [[ ! -e "$RELINK_OUTPUT" && ! -L "$RELINK_OUTPUT" ]] || {
+        echo "ERROR: refusing to overwrite AirPlay relink output: $RELINK_OUTPUT" >&2
+        exit 1
+    }
+    mkdir -p "$RELINK_OUTPUT"
+    local root label object relative destination count=0
+    while IFS='|' read -r root label; do
+        while IFS= read -r -d '' object; do
+            relative=${object#"$root"/}
+            destination="$RELINK_OUTPUT/$label/$relative"
+            mkdir -p "$(dirname -- "$destination")"
+            install -m 0644 "$object" "$destination"
+            count=$((count + 1))
+        done < <(find "$root" -type f -name '*.o' -print0 | sort -z)
+    done <<EOF
+$nqptp_source|nqptp
+$shairport_source|shairport-sync
+$ffmpeg_source|ffmpeg
+$tinyalsa_source|tinyalsa
+$work/libreecho-objects|libreecho
+EOF
+    [[ "$count" -gt 0 ]] || {
+        echo "ERROR: AirPlay build produced no relinkable objects" >&2
+        exit 1
+    }
+    printf 'airplay_relink_object_count=%s\n' "$count"
+}
+
 build_ffmpeg
 make_ffmpeg_pkgconfig
 build_nqptp
 build_tinyalsa
 build_audio_components
 build_shairport
+preserve_relink_objects
 mkdir -p "$OUTPUT"
 install -m 0755 "$nqptp_source/nqptp" "$OUTPUT/nqptp"
 install -m 0755 "$shairport_source/shairport-sync" "$OUTPUT/shairport-sync"
@@ -300,5 +424,6 @@ else
     echo "ERROR: ALSA runtime data is absent: $ALSA_DATA" >&2
     exit 1
 fi
+copy_release_notices
 file "$OUTPUT/nqptp" "$OUTPUT/shairport-sync"
 readelf -d "$OUTPUT/shairport-sync" | sed -n 's/.*Shared library: \[\([^]]*\)\].*/needed=\1/p'

@@ -41,10 +41,14 @@ CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
 CONNECTIVITY_IMPORTER_SHA256 = "27f20efb39825333838df76eb843e4af537864f326a9648702739286a25e5d3a"
 CONNECTIVITY_STOCK_SYSTEM_SHA256 = "56540b3a9ac4437901a5510d9fb5e09b1a8d0cc229548f0b08bb5c22d78684fe"
 CONNECTIVITY_EVIDENCE_MANIFEST_SHA256 = "d1eedd04efe0dbc78853f2b0f9357c092b4ca66242648908c0369956538441eb"
+WPA_SUPPLICANT_VERSION = "2.10"
+WPA_SOURCE_SHA256 = "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f"
+WPA_SOURCE_URL = "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz"
+WIRELESS_TOOLS_VERSION = "30~pre9"
+WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
+WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-BUSYBOX_SHA256 = "d4c8fd2aea01abd851c703f39b29c0de748b2751e4e1a85cae570fa53ad8f4fb"
-LOADER_SHA256 = "1063871174f1bd4f08f4d330e20b07aeb0820327ee739a4d8d1b644df842cb6b"
-INIT_SHA256 = "767d32df45cdc1b20cfe4bd7cb681c44140ea396f26c65e86282d7de833381b0"
+INIT_SHA256 = "61ca87a17a162af4e498cfca95275aeb60dca0e06f64152a1f268e996354bf06"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -150,19 +154,19 @@ CONNECTIVITY_ASSET_REQUIREMENTS = {
 
 CONNECTIVITY_HELPERS = {
     "sbin/wmt_configure": (
-        428704, "2fa1c78546b3a0d35442ffa196f3eaa13b1ce4609b537332b016bc88ea663be2",
+        25744, "2a57272037a34519e9f6f5dd64ab5a16ad304c81535c4aa7f15a8afae34aadb1",
     ),
     "sbin/wmt_responder": (
-        428796, "e20bdaf559165077ff8211c64ed38a10ecee1006641e94302cf14d3be397c350",
+        21648, "46170ddc1d1ddf21a85ec16df129aac47a258a439bc9e6ed061d1e5942aa48eb",
     ),
     "sbin/wmt_bt_on": (
-        424540, "4365c1b1046bf2ce1045a3fbd4578ee21d8f1a9900a01cb0cde9cea478821d82",
+        21648, "985320b270149cd27bc59d7f34d0da829817f225a4e712037633517c843cc745",
     ),
     "sbin/wmt_stock_compat": (
-        341184, "5be9b801153c79f85260b193c57a5ba5c4155f9fccbad47a794e9445e94d654c",
+        21648, "7e3afe31b706029ebf6e271f5cda6e3880cfc5b184abb052a190662759708c87",
     ),
     "sbin/wmt_launcher": (
-        428912, "6e65e46536bfea0b44f0887998a4d556338250d42609e13fbe6d7833a08187c3",
+        21648, "65cb5c0c49bb61aec657c114cf67269e398bf41ff7b70a4abb8eb0ec36ff2c99",
     ),
 }
 
@@ -652,6 +656,35 @@ def validate_network_tools(entries: dict[str, Entry], manifest: dict[str, object
     if not isinstance(raw_iwconfig, dict):
         fail("iwconfig manifest record is missing")
     iwconfig_record = cast(dict[str, object], raw_iwconfig)
+    raw_source = iwconfig_record.get("source")
+    required_source = {
+        "binary_sha256", "binary_size", "build_epoch", "compiler",
+        "kernel_uapi_sha256", "license", "license_file", "license_sha256",
+        "source_sha256", "source_url", "static", "version",
+    }
+    if not isinstance(raw_source, dict) or set(raw_source) != required_source:
+        fail("wireless-tools source provenance is missing or malformed")
+    source = cast(dict[str, object], raw_source)
+    if (source.get("binary_sha256") != expected_iwconfig_sha256 or
+            source.get("binary_size") != len(require_member(
+                entries, "sbin/iwconfig", expected_iwconfig_sha256, 0o755,
+            ).data) or
+            source.get("license") != "GPL-2.0-only AND LGPL-2.1-or-later" or
+            source.get("license_file") != "wireless-tools-COPYING" or
+            source.get("source_sha256") != WIRELESS_TOOLS_SOURCE_SHA256 or
+            source.get("source_url") != WIRELESS_TOOLS_SOURCE_URL or
+            source.get("static") is not True or
+            source.get("version") != WIRELESS_TOOLS_VERSION or
+            not re.fullmatch(r"[0-9a-f]{64}", str(source.get("kernel_uapi_sha256", ""))) or
+            not re.fullmatch(r"[0-9a-f]{64}", str(source.get("license_sha256", ""))) or
+            "/home/" in str(source.get("compiler", ""))):
+        fail("wireless-tools source provenance is invalid")
+    license_member = require_member(
+        entries, "usr/local/share/licenses/libreecho-core/wireless-tools-COPYING",
+        str(source["license_sha256"]), 0o644,
+    )
+    if sha256(license_member.data) != source["license_sha256"]:
+        fail("wireless-tools license identity changed")
     iwconfig_path = iwconfig_record.get("path")
     if not isinstance(iwconfig_path, str) or not Path(iwconfig_path).is_absolute():
         fail("iwconfig manifest path is not absolute")
@@ -671,6 +704,7 @@ def validate_network_tools(entries: dict[str, Entry], manifest: dict[str, object
             "needed": [],
             "dynamic": False,
         },
+        "source": source,
     }:
         fail("iwconfig manifest record changed")
     return True
@@ -934,6 +968,9 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                        schema_version: int,
                        expected_image_profile: str,
                        expected_service_profile: str,
+                       expected_feature_policy: str,
+                       expected_busybox_sha256: str,
+                       expected_loader_sha256: str,
                        expected_bootctl_sha256: str,
                        expected_update_verifier_sha256: str,
                        expected_ota_public_key_sha256: str,
@@ -976,6 +1013,8 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         fail("image profile manifest mismatch")
     if manifest.get("service_profile") != expected_service_profile:
         fail("service profile manifest mismatch")
+    if manifest.get("feature_policy") != expected_feature_policy:
+        fail("feature policy manifest mismatch")
     require_member(
         entries, "etc/libreecho/image-profile",
         sha256((expected_image_profile + "\n").encode()), 0o644,
@@ -983,6 +1022,10 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     require_member(
         entries, "etc/libreecho/service-profile",
         sha256((expected_service_profile + "\n").encode()), 0o644,
+    )
+    require_member(
+        entries, "etc/libreecho/feature-policy",
+        sha256((expected_feature_policy + "\n").encode()), 0o644,
     )
     ota = manifest.get("ota")
     if not isinstance(ota, dict) or ota.get("format") != "libreecho-ota-v1":
@@ -1037,6 +1080,23 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         wpa = require_member(entries, "sbin/wpa_supplicant", wpa_hash, 0o755)
         if elf_info(wpa.data) != (1, 40, 0x05000400, None, (), False):
             fail("wpa_supplicant is not static ARM32 hard-float")
+        source_record = wpa_record.get("source")
+        required_source = {
+            "binary_sha256", "binary_size", "build_epoch", "compiler", "config_path",
+            "config_sha256", "crypto", "drivers", "kernel_uapi_sha256", "license",
+            "source_sha256", "source_url", "static", "version",
+        }
+        if (not isinstance(source_record, dict) or set(source_record) != required_source or
+                source_record.get("binary_sha256") != wpa_hash or
+                source_record.get("binary_size") != len(wpa.data) or
+                source_record.get("source_sha256") != WPA_SOURCE_SHA256 or
+                source_record.get("source_url") != WPA_SOURCE_URL or
+                source_record.get("license") != "BSD-3-Clause" or
+                source_record.get("version") != WPA_SUPPLICANT_VERSION or
+                source_record.get("static") is not True or
+                not re.fullmatch(r"[0-9a-f]{64}", str(source_record.get("config_sha256", ""))) or
+                not re.fullmatch(r"[0-9a-f]{64}", str(source_record.get("kernel_uapi_sha256", "")))):
+            fail("wpa source provenance is missing or mismatched")
         profile = require_member(entries, "etc/wifi/wpa_supplicant.conf", profile_hash, 0o600)
         if b"CHANGE_ME" in profile.data:
             fail("configured network image contains the profile template")
@@ -1063,7 +1123,7 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         payload = tts.get("payload")
         if (expected_tts_payload_sha256 is None or expected_tts_payload_size is None or
                 not tts.get("enabled") or not tts.get("external_payload") or
-                tts.get("voices") != ["southern-female", "alan"] or
+                tts.get("voices") != ["southern-female", "northern-male"] or
                 tts.get("default_voice") != "southern-female" or
                 tts.get("threads") != 4 or tts.get("streaming") is not True or
                 tts.get("in_process") is not True or
@@ -1078,17 +1138,29 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
             fail("external TTS payload file manifest is missing")
         for required in (
             "usr/local/sbin/libreecho-ttsd",
-            "usr/local/share/libreecho/tts/models/alan/model.onnx",
-            "usr/local/share/libreecho/tts/models/alan/tokens.txt",
+            "usr/local/share/libreecho/tts/models/northern-male/model.onnx",
+            "usr/local/share/libreecho/tts/models/northern-male/tokens.txt",
             "usr/local/share/libreecho/tts/models/southern-female/model.onnx",
             "usr/local/share/libreecho/tts/models/southern-female/tokens.txt",
         ):
             if required not in files:
                 fail(f"external TTS payload member missing: {required}")
-        for voice in ("alan", "southern-female"):
+        for voice in ("northern-male", "southern-female"):
             prefix = f"usr/local/share/libreecho/tts/models/{voice}/espeak-ng-data/"
             if not any(str(relative).startswith(prefix) for relative in files):
                 fail(f"external TTS payload lacks eSpeak data for {voice}")
+        for required_notice in (
+            "usr/local/share/licenses/libreecho-tts/THIRD_PARTY_NOTICES.md",
+            "usr/local/share/licenses/libreecho-tts/NORTHERN-MALE-MODEL-CARD.md",
+            "usr/local/share/licenses/libreecho-tts/SOUTHERN-FEMALE-MODEL-CARD.md",
+            "usr/local/share/licenses/libreecho-tts/CC-BY-SA-4.0.txt",
+            "usr/local/share/licenses/libreecho-tts/runtime/RUNTIME-NOTICES.txt",
+            "usr/local/share/licenses/libreecho-tts/runtime/ONNX-Runtime-MIT.txt",
+            "usr/local/share/licenses/libreecho-tts/runtime/sherpa-onnx-Apache-2.0.txt",
+            "usr/local/share/licenses/libreecho-tts/runtime/SpeexDSP-COPYING.txt",
+        ):
+            if required_notice not in files:
+                fail(f"external TTS payload notice missing: {required_notice}")
         for relative, record in files.items():
             if (not isinstance(relative, str) or not relative or relative.startswith("/") or
                     "//" in relative or "/../" in f"/{relative}/" or
@@ -1133,6 +1205,10 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
             "usr/local/share/libreecho/openwakeword/embedding_model.onnx",
             "usr/local/share/libreecho/openwakeword/alexa_v0.1.onnx",
             "usr/local/share/licenses/libreecho-openwakeword/MODEL-LICENSE.txt",
+            "usr/local/share/licenses/libreecho-openwakeword/CC-BY-NC-SA-4.0.txt",
+            "usr/local/share/licenses/libreecho-openwakeword/runtime/RUNTIME-NOTICES.txt",
+            "usr/local/share/licenses/libreecho-openwakeword/runtime/ONNX-Runtime-MIT.txt",
+            "usr/local/share/licenses/libreecho-openwakeword/runtime/SpeexDSP-COPYING.txt",
         ):
             if required not in files:
                 fail(f"external wakeword payload member missing: {required}")
@@ -1185,6 +1261,10 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                 "49e3c2646595fd907228b3c6787069658f67b17377c60aeb8619c4551b2316fb",
             "usr/local/share/licenses/libreecho-stt-model/MODEL-LICENSE.md":
                 "505f6b0e8a39f066a0794c4fb0b5689533d3bcd9d1dc5e5f47ccffeef1af9877",
+            "usr/local/share/licenses/libreecho-stt-runtime/RUNTIME-NOTICES.txt": None,
+            "usr/local/share/licenses/libreecho-stt-runtime/ONNX-Runtime-MIT.txt": None,
+            "usr/local/share/licenses/libreecho-stt-runtime/sherpa-onnx-Apache-2.0.txt": None,
+            "usr/local/share/licenses/libreecho-stt-runtime/SpeexDSP-COPYING.txt": None,
         }
         if not isinstance(files, dict) or not files:
             fail("external STT payload file manifest is missing")
@@ -1240,6 +1320,10 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                 "c0c940a0e30d859783f7f130868d8082e79936ff0b41a0b1098ac7f98909263b",
             "usr/local/share/licenses/curl/COPYING": None,
             "usr/local/share/licenses/ca-certificates/copyright": None,
+            "usr/local/share/licenses/libreecho-assistant/THIRD_PARTY_NOTICES.txt": None,
+            "usr/local/share/licenses/libreecho-assistant/OpenSSL-copyright": None,
+            "usr/local/share/licenses/libreecho-assistant/glibc-copyright": None,
+            "usr/local/share/licenses/libreecho-assistant/gcc-runtime-copyright": None,
         }
         if not isinstance(files, dict) or not files:
             fail("external assistant payload file manifest is missing")
@@ -1304,9 +1388,18 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
             "usr/local/sbin/libreecho-audio-engine",
             "usr/local/sbin/shairport-sync",
             "etc/libreecho/airplay2.conf",
+            "usr/local/share/licenses/libreecho-airplay/COMPONENTS.tsv",
         ):
             if required not in files:
                 fail(f"external AirPlay payload member missing: {required}")
+        if not any(str(relative).startswith(
+                "usr/local/share/licenses/libreecho-airplay/debian/") and
+                str(relative).endswith("/copyright") for relative in files):
+            fail("external AirPlay Debian copyright closure is missing")
+        for component in ("nqptp", "shairport-sync", "ffmpeg", "tinyalsa"):
+            prefix = f"usr/local/share/licenses/libreecho-airplay/source/{component}/"
+            if not any(str(relative).startswith(prefix) for relative in files):
+                fail(f"external AirPlay source license closure missing: {component}")
         for relative, record in files.items():
             if (not isinstance(relative, str) or not relative or relative.startswith("/") or
                     "//" in relative or "/../" in f"/{relative}/" or
@@ -1524,8 +1617,8 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         fail("adbd source provenance or transport policy is invalid")
     if "stock_userspace" in manifest:
         fail("stock userspace manifest entry is forbidden")
-    busybox = require_member(entries, "bin/busybox", BUSYBOX_SHA256, 0o755)
-    loader = require_member(entries, "lib/ld-musl-armhf.so.1", LOADER_SHA256, 0o755)
+    busybox = require_member(entries, "bin/busybox", expected_busybox_sha256, 0o755)
+    loader = require_member(entries, "lib/ld-musl-armhf.so.1", expected_loader_sha256, 0o755)
     for name, member, expected_interpreter in (
         ("sbin/adbd", adbd, None),
         ("bin/busybox", busybox, "/lib/ld-musl-armhf.so.1"),
@@ -1560,6 +1653,12 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     applets = manifest.get("busybox_applets", {})
     if applets.get("count", 0) < 250 or not set(required_applets).issubset(applets.get("names", [])):
         fail("BusyBox applet manifest is incomplete")
+    busybox_record = manifest.get("busybox")
+    if not isinstance(busybox_record, dict) or busybox_record.get("sha256") != expected_busybox_sha256:
+        fail("BusyBox manifest identity mismatch")
+    loader_record = manifest.get("musl_loader")
+    if not isinstance(loader_record, dict) or loader_record.get("sha256") != expected_loader_sha256:
+        fail("musl loader manifest identity mismatch")
 
     overlay_dir = Path(__file__).resolve().parent / "initramfs"
     overlay_manifest = manifest.get("overlay", {})
@@ -1572,6 +1671,20 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         if record != {"sha256": sha256(expected), "size": len(expected), "mode": f"{mode:04o}"}:
             fail(f"overlay manifest mismatch for {name}")
         verified_overlay[name] = entry
+
+    core_license_root = overlay_dir / "usr/local/share/licenses/libreecho-core"
+    core_license_files = sorted(path for path in core_license_root.rglob("*") if path.is_file())
+    if not core_license_files:
+        fail("LibreEcho core license bundle is empty")
+    for source in core_license_files:
+        if source.is_symlink():
+            fail(f"core license input is a symlink: {source}")
+        name = source.relative_to(overlay_dir).as_posix()
+        expected = read(source)
+        require_member(entries, name, sha256(expected), 0o644)
+        record = overlay_manifest.get(name, {})
+        if record != {"sha256": sha256(expected), "size": len(expected), "mode": "0644"}:
+            fail(f"core license overlay manifest mismatch for {name}")
 
     control = verified_overlay["libreecho-init"]
     if init.data != control.data:
@@ -1608,6 +1721,42 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
             fail(f"root-ADB property contract lacks {setting!r}")
     if any(name.startswith("res/") or name in {"sbin/recovery", "sbin/multi_init"} for name in entries):
         fail("unneeded stock recovery workload remains in initramfs")
+    if expected_feature_policy == "exclude":
+        if expected_service_profile != "diagnostic":
+            fail("feature exclusion is not paired with the diagnostic service profile")
+        for feature in ("airplay", "tts", "wakeword", "stt", "assistant"):
+            record = manifest.get(feature, {"enabled": False})
+            if not isinstance(record, dict) or record.get("enabled") is not False:
+                fail(f"feature exclusion manifest enables {feature}")
+        if b"FEATURE_POLICY" not in control.data or b"feature-services-excluded" not in control.data:
+            fail("feature exclusion is not enforced by init")
+    elif expected_feature_policy == "redistributable":
+        if expected_service_profile != "production":
+            fail("redistributable feature policy manifest mismatch")
+        for feature in ("airplay", "tts", "stt", "assistant"):
+            record = manifest.get(feature, {"enabled": False})
+            if not isinstance(record, dict) or record.get("enabled") is not True:
+                fail(f"redistributable feature policy manifest mismatch: {feature} disabled")
+        wakeword = manifest.get("wakeword", {"enabled": False})
+        if not isinstance(wakeword, dict) or wakeword.get("enabled") is not False:
+            fail("redistributable feature policy manifest mismatch: wakeword enabled")
+        if b"ui-services-redistributable-without-wakeword" not in control.data:
+            fail("redistributable feature policy manifest mismatch: init graph marker missing")
+    elif expected_feature_policy == "community-noncommercial":
+        if expected_service_profile != "production":
+            fail("community-noncommercial feature policy manifest mismatch")
+        for feature in ("airplay", "tts", "wakeword", "stt", "assistant"):
+            record = manifest.get(feature, {"enabled": False})
+            if not isinstance(record, dict) or record.get("enabled") is not True:
+                fail(
+                    "community-noncommercial feature policy manifest mismatch: "
+                    f"{feature} disabled"
+                )
+        if b"ui-services-community-noncommercial-with-wakeword" not in control.data:
+            fail(
+                "community-noncommercial feature policy manifest mismatch: "
+                "init graph marker missing"
+            )
     for name, entry in entries.items():
         info = elf_info(entry.data)
         if info is not None and info[:2] != (1, 40):
@@ -1655,6 +1804,13 @@ def main() -> None:
     parser.add_argument("--expected-image-profile", choices=("development", "ota"), required=True)
     parser.add_argument("--expected-service-profile", choices=("diagnostic", "production"),
                         required=True)
+    parser.add_argument(
+        "--expected-feature-policy",
+        choices=("exclude", "preserve", "redistributable", "community-noncommercial"),
+        required=True,
+    )
+    parser.add_argument("--expected-busybox-sha256", required=True)
+    parser.add_argument("--expected-musl-loader-sha256", required=True)
     parser.add_argument("--expected-bootctl-sha256", required=True)
     parser.add_argument("--expected-update-verifier-sha256", required=True)
     parser.add_argument("--expected-ota-public-key-sha256", required=True)
@@ -1808,7 +1964,8 @@ def main() -> None:
 
     connectivity_enabled = validate_initramfs(
         ramdisk, manifest, schema_version, args.expected_image_profile,
-        args.expected_service_profile,
+        args.expected_service_profile, args.expected_feature_policy,
+        args.expected_busybox_sha256, args.expected_musl_loader_sha256,
         args.expected_bootctl_sha256, args.expected_update_verifier_sha256,
         args.expected_ota_public_key_sha256, args.expected_adbd_sha256,
         args.expected_audio_probe_sha256,
@@ -1844,7 +2001,8 @@ def main() -> None:
         "arm32_recovery_image_contract=PASS android_v0=yes mtk_wrapper=yes "
         "zimage=yes evt_dtb=yes initramfs_arm32=yes "
         f"fastboot_marker={'automatic' if args.expected_image_profile == 'development' else 'explicit-only'} "
-        f"image_profile={args.expected_image_profile} service_profile={args.expected_service_profile} ota=yes "
+        f"image_profile={args.expected_image_profile} service_profile={args.expected_service_profile} "
+        f"feature_policy={args.expected_feature_policy} ota=yes "
         "root_adb_staged=yes runme=yes memory_disjoint=yes "
         f"connectivity_bundle={'yes' if connectivity_enabled else 'no'} "
         f"audio_tools={'yes' if args.expected_tinyplay_sha256 and args.expected_tinycap_sha256 and args.expected_tinymix_sha256 else 'no'} "

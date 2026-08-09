@@ -9,8 +9,9 @@ kernel source of truth.
 
 The current kernel line is maintained separately in
 [`LibreEcho-Linux-6.1`](https://github.com/aslater3/LibreEcho-Linux-6.1). Kernel,
-device-tree, and driver changes belong there. The current PRD kernel baseline
-is commit `2aaa8bfae1cc7c9aed5afe0fbe9a8e6abcbc6872`; follow-up fixes remain on
+device-tree, and driver changes belong there. Public `main` is the clean
+development source line; complete hardware-validated image identities are
+pinned separately by private release provenance. Follow-up fixes remain on
 review branches until verified.
 
 The UI and service daemons are maintained in
@@ -19,4 +20,5 @@ release notes and cross-repository documentation belong in
 [`LibreEcho`](https://github.com/aslater3/LibreEcho).
 
 This boundary is source provenance only. A complete image still requires the
-paired kernel, product tooling, UI bundle, and independent image verification.
+paired kernel, product tooling, UI bundle, private build orchestration,
+independent image verification, and separate runtime acceptance.

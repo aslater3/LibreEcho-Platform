@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import io
+import json
 import re
 import tarfile
 from pathlib import Path
@@ -36,16 +37,30 @@ def tar_record(archive: tarfile.TarFile, name: str, data: bytes, mode: int) -> N
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--boot-image", type=Path, required=True)
+    parser.add_argument("--build-manifest", type=Path, required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--signing-key", type=Path, required=True)
     parser.add_argument("--public-key", type=Path, required=True)
     parser.add_argument("--service-profile", choices=("diagnostic", "production"),
                         default="diagnostic")
+    parser.add_argument("--feature-policy",
+                        choices=("exclude", "preserve", "redistributable",
+                                 "community-noncommercial"),
+                        default="preserve")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
     if not VALUE_RE.fullmatch(args.version):
         raise SystemExit("ERROR: version contains unsupported characters")
+    if args.feature_policy == "exclude" and args.service_profile != "diagnostic":
+        raise SystemExit(
+            "ERROR: feature exclusion requires the diagnostic service profile"
+        )
+    if (args.feature_policy in {"redistributable", "community-noncommercial"} and
+            args.service_profile != "production"):
+        raise SystemExit(
+            f"ERROR: {args.feature_policy} feature policy requires the production service profile"
+        )
     if args.output.exists():
         raise SystemExit(f"ERROR: refusing to overwrite {args.output}")
     boot = args.boot_image.read_bytes()
@@ -53,6 +68,24 @@ def main() -> None:
         raise SystemExit("ERROR: boot image must be an exact 16 MiB Android boot image")
 
     digest = hashlib.sha256(boot).hexdigest()
+    if not args.build_manifest.is_file() or args.build_manifest.is_symlink():
+        raise SystemExit("ERROR: build manifest is unavailable")
+    try:
+        build_manifest = json.loads(args.build_manifest.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SystemExit("ERROR: build manifest is malformed") from error
+    output_record = build_manifest.get("output", {}) if isinstance(build_manifest, dict) else {}
+    if (not isinstance(output_record, dict) or
+            output_record.get("sha256") != digest or
+            output_record.get("size") != len(boot)):
+        raise SystemExit("ERROR: boot image does not match build manifest")
+    if build_manifest.get("image_profile") != "ota":
+        raise SystemExit("ERROR: build manifest is not an OTA image")
+    if build_manifest.get("service_profile") != args.service_profile:
+        raise SystemExit("ERROR: service profile does not match build manifest")
+    if build_manifest.get("feature_policy") != args.feature_policy:
+        raise SystemExit("ERROR: feature policy does not match build manifest")
+
     manifest = (
         "format=libreecho-ota-v1\n"
         "manifest_version=1\n"
@@ -63,7 +96,7 @@ def main() -> None:
         "boot_filename=boot.img\n"
         f"boot_size={len(boot)}\n"
         f"boot_sha256={digest}\n"
-        "feature_policy=preserve\n"
+        f"feature_policy={args.feature_policy}\n"
         "image_profile=ota\n"
         f"service_profile={args.service_profile}\n"
     ).encode("ascii")

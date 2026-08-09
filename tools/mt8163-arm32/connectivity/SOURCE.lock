@@ -1,0 +1,14 @@
+{
+  "name": "LibreEcho MT8163 connectivity helpers",
+  "version": "1",
+  "license": "GPL-2.0-only",
+  "source_scope": "checked-in files in this directory",
+  "derivation": "Userspace ABI definitions and behavior are derived from the GPL-2.0 conn_soc kernel driver",
+  "outputs": [
+    "wmt_configure",
+    "wmt_responder",
+    "wmt_bt_on",
+    "wmt_stock_compat",
+    "wmt_launcher"
+  ]
+}

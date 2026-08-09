@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import json
 import os
 import re
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -226,6 +228,34 @@ class SourceTests(unittest.TestCase):
         self.assertNotIn(
             "windows95", (pipeline_root / "inputs/SHA256SUMS").read_text().lower()
         )
+
+    def test_connectivity_helpers_strip_toolchain_debug_paths(self) -> None:
+        source = (TOOLS_DIR / "connectivity/build_connectivity_helpers.sh").read_text()
+        self.assertIn("-Wl,--strip-all", source)
+        self.assertIn("contains a host/build path", source)
+
+    def test_wakeword_runtime_uses_explicit_re2_archive(self) -> None:
+        source = (TOOLS_DIR / "wakeword/build_runtime.sh").read_text()
+        self.assertIn(
+            "${LIBREECHO_WAKE_RE2_ARCHIVE:?ERROR:", source
+        )
+        self.assertIn('RE2_ARCHIVE="$RE2_ARCHIVE"', source)
+
+    def test_wakeword_runtime_snapshots_relink_objects(self) -> None:
+        source = (TOOLS_DIR / "wakeword/build_runtime.sh").read_text()
+        self.assertIn(
+            "${LIBREECHO_WAKE_RELINK_OUTPUT:?ERROR:", source
+        )
+        for object_name in (
+            "waked.wake.arm.o", "voice_aec.wake.arm.o",
+            "voice_reference.wake.arm.o", "voice_dsp.wake.arm.o",
+            "voice_stream.wake.arm.o", "wake_worker.wake.arm.o",
+            "wake_led.wake.arm.o", "adapter_client.wake.arm.o",
+            "adapter_server.wake.arm.o", "log.wake.arm.o",
+            "wake_engine_onnx.arm.o",
+        ):
+            self.assertIn(object_name, source)
+        self.assertIn("wakeword_relink_object_count=%s", source)
 
     def test_pinned_source_rejects_symlink_components(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -477,6 +507,390 @@ class SourceTests(unittest.TestCase):
                 self.assertIn("LIBREECHO_PIPELINE_ROOT", source)
                 self.assertNotIn("../../../../pipeline", source)
 
+    def test_release_payloads_embed_exact_license_closure(self) -> None:
+        tts = TOOLS_DIR / "tts"
+        self.assertIn("CC-BY-SA-4.0", (tts / "THIRD_PARTY_NOTICES.md").read_text())
+        self.assertIn("OpenSLR SLR83", (tts / "NORTHERN-MALE-MODEL-CARD.md").read_text())
+        self.assertTrue((tts / "CC-BY-SA-4.0.txt").stat().st_size > 10000)
+        tts_packager = (tts / "package_feature.sh").read_text()
+        self.assertIn("northern-male", tts_packager)
+        self.assertNotIn("ALAN_MODEL", tts_packager)
+        for required in (
+            "THIRD_PARTY_NOTICES.md",
+            "NORTHERN-MALE-MODEL-CARD.md",
+            "SOUTHERN-FEMALE-MODEL-CARD.md",
+            "CC-BY-SA-4.0.txt",
+        ):
+            self.assertIn(required, tts_packager)
+
+        wakeword = TOOLS_DIR / "wakeword"
+        wake_notice = (wakeword / "MODEL-LICENSE.txt").read_text()
+        self.assertIn("public payload", wake_notice)
+        self.assertIn("NonCommercial-ShareAlike", wake_notice)
+        self.assertTrue((wakeword / "CC-BY-NC-SA-4.0.txt").stat().st_size > 10000)
+        self.assertIn(
+            "CC-BY-NC-SA-4.0.txt",
+            (wakeword / "package_feature.sh").read_text(),
+        )
+
+        airplay_builder = (TOOLS_DIR / "airplay/build_airplay.sh").read_text()
+        airplay_packager = (TOOLS_DIR / "airplay/package_feature.sh").read_text()
+        for required in ("COMPONENTS.tsv", "debian", "nqptp", "shairport-sync", "ffmpeg", "tinyalsa"):
+            self.assertIn(required, airplay_builder)
+            self.assertIn(required, airplay_packager)
+
+        common = TOOLS_DIR / "third-party-licenses"
+        for required in (
+            "RUNTIME-NOTICES.txt", "ONNX-Runtime-MIT.txt",
+            "sherpa-onnx-Apache-2.0.txt", "SpeexDSP-COPYING.txt",
+            "OpenSSL-copyright", "glibc-copyright", "gcc-runtime-copyright",
+        ):
+            self.assertTrue((common / required).is_file(), required)
+        for feature in ("stt", "tts", "wakeword"):
+            packager = (TOOLS_DIR / feature / "package_feature.sh").read_text()
+            self.assertIn("COMMON_LICENSE_DIR", packager)
+            self.assertIn("runtime_license_root", packager)
+        assistant_packager = (TOOLS_DIR / "assistant/package_feature.sh").read_text()
+        self.assertIn("OpenSSL-copyright", assistant_packager)
+        self.assertIn("THIRD_PARTY_NOTICES.txt", assistant_packager)
+
+        core = TOOLS_DIR / "initramfs/usr/local/share/licenses/libreecho-core"
+        components = json.loads((core / "COMPONENTS.json").read_text())
+        component_ids = {component["id"] for component in components["components"]}
+        self.assertTrue({"busybox", "wpa-supplicant", "musl", "tinyalsa", "libsodium", "mt8163-audio-fpga"}.issubset(component_ids))
+        audio = next(component for component in components["components"] if component["id"] == "mt8163-audio-fpga")
+        self.assertTrue(audio["included_in_public_artifact"])
+        self.assertEqual(audio["redistribution_status"], "blocked")
+        core_notice = (core / "THIRD_PARTY_NOTICES.md").read_text()
+        self.assertIn("owner's", core_notice)
+        self.assertIn("`system_a`", core_notice)
+        self.assertIn("audio-capable candidate includes", core_notice)
+        self.assertNotIn("public base therefore makes no speaker or microphone claim", core_notice)
+        for required in (
+            "GPL-2.0-only.txt", "Apache-2.0.txt", "wpa_supplicant-BSD.txt",
+            "wireless-tools-copyright", "wireless-regdb-copyright",
+            "musl-1.2.5-COPYRIGHT.txt", "libsodium-1.0.18-LICENSE.txt",
+        ):
+            self.assertTrue((core / required).is_file(), required)
+
+    def test_public_core_runtime_is_rebuilt_from_locked_source(self) -> None:
+        expected = {
+            "busybox": (
+                "3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4",
+                "build_busybox.sh",
+            ),
+            "musl": (
+                "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4",
+                "build_musl.sh",
+            ),
+            "wpa-supplicant": (
+                "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f",
+                "build_wpa_supplicant.sh",
+            ),
+        }
+        for component, (archive_sha256, builder_name) in expected.items():
+            component_dir = TOOLS_DIR / component
+            lock = json.loads((component_dir / "SOURCE.lock").read_text())
+            self.assertEqual(lock["source_sha256"], archive_sha256)
+            builder = component_dir / builder_name
+            self.assertTrue(builder.is_file(), builder)
+            self.assertTrue(builder.stat().st_mode & 0o111, builder)
+            builder_source = builder.read_text()
+            self.assertIn("source_sha256", builder_source)
+            self.assertIn("-ffile-prefix-map", builder_source)
+            self.assertIn("source.json", builder_source)
+
+        image_builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        image_verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        for expected_argument in (
+            "--expected-busybox-sha256",
+            "--expected-musl-loader-sha256",
+        ):
+            self.assertIn(expected_argument, image_builder)
+            self.assertIn(expected_argument, image_verifier)
+        for obsolete_hash in (
+            "d4c8fd2aea01abd851c703f39b29c0de748b2751e4e1a85cae570fa53ad8f4fb",
+            "1063871174f1bd4f08f4d330e20b07aeb0820327ee739a4d8d1b644df842cb6b",
+        ):
+            self.assertNotIn(obsolete_hash, image_builder)
+            self.assertNotIn(obsolete_hash, image_verifier)
+
+        connectivity = TOOLS_DIR / "connectivity"
+        connectivity_builder = (connectivity / "build_connectivity_helpers.sh").read_text()
+        self.assertTrue((connectivity / "SOURCE.lock").is_file())
+        for helper in (
+            "wmt_configure", "wmt_responder", "wmt_bt_on",
+            "wmt_stock_compat", "wmt_launcher",
+        ):
+            self.assertTrue((connectivity / f"{helper}.c").is_file())
+            self.assertIn(helper, connectivity_builder)
+        self.assertIn("GPL-2.0-only", connectivity_builder)
+
+        audio_tools = TOOLS_DIR / "audio-tools"
+        audio_lock = json.loads((audio_tools / "SOURCE.lock").read_text())
+        self.assertEqual(
+            audio_lock["source_sha256"],
+            "dc75977453304fcce0b91cbfd2b27942641c93479f87898d230cdc440a042d4f",
+        )
+        self.assertEqual(
+            audio_lock["patch_sha256"],
+            "f63cacae35b0eb5291c8f4fa49c276c7aac3927426e529c50d74ab244c3ba7aa",
+        )
+        audio_builder = (audio_tools / "build_audio_tools.sh").read_text()
+        for tool in ("tinyplay", "tinycap", "tinymix"):
+            self.assertIn(tool, audio_builder)
+        self.assertIn("tinyalsa-source.json", audio_builder)
+        self.assertIn("--fuzz=0", audio_builder)
+        self.assertFalse(any((audio_tools / tool).exists() for tool in ("tinyplay", "tinycap", "tinymix")))
+
+        pipeline = pipeline_text("build.sh")
+        self.assertIn("build_connectivity_helpers.sh", pipeline)
+        self.assertIn("build_audio_tools.sh", pipeline)
+        self.assertNotIn('$INPUTS/connectivity-helpers', pipeline)
+        self.assertNotIn('AUDIO_TOOLS_DIR="$TOOLS_DIR/audio-tools"', pipeline)
+        self.assertNotIn('sha256sum -c SHA256SUMS', pipeline)
+        self.assertIn('verify_pinned_input', pipeline)
+        for product_field in (
+            'product_git_head=', 'product_git_state=',
+            'product_git_diff_sha256=', 'public_release_mode=',
+        ):
+            self.assertIn(product_field, pipeline)
+
+    def test_busybox_builder_pins_utc_timezone(self) -> None:
+        builder = (
+            TOOLS_DIR / "busybox" / "build_busybox.sh"
+        ).read_text()
+        self.assertIn("export TZ=UTC", builder)
+
+    def test_busybox_builder_sanitizes_host_linker_environment(self) -> None:
+        builder = (
+            TOOLS_DIR / "busybox" / "build_busybox.sh"
+        ).read_text()
+        self.assertIn("unset LD_LIBRARY_PATH", builder)
+
+    def test_wpa_builder_sanitizes_host_environment_before_extraction(self) -> None:
+        builder = (
+            TOOLS_DIR / "wpa-supplicant" / "build_wpa_supplicant.sh"
+        ).read_text()
+        self.assertIn("unset LD_LIBRARY_PATH", builder)
+        self.assertLess(
+            builder.index("unset LD_LIBRARY_PATH"),
+            builder.index('tar -xf "$ARCHIVE"'),
+        )
+
+    def test_wpa_builder_emits_static_non_pie(self) -> None:
+        builder = (
+            TOOLS_DIR / "wpa-supplicant" / "build_wpa_supplicant.sh"
+        ).read_text()
+        self.assertIn("LDFLAGS='-static -no-pie", builder)
+        self.assertIn("Type:[[:space:]]+EXEC", builder)
+
+    def test_wpa_builder_requires_exported_linux_uapi_headers(self) -> None:
+        builder = (
+            TOOLS_DIR / "wpa-supplicant" / "build_wpa_supplicant.sh"
+        ).read_text()
+        self.assertIn("--kernel-headers DIR", builder)
+        self.assertIn("KERNEL_HEADERS=", builder)
+        self.assertIn('"-idirafter" "$KERNEL_HEADERS"', builder)
+        self.assertIn("kernel_uapi_sha256", builder)
+        self.assertNotIn("/usr/arm-linux-gnueabihf/include", builder)
+        image_builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        self.assertIn("--wpa-source-metadata", image_builder)
+        self.assertIn("wpa source provenance is missing or mismatched", verifier)
+
+    def test_feature_policy_is_immutable_and_fail_closed(self) -> None:
+        builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
+        pipeline = pipeline_text("build.sh")
+        for source in (builder, verifier, updater, pipeline):
+            self.assertIn("feature_policy", source)
+        self.assertIn("--feature-policy", builder)
+        self.assertIn("--expected-feature-policy", verifier)
+        self.assertIn("/etc/libreecho/feature-policy", init)
+        self.assertIn("feature exclusion requires --service-profile diagnostic", pipeline)
+        self.assertIn('FEATURE_POLICY="${LIBREECHO_FEATURE_POLICY:-preserve}"', pipeline)
+
+    def test_redistributable_policy_is_four_payloads_without_wakeword(self) -> None:
+        builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
+        ota = (TOOLS_DIR / "ota/make_ota_bundle.py").read_text()
+        for source in (builder, verifier, updater, ota):
+            self.assertIn("redistributable", source)
+        self.assertIn("redistributable policy requires external AirPlay, TTS, STT, and assistant payloads", builder)
+        self.assertIn("wakeword payload inputs are forbidden by feature_policy=redistributable", builder)
+        self.assertIn("redistributable feature policy manifest mismatch", verifier)
+        self.assertIn("preserve|redistributable|community-noncommercial|exclude", init)
+        self.assertIn('if [ "$FEATURE_POLICY" = preserve ] ||', init)
+        self.assertIn("ui-services-redistributable-without-wakeword", init)
+
+    def test_community_noncommercial_policy_is_five_payloads_with_wakeword(self) -> None:
+        builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
+        ota = (TOOLS_DIR / "ota/make_ota_bundle.py").read_text()
+        for source in (builder, verifier, init, updater, ota):
+            self.assertIn("community-noncommercial", source)
+        self.assertIn(
+            "community-noncommercial policy requires external AirPlay, TTS, "
+            "wakeword, STT, and assistant payloads",
+            builder,
+        )
+        self.assertIn("community-noncommercial feature policy manifest mismatch", verifier)
+        self.assertIn("ui-services-community-noncommercial-with-wakeword", init)
+
+    def test_recovery_init_pin_matches_policy_source(self) -> None:
+        init_hash = hashlib.sha256(
+            (TOOLS_DIR / "initramfs/libreecho-init").read_bytes()
+        ).hexdigest()
+        pins = {
+            "build_recovery_image.py": "RECOVERY_INIT_SHA256",
+            "verify_recovery_image.py": "INIT_SHA256",
+        }
+        for name, constant in pins.items():
+            source = (TOOLS_DIR / name).read_text()
+            self.assertIn(f'{constant} = "{init_hash}"', source)
+
+    def test_ota_bundle_signs_redistributable_policy(self) -> None:
+        from nacl.signing import SigningKey
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            boot = root / "boot.img"
+            boot_bytes = b"ANDROID!" + bytes((16 * 1024 * 1024) - 8)
+            boot.write_bytes(boot_bytes)
+            key = SigningKey.generate()
+            private = root / "private.hex"
+            public = root / "public.hex"
+            build_manifest = root / "build-manifest.json"
+            private.write_text(key.encode().hex() + "\n")
+            public.write_text(key.verify_key.encode().hex() + "\n")
+            build_manifest.write_text(json.dumps({
+                "image_profile": "ota",
+                "service_profile": "production",
+                "feature_policy": "redistributable",
+                "output": {
+                    "sha256": hashlib.sha256(boot_bytes).hexdigest(),
+                    "size": len(boot_bytes),
+                },
+            }))
+            output = root / "update.ota.tar"
+            subprocess.run([
+                sys.executable, str(TOOLS_DIR / "ota/make_ota_bundle.py"),
+                "--boot-image", str(boot), "--build-manifest", str(build_manifest),
+                "--version", "test-v1",
+                "--signing-key", str(private), "--public-key", str(public),
+                "--service-profile", "production", "--feature-policy",
+                "redistributable", "--output", str(output),
+            ], check=True, capture_output=True, text=True)
+            with tarfile.open(output, "r:") as archive:
+                manifest = archive.extractfile("manifest").read().decode()
+            self.assertIn("feature_policy=redistributable\n", manifest)
+
+    def test_ota_bundle_signs_community_noncommercial_policy(self) -> None:
+        from nacl.signing import SigningKey
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            boot = root / "boot.img"
+            boot_bytes = b"ANDROID!" + bytes((16 * 1024 * 1024) - 8)
+            boot.write_bytes(boot_bytes)
+            key = SigningKey.generate()
+            private = root / "private.hex"
+            public = root / "public.hex"
+            build_manifest = root / "build-manifest.json"
+            private.write_text(key.encode().hex() + "\n")
+            public.write_text(key.verify_key.encode().hex() + "\n")
+            build_manifest.write_text(json.dumps({
+                "image_profile": "ota",
+                "service_profile": "production",
+                "feature_policy": "community-noncommercial",
+                "output": {
+                    "sha256": hashlib.sha256(boot_bytes).hexdigest(),
+                    "size": len(boot_bytes),
+                },
+            }))
+            output = root / "update.ota.tar"
+            subprocess.run([
+                sys.executable, str(TOOLS_DIR / "ota/make_ota_bundle.py"),
+                "--boot-image", str(boot), "--build-manifest", str(build_manifest),
+                "--version", "test-v1",
+                "--signing-key", str(private), "--public-key", str(public),
+                "--service-profile", "production", "--feature-policy",
+                "community-noncommercial", "--output", str(output),
+            ], check=True, capture_output=True, text=True)
+            with tarfile.open(output, "r:") as archive:
+                manifest = archive.extractfile("manifest").read().decode()
+            self.assertIn("feature_policy=community-noncommercial\n", manifest)
+
+    def test_ota_bundle_rejects_excluded_features_with_production_services(self) -> None:
+        from nacl.signing import SigningKey
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            boot = root / "boot.img"
+            boot_bytes = b"ANDROID!" + bytes((16 * 1024 * 1024) - 8)
+            boot.write_bytes(boot_bytes)
+            key = SigningKey.generate()
+            private = root / "private.hex"
+            public = root / "public.hex"
+            build_manifest = root / "build-manifest.json"
+            private.write_text(key.encode().hex() + "\n")
+            public.write_text(key.verify_key.encode().hex() + "\n")
+            build_manifest.write_text(json.dumps({
+                "image_profile": "ota",
+                "service_profile": "diagnostic",
+                "feature_policy": "exclude",
+                "output": {
+                    "sha256": hashlib.sha256(boot_bytes).hexdigest(),
+                    "size": len(boot_bytes),
+                },
+            }))
+            result = subprocess.run([
+                sys.executable, str(TOOLS_DIR / "ota/make_ota_bundle.py"),
+                "--boot-image", str(boot), "--build-manifest", str(build_manifest),
+                "--version", "test-v1", "--signing-key", str(private),
+                "--public-key", str(public), "--service-profile", "production",
+                "--feature-policy", "exclude", "--output", str(root / "update.ota.tar"),
+            ], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("feature exclusion requires the diagnostic service profile", result.stderr)
+
+    def test_ota_bundle_rejects_policy_not_bound_to_boot_manifest(self) -> None:
+        from nacl.signing import SigningKey
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            boot = root / "boot.img"
+            boot_bytes = b"ANDROID!" + bytes((16 * 1024 * 1024) - 8)
+            boot.write_bytes(boot_bytes)
+            key = SigningKey.generate()
+            private = root / "private.hex"
+            public = root / "public.hex"
+            build_manifest = root / "build-manifest.json"
+            private.write_text(key.encode().hex() + "\n")
+            public.write_text(key.verify_key.encode().hex() + "\n")
+            build_manifest.write_text(json.dumps({
+                "image_profile": "ota",
+                "service_profile": "production",
+                "feature_policy": "preserve",
+                "output": {
+                    "sha256": hashlib.sha256(boot_bytes).hexdigest(),
+                    "size": len(boot_bytes),
+                },
+            }))
+            result = subprocess.run([
+                sys.executable, str(TOOLS_DIR / "ota/make_ota_bundle.py"),
+                "--boot-image", str(boot), "--build-manifest", str(build_manifest),
+                "--version", "test-v1", "--signing-key", str(private),
+                "--public-key", str(public), "--service-profile", "production",
+                "--feature-policy", "redistributable",
+                "--output", str(root / "update.ota.tar"),
+            ], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("feature policy does not match build manifest", result.stderr)
+
     def test_stock_userspace_is_replaced_by_source_built_adbd(self) -> None:
         builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
         verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
@@ -510,6 +924,8 @@ class SourceTests(unittest.TestCase):
         self.assertIn("-fdebug-prefix-map=", builder_text)
         self.assertIn("--kernel-headers", builder_text)
         self.assertIn("--test-ffs-root", builder_text)
+        self.assertIn('"kernel_headers": "exported-linux-uapi"', builder_text)
+        self.assertNotIn('"kernel_headers": kernel_headers', builder_text)
         self.assertIn("libreecho-adbd-compat.h", builder_text)
         self.assertTrue((adbd_dir / "compat/libreecho-adbd-compat.h").is_file())
         self.assertNotIn("stock-root", builder_text)
@@ -561,11 +977,12 @@ class SourceTests(unittest.TestCase):
             init_source.index("start_wifi_network_sequence"),
         )
 
-    def test_audio_tools_are_pinned_and_gpu_input_wait_is_interruptible(self) -> None:
+    def test_audio_tools_are_source_built_and_gpu_input_wait_is_interruptible(self) -> None:
         tools = TOOLS_DIR / "audio-tools"
-        self.assertTrue((tools / "tinyplay").is_file())
-        self.assertTrue((tools / "tinycap").is_file())
-        self.assertTrue((tools / "tinymix").is_file())
+        self.assertTrue((tools / "build_audio_tools.sh").is_file())
+        self.assertTrue((tools / "SOURCE.lock").is_file())
+        self.assertTrue((tools / "tinyalsa-mt8163.patch").is_file())
+        self.assertFalse(any((tools / name).exists() for name in ("tinyplay", "tinycap", "tinymix")))
         pipeline_build = pipeline_text("build.sh")
         self.assertIn("--tinyplay", pipeline_build)
         self.assertIn("--tinymix", pipeline_build)
@@ -716,17 +1133,112 @@ class SourceTests(unittest.TestCase):
         self.assertIn("AudDrv_GPIO_DACMUX_Select(0)", prepare)
         self.assertNotIn("AudDrv_GPIO_DACMUX_Select(1)", prepare)
 
+    def test_relink_builders_remap_temporary_source_paths(self) -> None:
+        airplay_builder = (TOOLS_DIR / "airplay/build_airplay.sh").read_text()
+        self.assertIn(
+            "-ffile-prefix-map=$work=/usr/src/libreecho-airplay",
+            airplay_builder,
+        )
+        self.assertIn(
+            "-fdebug-prefix-map=$work=/usr/src/libreecho-airplay",
+            airplay_builder,
+        )
+        self.assertIn('"$ffmpeg_source/config.h" "$work"', airplay_builder)
+        self.assertIn(
+            'before.replace(work, "/usr/src/libreecho-airplay")',
+            airplay_builder,
+        )
+        assistant_builder = (TOOLS_DIR / "assistant/build_curl.sh").read_text()
+        self.assertIn(
+            "-ffile-prefix-map=$work=/usr/src/libreecho-curl",
+            assistant_builder,
+        )
+        self.assertIn(
+            "-fdebug-prefix-map=$work=/usr/src/libreecho-curl",
+            assistant_builder,
+        )
+
+    def test_connectivity_helper_pins_match_source_built_outputs(self) -> None:
+        expected = {
+            "sbin/wmt_configure": (
+                25744,
+                "2a57272037a34519e9f6f5dd64ab5a16ad304c81535c4aa7f15a8afae34aadb1",
+            ),
+            "sbin/wmt_responder": (
+                21648,
+                "46170ddc1d1ddf21a85ec16df129aac47a258a439bc9e6ed061d1e5942aa48eb",
+            ),
+            "sbin/wmt_bt_on": (
+                21648,
+                "985320b270149cd27bc59d7f34d0da829817f225a4e712037633517c843cc745",
+            ),
+            "sbin/wmt_stock_compat": (
+                21648,
+                "7e3afe31b706029ebf6e271f5cda6e3880cfc5b184abb052a190662759708c87",
+            ),
+            "sbin/wmt_launcher": (
+                21648,
+                "65cb5c0c49bb61aec657c114cf67269e398bf41ff7b70a4abb8eb0ec36ff2c99",
+            ),
+        }
+        builder_pins = {
+            target: (specification[1], specification[2])
+            for target, specification in builder.CONNECTIVITY_HELPERS.items()
+        }
+        self.assertEqual(builder_pins, expected)
+        self.assertEqual(verifier.CONNECTIVITY_HELPERS, expected)
+
     def test_network_tools_are_pinned_and_manual_only(self) -> None:
         builder_script = TOOLS_DIR / "network-tools/build_wireless_tools.sh"
         self.assertTrue(builder_script.is_file())
         self.assertTrue(os.access(builder_script, os.X_OK))
+        lock = json.loads((TOOLS_DIR / "network-tools/SOURCE.lock").read_text())
+        self.assertEqual(lock["version"], "30~pre9")
+        self.assertEqual(
+            lock["source_sha256"],
+            "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63",
+        )
+        builder_source = builder_script.read_text()
+        self.assertIn("--archive FILE", builder_source)
+        self.assertIn("--kernel-headers DIR", builder_source)
+        self.assertIn("--native-root DIR", builder_source)
+        self.assertIn("wireless-tools-source.json", builder_source)
+        self.assertIn("wireless-tools-COPYING", builder_source)
+        self.assertIn("-static -no-pie", builder_source)
+        self.assertIn("Type:[[:space:]]+EXEC", builder_source)
+        self.assertNotIn("curl --fail", builder_source)
+        regdb_builder = TOOLS_DIR / "network-tools/wireless-regdb/build_wireless_regdb.sh"
+        self.assertTrue(regdb_builder.is_file())
+        self.assertTrue(os.access(regdb_builder, os.X_OK))
+        regdb_lock = json.loads((regdb_builder.parent / "SOURCE.lock").read_text())
+        self.assertEqual(regdb_lock["version"], "2025.10.07")
+        self.assertEqual(
+            regdb_lock["source_sha256"],
+            "d4c872a44154604c869f5851f7d21d818d492835d370af7f58de8847973801c3",
+        )
+        self.assertIn("regulatory.db.p7s", regdb_builder.read_text())
+        sodium_builder = TOOLS_DIR / "ota/build_libsodium.sh"
+        self.assertTrue(sodium_builder.is_file())
+        self.assertTrue(os.access(sodium_builder, os.X_OK))
+        sodium_lock = json.loads((TOOLS_DIR / "ota/SOURCE.lock").read_text())
+        self.assertEqual(sodium_lock["version"], "1.0.18")
+        self.assertEqual(
+            sodium_lock["source_sha256"],
+            "d59323c6b712a1519a5daf710b68f5e7fde57040845ffec53850911f10a5d4f4",
+        )
         pipeline_build = pipeline_text("build.sh")
         pipeline_status = pipeline_text("status.sh")
         pipeline_flash = pipeline_text("flash.sh")
         self.assertIn("build_wireless_tools.sh", pipeline_build)
         self.assertIn("--iwconfig", pipeline_build)
+        self.assertIn("--iwconfig-source-metadata", pipeline_build)
         self.assertIn("--expected-iwconfig-sha256", pipeline_status)
         self.assertIn("--expected-iwconfig-sha256", pipeline_flash)
+        image_builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        self.assertIn("--iwconfig-source-metadata", image_builder)
+        self.assertIn("wireless-tools-COPYING", image_builder)
+        self.assertIn("wireless-tools-COPYING", verifier)
 
     def test_ssh_password_hash_is_salted_and_private(self) -> None:
         dropbear_builder = TOOLS_DIR / "ssh/build_dropbear.sh"

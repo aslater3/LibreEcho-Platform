@@ -1,0 +1,7 @@
+{
+  "name": "libsodium",
+  "version": "1.0.18",
+  "license": "ISC",
+  "source_url": "https://archive.ubuntu.com/ubuntu/pool/main/libs/libsodium/libsodium_1.0.18.orig.tar.gz",
+  "source_sha256": "d59323c6b712a1519a5daf710b68f5e7fde57040845ffec53850911f10a5d4f4"
+}

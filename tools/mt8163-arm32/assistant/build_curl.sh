@@ -8,6 +8,7 @@ LICENSE_OUTPUT="${4:?usage: build_curl.sh <curl-source.tar.xz> <armhf-sysroot> <
 CROSS="${LIBREECHO_ASSISTANT_CROSS:-/usr/bin/arm-linux-gnueabihf-}"
 JOBS="${JOBS:-$(nproc)}"
 SOURCE_SHA256=aa1b66a70eace83dc624508745646c08ae561de512ab403adffb93ac87fc72e6
+RELINK_OUTPUT="${LIBREECHO_ASSISTANT_RELINK_OUTPUT:-}"
 
 [[ -f "$SOURCE_ARCHIVE" && ! -L "$SOURCE_ARCHIVE" ]] || {
   echo "ERROR: curl source archive is missing or is a symlink" >&2
@@ -55,6 +56,7 @@ source_root="$work/source"
 build_root="$work/build"
 mkdir -p "$source_root" "$build_root"
 tar -xJf "$SOURCE_ARCHIVE" --strip-components=1 -C "$source_root"
+reproducible_path_flags="-ffile-prefix-map=$work=/usr/src/libreecho-curl -fdebug-prefix-map=$work=/usr/src/libreecho-curl"
 
 include_root="$SYSROOT/usr/include"
 library_root="$SYSROOT/usr/lib/arm-linux-gnueabihf"
@@ -63,13 +65,13 @@ pkgconfig_root="$library_root/pkgconfig"
 (
   cd "$build_root"
   env \
-    CC="${CROSS}gcc" AR="${CROSS}ar" RANLIB="${CROSS}ranlib" \
+    CC="${CROSS}gcc --sysroot=$SYSROOT" AR="${CROSS}ar" RANLIB="${CROSS}ranlib" \
     STRIP="${CROSS}strip" CURL_LDFLAGS_BIN=-all-static \
     PKG_CONFIG_SYSROOT_DIR="$SYSROOT" \
     PKG_CONFIG_LIBDIR="$pkgconfig_root" \
     CPPFLAGS="-I$include_root/arm-linux-gnueabihf -I$include_root" \
-    CFLAGS="-Os -ffunction-sections -fdata-sections" \
-    LDFLAGS="-static -Wl,--gc-sections -L$library_root" \
+    CFLAGS="--sysroot=$SYSROOT -Os -ffunction-sections -fdata-sections $reproducible_path_flags" \
+    LDFLAGS="--sysroot=$SYSROOT -static -Wl,--gc-sections -L$library_root" \
     "$source_root/configure" \
       --host=arm-linux-gnueabihf --build=x86_64-pc-linux-gnu \
       --prefix=/usr/local --disable-shared --enable-static \
@@ -101,6 +103,30 @@ pkgconfig_root="$library_root/pkgconfig"
   make -C src clean
   make -C src -j"$JOBS" CURL_LDFLAGS_BIN=-all-static curl
 )
+
+preserve_relink_objects() {
+  [[ -n "$RELINK_OUTPUT" ]] || return 0
+  [[ ! -e "$RELINK_OUTPUT" && ! -L "$RELINK_OUTPUT" ]] || {
+    echo "ERROR: refusing to overwrite curl relink output: $RELINK_OUTPUT" >&2
+    exit 1
+  }
+  mkdir -p "$RELINK_OUTPUT"
+  local object relative destination count=0
+  while IFS= read -r -d '' object; do
+    relative=${object#"$build_root"/}
+    destination="$RELINK_OUTPUT/$relative"
+    mkdir -p "$(dirname -- "$destination")"
+    install -m 0644 "$object" "$destination"
+    count=$((count + 1))
+  done < <(find "$build_root" -type f -name '*.o' -print0 | sort -z)
+  [[ "$count" -gt 0 ]] || {
+    echo "ERROR: curl build produced no relinkable objects" >&2
+    exit 1
+  }
+  printf 'curl_relink_object_count=%s\n' "$count"
+}
+
+preserve_relink_objects
 
 "${CROSS}strip" -o "$OUTPUT" "$build_root/src/curl"
 install -m 0644 "$source_root/COPYING" "$LICENSE_OUTPUT"
