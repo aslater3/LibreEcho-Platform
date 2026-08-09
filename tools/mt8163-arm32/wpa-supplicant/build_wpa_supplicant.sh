@@ -2,29 +2,42 @@
 set -euo pipefail
 
 usage() {
-  printf '%s\n' 'usage: build_wpa_supplicant.sh --archive FILE --output DIR --cc COMPILER --sysroot DIR'
+  printf '%s\n' 'usage: build_wpa_supplicant.sh --archive FILE --output DIR --cc COMPILER --sysroot DIR --kernel-headers DIR'
 }
 
 ARCHIVE=
 OUTPUT=
 CC=
 SYSROOT=
+KERNEL_HEADERS=
 while (($#)); do
   case "$1" in
     --archive) shift; (($#)) || { usage >&2; exit 2; }; ARCHIVE=$1 ;;
     --output) shift; (($#)) || { usage >&2; exit 2; }; OUTPUT=$1 ;;
     --cc) shift; (($#)) || { usage >&2; exit 2; }; CC=$1 ;;
     --sysroot) shift; (($#)) || { usage >&2; exit 2; }; SYSROOT=$1 ;;
+    --kernel-headers) shift; (($#)) || { usage >&2; exit 2; }; KERNEL_HEADERS=$1 ;;
     -h|--help) usage; exit 0 ;;
     *) printf 'ERROR: unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
   shift
 done
-[[ -n "$ARCHIVE" && -n "$OUTPUT" && -n "$CC" && -n "$SYSROOT" ]] || { usage >&2; exit 2; }
+[[ -n "$ARCHIVE" && -n "$OUTPUT" && -n "$CC" && -n "$SYSROOT" &&
+   -n "$KERNEL_HEADERS" ]] || { usage >&2; exit 2; }
 # Host archive, checksum, and build tools must not load target-chroot libraries.
 # The generated compiler wrapper restores the pmbootstrap runtime privately.
 unset LD_LIBRARY_PATH
 [[ -d "$SYSROOT/usr/include" ]] || { printf 'ERROR: target sysroot is unavailable\n' >&2; exit 1; }
+[[ -d "$KERNEL_HEADERS" && ! -L "$KERNEL_HEADERS" ]] || {
+  printf 'ERROR: exported Linux UAPI headers are unavailable\n' >&2
+  exit 1
+}
+for header_tree in linux asm asm-generic; do
+  [[ -d "$KERNEL_HEADERS/$header_tree" && ! -L "$KERNEL_HEADERS/$header_tree" ]] || {
+    printf 'ERROR: exported Linux UAPI subtree is missing: %s/%s\n' "$KERNEL_HEADERS" "$header_tree" >&2
+    exit 1
+  }
+done
 [[ -f "$ARCHIVE" && ! -L "$ARCHIVE" ]] || { printf 'ERROR: unsafe wpa_supplicant archive\n' >&2; exit 1; }
 [[ -x "$CC" ]] || { printf 'ERROR: cross compiler is unavailable\n' >&2; exit 1; }
 
@@ -67,7 +80,7 @@ export SOURCE_DATE_EPOCH=0
 canonical=/usr/src/wpa_supplicant-2.10
 cflags=(
   -Os -march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard
-  -idirafter /usr/arm-linux-gnueabihf/include
+  "-idirafter" "$KERNEL_HEADERS"
   "-ffile-prefix-map=$work=$canonical"
   "-fdebug-prefix-map=$work=$canonical"
   "-fmacro-prefix-map=$work=$canonical"
