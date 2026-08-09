@@ -633,6 +633,16 @@ class SourceTests(unittest.TestCase):
         ).read_text()
         self.assertIn("unset LD_LIBRARY_PATH", builder)
 
+    def test_wpa_builder_sanitizes_host_environment_before_extraction(self) -> None:
+        builder = (
+            TOOLS_DIR / "wpa-supplicant" / "build_wpa_supplicant.sh"
+        ).read_text()
+        self.assertIn("unset LD_LIBRARY_PATH", builder)
+        self.assertLess(
+            builder.index("unset LD_LIBRARY_PATH"),
+            builder.index('tar -xf "$ARCHIVE"'),
+        )
+
     def test_feature_policy_is_immutable_and_fail_closed(self) -> None:
         builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
         verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()

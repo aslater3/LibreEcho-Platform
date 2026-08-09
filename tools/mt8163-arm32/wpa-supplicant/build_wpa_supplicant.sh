@@ -21,6 +21,9 @@ while (($#)); do
   shift
 done
 [[ -n "$ARCHIVE" && -n "$OUTPUT" && -n "$CC" && -n "$SYSROOT" ]] || { usage >&2; exit 2; }
+# Host archive, checksum, and build tools must not load target-chroot libraries.
+# The generated compiler wrapper restores the pmbootstrap runtime privately.
+unset LD_LIBRARY_PATH
 [[ -d "$SYSROOT/usr/include" ]] || { printf 'ERROR: target sysroot is unavailable\n' >&2; exit 1; }
 [[ -f "$ARCHIVE" && ! -L "$ARCHIVE" ]] || { printf 'ERROR: unsafe wpa_supplicant archive\n' >&2; exit 1; }
 [[ -x "$CC" ]] || { printf 'ERROR: cross compiler is unavailable\n' >&2; exit 1; }
