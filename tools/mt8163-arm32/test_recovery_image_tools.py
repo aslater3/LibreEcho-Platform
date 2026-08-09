@@ -704,6 +704,8 @@ class SourceTests(unittest.TestCase):
         self.assertIn("-fdebug-prefix-map=", builder_text)
         self.assertIn("--kernel-headers", builder_text)
         self.assertIn("--test-ffs-root", builder_text)
+        self.assertIn('"kernel_headers": "exported-linux-uapi"', builder_text)
+        self.assertNotIn('"kernel_headers": kernel_headers', builder_text)
         self.assertIn("libreecho-adbd-compat.h", builder_text)
         self.assertTrue((adbd_dir / "compat/libreecho-adbd-compat.h").is_file())
         self.assertNotIn("stock-root", builder_text)

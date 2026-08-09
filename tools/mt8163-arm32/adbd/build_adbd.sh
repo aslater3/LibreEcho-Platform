@@ -137,7 +137,7 @@ pathlib.Path(out).write_text(json.dumps({
   "source_license": "Apache-2.0",
   "patch_sha256": patch_sha,
   "compiler": compiler,
-  "kernel_headers": kernel_headers,
+  "kernel_headers": "exported-linux-uapi",
   "binary_sha256": binary_sha,
   "binary_size": int(size),
   "transport": "usb-functionfs-only",
