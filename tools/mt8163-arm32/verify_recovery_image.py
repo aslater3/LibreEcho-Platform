@@ -41,6 +41,9 @@ CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
 CONNECTIVITY_IMPORTER_SHA256 = "27f20efb39825333838df76eb843e4af537864f326a9648702739286a25e5d3a"
 CONNECTIVITY_STOCK_SYSTEM_SHA256 = "56540b3a9ac4437901a5510d9fb5e09b1a8d0cc229548f0b08bb5c22d78684fe"
 CONNECTIVITY_EVIDENCE_MANIFEST_SHA256 = "d1eedd04efe0dbc78853f2b0f9357c092b4ca66242648908c0369956538441eb"
+WPA_SUPPLICANT_VERSION = "2.10"
+WPA_SOURCE_SHA256 = "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f"
+WPA_SOURCE_URL = "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz"
 
 INIT_SHA256 = "0437fd25319a25c1b7ccb4fb684c0ea52eb6b54fda2d11ddfaf6c1394b1d41e2"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
@@ -1044,6 +1047,23 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         wpa = require_member(entries, "sbin/wpa_supplicant", wpa_hash, 0o755)
         if elf_info(wpa.data) != (1, 40, 0x05000400, None, (), False):
             fail("wpa_supplicant is not static ARM32 hard-float")
+        source_record = wpa_record.get("source")
+        required_source = {
+            "binary_sha256", "binary_size", "build_epoch", "compiler", "config_path",
+            "config_sha256", "crypto", "drivers", "kernel_uapi_sha256", "license",
+            "source_sha256", "source_url", "static", "version",
+        }
+        if (not isinstance(source_record, dict) or set(source_record) != required_source or
+                source_record.get("binary_sha256") != wpa_hash or
+                source_record.get("binary_size") != len(wpa.data) or
+                source_record.get("source_sha256") != WPA_SOURCE_SHA256 or
+                source_record.get("source_url") != WPA_SOURCE_URL or
+                source_record.get("license") != "BSD-3-Clause" or
+                source_record.get("version") != WPA_SUPPLICANT_VERSION or
+                source_record.get("static") is not True or
+                not re.fullmatch(r"[0-9a-f]{64}", str(source_record.get("config_sha256", ""))) or
+                not re.fullmatch(r"[0-9a-f]{64}", str(source_record.get("kernel_uapi_sha256", "")))):
+            fail("wpa source provenance is missing or mismatched")
         profile = require_member(entries, "etc/wifi/wpa_supplicant.conf", profile_hash, 0o600)
         if b"CHANGE_ME" in profile.data:
             fail("configured network image contains the profile template")

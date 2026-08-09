@@ -111,19 +111,37 @@ license_output=$(qemu-arm-static "$binary" -L)
 }
 
 binary_sha=$(sha256sum "$binary" | awk '{print $1}')
+binary_size=$(stat -c %s "$binary")
 config_sha=$(sha256sum "$CONFIG" | awk '{print $1}')
 compiler=$("$cc_wrapper" --version | python3 -c 'import sys; print(sys.stdin.readline().strip())')
-python3 - "$OUTPUT/wpa-supplicant-source.json" "$binary_sha" "$config_sha" "$compiler" <<'PY'
+kernel_uapi_sha=$(python3 - "$KERNEL_HEADERS" <<'PY'
+import hashlib, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+digest = hashlib.sha256()
+for path in sorted(root.rglob("*")):
+    if path.is_symlink():
+        raise SystemExit(f"symlink in exported UAPI tree: {path}")
+    if path.is_file():
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+print(digest.hexdigest())
+PY
+)
+python3 - "$OUTPUT/wpa-supplicant-source.json" "$binary_sha" "$binary_size" "$config_sha" "$compiler" "$kernel_uapi_sha" <<'PY'
 import json, pathlib, sys
-out, binary_sha, config_sha, compiler = sys.argv[1:]
+out, binary_sha, binary_size, config_sha, compiler, kernel_uapi_sha = sys.argv[1:]
 pathlib.Path(out).write_text(json.dumps({
     "binary_sha256": binary_sha,
+    "binary_size": int(binary_size),
     "build_epoch": 0,
     "compiler": compiler,
     "config_path": "tools/mt8163-arm32/wpa-supplicant/wpa_supplicant-2.10.config",
     "config_sha256": config_sha,
     "crypto": "internal",
     "drivers": ["wext"],
+    "kernel_uapi_sha256": kernel_uapi_sha,
     "license": "BSD-3-Clause",
     "source_sha256": "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f",
     "source_url": "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz",
@@ -131,4 +149,4 @@ pathlib.Path(out).write_text(json.dumps({
     "version": "2.10",
 }, sort_keys=True, indent=2) + "\n")
 PY
-printf 'wpa_supplicant_sha256=%s\nwpa_supplicant_config_sha256=%s\n' "$binary_sha" "$config_sha"
+printf 'wpa_supplicant_sha256=%s\nwpa_supplicant_config_sha256=%s\nkernel_uapi_sha256=%s\n' "$binary_sha" "$config_sha" "$kernel_uapi_sha"

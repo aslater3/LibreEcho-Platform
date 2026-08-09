@@ -650,7 +650,12 @@ class SourceTests(unittest.TestCase):
         self.assertIn("--kernel-headers DIR", builder)
         self.assertIn("KERNEL_HEADERS=", builder)
         self.assertIn('"-idirafter" "$KERNEL_HEADERS"', builder)
+        self.assertIn("kernel_uapi_sha256", builder)
         self.assertNotIn("/usr/arm-linux-gnueabihf/include", builder)
+        image_builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        self.assertIn("--wpa-source-metadata", image_builder)
+        self.assertIn("wpa source provenance is missing or mismatched", verifier)
 
     def test_feature_policy_is_immutable_and_fail_closed(self) -> None:
         builder = (TOOLS_DIR / "build_recovery_image.py").read_text()

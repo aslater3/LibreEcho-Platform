@@ -46,6 +46,8 @@ PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd
 CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
 CONNECTIVITY_IMPORTER_SHA256 = "27f20efb39825333838df76eb843e4af537864f326a9648702739286a25e5d3a"
 WPA_SUPPLICANT_VERSION = "2.10"
+WPA_SOURCE_SHA256 = "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f"
+WPA_SOURCE_URL = "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz"
 SSH_PASSWORD_HASH_RE = re.compile(
     r"\$(?:1|5|6|2[abxy]?|y|gy)\$[^$:\r\n]{1,64}\$[^:\r\n]{1,512}\Z"
 )
@@ -1367,14 +1369,39 @@ def add_ssh_bundle(stage: Path, dropbear: Path, dropbearkey: Path,
     }
 
 
-def add_network_bundle(stage: Path, wpa_supplicant: Path, wifi_config: Path,
+def add_network_bundle(stage: Path, wpa_supplicant: Path, wpa_metadata_path: Path,
+                       wifi_config: Path,
                        manifest: dict[str, object]) -> None:
     """Add the verified static WPA client and a build-local Wi-Fi profile."""
     if wpa_supplicant.is_symlink() or not wpa_supplicant.is_file():
         raise SystemExit(f"ERROR: wpa_supplicant is not a regular file: {wpa_supplicant}")
+    if wpa_metadata_path.is_symlink() or not wpa_metadata_path.is_file():
+        raise SystemExit(f"ERROR: wpa source metadata is not a regular file: {wpa_metadata_path}")
     if wifi_config.is_symlink() or not wifi_config.is_file():
         raise SystemExit(f"ERROR: Wi-Fi profile is not a regular file: {wifi_config}")
     wpa_data = read(wpa_supplicant)
+    try:
+        wpa_metadata = json.loads(wpa_metadata_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"ERROR: invalid wpa source metadata: {exc}") from exc
+    required_metadata = {
+        "binary_sha256", "binary_size", "build_epoch", "compiler", "config_path",
+        "config_sha256", "crypto", "drivers", "kernel_uapi_sha256", "license",
+        "source_sha256", "source_url", "static", "version",
+    }
+    if not isinstance(wpa_metadata, dict) or set(wpa_metadata) != required_metadata:
+        raise SystemExit("ERROR: wpa source metadata schema mismatch")
+    if (wpa_metadata["binary_sha256"] != sha256(wpa_data) or
+            wpa_metadata["binary_size"] != len(wpa_data)):
+        raise SystemExit("ERROR: wpa source metadata binary identity mismatch")
+    if (wpa_metadata["source_sha256"] != WPA_SOURCE_SHA256 or
+            wpa_metadata["source_url"] != WPA_SOURCE_URL or
+            wpa_metadata["license"] != "BSD-3-Clause" or
+            wpa_metadata["version"] != WPA_SUPPLICANT_VERSION or
+            wpa_metadata["static"] is not True or
+            not isinstance(wpa_metadata["kernel_uapi_sha256"], str) or
+            not re.fullmatch(r"[0-9a-f]{64}", wpa_metadata["kernel_uapi_sha256"])):
+        raise SystemExit("ERROR: wpa source metadata provenance is invalid")
     config_data = read(wifi_config)
     target = stage / "sbin/wpa_supplicant"
     if target.exists() or target.is_symlink():
@@ -1398,6 +1425,7 @@ def add_network_bundle(stage: Path, wpa_supplicant: Path, wifi_config: Path,
             "size": len(wpa_data),
             "mode": "0755",
             "elf": elf,
+            "source": wpa_metadata,
         },
         "wifi_profile": {
             "sha256": sha256(config_data),
@@ -1785,6 +1813,8 @@ def main() -> None:
                         help="proven ARM32 one-shot WMT command responder")
     parser.add_argument("--wpa-supplicant", type=Path,
                         help="static ARM32 wpa_supplicant 2.10 client")
+    parser.add_argument("--wpa-source-metadata", type=Path,
+                        help="source/license metadata emitted by build_wpa_supplicant.sh")
     parser.add_argument("--wifi-config", type=Path,
                         help="build-local WPA profile; never committed to source")
     parser.add_argument("--qemu-arm", default="qemu-arm-static",
@@ -1818,7 +1848,11 @@ def main() -> None:
         raise SystemExit(f"ERROR: connectivity bundle is all-or-nothing; missing {missing}")
     if connectivity_enabled and not CONNECTIVITY_HELPERS:
         raise SystemExit("ERROR: connectivity helper identities have not been pinned")
-    network_options = {"wpa_supplicant": args.wpa_supplicant, "wifi_config": args.wifi_config}
+    network_options = {
+        "wpa_supplicant": args.wpa_supplicant,
+        "wpa_source_metadata": args.wpa_source_metadata,
+        "wifi_config": args.wifi_config,
+    }
     network_enabled = all(value is not None for value in network_options.values())
     if any(value is not None for value in network_options.values()) and not network_enabled:
         missing = ", ".join(
@@ -2158,7 +2192,8 @@ def main() -> None:
             )
         if network_enabled:
             add_network_bundle(
-                stage, args.wpa_supplicant.resolve(), args.wifi_config.resolve(), manifest,
+                stage, args.wpa_supplicant.resolve(), args.wpa_source_metadata.resolve(),
+                args.wifi_config.resolve(), manifest,
             )
         validate_stage(stage)
         cpio = build_cpio(stage, 0)
