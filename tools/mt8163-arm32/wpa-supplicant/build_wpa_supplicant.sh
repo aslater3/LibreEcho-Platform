@@ -86,12 +86,17 @@ cflags=(
   "-fmacro-prefix-map=$work=$canonical"
 )
 make -C "$src/wpa_supplicant" -j"${LIBREECHO_BUILD_JOBS:-2}" \
-  CC="$cc_wrapper" EXTRA_CFLAGS="${cflags[*]}" LDFLAGS='-static -s -Wl,--build-id=none' \
+  CC="$cc_wrapper" EXTRA_CFLAGS="${cflags[*]}" LDFLAGS='-static -no-pie -s -Wl,--build-id=none' \
   wpa_supplicant >/dev/null
 
 binary="$OUTPUT/wpa_supplicant"
 install -m 0755 "$src/wpa_supplicant/wpa_supplicant" "$binary"
-if readelf -l "$binary" | grep -q 'Requesting program interpreter'; then
+readelf_output="$(readelf -h -l -d "$binary")"
+grep -Eq 'Type:[[:space:]]+EXEC' <<< "$readelf_output" || {
+  printf 'ERROR: wpa_supplicant is not a non-PIE executable\n' >&2
+  exit 1
+}
+if grep -q 'Requesting program interpreter' <<< "$readelf_output"; then
   printf 'ERROR: wpa_supplicant is not static\n' >&2
   exit 1
 fi

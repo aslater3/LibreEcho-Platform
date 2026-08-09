@@ -661,6 +661,13 @@ class SourceTests(unittest.TestCase):
             builder.index('tar -xf "$ARCHIVE"'),
         )
 
+    def test_wpa_builder_emits_static_non_pie(self) -> None:
+        builder = (
+            TOOLS_DIR / "wpa-supplicant" / "build_wpa_supplicant.sh"
+        ).read_text()
+        self.assertIn("LDFLAGS='-static -no-pie", builder)
+        self.assertIn("Type:[[:space:]]+EXEC", builder)
+
     def test_wpa_builder_requires_exported_linux_uapi_headers(self) -> None:
         builder = (
             TOOLS_DIR / "wpa-supplicant" / "build_wpa_supplicant.sh"
