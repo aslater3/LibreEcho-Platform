@@ -91,6 +91,25 @@ class SourceOfferTests(unittest.TestCase):
                     metadata={}, source_date_epoch=1,
                 )
 
+    def test_static_glibc_builders_preserve_relink_objects(self) -> None:
+        tools = Path(__file__).resolve().parent
+        expectations = {
+            tools / "airplay/build_airplay.sh": (
+                "LIBREECHO_AIRPLAY_RELINK_OUTPUT",
+                "preserve_relink_objects",
+            ),
+            tools / "assistant/build_curl.sh": (
+                "LIBREECHO_ASSISTANT_RELINK_OUTPUT",
+                "preserve_relink_objects",
+            ),
+        }
+        for path, markers in expectations.items():
+            source = path.read_text()
+            with self.subTest(path=path):
+                for marker in markers:
+                    self.assertIn(marker, source)
+                self.assertIn("*.o", source)
+
 
 if __name__ == "__main__":
     unittest.main()

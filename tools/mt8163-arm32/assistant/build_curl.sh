@@ -8,6 +8,7 @@ LICENSE_OUTPUT="${4:?usage: build_curl.sh <curl-source.tar.xz> <armhf-sysroot> <
 CROSS="${LIBREECHO_ASSISTANT_CROSS:-/usr/bin/arm-linux-gnueabihf-}"
 JOBS="${JOBS:-$(nproc)}"
 SOURCE_SHA256=aa1b66a70eace83dc624508745646c08ae561de512ab403adffb93ac87fc72e6
+RELINK_OUTPUT="${LIBREECHO_ASSISTANT_RELINK_OUTPUT:-}"
 
 [[ -f "$SOURCE_ARCHIVE" && ! -L "$SOURCE_ARCHIVE" ]] || {
   echo "ERROR: curl source archive is missing or is a symlink" >&2
@@ -101,6 +102,30 @@ pkgconfig_root="$library_root/pkgconfig"
   make -C src clean
   make -C src -j"$JOBS" CURL_LDFLAGS_BIN=-all-static curl
 )
+
+preserve_relink_objects() {
+  [[ -n "$RELINK_OUTPUT" ]] || return 0
+  [[ ! -e "$RELINK_OUTPUT" && ! -L "$RELINK_OUTPUT" ]] || {
+    echo "ERROR: refusing to overwrite curl relink output: $RELINK_OUTPUT" >&2
+    exit 1
+  }
+  mkdir -p "$RELINK_OUTPUT"
+  local object relative destination count=0
+  while IFS= read -r -d '' object; do
+    relative=${object#"$build_root"/}
+    destination="$RELINK_OUTPUT/$relative"
+    mkdir -p "$(dirname -- "$destination")"
+    install -m 0644 "$object" "$destination"
+    count=$((count + 1))
+  done < <(find "$build_root" -type f -name '*.o' -print0 | sort -z)
+  [[ "$count" -gt 0 ]] || {
+    echo "ERROR: curl build produced no relinkable objects" >&2
+    exit 1
+  }
+  printf 'curl_relink_object_count=%s\n' "$count"
+}
+
+preserve_relink_objects
 
 "${CROSS}strip" -o "$OUTPUT" "$build_root/src/curl"
 install -m 0644 "$source_root/COPYING" "$LICENSE_OUTPUT"

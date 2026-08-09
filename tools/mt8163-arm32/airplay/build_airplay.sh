@@ -20,6 +20,7 @@ AUDIO_ENGINE_SOURCE=${LIBREECHO_AUDIO_ENGINE_SOURCE:-$SCRIPT_DIR/audio_engine.c}
 AUDIO_VISUALIZER_SOURCE=${LIBREECHO_AUDIO_VISUALIZER_SOURCE:-$SCRIPT_DIR/audio_visualizer.c}
 PLAYBACK_STATUS_SOURCE=${LIBREECHO_PLAYBACK_STATUS_SOURCE:-$SCRIPT_DIR/playback_status.c}
 AEC_REFERENCE_SOURCE=${LIBREECHO_AEC_REFERENCE_SOURCE:-$SCRIPT_DIR/aec_reference.c}
+RELINK_OUTPUT=${LIBREECHO_AIRPLAY_RELINK_OUTPUT:-}
 
 for archive in "$NQPTP_ARCHIVE" "$SHAIRPORT_ARCHIVE" "$FFMPEG_ARCHIVE" "$TINYALSA_ARCHIVE"; do
     [[ -f "$archive" ]] || { echo "ERROR: AirPlay source archive is missing: $archive" >&2; exit 1; }
@@ -176,18 +177,29 @@ build_tinyalsa() {
 
 build_audio_components() {
     local bridge_cflags="-O2 -std=c99 -Wall -Wextra -Wpedantic"
+    local objects="$work/libreecho-objects"
     bridge_cflags+=" -I$tinyalsa_source/include"
     if [[ -n "$KERNEL_HEADERS" ]]; then
         bridge_cflags+=" -I$KERNEL_HEADERS/include/uapi -I$KERNEL_HEADERS/include"
     fi
     bridge_cflags+=" -I$SYSROOT/usr/include/arm-linux-gnueabihf -I$SYSROOT/usr/include"
-    mkdir -p "$OUTPUT"
-    "$CC" $bridge_cflags "$AIRPLAY_AUDIO_SOURCE" -lm \
+    mkdir -p "$OUTPUT" "$objects"
+    "$CC" $bridge_cflags -c "$AIRPLAY_AUDIO_SOURCE" \
+        -o "$objects/airplay_audio.o"
+    "$CC" $bridge_cflags "$objects/airplay_audio.o" -lm \
         -o "$OUTPUT/libreecho-airplay-audio"
-    "$CC" $bridge_cflags "$AUDIO_ENGINE_SOURCE" "$AUDIO_VISUALIZER_SOURCE" \
-        "$PLAYBACK_STATUS_SOURCE" "$AEC_REFERENCE_SOURCE" \
-        "$tinyalsa_source/src/libtinyalsa.a" -ldl -lm \
-        -o "$OUTPUT/libreecho-audio-engine"
+    "$CC" $bridge_cflags -c "$AUDIO_ENGINE_SOURCE" \
+        -o "$objects/audio_engine.o"
+    "$CC" $bridge_cflags -c "$AUDIO_VISUALIZER_SOURCE" \
+        -o "$objects/audio_visualizer.o"
+    "$CC" $bridge_cflags -c "$PLAYBACK_STATUS_SOURCE" \
+        -o "$objects/playback_status.o"
+    "$CC" $bridge_cflags -c "$AEC_REFERENCE_SOURCE" \
+        -o "$objects/aec_reference.o"
+    "$CC" $bridge_cflags "$objects/audio_engine.o" \
+        "$objects/audio_visualizer.o" "$objects/playback_status.o" \
+        "$objects/aec_reference.o" "$tinyalsa_source/src/libtinyalsa.a" \
+        -ldl -lm -o "$OUTPUT/libreecho-audio-engine"
 }
 
 build_shairport() {
@@ -322,12 +334,43 @@ copy_release_notices() {
     } > "$license_root/COMPONENTS.tsv"
 }
 
+preserve_relink_objects() {
+    [[ -n "$RELINK_OUTPUT" ]] || return 0
+    [[ ! -e "$RELINK_OUTPUT" && ! -L "$RELINK_OUTPUT" ]] || {
+        echo "ERROR: refusing to overwrite AirPlay relink output: $RELINK_OUTPUT" >&2
+        exit 1
+    }
+    mkdir -p "$RELINK_OUTPUT"
+    local root label object relative destination count=0
+    while IFS='|' read -r root label; do
+        while IFS= read -r -d '' object; do
+            relative=${object#"$root"/}
+            destination="$RELINK_OUTPUT/$label/$relative"
+            mkdir -p "$(dirname -- "$destination")"
+            install -m 0644 "$object" "$destination"
+            count=$((count + 1))
+        done < <(find "$root" -type f -name '*.o' -print0 | sort -z)
+    done <<EOF
+$nqptp_source|nqptp
+$shairport_source|shairport-sync
+$ffmpeg_source|ffmpeg
+$tinyalsa_source|tinyalsa
+$work/libreecho-objects|libreecho
+EOF
+    [[ "$count" -gt 0 ]] || {
+        echo "ERROR: AirPlay build produced no relinkable objects" >&2
+        exit 1
+    }
+    printf 'airplay_relink_object_count=%s\n' "$count"
+}
+
 build_ffmpeg
 make_ffmpeg_pkgconfig
 build_nqptp
 build_tinyalsa
 build_audio_components
 build_shairport
+preserve_relink_objects
 mkdir -p "$OUTPUT"
 install -m 0755 "$nqptp_source/nqptp" "$OUTPUT/nqptp"
 install -m 0755 "$shairport_source/shairport-sync" "$OUTPUT/shairport-sync"
