@@ -240,6 +240,22 @@ class SourceTests(unittest.TestCase):
         )
         self.assertIn('RE2_ARCHIVE="$RE2_ARCHIVE"', source)
 
+    def test_wakeword_runtime_snapshots_relink_objects(self) -> None:
+        source = (TOOLS_DIR / "wakeword/build_runtime.sh").read_text()
+        self.assertIn(
+            "${LIBREECHO_WAKE_RELINK_OUTPUT:?ERROR:", source
+        )
+        for object_name in (
+            "waked.wake.arm.o", "voice_aec.wake.arm.o",
+            "voice_reference.wake.arm.o", "voice_dsp.wake.arm.o",
+            "voice_stream.wake.arm.o", "wake_worker.wake.arm.o",
+            "wake_led.wake.arm.o", "adapter_client.wake.arm.o",
+            "adapter_server.wake.arm.o", "log.wake.arm.o",
+            "wake_engine_onnx.arm.o",
+        ):
+            self.assertIn(object_name, source)
+        self.assertIn("wakeword_relink_object_count=%s", source)
+
     def test_pinned_source_rejects_symlink_components(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

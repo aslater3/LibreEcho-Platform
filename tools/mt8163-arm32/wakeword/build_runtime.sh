@@ -12,6 +12,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd -P)"
 OPS_CONFIG="$SCRIPT_DIR/required_operators.config"
 FLATBUFFERS_PYTHON="${LIBREECHO_WAKE_FLATBUFFERS_PYTHON:?ERROR: set LIBREECHO_WAKE_FLATBUFFERS_PYTHON to the pinned FlatBuffers Python source}"
 RE2_ARCHIVE="${LIBREECHO_WAKE_RE2_ARCHIVE:?ERROR: set LIBREECHO_WAKE_RE2_ARCHIVE to the pinned ARM32 RE2 archive}"
+RELINK_OUTPUT="${LIBREECHO_WAKE_RELINK_OUTPUT:?ERROR: set LIBREECHO_WAKE_RELINK_OUTPUT to an immutable run-local directory}"
 CROSS="${LIBREECHO_WAKE_CROSS:-/usr/bin/arm-linux-gnueabihf-}"
 JOBS="${JOBS:-$(nproc)}"
 ORT_COMMIT=8f0278c77bf44b0cc83c098c6c722b92a36ac4b5
@@ -56,6 +57,10 @@ done
 }
 [[ ! -e "$OUTPUT" ]] || {
   echo "ERROR: refusing to overwrite wakeword runtime: $OUTPUT" >&2
+  exit 1
+}
+[[ ! -e "$RELINK_OUTPUT" && ! -L "$RELINK_OUTPUT" ]] || {
+  echo "ERROR: refusing to overwrite wakeword relink snapshot: $RELINK_OUTPUT" >&2
   exit 1
 }
 
@@ -186,6 +191,22 @@ make -C "$UI_SOURCE" \
   WAKE_ORT_SOURCE="$ORT_SOURCE" \
   WAKE_ORT_BUILD="$ORT_BUILD" \
   build/libreecho-waked-onnx-arm32
+relink_objects=(
+  waked.wake.arm.o voice_aec.wake.arm.o voice_reference.wake.arm.o
+  voice_dsp.wake.arm.o voice_stream.wake.arm.o wake_worker.wake.arm.o
+  wake_led.wake.arm.o adapter_client.wake.arm.o adapter_server.wake.arm.o
+  log.wake.arm.o wake_engine_onnx.arm.o
+)
+mkdir -p "$RELINK_OUTPUT"
+for object_name in "${relink_objects[@]}"; do
+  object="$UI_SOURCE/build/$object_name"
+  [[ -f "$object" && ! -L "$object" ]] || {
+    echo "ERROR: wakeword relink object is missing or unsafe: $object" >&2
+    exit 1
+  }
+  install -m 0644 "$object" "$RELINK_OUTPUT/$object_name"
+done
+printf 'wakeword_relink_object_count=%s\n' "${#relink_objects[@]}"
 install -m 0755 "$UI_SOURCE/build/libreecho-waked-onnx-arm32" "$OUTPUT"
 file -b "$OUTPUT" | grep -Eq 'ELF 32-bit.*ARM.*statically linked' || {
   echo "ERROR: wakeword runtime output is not static ARM32" >&2
