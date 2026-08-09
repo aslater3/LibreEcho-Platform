@@ -64,6 +64,7 @@
       "id": "wireless-regdb",
       "license": "ISC",
       "source": "https://launchpad.net/ubuntu/+source/wireless-regdb/2025.10.07-0ubuntu1~24.04.1",
+      "source_archive_sha256": "d4c872a44154604c869f5851f7d21d818d492835d370af7f58de8847973801c3",
       "version": "2025.10.07-0ubuntu1~24.04.1"
     },
     {

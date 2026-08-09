@@ -1,0 +1,17 @@
+{
+  "name": "wireless-regdb",
+  "version": "2025.10.07",
+  "license": "ISC",
+  "source_url": "https://launchpad.net/ubuntu/+archive/primary/+sourcefiles/wireless-regdb/2025.10.07-0ubuntu1~24.04.1/wireless-regdb_2025.10.07.orig.tar.xz",
+  "source_sha256": "d4c872a44154604c869f5851f7d21d818d492835d370af7f58de8847973801c3",
+  "outputs": {
+    "regulatory.db": {
+      "sha256": "5560f4f0fdac7d1bb2adf8d4d083f39e3bee5ba55192feadadc091df55a813eb",
+      "size": 6328
+    },
+    "regulatory.db.p7s": {
+      "sha256": "5dd27969661bed1e021ce435f535a53f201705bda14c2dba0db6353d1cdc6fff",
+      "size": 1085
+    }
+  }
+}

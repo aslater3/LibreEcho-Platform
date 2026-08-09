@@ -36,7 +36,9 @@ recorded in `COMPONENTS.json`, the image manifest, and the release SPDX SBOM.
   LGPL-2.1-or-later for the incorporated `wireless.21.h` interface. The exact
   upstream archive, SHA-256, static build metadata, and complete `COPYING`
   record are emitted by the source builder and included with the image.
-- **wireless-regdb 2025.10.07-0ubuntu1~24.04.1** — ISC.
+- **wireless-regdb 2025.10.07-0ubuntu1~24.04.1** — ISC. The pinned Ubuntu
+  upstream archive contains the exact `regulatory.db` and signature shipped by
+  the image; the materializer verifies both output hashes before packaging.
 - **TinyALSA e43025bbf702eb7dd8edd48c1eb50530c60f1de8** — BSD-3-Clause.
 - **libsodium 1.0.18** — ISC, statically linked into the OTA verifier.
 

@@ -936,6 +936,16 @@ class SourceTests(unittest.TestCase):
         self.assertIn("wireless-tools-source.json", builder_source)
         self.assertIn("wireless-tools-COPYING", builder_source)
         self.assertNotIn("curl --fail", builder_source)
+        regdb_builder = TOOLS_DIR / "network-tools/wireless-regdb/build_wireless_regdb.sh"
+        self.assertTrue(regdb_builder.is_file())
+        self.assertTrue(os.access(regdb_builder, os.X_OK))
+        regdb_lock = json.loads((regdb_builder.parent / "SOURCE.lock").read_text())
+        self.assertEqual(regdb_lock["version"], "2025.10.07")
+        self.assertEqual(
+            regdb_lock["source_sha256"],
+            "d4c872a44154604c869f5851f7d21d818d492835d370af7f58de8847973801c3",
+        )
+        self.assertIn("regulatory.db.p7s", regdb_builder.read_text())
         pipeline_build = pipeline_text("build.sh")
         pipeline_status = pipeline_text("status.sh")
         pipeline_flash = pipeline_text("flash.sh")
