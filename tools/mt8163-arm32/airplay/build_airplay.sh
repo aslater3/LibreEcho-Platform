@@ -94,9 +94,9 @@ export PKG_CONFIG_SYSROOT_DIR="$SYSROOT"
 export PKG_CONFIG_PATH="$SYSROOT/usr/lib/arm-linux-gnueabihf/pkgconfig:$SYSROOT/usr/share/pkgconfig"
 unset PKG_CONFIG_LIBDIR
 export CPPFLAGS="${CPPFLAGS:--I$SYSROOT/usr/include -I$SYSROOT/usr/include/arm-linux-gnueabihf}"
-export CFLAGS="${CFLAGS:--O2 $CPPFLAGS}"
-export CXXFLAGS="${CXXFLAGS:--O2 $CPPFLAGS}"
-export LDFLAGS="${LDFLAGS:--L$SYSROOT/usr/lib/arm-linux-gnueabihf -Wl,-rpath-link,$SYSROOT/usr/lib/arm-linux-gnueabihf -L$SYSROOT/usr/lib -Wl,-rpath-link,$SYSROOT/usr/lib -Wl,--allow-shlib-undefined}"
+export CFLAGS="${CFLAGS:---sysroot=$SYSROOT -O2 $CPPFLAGS}"
+export CXXFLAGS="${CXXFLAGS:---sysroot=$SYSROOT -O2 $CPPFLAGS}"
+export LDFLAGS="${LDFLAGS:---sysroot=$SYSROOT -L$SYSROOT/usr/lib/arm-linux-gnueabihf -Wl,-rpath-link,$SYSROOT/usr/lib/arm-linux-gnueabihf -L$SYSROOT/usr/lib -Wl,-rpath-link,$SYSROOT/usr/lib -Wl,--allow-shlib-undefined}"
 
 build_ffmpeg() {
     pushd "$ffmpeg_source" >/dev/null
@@ -109,7 +109,8 @@ build_ffmpeg() {
         --enable-avcodec --enable-avformat --enable-avutil --enable-swresample \
         --enable-decoder=aac --enable-decoder=alac --enable-parser=aac \
         --enable-demuxer=aac --enable-demuxer=mov --enable-protocol=file \
-        --enable-pic --enable-static --disable-shared --extra-cflags=-O2
+        --enable-pic --enable-static --disable-shared --sysroot="$SYSROOT" \
+        --extra-cflags=-O2
     make -j"$JOBS"
     make DESTDIR="$SYSROOT" install
     popd >/dev/null
@@ -153,7 +154,7 @@ EOF
 build_nqptp() {
     pushd "$nqptp_source" >/dev/null
     autoreconf -fi
-    LDFLAGS="-static -L$SYSROOT/usr/lib/arm-linux-gnueabihf" \
+    LDFLAGS="--sysroot=$SYSROOT -static -L$SYSROOT/usr/lib/arm-linux-gnueabihf" \
         ./configure --host=arm-linux-gnueabihf --disable-systemd-startup
     make -j"$JOBS"
     popd >/dev/null
@@ -164,7 +165,7 @@ build_tinyalsa() {
     # an informational user-space-header warning from linux/types.h; the
     # upstream TinyALSA Makefile promotes warnings to errors, so suppress only
     # that known diagnostic rather than weakening the rest of the build.
-    local tiny_cflags="-O2 -Wno-cpp"
+    local tiny_cflags="--sysroot=$SYSROOT -O2 -Wno-cpp"
     if [[ -n "$KERNEL_HEADERS" ]]; then
         tiny_cflags+=" -I$KERNEL_HEADERS/include/uapi -I$KERNEL_HEADERS/include"
     fi
@@ -176,7 +177,7 @@ build_tinyalsa() {
 }
 
 build_audio_components() {
-    local bridge_cflags="-O2 -std=c99 -Wall -Wextra -Wpedantic"
+    local bridge_cflags="--sysroot=$SYSROOT -O2 -std=c99 -Wall -Wextra -Wpedantic"
     local objects="$work/libreecho-objects"
     bridge_cflags+=" -I$tinyalsa_source/include"
     if [[ -n "$KERNEL_HEADERS" ]]; then

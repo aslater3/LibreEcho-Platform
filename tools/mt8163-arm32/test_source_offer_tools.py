@@ -108,7 +108,17 @@ class SourceOfferTests(unittest.TestCase):
             with self.subTest(path=path):
                 for marker in markers:
                     self.assertIn(marker, source)
-                self.assertIn("*.o", source)
+                self.assertIn("-name '*.o'", source)
+
+    def test_glibc_builders_use_the_reviewed_sysroot_for_linking(self) -> None:
+        tools = Path(__file__).resolve().parent
+        for relative in (
+            "airplay/build_airplay.sh",
+            "assistant/build_curl.sh",
+        ):
+            source = (tools / relative).read_text(encoding="utf-8")
+            with self.subTest(path=relative):
+                self.assertIn('--sysroot=$SYSROOT', source)
 
 
 if __name__ == "__main__":

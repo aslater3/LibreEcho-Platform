@@ -64,13 +64,13 @@ pkgconfig_root="$library_root/pkgconfig"
 (
   cd "$build_root"
   env \
-    CC="${CROSS}gcc" AR="${CROSS}ar" RANLIB="${CROSS}ranlib" \
+    CC="${CROSS}gcc --sysroot=$SYSROOT" AR="${CROSS}ar" RANLIB="${CROSS}ranlib" \
     STRIP="${CROSS}strip" CURL_LDFLAGS_BIN=-all-static \
     PKG_CONFIG_SYSROOT_DIR="$SYSROOT" \
     PKG_CONFIG_LIBDIR="$pkgconfig_root" \
     CPPFLAGS="-I$include_root/arm-linux-gnueabihf -I$include_root" \
-    CFLAGS="-Os -ffunction-sections -fdata-sections" \
-    LDFLAGS="-static -Wl,--gc-sections -L$library_root" \
+    CFLAGS="--sysroot=$SYSROOT -Os -ffunction-sections -fdata-sections" \
+    LDFLAGS="--sysroot=$SYSROOT -static -Wl,--gc-sections -L$library_root" \
     "$source_root/configure" \
       --host=arm-linux-gnueabihf --build=x86_64-pc-linux-gnu \
       --prefix=/usr/local --disable-shared --enable-static \
