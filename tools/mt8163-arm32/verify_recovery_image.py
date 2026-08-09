@@ -44,6 +44,9 @@ CONNECTIVITY_EVIDENCE_MANIFEST_SHA256 = "d1eedd04efe0dbc78853f2b0f9357c092b4ca66
 WPA_SUPPLICANT_VERSION = "2.10"
 WPA_SOURCE_SHA256 = "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f"
 WPA_SOURCE_URL = "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz"
+WIRELESS_TOOLS_VERSION = "30~pre9"
+WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
+WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
 INIT_SHA256 = "0437fd25319a25c1b7ccb4fb684c0ea52eb6b54fda2d11ddfaf6c1394b1d41e2"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
@@ -653,6 +656,35 @@ def validate_network_tools(entries: dict[str, Entry], manifest: dict[str, object
     if not isinstance(raw_iwconfig, dict):
         fail("iwconfig manifest record is missing")
     iwconfig_record = cast(dict[str, object], raw_iwconfig)
+    raw_source = iwconfig_record.get("source")
+    required_source = {
+        "binary_sha256", "binary_size", "build_epoch", "compiler",
+        "kernel_uapi_sha256", "license", "license_file", "license_sha256",
+        "source_sha256", "source_url", "static", "version",
+    }
+    if not isinstance(raw_source, dict) or set(raw_source) != required_source:
+        fail("wireless-tools source provenance is missing or malformed")
+    source = cast(dict[str, object], raw_source)
+    if (source.get("binary_sha256") != expected_iwconfig_sha256 or
+            source.get("binary_size") != len(require_member(
+                entries, "sbin/iwconfig", expected_iwconfig_sha256, 0o755,
+            ).data) or
+            source.get("license") != "GPL-2.0-only AND LGPL-2.1-or-later" or
+            source.get("license_file") != "wireless-tools-COPYING" or
+            source.get("source_sha256") != WIRELESS_TOOLS_SOURCE_SHA256 or
+            source.get("source_url") != WIRELESS_TOOLS_SOURCE_URL or
+            source.get("static") is not True or
+            source.get("version") != WIRELESS_TOOLS_VERSION or
+            not re.fullmatch(r"[0-9a-f]{64}", str(source.get("kernel_uapi_sha256", ""))) or
+            not re.fullmatch(r"[0-9a-f]{64}", str(source.get("license_sha256", ""))) or
+            "/home/" in str(source.get("compiler", ""))):
+        fail("wireless-tools source provenance is invalid")
+    license_member = require_member(
+        entries, "usr/local/share/licenses/libreecho-core/wireless-tools-COPYING",
+        str(source["license_sha256"]), 0o644,
+    )
+    if sha256(license_member.data) != source["license_sha256"]:
+        fail("wireless-tools license identity changed")
     iwconfig_path = iwconfig_record.get("path")
     if not isinstance(iwconfig_path, str) or not Path(iwconfig_path).is_absolute():
         fail("iwconfig manifest path is not absolute")
@@ -672,6 +704,7 @@ def validate_network_tools(entries: dict[str, Entry], manifest: dict[str, object
             "needed": [],
             "dynamic": False,
         },
+        "source": source,
     }:
         fail("iwconfig manifest record changed")
     return True

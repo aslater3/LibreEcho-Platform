@@ -1,0 +1,8 @@
+{
+  "name": "wireless-tools",
+  "version": "30~pre9",
+  "license": "GPL-2.0-only",
+  "source_url": "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz",
+  "source_sha256": "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63",
+  "source_license": "COPYING"
+}

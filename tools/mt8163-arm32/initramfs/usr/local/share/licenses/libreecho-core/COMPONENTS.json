@@ -55,9 +55,10 @@
     },
     {
       "id": "wireless-tools",
-      "license": "GPL-2.0-only",
-      "source": "https://launchpad.net/ubuntu/+source/wireless-tools/30~pre9-16.1ubuntu2",
-      "version": "30~pre9-16.1ubuntu2"
+      "license": "GPL-2.0-only AND LGPL-2.1-or-later",
+      "source": "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz",
+      "source_archive_sha256": "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63",
+      "version": "30~pre9"
     },
     {
       "id": "wireless-regdb",

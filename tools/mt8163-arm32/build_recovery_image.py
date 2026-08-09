@@ -48,6 +48,9 @@ CONNECTIVITY_IMPORTER_SHA256 = "27f20efb39825333838df76eb843e4af537864f326a96487
 WPA_SUPPLICANT_VERSION = "2.10"
 WPA_SOURCE_SHA256 = "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f"
 WPA_SOURCE_URL = "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz"
+WIRELESS_TOOLS_VERSION = "30~pre9"
+WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
+WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 SSH_PASSWORD_HASH_RE = re.compile(
     r"\$(?:1|5|6|2[abxy]?|y|gy)\$[^$:\r\n]{1,64}\$[^:\r\n]{1,512}\Z"
 )
@@ -600,7 +603,7 @@ def add_audio_tools(stage: Path, tinyplay: Path, tinycap: Path, tinymix: Path,
     audio["tools"] = tools
 
 
-def add_network_tools(stage: Path, iwconfig: Path,
+def add_network_tools(stage: Path, iwconfig: Path, iwconfig_metadata_path: Path,
                       manifest: dict[str, object]) -> None:
     """Install the manual network inspection tools.
 
@@ -618,7 +621,40 @@ def add_network_tools(stage: Path, iwconfig: Path,
 
     if iwconfig.is_symlink() or not iwconfig.is_file():
         raise SystemExit(f"ERROR: iwconfig is not a regular file: {iwconfig}")
+    if iwconfig_metadata_path.is_symlink() or not iwconfig_metadata_path.is_file():
+        raise SystemExit(f"ERROR: wireless-tools source metadata is not a regular file: {iwconfig_metadata_path}")
     iwconfig_data = read(iwconfig)
+    try:
+        iwconfig_metadata = json.loads(iwconfig_metadata_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"ERROR: invalid wireless-tools source metadata: {exc}") from exc
+    required_metadata = {
+        "binary_sha256", "binary_size", "build_epoch", "compiler",
+        "kernel_uapi_sha256", "license", "license_file", "license_sha256",
+        "source_sha256", "source_url", "static", "version",
+    }
+    if not isinstance(iwconfig_metadata, dict) or set(iwconfig_metadata) != required_metadata:
+        raise SystemExit("ERROR: wireless-tools source metadata schema mismatch")
+    if (iwconfig_metadata["binary_sha256"] != sha256(iwconfig_data) or
+            iwconfig_metadata["binary_size"] != len(iwconfig_data)):
+        raise SystemExit("ERROR: wireless-tools source metadata binary identity mismatch")
+    if iwconfig_metadata["license_file"] != "wireless-tools-COPYING":
+        raise SystemExit("ERROR: wireless-tools license file identity is invalid")
+    license_data = read(iwconfig_metadata_path.parent / "wireless-tools-COPYING")
+    if (iwconfig_metadata["license_sha256"] != sha256(license_data) or
+            iwconfig_metadata["source_sha256"] != WIRELESS_TOOLS_SOURCE_SHA256 or
+            iwconfig_metadata["source_url"] != WIRELESS_TOOLS_SOURCE_URL or
+            iwconfig_metadata["license"] != "GPL-2.0-only AND LGPL-2.1-or-later" or
+            iwconfig_metadata["version"] != WIRELESS_TOOLS_VERSION or
+            iwconfig_metadata["static"] is not True or
+            not isinstance(iwconfig_metadata["kernel_uapi_sha256"], str) or
+            not re.fullmatch(r"[0-9a-f]{64}", iwconfig_metadata["kernel_uapi_sha256"])):
+        raise SystemExit("ERROR: wireless-tools source metadata provenance is invalid")
+    license_target = stage / "usr/local/share/licenses/libreecho-core/wireless-tools-COPYING"
+    if license_target.exists() or license_target.is_symlink():
+        raise SystemExit(f"ERROR: wireless-tools license collides with {license_target}")
+    license_target.write_bytes(license_data)
+    license_target.chmod(0o644)
     iwconfig_target = stage / "sbin/iwconfig"
     if iwconfig_target.exists() or iwconfig_target.is_symlink():
         raise SystemExit(f"ERROR: network tool collides with {iwconfig_target}")
@@ -643,6 +679,7 @@ def add_network_tools(stage: Path, iwconfig: Path,
                 "size": len(iwconfig_data),
                 "mode": "0755",
                 "elf": iwconfig_elf,
+                "source": iwconfig_metadata,
             },
         },
     }
@@ -1454,6 +1491,7 @@ def validate_stage(stage: Path) -> None:
         "usr/local/share/licenses/libreecho-core/COMPONENTS.json",
         "usr/local/share/licenses/libreecho-core/GPL-2.0-only.txt",
         "usr/local/share/licenses/libreecho-core/wpa_supplicant-BSD.txt",
+
     )
     for relative in required:
         if not (stage / relative).exists():
@@ -1753,6 +1791,8 @@ def main() -> None:
                         help="static ARM32 TinyALSA mixer utility to add to the initramfs")
     parser.add_argument("--iwconfig", type=Path,
                         help="static ARM32 wireless-tools iwconfig utility")
+    parser.add_argument("--iwconfig-source-metadata", type=Path,
+                        help="source/license metadata emitted by build_wireless_tools.sh")
     parser.add_argument("--ui-bundle", type=Path,
                         help="staged static ARM32 LibreEcho-UI bundle")
     parser.add_argument("--ui-source", type=Path,
@@ -2135,7 +2175,12 @@ def main() -> None:
                 args.tinymix.resolve(), manifest,
             )
         if args.iwconfig is not None:
-            add_network_tools(stage, args.iwconfig.resolve(), manifest)
+            if args.iwconfig_source_metadata is None:
+                raise SystemExit("ERROR: iwconfig source metadata is required")
+            add_network_tools(
+                stage, args.iwconfig.resolve(),
+                args.iwconfig_source_metadata.resolve(), manifest,
+            )
         if ui_enabled:
             add_ui_bundle(
                 stage, args.ui_bundle.resolve(), args.ui_source.resolve(),

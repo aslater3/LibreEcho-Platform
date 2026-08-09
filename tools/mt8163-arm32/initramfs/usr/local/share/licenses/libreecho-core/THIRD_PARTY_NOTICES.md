@@ -32,7 +32,10 @@ recorded in `COMPONENTS.json`, the image manifest, and the release SPDX SBOM.
 - **LibreEcho MT8163 connectivity helpers** — GPL-2.0-only. All five ARM32
   helpers are rebuilt from the checked-in Platform sources; no extracted WMT
   userspace executable is shipped.
-- **wireless-tools 30~pre9-16.1ubuntu2** — GPL-2.0-only.
+- **wireless-tools 30~pre9** — GPL-2.0-only for the utilities and
+  LGPL-2.1-or-later for the incorporated `wireless.21.h` interface. The exact
+  upstream archive, SHA-256, static build metadata, and complete `COPYING`
+  record are emitted by the source builder and included with the image.
 - **wireless-regdb 2025.10.07-0ubuntu1~24.04.1** — ISC.
 - **TinyALSA e43025bbf702eb7dd8edd48c1eb50530c60f1de8** — BSD-3-Clause.
 - **libsodium 1.0.18** — ISC, statically linked into the OTA verifier.

@@ -539,6 +539,7 @@ class SourceTests(unittest.TestCase):
         self.assertNotIn("public base therefore makes no speaker or microphone claim", core_notice)
         for required in (
             "GPL-2.0-only.txt", "Apache-2.0.txt", "wpa_supplicant-BSD.txt",
+            "wireless-tools-copyright", "wireless-regdb-copyright",
             "musl-1.2.5-COPYRIGHT.txt", "libsodium-1.0.18-LICENSE.txt",
         ):
             self.assertTrue((core / required).is_file(), required)
@@ -922,13 +923,32 @@ class SourceTests(unittest.TestCase):
         builder_script = TOOLS_DIR / "network-tools/build_wireless_tools.sh"
         self.assertTrue(builder_script.is_file())
         self.assertTrue(os.access(builder_script, os.X_OK))
+        lock = json.loads((TOOLS_DIR / "network-tools/SOURCE.lock").read_text())
+        self.assertEqual(lock["version"], "30~pre9")
+        self.assertEqual(
+            lock["source_sha256"],
+            "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63",
+        )
+        builder_source = builder_script.read_text()
+        self.assertIn("--archive FILE", builder_source)
+        self.assertIn("--kernel-headers DIR", builder_source)
+        self.assertIn("--native-root DIR", builder_source)
+        self.assertIn("wireless-tools-source.json", builder_source)
+        self.assertIn("wireless-tools-COPYING", builder_source)
+        self.assertNotIn("curl --fail", builder_source)
         pipeline_build = pipeline_text("build.sh")
         pipeline_status = pipeline_text("status.sh")
         pipeline_flash = pipeline_text("flash.sh")
         self.assertIn("build_wireless_tools.sh", pipeline_build)
         self.assertIn("--iwconfig", pipeline_build)
+        self.assertIn("--iwconfig-source-metadata", pipeline_build)
         self.assertIn("--expected-iwconfig-sha256", pipeline_status)
         self.assertIn("--expected-iwconfig-sha256", pipeline_flash)
+        image_builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        self.assertIn("--iwconfig-source-metadata", image_builder)
+        self.assertIn("wireless-tools-COPYING", image_builder)
+        self.assertIn("wireless-tools-COPYING", verifier)
 
     def test_ssh_password_hash_is_salted_and_private(self) -> None:
         dropbear_builder = TOOLS_DIR / "ssh/build_dropbear.sh"
