@@ -67,6 +67,7 @@ pathlib.Path(out).chmod(0o755)
 PY
 done
 export SOURCE_DATE_EPOCH=0
+export TZ=UTC
 export KBUILD_BUILD_USER=libreecho
 export KBUILD_BUILD_HOST=release
 export KBUILD_BUILD_TIMESTAMP='1970-01-01 00:00:00 UTC'

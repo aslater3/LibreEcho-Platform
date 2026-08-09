@@ -621,6 +621,12 @@ class SourceTests(unittest.TestCase):
         ):
             self.assertIn(product_field, pipeline)
 
+    def test_busybox_builder_pins_utc_timezone(self) -> None:
+        builder = (
+            TOOLS_DIR / "busybox" / "build_busybox.sh"
+        ).read_text()
+        self.assertIn("export TZ=UTC", builder)
+
     def test_feature_policy_is_immutable_and_fail_closed(self) -> None:
         builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
         verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
