@@ -30,7 +30,7 @@ esac
 FEATURE_POLICY_VALUE=$($BB cat /etc/libreecho/feature-policy 2>/dev/null)
 FEATURE_POLICY=exclude
 case "$FEATURE_POLICY_VALUE" in
-    preserve|redistributable|exclude)
+    preserve|redistributable|community-noncommercial|exclude)
         FEATURE_POLICY=$FEATURE_POLICY_VALUE
         ;;
 esac
@@ -817,12 +817,16 @@ start_ui_services()
             *) [ $((integrations & 1)) -ne 0 ] && ha_enabled=1 ;;
         esac
     fi
-    if [ "$FEATURE_POLICY" = preserve ]; then
+    if [ "$FEATURE_POLICY" = preserve ] ||
+            [ "$FEATURE_POLICY" = community-noncommercial ]; then
         if [ "$ha_enabled" -eq 1 ]; then
             log ui-home-assistant-mode-enabled
             services="logd networkd timed audiod micd waked ledd btd airplayd wyomingd web"
         else
             services="logd networkd timed audiod micd waked sttd ledd btd airplayd ttsd agentd web"
+        fi
+        if [ "$FEATURE_POLICY" = community-noncommercial ]; then
+            log ui-services-community-noncommercial-with-wakeword
         fi
     else
         if [ "$ha_enabled" -eq 1 ]; then

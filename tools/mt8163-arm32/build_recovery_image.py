@@ -39,7 +39,7 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "c81a317db0793e7b1b502e49475f6d40383683dda90bc9ee40efe2dde83d4d6b"
+RECOVERY_INIT_SHA256 = "61ca87a17a162af4e498cfca95275aeb60dca0e06f64152a1f268e996354bf06"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
@@ -1776,7 +1776,9 @@ def main() -> None:
     parser.add_argument("--image-profile", choices=("development", "ota"), required=True)
     parser.add_argument("--service-profile", choices=("diagnostic", "production"),
                         default="diagnostic")
-    parser.add_argument("--feature-policy", choices=("exclude", "preserve", "redistributable"),
+    parser.add_argument(
+        "--feature-policy",
+        choices=("exclude", "preserve", "redistributable", "community-noncommercial"),
                         default="preserve")
     parser.add_argument("--bootctl", type=Path, required=True)
     parser.add_argument("--update-verifier", type=Path, required=True)
@@ -2055,6 +2057,20 @@ def main() -> None:
         if wakeword_payload_enabled:
             raise SystemExit(
                 "ERROR: wakeword payload inputs are forbidden by feature_policy=redistributable"
+            )
+    elif args.feature_policy == "community-noncommercial":
+        if args.service_profile != "production":
+            raise SystemExit(
+                "ERROR: community-noncommercial policy requires the production service profile"
+            )
+        if not all((airplay_payload_enabled, tts_payload_enabled,
+                    wakeword_payload_enabled, stt_payload_enabled,
+                    assistant_payload_enabled)):
+            raise SystemExit("ERROR: community-noncommercial policy requires external AirPlay, TTS, wakeword, STT, and assistant payloads")
+        if airplay_legacy_enabled:
+            raise SystemExit(
+                "ERROR: embedded AirPlay assets are forbidden by "
+                "feature_policy=community-noncommercial"
             )
 
     envelope = read(args.boot_envelope)

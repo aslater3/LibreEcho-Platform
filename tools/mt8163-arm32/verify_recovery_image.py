@@ -48,7 +48,7 @@ WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-INIT_SHA256 = "c81a317db0793e7b1b502e49475f6d40383683dda90bc9ee40efe2dde83d4d6b"
+INIT_SHA256 = "61ca87a17a162af4e498cfca95275aeb60dca0e06f64152a1f268e996354bf06"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -1742,6 +1742,21 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
             fail("redistributable feature policy manifest mismatch: wakeword enabled")
         if b"ui-services-redistributable-without-wakeword" not in control.data:
             fail("redistributable feature policy manifest mismatch: init graph marker missing")
+    elif expected_feature_policy == "community-noncommercial":
+        if expected_service_profile != "production":
+            fail("community-noncommercial feature policy manifest mismatch")
+        for feature in ("airplay", "tts", "wakeword", "stt", "assistant"):
+            record = manifest.get(feature, {"enabled": False})
+            if not isinstance(record, dict) or record.get("enabled") is not True:
+                fail(
+                    "community-noncommercial feature policy manifest mismatch: "
+                    f"{feature} disabled"
+                )
+        if b"ui-services-community-noncommercial-with-wakeword" not in control.data:
+            fail(
+                "community-noncommercial feature policy manifest mismatch: "
+                "init graph marker missing"
+            )
     for name, entry in entries.items():
         info = elf_info(entry.data)
         if info is not None and info[:2] != (1, 40):
@@ -1789,7 +1804,11 @@ def main() -> None:
     parser.add_argument("--expected-image-profile", choices=("development", "ota"), required=True)
     parser.add_argument("--expected-service-profile", choices=("diagnostic", "production"),
                         required=True)
-    parser.add_argument("--expected-feature-policy", choices=("exclude", "preserve", "redistributable"), required=True)
+    parser.add_argument(
+        "--expected-feature-policy",
+        choices=("exclude", "preserve", "redistributable", "community-noncommercial"),
+        required=True,
+    )
     parser.add_argument("--expected-busybox-sha256", required=True)
     parser.add_argument("--expected-musl-loader-sha256", required=True)
     parser.add_argument("--expected-bootctl-sha256", required=True)

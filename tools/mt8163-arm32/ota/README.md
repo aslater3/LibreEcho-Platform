@@ -70,9 +70,11 @@ manifest identifies the board, SoC, ARM architecture, version, boot image size,
 SHA-256 digest, and required `image_profile=ota`. Version 1 deliberately updates the boot image only;
 persistent feature squashfs payloads and all configuration remain unchanged.
 The signed `feature_policy` is immutable across installation. `preserve` means
-the private five-payload graph; `redistributable` means the public production
-graph with AirPlay, STT, TTS, and assistant present and wakeword absent;
-`exclude` remains the diagnostic payload-free graph.
+the private five-payload graph; `community-noncommercial` means the public
+five-payload graph with the separately licensed CC-BY-NC-SA wakeword model;
+`redistributable` means the commercially unrestricted public production graph
+with AirPlay, STT, TTS, and assistant present and wakeword absent; `exclude`
+remains the diagnostic payload-free graph.
 
 Manual browser upload streams the tar to `/data/libreecho/update/incoming` and
 invokes the target installer. OTA-profile images also check the stable public
