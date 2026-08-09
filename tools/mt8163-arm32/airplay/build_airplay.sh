@@ -85,6 +85,7 @@ tinyalsa_source=$(find "$work" -mindepth 1 -maxdepth 1 -type d -name 'tinyalsa-*
     echo "ERROR: source archive layout is not recognised" >&2
     exit 1
 }
+reproducible_path_flags="-ffile-prefix-map=$work=/usr/src/libreecho-airplay -fdebug-prefix-map=$work=/usr/src/libreecho-airplay"
 
 export CC="${CROSS_PREFIX}gcc"
 export AR="${CROSS_PREFIX}ar"
@@ -94,8 +95,8 @@ export PKG_CONFIG_SYSROOT_DIR="$SYSROOT"
 export PKG_CONFIG_PATH="$SYSROOT/usr/lib/arm-linux-gnueabihf/pkgconfig:$SYSROOT/usr/share/pkgconfig"
 unset PKG_CONFIG_LIBDIR
 export CPPFLAGS="${CPPFLAGS:--I$SYSROOT/usr/include -I$SYSROOT/usr/include/arm-linux-gnueabihf}"
-export CFLAGS="${CFLAGS:---sysroot=$SYSROOT -O2 $CPPFLAGS}"
-export CXXFLAGS="${CXXFLAGS:---sysroot=$SYSROOT -O2 $CPPFLAGS}"
+export CFLAGS="${CFLAGS:---sysroot=$SYSROOT -O2 $CPPFLAGS} $reproducible_path_flags"
+export CXXFLAGS="${CXXFLAGS:---sysroot=$SYSROOT -O2 $CPPFLAGS} $reproducible_path_flags"
 export LDFLAGS="${LDFLAGS:---sysroot=$SYSROOT -L$SYSROOT/usr/lib/arm-linux-gnueabihf -Wl,-rpath-link,$SYSROOT/usr/lib/arm-linux-gnueabihf -L$SYSROOT/usr/lib -Wl,-rpath-link,$SYSROOT/usr/lib -Wl,--allow-shlib-undefined}"
 
 build_ffmpeg() {
@@ -110,7 +111,21 @@ build_ffmpeg() {
         --enable-decoder=aac --enable-decoder=alac --enable-parser=aac \
         --enable-demuxer=aac --enable-demuxer=mov --enable-protocol=file \
         --enable-pic --enable-static --disable-shared --sysroot="$SYSROOT" \
-        --extra-cflags=-O2
+        --extra-cflags="-O2 $reproducible_path_flags"
+    python3 - "$ffmpeg_source/config.h" "$work" <<'PY'
+from pathlib import Path
+import sys
+
+config = Path(sys.argv[1])
+work = sys.argv[2]
+before = config.read_text()
+if work not in before:
+    raise SystemExit("ERROR: FFmpeg configuration did not record its build root")
+after = before.replace(work, "/usr/src/libreecho-airplay")
+config.write_text(after)
+if work in config.read_text():
+    raise SystemExit("ERROR: FFmpeg configuration still contains its build root")
+PY
     make -j"$JOBS"
     make DESTDIR="$SYSROOT" install
     popd >/dev/null
@@ -165,7 +180,7 @@ build_tinyalsa() {
     # an informational user-space-header warning from linux/types.h; the
     # upstream TinyALSA Makefile promotes warnings to errors, so suppress only
     # that known diagnostic rather than weakening the rest of the build.
-    local tiny_cflags="--sysroot=$SYSROOT -O2 -Wno-cpp"
+    local tiny_cflags="--sysroot=$SYSROOT -O2 -Wno-cpp $reproducible_path_flags"
     if [[ -n "$KERNEL_HEADERS" ]]; then
         tiny_cflags+=" -I$KERNEL_HEADERS/include/uapi -I$KERNEL_HEADERS/include"
     fi
@@ -177,7 +192,7 @@ build_tinyalsa() {
 }
 
 build_audio_components() {
-    local bridge_cflags="--sysroot=$SYSROOT -O2 -std=c99 -Wall -Wextra -Wpedantic"
+    local bridge_cflags="--sysroot=$SYSROOT -O2 -std=c99 -Wall -Wextra -Wpedantic $reproducible_path_flags"
     local objects="$work/libreecho-objects"
     bridge_cflags+=" -I$tinyalsa_source/include"
     if [[ -n "$KERNEL_HEADERS" ]]; then

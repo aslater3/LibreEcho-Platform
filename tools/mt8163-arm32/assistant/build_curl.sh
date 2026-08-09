@@ -56,6 +56,7 @@ source_root="$work/source"
 build_root="$work/build"
 mkdir -p "$source_root" "$build_root"
 tar -xJf "$SOURCE_ARCHIVE" --strip-components=1 -C "$source_root"
+reproducible_path_flags="-ffile-prefix-map=$work=/usr/src/libreecho-curl -fdebug-prefix-map=$work=/usr/src/libreecho-curl"
 
 include_root="$SYSROOT/usr/include"
 library_root="$SYSROOT/usr/lib/arm-linux-gnueabihf"
@@ -69,7 +70,7 @@ pkgconfig_root="$library_root/pkgconfig"
     PKG_CONFIG_SYSROOT_DIR="$SYSROOT" \
     PKG_CONFIG_LIBDIR="$pkgconfig_root" \
     CPPFLAGS="-I$include_root/arm-linux-gnueabihf -I$include_root" \
-    CFLAGS="--sysroot=$SYSROOT -Os -ffunction-sections -fdata-sections" \
+    CFLAGS="--sysroot=$SYSROOT -Os -ffunction-sections -fdata-sections $reproducible_path_flags" \
     LDFLAGS="--sysroot=$SYSROOT -static -Wl,--gc-sections -L$library_root" \
     "$source_root/configure" \
       --host=arm-linux-gnueabihf --build=x86_64-pc-linux-gnu \

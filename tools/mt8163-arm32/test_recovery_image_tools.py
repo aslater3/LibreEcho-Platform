@@ -938,6 +938,31 @@ class SourceTests(unittest.TestCase):
         self.assertIn("AudDrv_GPIO_DACMUX_Select(0)", prepare)
         self.assertNotIn("AudDrv_GPIO_DACMUX_Select(1)", prepare)
 
+    def test_relink_builders_remap_temporary_source_paths(self) -> None:
+        airplay_builder = (TOOLS_DIR / "airplay/build_airplay.sh").read_text()
+        self.assertIn(
+            "-ffile-prefix-map=$work=/usr/src/libreecho-airplay",
+            airplay_builder,
+        )
+        self.assertIn(
+            "-fdebug-prefix-map=$work=/usr/src/libreecho-airplay",
+            airplay_builder,
+        )
+        self.assertIn('"$ffmpeg_source/config.h" "$work"', airplay_builder)
+        self.assertIn(
+            'before.replace(work, "/usr/src/libreecho-airplay")',
+            airplay_builder,
+        )
+        assistant_builder = (TOOLS_DIR / "assistant/build_curl.sh").read_text()
+        self.assertIn(
+            "-ffile-prefix-map=$work=/usr/src/libreecho-curl",
+            assistant_builder,
+        )
+        self.assertIn(
+            "-fdebug-prefix-map=$work=/usr/src/libreecho-curl",
+            assistant_builder,
+        )
+
     def test_connectivity_helper_pins_match_source_built_outputs(self) -> None:
         expected = {
             "sbin/wmt_configure": (
