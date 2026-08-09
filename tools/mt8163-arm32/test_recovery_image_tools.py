@@ -228,6 +228,13 @@ class SourceTests(unittest.TestCase):
             "windows95", (pipeline_root / "inputs/SHA256SUMS").read_text().lower()
         )
 
+    def test_wakeword_runtime_uses_explicit_re2_archive(self) -> None:
+        source = (TOOLS_DIR / "wakeword/build_runtime.sh").read_text()
+        self.assertIn(
+            "${LIBREECHO_WAKE_RE2_ARCHIVE:?ERROR:", source
+        )
+        self.assertIn('RE2_ARCHIVE="$RE2_ARCHIVE"', source)
+
     def test_pinned_source_rejects_symlink_components(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

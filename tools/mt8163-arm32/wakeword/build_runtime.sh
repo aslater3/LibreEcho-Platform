@@ -11,6 +11,7 @@ OUTPUT="${6:?usage: build_runtime.sh <ui-source> <ort-source> <ort-build> <speex
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd -P)"
 OPS_CONFIG="$SCRIPT_DIR/required_operators.config"
 FLATBUFFERS_PYTHON="${LIBREECHO_WAKE_FLATBUFFERS_PYTHON:?ERROR: set LIBREECHO_WAKE_FLATBUFFERS_PYTHON to the pinned FlatBuffers Python source}"
+RE2_ARCHIVE="${LIBREECHO_WAKE_RE2_ARCHIVE:?ERROR: set LIBREECHO_WAKE_RE2_ARCHIVE to the pinned ARM32 RE2 archive}"
 CROSS="${LIBREECHO_WAKE_CROSS:-/usr/bin/arm-linux-gnueabihf-}"
 JOBS="${JOBS:-$(nproc)}"
 ORT_COMMIT=8f0278c77bf44b0cc83c098c6c722b92a36ac4b5
@@ -47,6 +48,10 @@ done
 }
 [[ -f "$FLATBUFFERS_PYTHON/flatbuffers/__init__.py" ]] || {
   echo "ERROR: pinned FlatBuffers Python source is unavailable: $FLATBUFFERS_PYTHON" >&2
+  exit 1
+}
+[[ -f "$RE2_ARCHIVE" && ! -L "$RE2_ARCHIVE" ]] || {
+  echo "ERROR: pinned ARM32 RE2 archive is unavailable: $RE2_ARCHIVE" >&2
   exit 1
 }
 [[ ! -e "$OUTPUT" ]] || {
@@ -177,6 +182,7 @@ mkdir -p "$(dirname -- "$OUTPUT")"
 make -C "$UI_SOURCE" \
   CROSS_COMPILE="$CROSS" CC=gcc \
   ARM_SPEEX_PREFIX="$SPEEX_PREFIX" \
+  RE2_ARCHIVE="$RE2_ARCHIVE" \
   WAKE_ORT_SOURCE="$ORT_SOURCE" \
   WAKE_ORT_BUILD="$ORT_BUILD" \
   build/libreecho-waked-onnx-arm32
