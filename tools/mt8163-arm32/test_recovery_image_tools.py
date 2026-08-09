@@ -615,6 +615,11 @@ class SourceTests(unittest.TestCase):
         self.assertNotIn('AUDIO_TOOLS_DIR="$TOOLS_DIR/audio-tools"', pipeline)
         self.assertNotIn('sha256sum -c SHA256SUMS', pipeline)
         self.assertIn('verify_pinned_input', pipeline)
+        for product_field in (
+            'product_git_head=', 'product_git_state=',
+            'product_git_diff_sha256=', 'public_release_mode=',
+        ):
+            self.assertIn(product_field, pipeline)
 
     def test_feature_policy_is_immutable_and_fail_closed(self) -> None:
         builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
