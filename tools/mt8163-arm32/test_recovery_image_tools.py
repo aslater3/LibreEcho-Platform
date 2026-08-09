@@ -728,6 +728,18 @@ class SourceTests(unittest.TestCase):
         self.assertIn('if [ "$FEATURE_POLICY" = preserve ]; then', init)
         self.assertIn("ui-services-redistributable-without-wakeword", init)
 
+    def test_recovery_init_pin_matches_policy_source(self) -> None:
+        init_hash = hashlib.sha256(
+            (TOOLS_DIR / "initramfs/libreecho-init").read_bytes()
+        ).hexdigest()
+        pins = {
+            "build_recovery_image.py": "RECOVERY_INIT_SHA256",
+            "verify_recovery_image.py": "INIT_SHA256",
+        }
+        for name, constant in pins.items():
+            source = (TOOLS_DIR / name).read_text()
+            self.assertIn(f'{constant} = "{init_hash}"', source)
+
     def test_ota_bundle_signs_redistributable_policy(self) -> None:
         from nacl.signing import SigningKey
         with tempfile.TemporaryDirectory() as temporary:
