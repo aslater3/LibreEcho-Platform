@@ -25,26 +25,33 @@
       "version": "4f247d753a8865cd16292ff0b720b72c28049786"
     },
     {
-      "binary_sha256": "d4c8fd2aea01abd851c703f39b29c0de748b2751e4e1a85cae570fa53ad8f4fb",
+      "config": "tools/mt8163-arm32/busybox/busybox-1.37.0.config",
       "id": "busybox",
       "license": "GPL-2.0-only",
-      "packaging_commit": "1e823a60eb85606954b3a5af5f8e5bbd1ea680cf",
-      "source": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/1e823a60eb85606954b3a5af5f8e5bbd1ea680cf/main/busybox",
-      "version": "1.37.0-r30"
+      "source": "https://busybox.net/downloads/busybox-1.37.0.tar.bz2",
+      "source_archive_sha256": "3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4",
+      "version": "1.37.0"
     },
     {
-      "binary_sha256": "1063871174f1bd4f08f4d330e20b07aeb0820327ee739a4d8d1b644df842cb6b",
       "id": "musl",
       "license": "MIT",
       "source": "https://musl.libc.org/releases/musl-1.2.5.tar.gz",
-      "version": "1.2.5-r21"
+      "source_archive_sha256": "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4",
+      "version": "1.2.5"
     },
     {
-      "binary_sha256": "79149bd547351a7e54c97ecf250d339c6a836bca0b1ae9386ae208153d6fff7c",
+      "config": "tools/mt8163-arm32/wpa-supplicant/wpa_supplicant-2.10.config",
       "id": "wpa-supplicant",
       "license": "BSD-3-Clause",
       "source": "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz",
+      "source_archive_sha256": "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f",
       "version": "2.10"
+    },
+    {
+      "id": "libreecho-mt8163-connectivity-helpers",
+      "license": "GPL-2.0-only",
+      "source": "https://github.com/aslater3/LibreEcho-Platform/tree/main/tools/mt8163-arm32/connectivity",
+      "version": "source-commit-in-image-manifest"
     },
     {
       "id": "wireless-tools",
@@ -75,7 +82,10 @@
     {
       "binary_sha256": "77a558bacdaaf9e343f02f2d74f27a5f2bb2dc8b6d66cc2499b60ed14ef62fe6",
       "id": "mt8163-audio-fpga",
-      "license": "GPL-2.0-only-kernel-distribution",
+      "included_in_public_artifact": false,
+      "license": "NOASSERTION",
+      "redistribution_status": "excluded",
+      "reason": "No authoritative redistribution permission or preferred-form FPGA source/generation record",
       "source": "https://github.com/carlitros900/karnak_3.18.48/commit/5b48c78b249ed9129fe92d30087de25b20152538",
       "version": "i2s_to_spi_v34"
     },

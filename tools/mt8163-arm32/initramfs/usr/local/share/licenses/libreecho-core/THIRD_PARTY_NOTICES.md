@@ -19,13 +19,19 @@ recorded in `COMPONENTS.json`, the image manifest, and the release SPDX SBOM.
 
 ## Runtime utilities
 
-- **BusyBox 1.37.0-r30 (Alpine)** — GPL-2.0-only. The complete configuration
-  exported by the shipped binary, Alpine APKBUILD, Alpine packaging commit,
-  patches, and upstream source are part of the corresponding-source offer.
-- **musl 1.2.5-r21 (Alpine)** — MIT. The shipped loader hash is pinned in
-  `COMPONENTS.json`.
-- **wpa_supplicant 2.10** — BSD-3-Clause. The exact binary prints the included
-  BSD terms with `wpa_supplicant -L`.
+- **BusyBox 1.37.0** — GPL-2.0-only. The release rebuilds the binary from
+  the pinned upstream archive and the public
+  `tools/mt8163-arm32/busybox/busybox-1.37.0.config`; build metadata records the
+  compiler, source/config hashes, and output hash.
+- **musl 1.2.5** — MIT. The release rebuilds the ARM32 dynamic loader from the
+  pinned upstream archive; build metadata records the compiler and output hash.
+- **wpa_supplicant 2.10** — BSD-3-Clause. The release rebuilds a static,
+  WEXT-only WPA2-PSK client with internal crypto from the pinned upstream
+  archive and public config, eliminating the previous libnl/glibc ambiguity.
+  The binary prints the included BSD terms with `wpa_supplicant -L`.
+- **LibreEcho MT8163 connectivity helpers** — GPL-2.0-only. All five ARM32
+  helpers are rebuilt from the checked-in Platform sources; no extracted WMT
+  userspace executable is shipped.
 - **wireless-tools 30~pre9-16.1ubuntu2** — GPL-2.0-only.
 - **wireless-regdb 2025.10.07-0ubuntu1~24.04.1** — ISC.
 - **TinyALSA e43025bbf702eb7dd8edd48c1eb50530c60f1de8** — BSD-3-Clause.
@@ -38,15 +44,13 @@ The release source offer records the exact toolchain, glibc source under
 LGPL-2.1-or-later, GCC runtime source under GPL-3.0-or-later WITH
 GCC-exception-3.1, and LibreEcho source/build instructions sufficient to relink.
 
-## MT8163 audio FPGA bridge
+## MT8163 audio FPGA bridge — excluded
 
-The kernel embeds `firmware/i2s_to_spi_v34.bin` (30,964 bytes, SHA-256
-`77a558bacdaaf9e343f02f2d74f27a5f2bb2dc8b6d66cc2499b60ed14ef62fe6`).
-The identical file appears in the published Amazon-device Linux 3.18 kernel
-source lineage at commit `5b48c78b249ed9129fe92d30087de25b20152538`, distributed with the kernel's
-GPL-2.0 COPYING file. Credit belongs to the Amazon/MediaTek device-kernel
-contributors. LibreEcho preserves the file byte-for-byte and does not claim
-original authorship.
+The public base kernel deliberately disables the Radar-Puffin machine driver
+and FPGA-backed capture path. `i2s_to_spi_v34.bin` is not included in the public
+source branch, boot image, OTA archive, or source offer because no authoritative
+redistribution permission or FPGA source/generation record has been established.
+The public base therefore makes no speaker or microphone claim.
 
 ## Owner-device connectivity firmware
 

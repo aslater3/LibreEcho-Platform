@@ -24,6 +24,17 @@ case "$SERVICE_PROFILE_VALUE" in
         ;;
 esac
 
+# Feature policy is immutable image policy. Missing or malformed content fails
+# closed to the payload-free graph even if a production service profile was
+# accidentally selected.
+FEATURE_POLICY_VALUE=$($BB cat /etc/libreecho/feature-policy 2>/dev/null)
+FEATURE_POLICY=exclude
+case "$FEATURE_POLICY_VALUE" in
+    preserve|exclude)
+        FEATURE_POLICY=$FEATURE_POLICY_VALUE
+        ;;
+esac
+
 $BB mkdir -p /dev/pts /dev/usb-ffs/adb /dev/socket /proc /sys /tmp
 $BB chmod 0777 /tmp
 
@@ -787,9 +798,13 @@ start_ui_services()
         log ui-services-blocked-by-data-contract
         return 1
     fi
-    if [ "$SERVICE_PROFILE" = diagnostic ]; then
+    if [ "$SERVICE_PROFILE" = diagnostic ] || [ "$FEATURE_POLICY" = exclude ]; then
         services="logd timed web"
-        log ui-connectivity-services-disabled-for-diagnostic-profile
+        if [ "$FEATURE_POLICY" = exclude ]; then
+            log feature-services-excluded
+        else
+            log ui-connectivity-services-disabled-for-diagnostic-profile
+        fi
     else
     ha_enabled=0
     config=/data/libreecho/config/web-config.json
@@ -838,6 +853,10 @@ log ui-services-autostart-started
 ota_health_confirm_worker()
 {
     [ "$IMAGE_PROFILE" = ota ] || return 0
+    [ "$FEATURE_POLICY" = preserve ] || {
+        log ota-health-feature-validation-skipped-by-exclusion-policy
+        return 0
+    }
     [ -r /data/libreecho/update/pending ] || return 0
     log ota-health-confirm-pending
     pending_slot=$($BB sed -n 's/^slot=//p' /data/libreecho/update/pending)

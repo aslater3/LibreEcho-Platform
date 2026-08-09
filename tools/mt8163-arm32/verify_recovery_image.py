@@ -42,9 +42,7 @@ CONNECTIVITY_IMPORTER_SHA256 = "27f20efb39825333838df76eb843e4af537864f326a96487
 CONNECTIVITY_STOCK_SYSTEM_SHA256 = "56540b3a9ac4437901a5510d9fb5e09b1a8d0cc229548f0b08bb5c22d78684fe"
 CONNECTIVITY_EVIDENCE_MANIFEST_SHA256 = "d1eedd04efe0dbc78853f2b0f9357c092b4ca66242648908c0369956538441eb"
 
-BUSYBOX_SHA256 = "d4c8fd2aea01abd851c703f39b29c0de748b2751e4e1a85cae570fa53ad8f4fb"
-LOADER_SHA256 = "1063871174f1bd4f08f4d330e20b07aeb0820327ee739a4d8d1b644df842cb6b"
-INIT_SHA256 = "767d32df45cdc1b20cfe4bd7cb681c44140ea396f26c65e86282d7de833381b0"
+INIT_SHA256 = "0437fd25319a25c1b7ccb4fb684c0ea52eb6b54fda2d11ddfaf6c1394b1d41e2"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -150,19 +148,19 @@ CONNECTIVITY_ASSET_REQUIREMENTS = {
 
 CONNECTIVITY_HELPERS = {
     "sbin/wmt_configure": (
-        428704, "2fa1c78546b3a0d35442ffa196f3eaa13b1ce4609b537332b016bc88ea663be2",
+        184892, "e31f7e508f1f9eccfa999539a4e05665ccc4a994aa2d37698bc71a7e7c3c0f6e",
     ),
     "sbin/wmt_responder": (
-        428796, "e20bdaf559165077ff8211c64ed38a10ecee1006641e94302cf14d3be397c350",
+        170092, "808b10a0a0def6d37e7790a223cffa3d409097105eceb0f4ffe38d2af8fe5bde",
     ),
     "sbin/wmt_bt_on": (
-        424540, "4365c1b1046bf2ce1045a3fbd4578ee21d8f1a9900a01cb0cde9cea478821d82",
+        164436, "46d3dec86d9551c304d6c4e1e5fedeab244a0ffd688baea5fe5af35b1fa7cc08",
     ),
     "sbin/wmt_stock_compat": (
-        341184, "5be9b801153c79f85260b193c57a5ba5c4155f9fccbad47a794e9445e94d654c",
+        164808, "c593e6f2a177428632d7a2ef1abdff6bbd4997cca767825e021cdd9b0bf681a8",
     ),
     "sbin/wmt_launcher": (
-        428912, "6e65e46536bfea0b44f0887998a4d556338250d42609e13fbe6d7833a08187c3",
+        172324, "c126ab1eed0f0499e26b8b8c7e632ea20a7d848a11f5a6c70fa0a5ec87be6967",
     ),
 }
 
@@ -934,6 +932,9 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                        schema_version: int,
                        expected_image_profile: str,
                        expected_service_profile: str,
+                       expected_feature_policy: str,
+                       expected_busybox_sha256: str,
+                       expected_loader_sha256: str,
                        expected_bootctl_sha256: str,
                        expected_update_verifier_sha256: str,
                        expected_ota_public_key_sha256: str,
@@ -976,6 +977,8 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         fail("image profile manifest mismatch")
     if manifest.get("service_profile") != expected_service_profile:
         fail("service profile manifest mismatch")
+    if manifest.get("feature_policy") != expected_feature_policy:
+        fail("feature policy manifest mismatch")
     require_member(
         entries, "etc/libreecho/image-profile",
         sha256((expected_image_profile + "\n").encode()), 0o644,
@@ -983,6 +986,10 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     require_member(
         entries, "etc/libreecho/service-profile",
         sha256((expected_service_profile + "\n").encode()), 0o644,
+    )
+    require_member(
+        entries, "etc/libreecho/feature-policy",
+        sha256((expected_feature_policy + "\n").encode()), 0o644,
     )
     ota = manifest.get("ota")
     if not isinstance(ota, dict) or ota.get("format") != "libreecho-ota-v1":
@@ -1557,8 +1564,8 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         fail("adbd source provenance or transport policy is invalid")
     if "stock_userspace" in manifest:
         fail("stock userspace manifest entry is forbidden")
-    busybox = require_member(entries, "bin/busybox", BUSYBOX_SHA256, 0o755)
-    loader = require_member(entries, "lib/ld-musl-armhf.so.1", LOADER_SHA256, 0o755)
+    busybox = require_member(entries, "bin/busybox", expected_busybox_sha256, 0o755)
+    loader = require_member(entries, "lib/ld-musl-armhf.so.1", expected_loader_sha256, 0o755)
     for name, member, expected_interpreter in (
         ("sbin/adbd", adbd, None),
         ("bin/busybox", busybox, "/lib/ld-musl-armhf.so.1"),
@@ -1593,6 +1600,12 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     applets = manifest.get("busybox_applets", {})
     if applets.get("count", 0) < 250 or not set(required_applets).issubset(applets.get("names", [])):
         fail("BusyBox applet manifest is incomplete")
+    busybox_record = manifest.get("busybox")
+    if not isinstance(busybox_record, dict) or busybox_record.get("sha256") != expected_busybox_sha256:
+        fail("BusyBox manifest identity mismatch")
+    loader_record = manifest.get("musl_loader")
+    if not isinstance(loader_record, dict) or loader_record.get("sha256") != expected_loader_sha256:
+        fail("musl loader manifest identity mismatch")
 
     overlay_dir = Path(__file__).resolve().parent / "initramfs"
     overlay_manifest = manifest.get("overlay", {})
@@ -1655,6 +1668,15 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
             fail(f"root-ADB property contract lacks {setting!r}")
     if any(name.startswith("res/") or name in {"sbin/recovery", "sbin/multi_init"} for name in entries):
         fail("unneeded stock recovery workload remains in initramfs")
+    if expected_feature_policy == "exclude":
+        if expected_service_profile != "diagnostic":
+            fail("feature exclusion is not paired with the diagnostic service profile")
+        for feature in ("airplay", "tts", "wakeword", "stt", "assistant"):
+            record = manifest.get(feature, {"enabled": False})
+            if not isinstance(record, dict) or record.get("enabled") is not False:
+                fail(f"feature exclusion manifest enables {feature}")
+        if b"FEATURE_POLICY" not in control.data or b"feature-services-excluded" not in control.data:
+            fail("feature exclusion is not enforced by init")
     for name, entry in entries.items():
         info = elf_info(entry.data)
         if info is not None and info[:2] != (1, 40):
@@ -1702,6 +1724,9 @@ def main() -> None:
     parser.add_argument("--expected-image-profile", choices=("development", "ota"), required=True)
     parser.add_argument("--expected-service-profile", choices=("diagnostic", "production"),
                         required=True)
+    parser.add_argument("--expected-feature-policy", choices=("exclude", "preserve"), required=True)
+    parser.add_argument("--expected-busybox-sha256", required=True)
+    parser.add_argument("--expected-musl-loader-sha256", required=True)
     parser.add_argument("--expected-bootctl-sha256", required=True)
     parser.add_argument("--expected-update-verifier-sha256", required=True)
     parser.add_argument("--expected-ota-public-key-sha256", required=True)
@@ -1855,7 +1880,8 @@ def main() -> None:
 
     connectivity_enabled = validate_initramfs(
         ramdisk, manifest, schema_version, args.expected_image_profile,
-        args.expected_service_profile,
+        args.expected_service_profile, args.expected_feature_policy,
+        args.expected_busybox_sha256, args.expected_musl_loader_sha256,
         args.expected_bootctl_sha256, args.expected_update_verifier_sha256,
         args.expected_ota_public_key_sha256, args.expected_adbd_sha256,
         args.expected_audio_probe_sha256,
@@ -1891,7 +1917,8 @@ def main() -> None:
         "arm32_recovery_image_contract=PASS android_v0=yes mtk_wrapper=yes "
         "zimage=yes evt_dtb=yes initramfs_arm32=yes "
         f"fastboot_marker={'automatic' if args.expected_image_profile == 'development' else 'explicit-only'} "
-        f"image_profile={args.expected_image_profile} service_profile={args.expected_service_profile} ota=yes "
+        f"image_profile={args.expected_image_profile} service_profile={args.expected_service_profile} "
+        f"feature_policy={args.expected_feature_policy} ota=yes "
         "root_adb_staged=yes runme=yes memory_disjoint=yes "
         f"connectivity_bundle={'yes' if connectivity_enabled else 'no'} "
         f"audio_tools={'yes' if args.expected_tinyplay_sha256 and args.expected_tinycap_sha256 and args.expected_tinymix_sha256 else 'no'} "

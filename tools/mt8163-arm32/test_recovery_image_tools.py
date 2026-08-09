@@ -538,6 +538,98 @@ class SourceTests(unittest.TestCase):
         ):
             self.assertTrue((core / required).is_file(), required)
 
+    def test_public_core_runtime_is_rebuilt_from_locked_source(self) -> None:
+        expected = {
+            "busybox": (
+                "3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4",
+                "build_busybox.sh",
+            ),
+            "musl": (
+                "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4",
+                "build_musl.sh",
+            ),
+            "wpa-supplicant": (
+                "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f",
+                "build_wpa_supplicant.sh",
+            ),
+        }
+        for component, (archive_sha256, builder_name) in expected.items():
+            component_dir = TOOLS_DIR / component
+            lock = json.loads((component_dir / "SOURCE.lock").read_text())
+            self.assertEqual(lock["source_sha256"], archive_sha256)
+            builder = component_dir / builder_name
+            self.assertTrue(builder.is_file(), builder)
+            self.assertTrue(builder.stat().st_mode & 0o111, builder)
+            builder_source = builder.read_text()
+            self.assertIn("source_sha256", builder_source)
+            self.assertIn("-ffile-prefix-map", builder_source)
+            self.assertIn("source.json", builder_source)
+
+        image_builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        image_verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        for expected_argument in (
+            "--expected-busybox-sha256",
+            "--expected-musl-loader-sha256",
+        ):
+            self.assertIn(expected_argument, image_builder)
+            self.assertIn(expected_argument, image_verifier)
+        for obsolete_hash in (
+            "d4c8fd2aea01abd851c703f39b29c0de748b2751e4e1a85cae570fa53ad8f4fb",
+            "1063871174f1bd4f08f4d330e20b07aeb0820327ee739a4d8d1b644df842cb6b",
+        ):
+            self.assertNotIn(obsolete_hash, image_builder)
+            self.assertNotIn(obsolete_hash, image_verifier)
+
+        connectivity = TOOLS_DIR / "connectivity"
+        connectivity_builder = (connectivity / "build_connectivity_helpers.sh").read_text()
+        self.assertTrue((connectivity / "SOURCE.lock").is_file())
+        for helper in (
+            "wmt_configure", "wmt_responder", "wmt_bt_on",
+            "wmt_stock_compat", "wmt_launcher",
+        ):
+            self.assertTrue((connectivity / f"{helper}.c").is_file())
+            self.assertIn(helper, connectivity_builder)
+        self.assertIn("GPL-2.0-only", connectivity_builder)
+
+        audio_tools = TOOLS_DIR / "audio-tools"
+        audio_lock = json.loads((audio_tools / "SOURCE.lock").read_text())
+        self.assertEqual(
+            audio_lock["source_sha256"],
+            "dc75977453304fcce0b91cbfd2b27942641c93479f87898d230cdc440a042d4f",
+        )
+        self.assertEqual(
+            audio_lock["patch_sha256"],
+            "f63cacae35b0eb5291c8f4fa49c276c7aac3927426e529c50d74ab244c3ba7aa",
+        )
+        audio_builder = (audio_tools / "build_audio_tools.sh").read_text()
+        for tool in ("tinyplay", "tinycap", "tinymix"):
+            self.assertIn(tool, audio_builder)
+        self.assertIn("tinyalsa-source.json", audio_builder)
+        self.assertIn("--fuzz=0", audio_builder)
+        self.assertFalse(any((audio_tools / tool).exists() for tool in ("tinyplay", "tinycap", "tinymix")))
+
+        pipeline = pipeline_text("build.sh")
+        self.assertIn("build_connectivity_helpers.sh", pipeline)
+        self.assertIn("build_audio_tools.sh", pipeline)
+        self.assertNotIn('$INPUTS/connectivity-helpers', pipeline)
+        self.assertNotIn('AUDIO_TOOLS_DIR="$TOOLS_DIR/audio-tools"', pipeline)
+        self.assertNotIn('sha256sum -c SHA256SUMS', pipeline)
+        self.assertIn('verify_pinned_input', pipeline)
+
+    def test_feature_policy_is_immutable_and_fail_closed(self) -> None:
+        builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
+        pipeline = pipeline_text("build.sh")
+        for source in (builder, verifier, updater, pipeline):
+            self.assertIn("feature_policy", source)
+        self.assertIn("--feature-policy", builder)
+        self.assertIn("--expected-feature-policy", verifier)
+        self.assertIn("/etc/libreecho/feature-policy", init)
+        self.assertIn("feature exclusion requires --service-profile diagnostic", pipeline)
+        self.assertIn('FEATURE_POLICY="${LIBREECHO_FEATURE_POLICY:-preserve}"', pipeline)
+
     def test_stock_userspace_is_replaced_by_source_built_adbd(self) -> None:
         builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
         verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
@@ -622,11 +714,12 @@ class SourceTests(unittest.TestCase):
             init_source.index("start_wifi_network_sequence"),
         )
 
-    def test_audio_tools_are_pinned_and_gpu_input_wait_is_interruptible(self) -> None:
+    def test_audio_tools_are_source_built_and_gpu_input_wait_is_interruptible(self) -> None:
         tools = TOOLS_DIR / "audio-tools"
-        self.assertTrue((tools / "tinyplay").is_file())
-        self.assertTrue((tools / "tinycap").is_file())
-        self.assertTrue((tools / "tinymix").is_file())
+        self.assertTrue((tools / "build_audio_tools.sh").is_file())
+        self.assertTrue((tools / "SOURCE.lock").is_file())
+        self.assertTrue((tools / "tinyalsa-mt8163.patch").is_file())
+        self.assertFalse(any((tools / name).exists() for name in ("tinyplay", "tinycap", "tinymix")))
         pipeline_build = pipeline_text("build.sh")
         self.assertIn("--tinyplay", pipeline_build)
         self.assertIn("--tinymix", pipeline_build)

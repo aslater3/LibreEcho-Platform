@@ -39,9 +39,7 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-BUSYBOX_SHA256 = "d4c8fd2aea01abd851c703f39b29c0de748b2751e4e1a85cae570fa53ad8f4fb"
-MUSL_LOADER_SHA256 = "1063871174f1bd4f08f4d330e20b07aeb0820327ee739a4d8d1b644df842cb6b"
-RECOVERY_INIT_SHA256 = "767d32df45cdc1b20cfe4bd7cb681c44140ea396f26c65e86282d7de833381b0"
+RECOVERY_INIT_SHA256 = "0437fd25319a25c1b7ccb4fb684c0ea52eb6b54fda2d11ddfaf6c1394b1d41e2"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
@@ -76,24 +74,24 @@ CONNECTIVITY_ASSET_REQUIREMENTS = {
 
 CONNECTIVITY_HELPERS = {
     "sbin/wmt_configure": (
-        "wmt_config_helper", 428704,
-        "2fa1c78546b3a0d35442ffa196f3eaa13b1ce4609b537332b016bc88ea663be2",
+        "wmt_config_helper", 184892,
+        "e31f7e508f1f9eccfa999539a4e05665ccc4a994aa2d37698bc71a7e7c3c0f6e",
     ),
     "sbin/wmt_responder": (
-        "wmt_responder", 428796,
-        "e20bdaf559165077ff8211c64ed38a10ecee1006641e94302cf14d3be397c350",
+        "wmt_responder", 170092,
+        "808b10a0a0def6d37e7790a223cffa3d409097105eceb0f4ffe38d2af8fe5bde",
     ),
     "sbin/wmt_bt_on": (
-        "wmt_bt_on", 424540,
-        "4365c1b1046bf2ce1045a3fbd4578ee21d8f1a9900a01cb0cde9cea478821d82",
+        "wmt_bt_on", 164436,
+        "46d3dec86d9551c304d6c4e1e5fedeab244a0ffd688baea5fe5af35b1fa7cc08",
     ),
     "sbin/wmt_stock_compat": (
-        "wmt_stock_compat", 341184,
-        "5be9b801153c79f85260b193c57a5ba5c4155f9fccbad47a794e9445e94d654c",
+        "wmt_stock_compat", 164808,
+        "c593e6f2a177428632d7a2ef1abdff6bbd4997cca767825e021cdd9b0bf681a8",
     ),
     "sbin/wmt_launcher": (
-        "wmt_launcher", 428912,
-        "6e65e46536bfea0b44f0887998a4d556338250d42609e13fbe6d7833a08187c3",
+        "wmt_launcher", 172324,
+        "c126ab1eed0f0499e26b8b8c7e632ea20a7d848a11f5a6c70fa0a5ec87be6967",
     ),
 }
 
@@ -364,7 +362,9 @@ def add_connectivity_bundle(stage: Path, helpers: dict[str, Path],
 
 
 def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
-                qemu_arm: str, manifest: dict[str, object]) -> None:
+                expected_busybox_sha256: str, expected_loader_sha256: str,
+                qemu_arm: str,
+                manifest: dict[str, object]) -> None:
     directories = (
         "bin", "dev", "dev/pts", "dev/socket", "dev/usb-ffs", "dev/usb-ffs/adb",
         "etc", "etc/wifi", "lib", "lib/firmware", "proc", "sbin", "sys", "system", "system/bin", "tmp",
@@ -444,8 +444,8 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
 
     busybox_data = read(busybox)
     loader_data = read(loader)
-    require_hash("ARM32 BusyBox", busybox_data, BUSYBOX_SHA256)
-    require_hash("ARM32 musl loader", loader_data, MUSL_LOADER_SHA256)
+    require_hash("ARM32 BusyBox", busybox_data, expected_busybox_sha256)
+    require_hash("ARM32 musl loader", loader_data, expected_loader_sha256)
     (stage / "bin/busybox").write_bytes(busybox_data)
     (stage / "bin/busybox").chmod(0o755)
     (stage / "lib/ld-musl-armhf.so.1").write_bytes(loader_data)
@@ -477,14 +477,14 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         os.symlink("busybox", target)
 
     manifest["overlay"] = overlay_manifest
-    manifest["busybox"] = {"sha256": BUSYBOX_SHA256, "size": len(busybox_data)}
-    manifest["musl_loader"] = {"sha256": MUSL_LOADER_SHA256, "size": len(loader_data)}
+    manifest["busybox"] = {"sha256": expected_busybox_sha256, "size": len(busybox_data)}
+    manifest["musl_loader"] = {"sha256": expected_loader_sha256, "size": len(loader_data)}
     manifest["symlinks"] = fixed_links
     manifest["busybox_applets"] = {"count": len(applets), "names": applets}
 
 
 def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
-                  image_profile: str, service_profile: str,
+                  image_profile: str, service_profile: str, feature_policy: str,
                   manifest: dict[str, object]) -> None:
     sources = (
         ("bootctl", bootctl, "usr/local/sbin/libreecho-bootctl",
@@ -524,8 +524,12 @@ def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
     service_profile_target = stage / "etc/libreecho/service-profile"
     service_profile_target.write_text(service_profile + "\n")
     service_profile_target.chmod(0o644)
+    feature_policy_target = stage / "etc/libreecho/feature-policy"
+    feature_policy_target.write_text(feature_policy + "\n")
+    feature_policy_target.chmod(0o644)
     manifest["image_profile"] = image_profile
     manifest["service_profile"] = service_profile
+    manifest["feature_policy"] = feature_policy
     manifest["ota"] = {
         "enabled": True,
         "format": "libreecho-ota-v1",
@@ -1417,6 +1421,7 @@ def validate_stage(stage: Path) -> None:
         "usr/local/libexec/libreecho-update-verify",
         "etc/libreecho/ota-public-key.hex", "etc/libreecho/ota-source.conf",
         "etc/libreecho/image-profile", "etc/libreecho/service-profile",
+        "etc/libreecho/feature-policy",
         "usr/local/share/licenses/libreecho-core/THIRD_PARTY_NOTICES.md",
         "usr/local/share/licenses/libreecho-core/COMPONENTS.json",
         "usr/local/share/licenses/libreecho-core/GPL-2.0-only.txt",
@@ -1699,10 +1704,14 @@ def main() -> None:
     parser.add_argument("--adbd-source-metadata", type=Path, required=True,
                         help="source/license metadata emitted by build_adbd.sh")
     parser.add_argument("--busybox", type=Path, required=True)
+    parser.add_argument("--expected-busybox-sha256", required=True)
     parser.add_argument("--musl-loader", type=Path, required=True)
+    parser.add_argument("--expected-musl-loader-sha256", required=True)
     parser.add_argument("--image-profile", choices=("development", "ota"), required=True)
     parser.add_argument("--service-profile", choices=("diagnostic", "production"),
                         default="diagnostic")
+    parser.add_argument("--feature-policy", choices=("exclude", "preserve"),
+                        default="preserve")
     parser.add_argument("--bootctl", type=Path, required=True)
     parser.add_argument("--update-verifier", type=Path, required=True)
     parser.add_argument("--ota-public-key", type=Path, required=True)
@@ -1951,6 +1960,15 @@ def main() -> None:
             f"missing {missing}"
         )
 
+    if args.feature_policy == "exclude":
+        if args.service_profile != "diagnostic":
+            raise SystemExit("ERROR: feature exclusion requires the diagnostic service profile")
+        if any((
+            airplay_legacy_enabled, airplay_payload_enabled, tts_payload_enabled,
+            wakeword_payload_enabled, stt_payload_enabled, assistant_payload_enabled,
+        )):
+            raise SystemExit("ERROR: feature payload inputs are forbidden by feature_policy=exclude")
+
     envelope = read(args.boot_envelope)
     canonical_envelope = generate_boot_envelope()
     if envelope != canonical_envelope:
@@ -2067,12 +2085,13 @@ def main() -> None:
         copy_adbd(args.adbd.resolve(), args.adbd_source_metadata.resolve(), stage, manifest)
         add_overlay(
             stage, overlay, args.busybox.resolve(), args.musl_loader.resolve(),
+            args.expected_busybox_sha256, args.expected_musl_loader_sha256,
             qemu_arm, manifest,
         )
         add_ota_tools(
             stage, args.bootctl.resolve(), args.update_verifier.resolve(),
-            args.ota_public_key.resolve(), args.image_profile, args.service_profile,
-            manifest,
+            args.ota_public_key.resolve(), args.image_profile,
+            args.service_profile, args.feature_policy, manifest,
         )
         if args.audio_probe is not None:
             add_audio_probe(stage, args.audio_probe.resolve(), manifest)
