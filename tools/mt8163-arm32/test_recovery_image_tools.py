@@ -946,6 +946,15 @@ class SourceTests(unittest.TestCase):
             "d4c872a44154604c869f5851f7d21d818d492835d370af7f58de8847973801c3",
         )
         self.assertIn("regulatory.db.p7s", regdb_builder.read_text())
+        sodium_builder = TOOLS_DIR / "ota/build_libsodium.sh"
+        self.assertTrue(sodium_builder.is_file())
+        self.assertTrue(os.access(sodium_builder, os.X_OK))
+        sodium_lock = json.loads((TOOLS_DIR / "ota/SOURCE.lock").read_text())
+        self.assertEqual(sodium_lock["version"], "1.0.18")
+        self.assertEqual(
+            sodium_lock["source_sha256"],
+            "d59323c6b712a1519a5daf710b68f5e7fde57040845ffec53850911f10a5d4f4",
+        )
         pipeline_build = pipeline_text("build.sh")
         pipeline_status = pipeline_text("status.sh")
         pipeline_flash = pipeline_text("flash.sh")
