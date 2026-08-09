@@ -44,13 +44,17 @@ The release source offer records the exact toolchain, glibc source under
 LGPL-2.1-or-later, GCC runtime source under GPL-3.0-or-later WITH
 GCC-exception-3.1, and LibreEcho source/build instructions sufficient to relink.
 
-## MT8163 audio FPGA bridge — excluded
+## MT8163 audio FPGA bridge — included, release-blocked
 
-The public base kernel deliberately disables the Radar-Puffin machine driver
-and FPGA-backed capture path. `i2s_to_spi_v34.bin` is not included in the public
-source branch, boot image, OTA archive, or source offer because no authoritative
-redistribution permission or FPGA source/generation record has been established.
-The public base therefore makes no speaker or microphone claim.
+The audio-capable candidate includes `i2s_to_spi_v34.bin` in the kernel firmware
+source tree and embeds it through `CONFIG_EXTRA_FIRMWARE`. It is required by the
+Radar-Puffin speaker and microphone FPGA path. Its 30,964-byte SHA-256 is
+`77a558bacdaaf9e343f02f2d74f27a5f2bb2dc8b6d66cc2499b60ed14ef62fe6`.
+
+The binary remains **blocked from public redistribution** until authoritative
+creator/generation provenance, license or source-offer terms, and redistribution
+permission are established. Its presence in the source tree proves the exact
+candidate can be reproduced; it does not by itself grant redistribution rights.
 
 ## Owner-device connectivity firmware
 

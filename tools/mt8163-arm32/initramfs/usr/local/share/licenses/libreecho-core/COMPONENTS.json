@@ -82,10 +82,10 @@
     {
       "binary_sha256": "77a558bacdaaf9e343f02f2d74f27a5f2bb2dc8b6d66cc2499b60ed14ef62fe6",
       "id": "mt8163-audio-fpga",
-      "included_in_public_artifact": false,
+      "included_in_public_artifact": true,
       "license": "NOASSERTION",
-      "redistribution_status": "excluded",
-      "reason": "No authoritative redistribution permission or preferred-form FPGA source/generation record",
+      "redistribution_status": "blocked",
+      "reason": "Required by the audio-capable candidate; no authoritative redistribution permission or preferred-form FPGA source/generation record",
       "source": "https://github.com/carlitros900/karnak_3.18.48/commit/5b48c78b249ed9129fe92d30087de25b20152538",
       "version": "i2s_to_spi_v34"
     },

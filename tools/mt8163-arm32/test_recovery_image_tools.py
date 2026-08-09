@@ -529,9 +529,14 @@ class SourceTests(unittest.TestCase):
         components = json.loads((core / "COMPONENTS.json").read_text())
         component_ids = {component["id"] for component in components["components"]}
         self.assertTrue({"busybox", "wpa-supplicant", "musl", "tinyalsa", "libsodium", "mt8163-audio-fpga"}.issubset(component_ids))
+        audio = next(component for component in components["components"] if component["id"] == "mt8163-audio-fpga")
+        self.assertTrue(audio["included_in_public_artifact"])
+        self.assertEqual(audio["redistribution_status"], "blocked")
         core_notice = (core / "THIRD_PARTY_NOTICES.md").read_text()
         self.assertIn("owner's", core_notice)
         self.assertIn("`system_a`", core_notice)
+        self.assertIn("audio-capable candidate includes", core_notice)
+        self.assertNotIn("public base therefore makes no speaker or microphone claim", core_notice)
         for required in (
             "GPL-2.0-only.txt", "Apache-2.0.txt", "wpa_supplicant-BSD.txt",
             "musl-1.2.5-COPYRIGHT.txt", "libsodium-1.0.18-LICENSE.txt",
