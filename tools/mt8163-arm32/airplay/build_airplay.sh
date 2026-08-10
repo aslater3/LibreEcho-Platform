@@ -107,6 +107,7 @@ build_ffmpeg() {
         --arch=arm --target-os=linux --enable-cross-compile --cpu=cortex-a7 \
         --disable-programs --disable-doc --disable-debug --disable-network \
         --disable-autodetect --disable-everything \
+        --disable-avdevice --disable-avfilter --disable-postproc --disable-swscale \
         --enable-avcodec --enable-avformat --enable-avutil --enable-swresample \
         --enable-decoder=aac --enable-decoder=alac --enable-parser=aac \
         --enable-demuxer=aac --enable-demuxer=mov --enable-protocol=file \
