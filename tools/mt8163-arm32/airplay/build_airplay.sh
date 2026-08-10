@@ -128,11 +128,16 @@ if work in config.read_text():
     raise SystemExit("ERROR: FFmpeg configuration still contains its build root")
 PY
     make -j"$JOBS"
-    # FFmpeg's top-level `install` target also inherits the doc/examples
-    # install rule even with --disable-doc.  The AirPlay payload needs only the
-    # static libraries and headers; avoid installing/building documentation
-    # examples, which can fail on the cross runner.
-    make DESTDIR="$SYSROOT" install-libs install-headers
+    # Install only the four libraries enabled above.  FFmpeg's aggregate
+    # install-libs target expands across disabled/partially generated library
+    # targets on the persistent self-hosted runner and can fail in unrelated
+    # install-lib*-static rules.
+    for library in avcodec avformat avutil swresample; do
+        make DESTDIR="$SYSROOT" \
+            "install-lib${library}-static" \
+            "install-lib${library}-headers" \
+            "install-lib${library}-pkgconfig"
+    done
     popd >/dev/null
 }
 
