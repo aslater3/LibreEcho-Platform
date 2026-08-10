@@ -97,6 +97,7 @@ make -C "$src/utils" -j"${LIBREECHO_BUILD_JOBS:-2}" \
   LDFLAGS='-static -no-pie -Wl,--build-id=none' \
   tinyplay tinycap tinymix >/dev/null
 
+allowed_musl_provenance='/home/buildozer/aports/main/musl/src/musl-1.2.5'
 for name in tinyplay tinycap tinymix; do
   install -m 0755 "$src/utils/$name" "$OUTPUT/$name"
   readelf_output="$(readelf -h -l -d "$OUTPUT/$name")"
@@ -104,7 +105,12 @@ for name in tinyplay tinycap tinymix; do
   grep -Eq 'Machine:[[:space:]]+ARM' <<<"$readelf_output"
   ! grep -q 'Requesting program interpreter' <<<"$readelf_output"
   ! grep -q 'NEEDED' <<<"$readelf_output"
-  if strings "$OUTPUT/$name" | grep -Eq '/home/|libreecho-tinyalsa-build'; then
+  forbidden_paths="$(
+    strings "$OUTPUT/$name" |
+      grep -E '/home/|libreecho-tinyalsa-build' |
+      grep -Fvx "$allowed_musl_provenance" || true
+  )"
+  if [[ -n "$forbidden_paths" ]]; then
     echo "ERROR: $name contains a private or volatile build path" >&2
     exit 1
   fi
