@@ -792,6 +792,7 @@ class SourceTests(unittest.TestCase):
                 "image_profile": "ota",
                 "service_profile": "production",
                 "feature_policy": "redistributable",
+                "update_channel": "dev",
                 "output": {
                     "sha256": hashlib.sha256(boot_bytes).hexdigest(),
                     "size": len(boot_bytes),
@@ -804,7 +805,7 @@ class SourceTests(unittest.TestCase):
                 "--version", "test-v1",
                 "--signing-key", str(private), "--public-key", str(public),
                 "--service-profile", "production", "--feature-policy",
-                "redistributable", "--output", str(output),
+                "redistributable", "--update-channel", "dev", "--output", str(output),
             ], check=True, capture_output=True, text=True)
             with tarfile.open(output, "r:") as archive:
                 manifest = archive.extractfile("manifest").read().decode()
@@ -827,6 +828,7 @@ class SourceTests(unittest.TestCase):
                 "image_profile": "ota",
                 "service_profile": "production",
                 "feature_policy": "community-noncommercial",
+                "update_channel": "dev",
                 "output": {
                     "sha256": hashlib.sha256(boot_bytes).hexdigest(),
                     "size": len(boot_bytes),
@@ -839,7 +841,7 @@ class SourceTests(unittest.TestCase):
                 "--version", "test-v1",
                 "--signing-key", str(private), "--public-key", str(public),
                 "--service-profile", "production", "--feature-policy",
-                "community-noncommercial", "--output", str(output),
+                "community-noncommercial", "--update-channel", "dev", "--output", str(output),
             ], check=True, capture_output=True, text=True)
             with tarfile.open(output, "r:") as archive:
                 manifest = archive.extractfile("manifest").read().decode()
@@ -862,6 +864,7 @@ class SourceTests(unittest.TestCase):
                 "image_profile": "ota",
                 "service_profile": "diagnostic",
                 "feature_policy": "exclude",
+                "update_channel": "dev",
                 "output": {
                     "sha256": hashlib.sha256(boot_bytes).hexdigest(),
                     "size": len(boot_bytes),
@@ -872,7 +875,7 @@ class SourceTests(unittest.TestCase):
                 "--boot-image", str(boot), "--build-manifest", str(build_manifest),
                 "--version", "test-v1", "--signing-key", str(private),
                 "--public-key", str(public), "--service-profile", "production",
-                "--feature-policy", "exclude", "--output", str(root / "update.ota.tar"),
+                "--feature-policy", "exclude", "--update-channel", "dev", "--output", str(root / "update.ota.tar"),
             ], capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("feature exclusion requires the diagnostic service profile", result.stderr)
@@ -894,6 +897,7 @@ class SourceTests(unittest.TestCase):
                 "image_profile": "ota",
                 "service_profile": "production",
                 "feature_policy": "preserve",
+                "update_channel": "dev",
                 "output": {
                     "sha256": hashlib.sha256(boot_bytes).hexdigest(),
                     "size": len(boot_bytes),
@@ -904,7 +908,7 @@ class SourceTests(unittest.TestCase):
                 "--boot-image", str(boot), "--build-manifest", str(build_manifest),
                 "--version", "test-v1", "--signing-key", str(private),
                 "--public-key", str(public), "--service-profile", "production",
-                "--feature-policy", "redistributable",
+                "--feature-policy", "redistributable", "--update-channel", "dev",
                 "--output", str(root / "update.ota.tar"),
             ], capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
@@ -1726,10 +1730,12 @@ class PolicyTests(unittest.TestCase):
     def test_ota_manifest_accepts_and_validates_service_profile(self) -> None:
         updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
         self.assertIn(
-            "boot_sha256 feature_policy image_profile service_profile'",
+            "boot_sha256 feature_policy image_profile service_profile update_channel'",
             updater,
         )
         self.assertIn("diagnostic|production", updater)
+        self.assertIn("update_channel", updater)
+        self.assertIn("dev|stable", updater)
         self.assertIn("die manifest_service_profile", updater)
 
     def test_host_ota_path_is_explicit_and_uses_guarded_updater(self) -> None:
@@ -1872,12 +1878,15 @@ class PolicyTests(unittest.TestCase):
     def test_ota_source_uses_product_release_repository(self) -> None:
         expected = (
             "https://github.com/aslater3/LibreEcho/releases/latest/download/"
-            "libreecho-radar-puffin-stable.ota.tar"
+            "libreecho-radar-puffin-dev.ota.tar"
         )
         source = (TOOLS_DIR / "initramfs/ota-source.conf").read_text()
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
         self.assertIn(expected, source)
-        self.assertIn(expected, fetcher)
+        self.assertIn(
+            'expected_url="https://github.com/aslater3/LibreEcho/releases/latest/download/libreecho-radar-puffin-$channel.ota.tar"',
+            fetcher,
+        )
         self.assertNotIn("LibreEcho-Platform/releases", source + fetcher)
 
     def test_schema2_disabled_record_is_exact(self) -> None:

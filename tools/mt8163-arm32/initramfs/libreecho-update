@@ -85,7 +85,7 @@ manifest_value()
 
 verify_manifest()
 {
-    expected_keys='format manifest_version board soc architecture version boot_filename boot_size boot_sha256 feature_policy image_profile service_profile'
+    expected_keys='format manifest_version board soc architecture version boot_filename boot_size boot_sha256 feature_policy image_profile service_profile update_channel'
     seen=
     while IFS='=' read -r key value; do
         [ -n "$key" ] && [ -n "$value" ] || die manifest_syntax
@@ -131,6 +131,11 @@ verify_manifest()
     case "$SERVICE_PROFILE" in
         diagnostic|production) ;;
         *) die manifest_service_profile ;;
+    esac
+    UPDATE_CHANNEL=$(manifest_value update_channel)
+    case "$UPDATE_CHANNEL" in
+        dev|stable) ;;
+        *) die manifest_update_channel ;;
     esac
     if [ "$FEATURE_POLICY" = exclude ] && [ "$SERVICE_PROFILE" != diagnostic ]; then
         die manifest_excluded_features_require_diagnostic_profile
