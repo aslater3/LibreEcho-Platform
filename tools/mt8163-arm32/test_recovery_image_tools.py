@@ -668,6 +668,13 @@ class SourceTests(unittest.TestCase):
         ).read_text()
         self.assertIn("unset LD_LIBRARY_PATH", builder)
 
+    def test_busybox_builder_allows_only_runtime_home_template(self) -> None:
+        builder = (
+            TOOLS_DIR / "busybox" / "build_busybox.sh"
+        ).read_text()
+        self.assertIn("grep -E '/home/|libreecho-busybox-build'", builder)
+        self.assertIn("grep -Fvx '/home/%s'", builder)
+
     def test_wpa_builder_sanitizes_host_environment_before_extraction(self) -> None:
         builder = (
             TOOLS_DIR / "wpa-supplicant" / "build_wpa_supplicant.sh"
