@@ -1172,12 +1172,19 @@ class SourceTests(unittest.TestCase):
             airplay_builder,
         )
         self.assertIn(
-            'make DESTDIR="$SYSROOT" install-libs install-headers',
+            '"install-lib${library}-static"',
             airplay_builder,
         )
-        self.assertNotIn('make DESTDIR="$SYSROOT" install\n', airplay_builder)
         self.assertIn(
-            'FFmpeg\'s top-level `install` target also inherits the doc/examples',
+            '"install-lib${library}-headers"',
+            airplay_builder,
+        )
+        self.assertIn(
+            '"install-lib${library}-pkgconfig"',
+            airplay_builder,
+        )
+        self.assertNotIn(
+            'make DESTDIR="$SYSROOT" install-libs install-headers',
             airplay_builder,
         )
         self.assertIn(
