@@ -1168,6 +1168,10 @@ class SourceTests(unittest.TestCase):
         )
         self.assertIn('"$ffmpeg_source/config.h" "$work"', airplay_builder)
         self.assertIn(
+            "--disable-avdevice --disable-avfilter --disable-postproc --disable-swscale",
+            airplay_builder,
+        )
+        self.assertIn(
             'make DESTDIR="$SYSROOT" install-libs install-headers',
             airplay_builder,
         )
