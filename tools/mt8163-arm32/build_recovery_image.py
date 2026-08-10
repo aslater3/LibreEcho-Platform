@@ -490,7 +490,7 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
 
 def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
                   image_profile: str, service_profile: str, feature_policy: str,
-                  manifest: dict[str, object]) -> None:
+                  update_channel: str, manifest: dict[str, object]) -> None:
     sources = (
         ("bootctl", bootctl, "usr/local/sbin/libreecho-bootctl",
          "/lib/ld-musl-armhf.so.1", ("libc.musl-armv7.so.1",), True),
@@ -532,9 +532,25 @@ def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
     feature_policy_target = stage / "etc/libreecho/feature-policy"
     feature_policy_target.write_text(feature_policy + "\n")
     feature_policy_target.chmod(0o644)
+    update_channel_target = stage / "etc/libreecho/update-channel"
+    update_channel_target.write_text(update_channel + "\n")
+    update_channel_target.chmod(0o644)
+    ota_source = stage / "etc/libreecho/ota-source.conf"
+    if ota_source.is_file() and not ota_source.is_symlink():
+        source_text = ota_source.read_text()
+        source_text = re.sub(
+            r"^channel=.*$", f"channel={update_channel}", source_text,
+            count=1, flags=re.MULTILINE,
+        )
+        source_text = re.sub(
+            r"libreecho-radar-puffin-(?:dev|stable)\\.ota\\.tar",
+            f"libreecho-radar-puffin-{update_channel}.ota.tar", source_text,
+        )
+        ota_source.write_text(source_text)
     manifest["image_profile"] = image_profile
     manifest["service_profile"] = service_profile
     manifest["feature_policy"] = feature_policy
+    manifest["update_channel"] = update_channel
     manifest["ota"] = {
         "enabled": True,
         "format": "libreecho-ota-v1",
@@ -1780,6 +1796,8 @@ def main() -> None:
         "--feature-policy",
         choices=("exclude", "preserve", "redistributable", "community-noncommercial"),
                         default="preserve")
+    parser.add_argument("--update-channel", choices=("dev", "stable"),
+                        required=True)
     parser.add_argument("--bootctl", type=Path, required=True)
     parser.add_argument("--update-verifier", type=Path, required=True)
     parser.add_argument("--ota-public-key", type=Path, required=True)
@@ -2195,7 +2213,7 @@ def main() -> None:
         add_ota_tools(
             stage, args.bootctl.resolve(), args.update_verifier.resolve(),
             args.ota_public_key.resolve(), args.image_profile,
-            args.service_profile, args.feature_policy, manifest,
+            args.service_profile, args.feature_policy, args.update_channel, manifest,
         )
         if args.audio_probe is not None:
             add_audio_probe(stage, args.audio_probe.resolve(), manifest)

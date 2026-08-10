@@ -969,6 +969,7 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                        expected_image_profile: str,
                        expected_service_profile: str,
                        expected_feature_policy: str,
+                       expected_update_channel: str,
                        expected_busybox_sha256: str,
                        expected_loader_sha256: str,
                        expected_bootctl_sha256: str,
@@ -1015,6 +1016,8 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         fail("service profile manifest mismatch")
     if manifest.get("feature_policy") != expected_feature_policy:
         fail("feature policy manifest mismatch")
+    if manifest.get("update_channel") != expected_update_channel:
+        fail("update channel manifest mismatch")
     require_member(
         entries, "etc/libreecho/image-profile",
         sha256((expected_image_profile + "\n").encode()), 0o644,
@@ -1026,6 +1029,10 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     require_member(
         entries, "etc/libreecho/feature-policy",
         sha256((expected_feature_policy + "\n").encode()), 0o644,
+    )
+    require_member(
+        entries, "etc/libreecho/update-channel",
+        sha256((expected_update_channel + "\n").encode()), 0o644,
     )
     ota = manifest.get("ota")
     if not isinstance(ota, dict) or ota.get("format") != "libreecho-ota-v1":
@@ -1804,11 +1811,12 @@ def main() -> None:
     parser.add_argument("--expected-image-profile", choices=("development", "ota"), required=True)
     parser.add_argument("--expected-service-profile", choices=("diagnostic", "production"),
                         required=True)
-    parser.add_argument(
-        "--expected-feature-policy",
+    parser.add_argument("--expected-feature-policy",
         choices=("exclude", "preserve", "redistributable", "community-noncommercial"),
         required=True,
     )
+    parser.add_argument("--expected-update-channel", choices=("dev", "stable"),
+                        required=True)
     parser.add_argument("--expected-busybox-sha256", required=True)
     parser.add_argument("--expected-musl-loader-sha256", required=True)
     parser.add_argument("--expected-bootctl-sha256", required=True)

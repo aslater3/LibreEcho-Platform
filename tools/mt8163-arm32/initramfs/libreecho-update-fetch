@@ -5,9 +5,10 @@ BB=/bin/busybox
 UPDATE=/usr/local/sbin/libreecho-update
 CONFIG=/etc/libreecho/ota-source.conf
 PROFILE=/etc/libreecho/image-profile
+CHANNEL_FILE=/etc/libreecho/update-channel
 ROOT=/data/libreecho/update
 INCOMING=$ROOT/incoming
-PACKAGE=$INCOMING/github-stable.ota.tar
+PACKAGE=$INCOMING/github-update.ota.tar
 PART=$PACKAGE.part
 LOCK=$ROOT/fetch.lock
 CHECK_STATUS=$ROOT/check-status
@@ -42,7 +43,8 @@ check_status_write()
             ;;
     esac
     channel=$(config_value channel)
-    [ -n "$channel" ] || channel=stable
+    [ "$channel" = dev ] || [ "$channel" = stable ] || channel=$($BB cat "$CHANNEL_FILE" 2>/dev/null)
+    [ "$channel" = dev ] || [ "$channel" = stable ] || channel=dev
     {
         echo schema=1
         echo source=github-releases
@@ -110,9 +112,13 @@ config_value()
 validate_source()
 {
     [ "$(config_value schema)" = 1 ] || die source_schema
+    channel=$(config_value channel)
+    expected_channel=$($BB cat "$CHANNEL_FILE" 2>/dev/null)
+    [ "$channel" = dev ] || [ "$channel" = stable ] || die source_channel
+    [ "$channel" = "$expected_channel" ] || die source_channel_mismatch
     url=$(config_value url)
-    [ "$url" = "https://github.com/aslater3/LibreEcho/releases/latest/download/libreecho-radar-puffin-stable.ota.tar" ] ||
-        die source_url
+    expected_url="https://github.com/aslater3/LibreEcho/releases/latest/download/libreecho-radar-puffin-$channel.ota.tar"
+    [ "$url" = "$expected_url" ] || die source_url
 }
 
 manifest_payload_value()

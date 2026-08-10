@@ -47,6 +47,8 @@ def main() -> None:
                         choices=("exclude", "preserve", "redistributable",
                                  "community-noncommercial"),
                         default="preserve")
+    parser.add_argument("--update-channel", choices=("dev", "stable"),
+                        required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -85,6 +87,8 @@ def main() -> None:
         raise SystemExit("ERROR: service profile does not match build manifest")
     if build_manifest.get("feature_policy") != args.feature_policy:
         raise SystemExit("ERROR: feature policy does not match build manifest")
+    if build_manifest.get("update_channel") != args.update_channel:
+        raise SystemExit("ERROR: update channel does not match build manifest")
 
     manifest = (
         "format=libreecho-ota-v1\n"
@@ -99,6 +103,7 @@ def main() -> None:
         f"feature_policy={args.feature_policy}\n"
         "image_profile=ota\n"
         f"service_profile={args.service_profile}\n"
+        f"update_channel={args.update_channel}\n"
     ).encode("ascii")
     signing_key = read_signing_key(args.signing_key)
     public_key = args.public_key.read_text(encoding="ascii").strip()
