@@ -543,7 +543,7 @@ def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
             count=1, flags=re.MULTILINE,
         )
         source_text = re.sub(
-            r"libreecho-radar-puffin-(?:dev|stable)\\.ota\\.tar",
+            r"libreecho-radar-puffin-(?:dev|stable)\.ota\.tar",
             f"libreecho-radar-puffin-{update_channel}.ota.tar", source_text,
         )
         ota_source.write_text(source_text)

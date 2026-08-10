@@ -1736,6 +1736,10 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("diagnostic|production", updater)
         self.assertIn("update_channel", updater)
         self.assertIn("dev|stable", updater)
+        self.assertIn("manifest_update_channel_mismatch", updater)
+        self.assertIn("CHANNEL_FILE=/etc/libreecho/update-channel", updater)
+        verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        self.assertIn("args.expected_update_channel, args.expected_busybox_sha256", verifier)
         self.assertIn("die manifest_service_profile", updater)
 
     def test_host_ota_path_is_explicit_and_uses_guarded_updater(self) -> None:
@@ -1881,6 +1885,8 @@ class PolicyTests(unittest.TestCase):
             "libreecho-radar-puffin-dev.ota.tar"
         )
         source = (TOOLS_DIR / "initramfs/ota-source.conf").read_text()
+        builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        self.assertIn('r"libreecho-radar-puffin-(?:dev|stable)\\.ota\\.tar"', builder)
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
         self.assertIn(expected, source)
         self.assertIn(

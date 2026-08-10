@@ -11,6 +11,7 @@ LOCK=$UPDATE_ROOT/install.lock
 VERIFY=/usr/local/libexec/libreecho-update-verify
 BOOTCTL=/usr/local/sbin/libreecho-bootctl
 PUBLIC_KEY=/etc/libreecho/ota-public-key.hex
+CHANNEL_FILE=/etc/libreecho/update-channel
 BOOT_SIZE=16777216
 BOOT_SECTORS=32768
 
@@ -137,6 +138,11 @@ verify_manifest()
         dev|stable) ;;
         *) die manifest_update_channel ;;
     esac
+    device_channel=$($BB cat "$CHANNEL_FILE" 2>/dev/null)
+    [ "$device_channel" = dev ] || [ "$device_channel" = stable ] ||
+        die device_update_channel
+    [ "$UPDATE_CHANNEL" = "$device_channel" ] ||
+        die manifest_update_channel_mismatch
     if [ "$FEATURE_POLICY" = exclude ] && [ "$SERVICE_PROFILE" != diagnostic ]; then
         die manifest_excluded_features_require_diagnostic_profile
     fi

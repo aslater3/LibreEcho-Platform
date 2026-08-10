@@ -1973,7 +1973,7 @@ def main() -> None:
     connectivity_enabled = validate_initramfs(
         ramdisk, manifest, schema_version, args.expected_image_profile,
         args.expected_service_profile, args.expected_feature_policy,
-        args.expected_busybox_sha256, args.expected_musl_loader_sha256,
+        args.expected_update_channel, args.expected_busybox_sha256, args.expected_musl_loader_sha256,
         args.expected_bootctl_sha256, args.expected_update_verifier_sha256,
         args.expected_ota_public_key_sha256, args.expected_adbd_sha256,
         args.expected_audio_probe_sha256,
