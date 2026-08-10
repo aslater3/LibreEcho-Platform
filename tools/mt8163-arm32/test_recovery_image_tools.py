@@ -1168,6 +1168,15 @@ class SourceTests(unittest.TestCase):
         )
         self.assertIn('"$ffmpeg_source/config.h" "$work"', airplay_builder)
         self.assertIn(
+            'make DESTDIR="$SYSROOT" install-libs install-headers',
+            airplay_builder,
+        )
+        self.assertNotIn('make DESTDIR="$SYSROOT" install\n', airplay_builder)
+        self.assertIn(
+            'FFmpeg\'s top-level `install` target also inherits the doc/examples',
+            airplay_builder,
+        )
+        self.assertIn(
             'before.replace(work, "/usr/src/libreecho-airplay")',
             airplay_builder,
         )

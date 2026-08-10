@@ -127,7 +127,11 @@ if work in config.read_text():
     raise SystemExit("ERROR: FFmpeg configuration still contains its build root")
 PY
     make -j"$JOBS"
-    make DESTDIR="$SYSROOT" install
+    # FFmpeg's top-level `install` target also inherits the doc/examples
+    # install rule even with --disable-doc.  The AirPlay payload needs only the
+    # static libraries and headers; avoid installing/building documentation
+    # examples, which can fail on the cross runner.
+    make DESTDIR="$SYSROOT" install-libs install-headers
     popd >/dev/null
 }
 
