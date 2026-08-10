@@ -81,7 +81,12 @@ make -C "$src" -j"${LIBREECHO_BUILD_JOBS:-2}" \
 
 binary="$OUTPUT/busybox"
 install -m 0755 "$src/busybox" "$binary"
-if strings "$binary" | grep -Eq '/home/|libreecho-busybox-build'; then
+forbidden_paths="$(
+  strings "$binary" |
+    grep -E '/home/|libreecho-busybox-build' |
+    grep -Fvx '/home/%s' || true
+)"
+if [[ -n "$forbidden_paths" ]]; then
   printf 'ERROR: BusyBox contains a private or volatile build path\n' >&2
   exit 1
 fi
