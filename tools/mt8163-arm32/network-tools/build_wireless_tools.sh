@@ -123,7 +123,16 @@ grep -Eq 'Flags:.*0x(05000400|5000400)' <<< "$readelf_output"
 ! grep -q 'Requesting program interpreter' <<< "$readelf_output"
 ! grep -q 'NEEDED' <<< "$readelf_output"
 ! grep -q 'There is a dynamic section' <<< "$readelf_output"
-if strings "$OUTPUT/iwconfig" | grep -Eq '/home/|libreecho-wireless-tools-build'; then
+allowed_musl_provenance='/home/buildozer/aports/main/musl/src/musl-1.2.5'
+provenance_paths="$(
+  strings "$OUTPUT/iwconfig" |
+    grep -F -e '/home/' -e 'libreecho-wireless-tools-build' || true
+)"
+forbidden_paths="$(
+  printf '%s\n' "$provenance_paths" |
+    grep -Fvx "$allowed_musl_provenance" || true
+)"
+if [[ -n "$forbidden_paths" ]]; then
   printf 'ERROR: iwconfig contains a private or volatile build path\n' >&2
   exit 1
 fi
