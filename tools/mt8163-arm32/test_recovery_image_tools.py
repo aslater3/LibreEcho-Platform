@@ -641,6 +641,18 @@ class SourceTests(unittest.TestCase):
             self.assertIn(tool, audio_builder)
         self.assertIn("tinyalsa-source.json", audio_builder)
         self.assertIn("--fuzz=0", audio_builder)
+        self.assertIn(
+            "/home/buildozer/aports/main/musl/src/musl-1.2.5",
+            audio_builder,
+        )
+        self.assertIn(
+            "grep -E '/home/|libreecho-tinyalsa-build'",
+            audio_builder,
+        )
+        self.assertIn(
+            "grep -Fvx \"$allowed_musl_provenance\"",
+            audio_builder,
+        )
         self.assertFalse(any((audio_tools / tool).exists() for tool in ("tinyplay", "tinycap", "tinymix")))
 
         pipeline = pipeline_text("build.sh")
