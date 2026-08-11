@@ -1194,6 +1194,14 @@ class SourceTests(unittest.TestCase):
         self.assertIn('cp -a -- "$SYSROOT" "$work_sysroot"', airplay_builder)
         self.assertIn('chmod -R u+w -- "$work_sysroot"', airplay_builder)
         self.assertIn('SYSROOT="$work_sysroot"', airplay_builder)
+        # A symlinked sysroot argument must be rejected: cp -a would preserve
+        # the link and the recursive chmod would make the pinned tree writable.
+        self.assertIn(
+            '[[ -d "$SYSROOT" && ! -L "$SYSROOT" ]]', airplay_builder
+        )
+        self.assertIn(
+            '[[ -d "$work_sysroot" && ! -L "$work_sysroot" ]]', airplay_builder
+        )
         self.assertIn(
             'before.replace(work, "/usr/src/libreecho-airplay")',
             airplay_builder,

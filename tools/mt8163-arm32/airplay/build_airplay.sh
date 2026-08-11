@@ -25,7 +25,7 @@ RELINK_OUTPUT=${LIBREECHO_AIRPLAY_RELINK_OUTPUT:-}
 for archive in "$NQPTP_ARCHIVE" "$SHAIRPORT_ARCHIVE" "$FFMPEG_ARCHIVE" "$TINYALSA_ARCHIVE"; do
     [[ -f "$archive" ]] || { echo "ERROR: AirPlay source archive is missing: $archive" >&2; exit 1; }
 done
-[[ -d "$SYSROOT" ]] || { echo "ERROR: ARMHF sysroot is missing: $SYSROOT" >&2; exit 1; }
+[[ -d "$SYSROOT" && ! -L "$SYSROOT" ]] || { echo "ERROR: ARMHF sysroot is missing or not a real directory: $SYSROOT" >&2; exit 1; }
 [[ ! -e "$OUTPUT" ]] || { echo "ERROR: refusing to overwrite AirPlay output: $OUTPUT" >&2; exit 1; }
 command -v autoreconf >/dev/null 2>&1 || { echo "ERROR: autoreconf is required" >&2; exit 1; }
 command -v make >/dev/null 2>&1 || { echo "ERROR: make is required" >&2; exit 1; }
@@ -79,10 +79,16 @@ trap 'rm -rf "$work"' EXIT
 # unprivileged self-hosted CI user.  Validate above against the pinned input,
 # then build and install exclusively against the copy.  `cp -a` preserves the
 # read-only mode of the pinned tree, so explicitly restore owner write
-# permission on the copy; without that, FFmpeg's install still fails.
+# permission on the copy; without that, FFmpeg's install still fails.  A
+# symlinked sysroot argument is rejected above: `cp -a` would preserve the
+# link and the recursive chmod below would make the pinned tree writable.
 work_sysroot="$work/sysroot"
 cp -a -- "$SYSROOT" "$work_sysroot" || {
     echo "ERROR: unable to stage a writable AirPlay sysroot copy from: $SYSROOT" >&2
+    exit 1
+}
+[[ -d "$work_sysroot" && ! -L "$work_sysroot" ]] || {
+    echo "ERROR: staged sysroot copy is not a real directory" >&2
     exit 1
 }
 chmod -R u+w -- "$work_sysroot"
