@@ -76,16 +76,24 @@ def assemble(
     for kind, entries in (("source", source_files), ("relink-object", relink_files)):
         for path, raw_logical in entries:
             logical = _logical_path(raw_logical)
+            path = _regular(path)
+            digest = sha256(path)
+            if kind == "relink-object":
+                original = PurePosixPath(logical)
+                logical = (
+                    f"{original.parts[0]}/objects/{digest}/{original.name}"
+                )
             if logical in seen:
+                if kind == "relink-object":
+                    continue
                 raise ValueError(f"duplicate logical path: {logical}")
             seen.add(logical)
-            path = _regular(path)
             inputs.append((logical, path, kind))
             members.append(
                 {
                     "kind": kind,
                     "path": logical,
-                    "sha256": sha256(path),
+                    "sha256": digest,
                     "size": path.stat().st_size,
                 }
             )
