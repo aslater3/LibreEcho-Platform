@@ -73,6 +73,20 @@ command -v readelf >/dev/null 2>&1 || { echo "ERROR: readelf is required" >&2; e
 
 work=$(mktemp -d /tmp/libreecho-airplay-build.XXXXXX)
 trap 'rm -rf "$work"' EXIT
+# Stage a writable, build-local copy of the pinned dependency sysroot.  The
+# FFmpeg static-library install writes DESTDIR into that sysroot, but the
+# pinned dependency tree must remain immutable and is read-only for the
+# unprivileged self-hosted CI user.  Validate above against the pinned input,
+# then build and install exclusively against the copy.  `cp -a` preserves the
+# read-only mode of the pinned tree, so explicitly restore owner write
+# permission on the copy; without that, FFmpeg's install still fails.
+work_sysroot="$work/sysroot"
+cp -a -- "$SYSROOT" "$work_sysroot" || {
+    echo "ERROR: unable to stage a writable AirPlay sysroot copy from: $SYSROOT" >&2
+    exit 1
+}
+chmod -R u+w -- "$work_sysroot"
+SYSROOT="$work_sysroot"
 tar -xf "$NQPTP_ARCHIVE" -C "$work"
 tar -xf "$SHAIRPORT_ARCHIVE" -C "$work"
 tar -xf "$FFMPEG_ARCHIVE" -C "$work"

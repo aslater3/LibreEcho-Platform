@@ -1187,6 +1187,13 @@ class SourceTests(unittest.TestCase):
             'make DESTDIR="$SYSROOT" install-libs install-headers',
             airplay_builder,
         )
+        # The pinned dependency sysroot is immutable on the runner.  FFmpeg's
+        # static install writes DESTDIR into the sysroot, so the builder must
+        # stage a writable build-local copy and never write into the pinned input.
+        self.assertIn('work_sysroot="$work/sysroot"', airplay_builder)
+        self.assertIn('cp -a -- "$SYSROOT" "$work_sysroot"', airplay_builder)
+        self.assertIn('chmod -R u+w -- "$work_sysroot"', airplay_builder)
+        self.assertIn('SYSROOT="$work_sysroot"', airplay_builder)
         self.assertIn(
             'before.replace(work, "/usr/src/libreecho-airplay")',
             airplay_builder,
