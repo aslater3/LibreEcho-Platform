@@ -72,20 +72,30 @@ def assemble(
 
     members: list[dict[str, object]] = []
     inputs: list[tuple[str, Path, str]] = []
-    seen: set[str] = set()
+    seen: dict[str, tuple[str, str, int]] = {}
     for kind, entries in (("source", source_files), ("relink-object", relink_files)):
         for path, raw_logical in entries:
             logical = _logical_path(raw_logical)
-            if logical in seen:
-                raise ValueError(f"duplicate logical path: {logical}")
-            seen.add(logical)
             path = _regular(path)
+            digest = sha256(path)
+            if kind == "relink-object":
+                original = PurePosixPath(logical)
+                suffix = original.suffix
+                if suffix not in {".a", ".o"}:
+                    raise ValueError(f"unsupported relink-object suffix: {logical}")
+                logical = f"{original.parts[0]}/objects/{digest}{suffix}"
+            identity = (kind, digest, path.stat().st_size)
+            if logical in seen:
+                if kind == "relink-object" and seen[logical] == identity:
+                    continue
+                raise ValueError(f"duplicate logical path: {logical}")
+            seen[logical] = identity
             inputs.append((logical, path, kind))
             members.append(
                 {
                     "kind": kind,
                     "path": logical,
-                    "sha256": sha256(path),
+                    "sha256": digest,
                     "size": path.stat().st_size,
                 }
             )
@@ -160,9 +170,11 @@ def main() -> None:
     print(f"source_offer={args.output}")
     print(f"source_offer_sha256={sha256(args.output)}")
     print(f"source_offer_manifest={sidecar}")
+    manifest_members = manifest["members"]
+    assert isinstance(manifest_members, list)
     print(
         f"source_offer_member_count="
-        f"{len(args.source_file) + len(args.relink_file)}"
+        f"{len(manifest_members)}"
     )
 
 

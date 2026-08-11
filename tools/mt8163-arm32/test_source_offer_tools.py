@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import tarfile
 import tempfile
@@ -18,6 +19,70 @@ spec.loader.exec_module(module)
 
 
 class SourceOfferTests(unittest.TestCase):
+    def test_relink_names_are_content_addressed_and_host_independent(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            payload = b"same compiled object"
+            digest = hashlib.sha256(payload).hexdigest()
+            outputs = []
+            manifests = []
+            for host_path, output_name in (
+                ("home/andy/workspace/onnxruntime-src", "home.tar.gz"),
+                ("srv/runner/_work/onnxruntime-src", "runner.tar.gz"),
+            ):
+                object_file = root / host_path / "core" / "kernel.cc.o"
+                object_file.parent.mkdir(parents=True)
+                object_file.write_bytes(payload)
+                output = root / output_name
+                manifest = module.assemble(
+                    component="stt-payload",
+                    output=output,
+                    source_files=[],
+                    relink_files=[(
+                        object_file,
+                        f"onnxruntime-build/CMakeFiles/runtime.dir/{host_path}/core/kernel.cc.o",
+                    )],
+                    metadata={},
+                    source_date_epoch=1_700_000_000,
+                )
+                outputs.append(output)
+                manifests.append(manifest)
+
+            expected = f"onnxruntime-build/objects/{digest}.o"
+            self.assertEqual(module.sha256(outputs[0]), module.sha256(outputs[1]))
+            self.assertEqual(manifests[0], manifests[1])
+            self.assertEqual([item["path"] for item in manifests[0]["members"]], [expected])
+            self.assertNotIn("/home/", json.dumps(manifests[0]))
+            self.assertNotIn("/srv/", json.dumps(manifests[1]))
+
+    def test_distinct_relink_bytes_are_preserved_and_identical_bytes_deduplicated(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            first = root / "host-a" / "same.o"
+            duplicate = root / "host-b" / "renamed.o"
+            distinct = root / "host-c" / "same.o"
+            for path, payload in ((first, b"one"), (duplicate, b"one"), (distinct, b"two")):
+                path.parent.mkdir(parents=True)
+                path.write_bytes(payload)
+            manifest = module.assemble(
+                component="stt-payload",
+                output=root / "offer.tar.gz",
+                source_files=[],
+                relink_files=[
+                    (first, "runtime/CMakeFiles/a.dir/home/a/same.o"),
+                    (duplicate, "runtime/CMakeFiles/b.dir/srv/b/renamed.o"),
+                    (distinct, "runtime/CMakeFiles/c.dir/tmp/c/same.o"),
+                ],
+                metadata={},
+                source_date_epoch=0,
+            )
+            expected = {
+                f"runtime/objects/{hashlib.sha256(payload).hexdigest()}.o"
+                for payload in (b"one", b"two")
+            }
+            self.assertEqual({item["path"] for item in manifest["members"]}, expected)
+            self.assertEqual(len(manifest["members"]), 2)
+
     def test_archive_is_deterministic_and_manifest_covers_every_member(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -41,9 +106,13 @@ class SourceOfferTests(unittest.TestCase):
             self.assertEqual(module.sha256(first), module.sha256(second))
             self.assertEqual(manifest_a, manifest_b)
             self.assertEqual(manifest_a["component"], "tts-payload")
+            relink_path = (
+                "relink/objects/"
+                f"{hashlib.sha256(b'object').hexdigest()}.o"
+            )
             self.assertEqual(
                 [item["path"] for item in manifest_a["members"]],
-                ["relink/adapter.o", "sources/source.txt"],
+                [relink_path, "sources/source.txt"],
             )
             with tarfile.open(first, "r:gz") as archive:
                 names = archive.getnames()
@@ -53,7 +122,7 @@ class SourceOfferTests(unittest.TestCase):
                 embedded = json.loads(manifest_file.read())
             self.assertEqual(
                 names,
-                ["SOURCE-OFFER-MANIFEST.json", "relink/adapter.o", "sources/source.txt"],
+                ["SOURCE-OFFER-MANIFEST.json", relink_path, "sources/source.txt"],
             )
             self.assertEqual(embedded, manifest_a)
 
@@ -72,8 +141,8 @@ class SourceOfferTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "duplicate logical path"):
                 module.assemble(
                     component="bad", output=output,
-                    source_files=[(source, "same")],
-                    relink_files=[(source, "same")],
+                    source_files=[(source, "same"), (source, "same")],
+                    relink_files=[],
                     metadata={}, source_date_epoch=1,
                 )
 
