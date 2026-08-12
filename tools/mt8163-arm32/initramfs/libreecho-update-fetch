@@ -5,13 +5,16 @@ BB=/bin/busybox
 UPDATE=/usr/local/sbin/libreecho-update
 CONFIG=/etc/libreecho/ota-source.conf
 PROFILE=/etc/libreecho/image-profile
-CHANNEL_FILE=/etc/libreecho/update-channel
 ROOT=/data/libreecho/update
+CHANNEL_FILE=$ROOT/automatic-updates
+PACKAGED_CHANNEL_FILE=/etc/libreecho/update-channel
 INCOMING=$ROOT/incoming
 PACKAGE=$INCOMING/github-update.ota.tar
 PART=$PACKAGE.part
 LOCK=$ROOT/fetch.lock
 CHECK_STATUS=$ROOT/check-status
+PENDING=$ROOT/pending
+INSTALL_LOCK=$ROOT/install.lock
 AUTOMATIC=$ROOT/automatic-updates
 ASSISTANT_PAYLOAD=/data/libreecho/features/assistant/payload.squashfs
 ASSISTANT_MANIFEST=/data/libreecho/features/assistant/manifest.json
@@ -42,8 +45,8 @@ check_status_write()
             last_success=$now
             ;;
     esac
-    channel=$(config_value channel)
-    [ "$channel" = dev ] || [ "$channel" = stable ] || channel=$($BB cat "$CHANNEL_FILE" 2>/dev/null)
+    channel=$(channel_value)
+    [ "$channel" = dev ] || [ "$channel" = stable ] || channel=$(config_value channel)
     [ "$channel" = dev ] || [ "$channel" = stable ] || channel=dev
     {
         echo schema=1
@@ -76,9 +79,16 @@ set_automatic_updates()
     enabled=$1
     [ "$($BB cat "$PROFILE" 2>/dev/null)" = ota ] || die ota_profile_required
     $BB mkdir -p "$ROOT" || die update_directory_failed
+    fetch_lock
+    install_lock
     $BB chmod 0700 /data/libreecho "$ROOT" 2>/dev/null
+    channel=$(channel_value)
+    [ "$channel" = dev ] || [ "$channel" = stable ] ||
+        channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
+    [ "$channel" = dev ] || [ "$channel" = stable ] || die source_channel
     {
         echo schema=1
+        echo "channel=$channel"
         echo "enabled=$enabled"
     } > "$AUTOMATIC.tmp" &&
         $BB chmod 0600 "$AUTOMATIC.tmp" &&
@@ -104,6 +114,32 @@ require_environment()
     $BB chmod 0700 /data/libreecho "$ROOT" "$INCOMING" 2>/dev/null
 }
 
+channel_value()
+{
+    $BB sed -n 's/^channel=//p' "$CHANNEL_FILE" 2>/dev/null
+}
+
+write_channel()
+{
+    channel=$1
+    {
+        [ -r "$CHANNEL_FILE" ] && $BB sed '/^channel=/d' "$CHANNEL_FILE"
+        printf '%s\n' "channel=$channel"
+    } > "$CHANNEL_FILE.tmp" || die channel_write_failed
+    $BB chmod 0600 "$CHANNEL_FILE.tmp" &&
+        $BB mv "$CHANNEL_FILE.tmp" "$CHANNEL_FILE" || die channel_commit_failed
+}
+
+seed_channel()
+{
+    channel=$(channel_value)
+    [ "$channel" = dev ] || [ "$channel" = stable ] || {
+        channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
+        [ "$channel" = dev ] || [ "$channel" = stable ] || die source_channel
+        write_channel "$channel"
+    }
+}
+
 config_value()
 {
     $BB sed -n "s/^$1=//p" "$CONFIG"
@@ -112,13 +148,37 @@ config_value()
 validate_source()
 {
     [ "$(config_value schema)" = 1 ] || die source_schema
-    channel=$(config_value channel)
-    expected_channel=$($BB cat "$CHANNEL_FILE" 2>/dev/null)
-    [ "$channel" = dev ] || [ "$channel" = stable ] || die source_channel
-    [ "$channel" = "$expected_channel" ] || die source_channel_mismatch
-    url=$(config_value url)
+    expected_channel=$(channel_value)
+    [ "$expected_channel" = dev ] || [ "$expected_channel" = stable ] || die source_channel
+    channel=$expected_channel
     expected_url="https://github.com/aslater3/LibreEcho/releases/latest/download/libreecho-radar-puffin-$channel.ota.tar"
-    [ "$url" = "$expected_url" ] || die source_url
+    url=$expected_url
+}
+
+set_channel()
+{
+    channel=${1:-}
+    [ "$channel" = dev ] || [ "$channel" = stable ] || die source_channel
+    [ "$($BB cat "$PROFILE" 2>/dev/null)" = ota ] || die ota_profile_required
+    $BB grep -q ' /data ' /proc/mounts 2>/dev/null || die userdata_not_mounted
+    $BB mkdir -p "$ROOT" || die update_directory_failed
+    fetch_lock
+    install_lock
+    write_channel "$channel"
+    {
+        echo schema=1
+        echo "channel=$channel"
+        echo status=not-checked
+        echo source_reachable=unknown
+        echo latest_version=
+        echo last_check_epoch=0
+        echo last_success_epoch=0
+        echo error=
+    } > "$CHECK_STATUS.tmp" || die channel_status_write
+    $BB mv "$CHECK_STATUS.tmp" "$CHECK_STATUS" || die channel_status_commit
+    cleanup_locks
+    trap - EXIT
+    printf 'UPDATE_CHANNEL channel=%s\n' "$channel"
 }
 
 manifest_payload_value()
@@ -174,10 +234,44 @@ prepare_https_client()
         die https_client_missing
 }
 
+record_channel()
+{
+    record=$1
+    record_channel_value=$($BB sed -n 's/^update_channel=//p' "$record" 2>/dev/null)
+    [ "$record_channel_value" = dev ] || [ "$record_channel_value" = stable ] ||
+        record_channel_value=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
+    printf '%s\n' "$record_channel_value"
+}
+
+FETCH_LOCK_HELD=0
+INSTALL_LOCK_HELD=0
+
+cleanup_locks()
+{
+    [ "$FETCH_LOCK_HELD" -eq 1 ] && $BB rmdir "$LOCK" 2>/dev/null
+    [ "$INSTALL_LOCK_HELD" -eq 1 ] && $BB rmdir "$INSTALL_LOCK" 2>/dev/null
+}
+
 fetch_lock()
 {
     $BB mkdir "$LOCK" 2>/dev/null || die download_busy
-    trap '$BB rmdir "$LOCK" 2>/dev/null' EXIT
+    FETCH_LOCK_HELD=1
+    trap cleanup_locks EXIT
+}
+
+install_lock()
+{
+    [ "$INSTALL_LOCK_HELD" -eq 1 ] && return 0
+    $BB mkdir "$INSTALL_LOCK" 2>/dev/null || die update_busy
+    INSTALL_LOCK_HELD=1
+    trap cleanup_locks EXIT
+}
+
+install_unlock()
+{
+    [ "$INSTALL_LOCK_HELD" -eq 1 ] || return 0
+    $BB rmdir "$INSTALL_LOCK" 2>/dev/null || die update_lock_release
+    INSTALL_LOCK_HELD=0
 }
 
 download_and_inspect()
@@ -218,17 +312,22 @@ check_or_install()
 {
     action=$1
     require_environment
-    validate_source
     fetch_lock
+    install_lock
+    seed_channel
+    validate_source
+    install_unlock
     version=$(download_and_inspect) || return 1
     installed=$($BB sed -n 's/^version=//p' "$ROOT/installed" 2>/dev/null)
+    installed_channel=$(record_channel "$ROOT/installed")
     rolled_back=$($BB sed -n 's/^version=//p' "$ROOT/rolled-back" 2>/dev/null)
-    if [ "$version" = "$installed" ]; then
+    rolled_back_channel=$(record_channel "$ROOT/rolled-back")
+    if [ "$version" = "$installed" ] && [ "$channel" = "$installed_channel" ]; then
         check_status_write up-to-date "$version" "" true
         echo "UPDATE_CURRENT version=$version"
         return 0
     fi
-    if [ -n "$rolled_back" ] && [ "$version" = "$rolled_back" ]; then
+    if [ -n "$rolled_back" ] && [ "$version" = "$rolled_back" ] && [ "$channel" = "$rolled_back_channel" ]; then
         check_status_write update-held-after-rollback "$version" "" true
         echo "UPDATE_HELD version=$version"
         return 0
@@ -271,6 +370,14 @@ case "${1:-}" in
         [ "$#" -eq 1 ] || die usage
         check_or_install "$1"
         ;;
+    set-channel)
+        [ "$#" -eq 2 ] || die usage
+        set_channel "$2"
+        ;;
+    set-channel-dev|set-channel-stable)
+        [ "$#" -eq 1 ] || die usage
+        set_channel "${1#set-channel-}"
+        ;;
     watch)
         [ "$#" -eq 1 ] || die usage
         watch_updates
@@ -284,7 +391,7 @@ case "${1:-}" in
         set_automatic_updates 0
         ;;
     *)
-        echo "Usage: libreecho-update-fetch check | install | watch | enable-automatic | disable-automatic" >&2
+        echo "Usage: libreecho-update-fetch check | install | set-channel dev|stable | watch | enable-automatic | disable-automatic" >&2
         exit 2
         ;;
 esac

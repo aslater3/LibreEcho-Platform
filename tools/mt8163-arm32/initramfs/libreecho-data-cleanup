@@ -191,7 +191,7 @@ check_children "$DATA_ROOT/libreecho/config" \
 check_children "$DATA_ROOT/libreecho/secrets" openai-codex.json
 
 check_children "$DATA_ROOT/libreecho/update" \
-    incoming staging state pending installed rolled-back check-status \
+    channel incoming staging state pending installed rolled-back check-status \
     automatic-updates install.lock bootctl.confirm
 
 if [ -d "$DATA_ROOT/libreecho/features" ]; then

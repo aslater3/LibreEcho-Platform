@@ -11,7 +11,8 @@ LOCK=$UPDATE_ROOT/install.lock
 VERIFY=/usr/local/libexec/libreecho-update-verify
 BOOTCTL=/usr/local/sbin/libreecho-bootctl
 PUBLIC_KEY=/etc/libreecho/ota-public-key.hex
-CHANNEL_FILE=/etc/libreecho/update-channel
+CHANNEL_FILE=$UPDATE_ROOT/automatic-updates
+PACKAGED_CHANNEL_FILE=/etc/libreecho/update-channel
 BOOT_SIZE=16777216
 BOOT_SECTORS=32768
 
@@ -31,6 +32,32 @@ require_userdata()
         die userdata_identity_or_mount_failed
     $BB mkdir -p "$INCOMING" "$UPDATE_ROOT" || die update_directory_failed
     $BB chmod 0700 /data/libreecho "$UPDATE_ROOT" "$INCOMING" 2>/dev/null
+}
+
+channel_value()
+{
+    $BB sed -n 's/^channel=//p' "$CHANNEL_FILE" 2>/dev/null
+}
+
+write_channel()
+{
+    channel=$1
+    {
+        [ -r "$CHANNEL_FILE" ] && $BB sed '/^channel=/d' "$CHANNEL_FILE"
+        printf '%s\n' "channel=$channel"
+    } > "$CHANNEL_FILE.tmp" || die channel_write_failed
+    $BB chmod 0600 "$CHANNEL_FILE.tmp" &&
+        $BB mv "$CHANNEL_FILE.tmp" "$CHANNEL_FILE" || die channel_commit_failed
+}
+
+seed_channel()
+{
+    channel=$(channel_value)
+    [ "$channel" = dev ] || [ "$channel" = stable ] || {
+        channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
+        [ "$channel" = dev ] || [ "$channel" = stable ] || die packaged_update_channel
+        write_channel "$channel"
+    }
 }
 
 target_device_for_slot()
@@ -138,7 +165,7 @@ verify_manifest()
         dev|stable) ;;
         *) die manifest_update_channel ;;
     esac
-    device_channel=$($BB cat "$CHANNEL_FILE" 2>/dev/null)
+    device_channel=$(channel_value)
     [ "$device_channel" = dev ] || [ "$device_channel" = stable ] ||
         die device_update_channel
     [ "$UPDATE_CHANNEL" = "$device_channel" ] ||
@@ -239,6 +266,7 @@ install_package()
     package=$1
     require_userdata
     lock_take
+    seed_channel
     state_write verifying 5 package
     extract_and_verify "$package"
     state_write verified 20 "$version"
@@ -257,6 +285,7 @@ install_package()
         echo "version=$version"
         echo "slot=$target"
         echo "boot_sha256=$boot_sha"
+        echo "update_channel=$UPDATE_CHANNEL"
         echo "feature_policy=$FEATURE_POLICY"
     } > "$PENDING.tmp" || die pending_write
     $BB mv "$PENDING.tmp" "$PENDING" || die pending_commit
@@ -280,10 +309,29 @@ confirm_pending()
     slot=$($BB sed -n 's/^slot=//p' "$PENDING")
     version=$($BB sed -n 's/^version=//p' "$PENDING")
     expected=$($BB sed -n 's/^boot_sha256=//p' "$PENDING")
+    update_channel=$($BB sed -n 's/^update_channel=//p' "$PENDING")
+    if [ "$update_channel" != dev ] && [ "$update_channel" != stable ]; then
+        update_channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
+        [ "$update_channel" = dev ] || [ "$update_channel" = stable ] ||
+            update_channel=$(channel_value)
+        [ "$update_channel" = dev ] || [ "$update_channel" = stable ] ||
+            die pending_update_channel
+        printf '%s\n' "update_channel=$update_channel" >> "$PENDING"
+    fi
     target_device_for_slot "$slot"
     actual=$($BB dd if="$target_device" bs=4096 count=4096 2>/dev/null |
         $BB sha256sum | $BB awk '{print $1}')
     [ "$actual" = "$expected" ] || die pending_boot_hash
+    selected_channel=$(channel_value)
+    case "$selected_channel" in
+        dev|stable)
+            {
+                $BB sed '/^channel=/d' "$PENDING"
+                printf '%s\n' "channel=$selected_channel"
+            } > "$PENDING.tmp" || die pending_channel_preserve
+            $BB mv "$PENDING.tmp" "$PENDING" || die pending_channel_preserve
+            ;;
+    esac
     "$BOOTCTL" confirm "$slot" > "$UPDATE_ROOT/bootctl.confirm" ||
         die boot_control_confirm
     $BB mv "$PENDING" "$UPDATE_ROOT/installed"
