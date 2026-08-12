@@ -1779,7 +1779,11 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("update_channel", updater)
         self.assertIn("dev|stable", updater)
         self.assertIn("printf '%s\\n' \"update_channel=$update_channel\" >> \"$PENDING\"", updater)
-        self.assertIn("pending_update_channel", updater)
+        self.assertIn('update_channel=$update_channel', updater)
+        self.assertLess(
+            updater.index('update_channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)', updater.index('confirm_pending()')),
+            updater.index('update_channel=$($BB cat "$CHANNEL_FILE" 2>/dev/null)', updater.index('confirm_pending()')),
+        )
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
         self.assertIn("installed_channel", fetcher)
         self.assertIn("rolled_back_channel", fetcher)

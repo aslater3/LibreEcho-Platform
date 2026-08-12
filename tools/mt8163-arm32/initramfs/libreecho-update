@@ -298,9 +298,9 @@ confirm_pending()
     expected=$($BB sed -n 's/^boot_sha256=//p' "$PENDING")
     update_channel=$($BB sed -n 's/^update_channel=//p' "$PENDING")
     if [ "$update_channel" != dev ] && [ "$update_channel" != stable ]; then
-        update_channel=$($BB cat "$CHANNEL_FILE" 2>/dev/null)
+        update_channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
         [ "$update_channel" = dev ] || [ "$update_channel" = stable ] ||
-            update_channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
+            update_channel=$($BB cat "$CHANNEL_FILE" 2>/dev/null)
         [ "$update_channel" = dev ] || [ "$update_channel" = stable ] ||
             die pending_update_channel
         printf '%s\n' "update_channel=$update_channel" >> "$PENDING"
