@@ -14,6 +14,7 @@ PART=$PACKAGE.part
 LOCK=$ROOT/fetch.lock
 CHECK_STATUS=$ROOT/check-status
 PENDING=$ROOT/pending
+INSTALL_LOCK=$ROOT/install.lock
 AUTOMATIC=$ROOT/automatic-updates
 ASSISTANT_PAYLOAD=/data/libreecho/features/assistant/payload.squashfs
 ASSISTANT_MANIFEST=/data/libreecho/features/assistant/manifest.json
@@ -139,8 +140,21 @@ migrate_pending_channel()
         pending_channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
         [ "$pending_channel" = dev ] || [ "$pending_channel" = stable ] ||
             die pending_update_channel
-        printf '%s\n' "update_channel=$pending_channel" >> "$PENDING" ||
-            die pending_channel_migration
+        $BB mkdir "$INSTALL_LOCK" 2>/dev/null || die update_busy
+        trap '$BB rmdir "$INSTALL_LOCK" 2>/dev/null' EXIT
+        pending_channel=$($BB sed -n 's/^update_channel=//p' "$PENDING" 2>/dev/null)
+        if [ -z "$pending_channel" ]; then
+            pending_channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
+            [ "$pending_channel" = dev ] || [ "$pending_channel" = stable ] ||
+                die pending_update_channel
+            {
+                $BB cat "$PENDING"
+                printf '%s\n' "update_channel=$pending_channel"
+            } > "$PENDING.tmp" || die pending_channel_migration
+            $BB mv "$PENDING.tmp" "$PENDING" || die pending_channel_migration
+        fi
+        $BB rmdir "$INSTALL_LOCK" 2>/dev/null || die update_busy
+        trap - EXIT
     }
 }
 
@@ -149,6 +163,7 @@ set_channel()
     channel=${1:-}
     [ "$channel" = dev ] || [ "$channel" = stable ] || die source_channel
     [ "$($BB cat "$PROFILE" 2>/dev/null)" = ota ] || die ota_profile_required
+    $BB grep -q ' /data ' /proc/mounts 2>/dev/null || die userdata_not_mounted
     $BB mkdir -p "$ROOT" || die update_directory_failed
     migrate_pending_channel
     printf '%s\n' "$channel" > "$CHANNEL_FILE.tmp" || die channel_write_failed
