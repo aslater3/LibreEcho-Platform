@@ -13,6 +13,7 @@ PACKAGE=$INCOMING/github-update.ota.tar
 PART=$PACKAGE.part
 LOCK=$ROOT/fetch.lock
 CHECK_STATUS=$ROOT/check-status
+PENDING=$ROOT/pending
 AUTOMATIC=$ROOT/automatic-updates
 ASSISTANT_PAYLOAD=/data/libreecho/features/assistant/payload.squashfs
 ASSISTANT_MANIFEST=/data/libreecho/features/assistant/manifest.json
