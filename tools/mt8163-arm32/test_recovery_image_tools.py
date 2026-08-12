@@ -1963,7 +1963,8 @@ class PolicyTests(unittest.TestCase):
 
         self.assertIn("CHANNEL_FILE=$ROOT/installed", fetcher)
         self.assertIn("fetch_lock", fetcher[fetcher.index("set_channel()"):])
-        self.assertIn("status=not-checked", fetcher)
+        self.assertIn("trap '$BB rmdir \"$LOCK\" \"$INSTALL_LOCK\" 2>/dev/null' EXIT", fetcher)
+        self.assertIn("$BB rmdir \"$INSTALL_LOCK\" 2>/dev/null", fetcher)
         self.assertIn("channel_value()", fetcher)
         self.assertIn("write_channel()", fetcher)
         self.assertIn("seed_channel()", fetcher)
