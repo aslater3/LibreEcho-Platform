@@ -11,7 +11,7 @@ LOCK=$UPDATE_ROOT/install.lock
 VERIFY=/usr/local/libexec/libreecho-update-verify
 BOOTCTL=/usr/local/sbin/libreecho-bootctl
 PUBLIC_KEY=/etc/libreecho/ota-public-key.hex
-CHANNEL_FILE=/data/libreecho/update/channel
+CHANNEL_FILE=/data/libreecho/update/check-status
 PACKAGED_CHANNEL_FILE=/etc/libreecho/update-channel
 BOOT_SIZE=16777216
 BOOT_SECTORS=32768
@@ -35,17 +35,30 @@ require_userdata()
     seed_channel
 }
 
+channel_value()
+{
+    $BB sed -n 's/^channel=//p' "$CHANNEL_FILE" 2>/dev/null
+}
+
+write_channel()
+{
+    channel=$1
+    {
+        [ -r "$CHANNEL_FILE" ] && $BB sed '/^channel=/d' "$CHANNEL_FILE"
+        printf '%s\n' "channel=$channel"
+    } > "$CHANNEL_FILE.tmp" || die channel_write_failed
+    $BB chmod 0600 "$CHANNEL_FILE.tmp" &&
+        $BB mv "$CHANNEL_FILE.tmp" "$CHANNEL_FILE" || die channel_commit_failed
+}
+
 seed_channel()
 {
-    [ -e "$CHANNEL_FILE" ] && return 0
-    channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
-    case "$channel" in
-        dev|stable) ;;
-        *) die packaged_update_channel ;;
-    esac
-    printf '%s\n' "$channel" > "$CHANNEL_FILE.tmp" || die channel_seed_write
-    $BB chmod 0600 "$CHANNEL_FILE.tmp" || die channel_seed_mode
-    $BB mv "$CHANNEL_FILE.tmp" "$CHANNEL_FILE" || die channel_seed_commit
+    channel=$(channel_value)
+    [ "$channel" = dev ] || [ "$channel" = stable ] || {
+        channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
+        [ "$channel" = dev ] || [ "$channel" = stable ] || die packaged_update_channel
+        write_channel "$channel"
+    }
 }
 
 target_device_for_slot()
@@ -153,7 +166,7 @@ verify_manifest()
         dev|stable) ;;
         *) die manifest_update_channel ;;
     esac
-    device_channel=$($BB cat "$CHANNEL_FILE" 2>/dev/null)
+    device_channel=$(channel_value)
     [ "$device_channel" = dev ] || [ "$device_channel" = stable ] ||
         die device_update_channel
     [ "$UPDATE_CHANNEL" = "$device_channel" ] ||
@@ -300,7 +313,7 @@ confirm_pending()
     if [ "$update_channel" != dev ] && [ "$update_channel" != stable ]; then
         update_channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
         [ "$update_channel" = dev ] || [ "$update_channel" = stable ] ||
-            update_channel=$($BB cat "$CHANNEL_FILE" 2>/dev/null)
+            update_channel=$(channel_value)
         [ "$update_channel" = dev ] || [ "$update_channel" = stable ] ||
             die pending_update_channel
         printf '%s\n' "update_channel=$update_channel" >> "$PENDING"

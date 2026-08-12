@@ -1764,11 +1764,13 @@ class PolicyTests(unittest.TestCase):
 
     def test_ota_manual_installer_seeds_persistent_channel(self) -> None:
         updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
-        self.assertIn("PACKAGED_CHANNEL_FILE=/etc/libreecho/update-channel", updater)
-        self.assertIn("seed_channel()", updater)
+        self.assertIn("CHANNEL_FILE=/data/libreecho/update/check-status", updater)
+        self.assertIn("channel_value()", updater)
+        self.assertIn("write_channel()", updater)
         setup = updater[updater.index("require_userdata()"):updater.index("target_device_for_slot()")]
-        self.assertIn("seed_channel", setup)
-        self.assertIn('[ -e "$CHANNEL_FILE" ] && return 0', updater)
+        self.assertIn('seed_channel', setup)
+        self.assertIn('channel_value()', updater)
+        self.assertIn('write_channel()', updater)
 
         updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
         self.assertIn(
@@ -1778,11 +1780,12 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("diagnostic|production", updater)
         self.assertIn("update_channel", updater)
         self.assertIn("dev|stable", updater)
-        self.assertIn("printf '%s\\n' \"update_channel=$update_channel\" >> \"$PENDING\"", updater)
-        self.assertIn('update_channel=$update_channel', updater)
+        self.assertIn("update_channel=$UPDATE_CHANNEL", updater)
+        self.assertIn("channel_value()", updater)
+        self.assertIn("write_channel()", updater)
         self.assertLess(
             updater.index('update_channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)', updater.index('confirm_pending()')),
-            updater.index('update_channel=$($BB cat "$CHANNEL_FILE" 2>/dev/null)', updater.index('confirm_pending()')),
+            updater.index('update_channel=$(channel_value)', updater.index('confirm_pending()')),
         )
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
         self.assertIn("installed_channel", fetcher)
@@ -1792,7 +1795,7 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("pending_channel_race", fetcher)
         self.assertIn("$BB cat \"$PENDING\" || die pending_channel_race", fetcher)
         set_channel = fetcher.index("set_channel()")
-        self.assertLess(fetcher.index("migrate_pending_channel", set_channel), fetcher.index('printf \'%s\\n\' "$channel" > "$CHANNEL_FILE.tmp"', set_channel))
+        self.assertLess(fetcher.index("migrate_pending_channel", set_channel), fetcher.index('write_channel "$channel"', set_channel))
         verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
         self.assertIn("args.expected_update_channel, args.expected_busybox_sha256", verifier)
         self.assertIn("die manifest_service_profile", updater)
@@ -1956,11 +1959,11 @@ class PolicyTests(unittest.TestCase):
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
         cleanup = (TOOLS_DIR / "initramfs/libreecho-data-cleanup").read_text()
 
-        self.assertIn("CHANNEL_FILE=$ROOT/channel", fetcher)
+        self.assertIn("CHANNEL_FILE=$ROOT/check-status", fetcher)
         self.assertIn("PACKAGED_CHANNEL_FILE=/etc/libreecho/update-channel", fetcher)
+        self.assertIn("channel_value()", fetcher)
+        self.assertIn("write_channel()", fetcher)
         self.assertIn("seed_channel()", fetcher)
-        self.assertIn('[ -e "$CHANNEL_FILE" ] && return 0', fetcher)
-        self.assertIn('channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)', fetcher)
         self.assertLess(fetcher.index("seed_channel"), fetcher.index("validate_source"))
         self.assertLess(fetcher.index("seed_channel"), fetcher.index("check_or_install()"))
 
@@ -1975,9 +1978,8 @@ class PolicyTests(unittest.TestCase):
         self.assertIn('set-channel)', fetcher)
         self.assertIn('[ "$#" -eq 2 ] || die usage', fetcher)
         self.assertIn('set_channel "$2"', fetcher)
-        self.assertIn('printf \'%s\\n\' "$channel" > "$CHANNEL_FILE.tmp"', fetcher)
-        self.assertIn('$BB chmod 0600 "$CHANNEL_FILE.tmp"', fetcher)
-        self.assertIn('$BB mv "$CHANNEL_FILE.tmp" "$CHANNEL_FILE"', fetcher)
+        self.assertIn("channel_value()", fetcher)
+        self.assertIn("write_channel \"$channel\"", fetcher)
         self.assertIn(
             'check_children "$DATA_ROOT/libreecho/update" \\\n    channel incoming',
             cleanup,

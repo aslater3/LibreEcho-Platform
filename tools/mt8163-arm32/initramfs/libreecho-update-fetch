@@ -6,7 +6,7 @@ UPDATE=/usr/local/sbin/libreecho-update
 CONFIG=/etc/libreecho/ota-source.conf
 PROFILE=/etc/libreecho/image-profile
 ROOT=/data/libreecho/update
-CHANNEL_FILE=$ROOT/channel
+CHANNEL_FILE=$ROOT/check-status
 PACKAGED_CHANNEL_FILE=/etc/libreecho/update-channel
 INCOMING=$ROOT/incoming
 PACKAGE=$INCOMING/github-update.ota.tar
@@ -45,7 +45,7 @@ check_status_write()
             last_success=$now
             ;;
     esac
-    channel=$($BB cat "$CHANNEL_FILE" 2>/dev/null)
+    channel=$($BB sed -n 's/^channel=//p' "$CHANNEL_FILE" 2>/dev/null)
     [ "$channel" = dev ] || [ "$channel" = stable ] || channel=$(config_value channel)
     [ "$channel" = dev ] || [ "$channel" = stable ] || channel=dev
     {
@@ -107,14 +107,30 @@ require_environment()
     $BB chmod 0700 /data/libreecho "$ROOT" "$INCOMING" 2>/dev/null
 }
 
-seed_channel()
+channel_value()
 {
-    [ -e "$CHANNEL_FILE" ] && return 0
-    channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
-    [ "$channel" = dev ] || [ "$channel" = stable ] || die source_channel
-    printf '%s\n' "$channel" > "$CHANNEL_FILE.tmp" || die channel_write_failed
+    $BB sed -n 's/^channel=//p' "$CHANNEL_FILE" 2>/dev/null
+}
+
+write_channel()
+{
+    channel=$1
+    {
+        [ -r "$CHANNEL_FILE" ] && $BB sed '/^channel=/d' "$CHANNEL_FILE"
+        printf '%s\n' "channel=$channel"
+    } > "$CHANNEL_FILE.tmp" || die channel_write_failed
     $BB chmod 0600 "$CHANNEL_FILE.tmp" &&
         $BB mv "$CHANNEL_FILE.tmp" "$CHANNEL_FILE" || die channel_commit_failed
+}
+
+seed_channel()
+{
+    channel=$(channel_value)
+    [ "$channel" = dev ] || [ "$channel" = stable ] || {
+        channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
+        [ "$channel" = dev ] || [ "$channel" = stable ] || die source_channel
+        write_channel "$channel"
+    }
 }
 
 config_value()
@@ -125,7 +141,7 @@ config_value()
 validate_source()
 {
     [ "$(config_value schema)" = 1 ] || die source_schema
-    expected_channel=$($BB cat "$CHANNEL_FILE" 2>/dev/null)
+    expected_channel=$(channel_value)
     [ "$expected_channel" = dev ] || [ "$expected_channel" = stable ] || die source_channel
     channel=$expected_channel
     expected_url="https://github.com/aslater3/LibreEcho/releases/latest/download/libreecho-radar-puffin-$channel.ota.tar"
@@ -167,9 +183,8 @@ set_channel()
     $BB grep -q ' /data ' /proc/mounts 2>/dev/null || die userdata_not_mounted
     $BB mkdir -p "$ROOT" || die update_directory_failed
     migrate_pending_channel
-    printf '%s\n' "$channel" > "$CHANNEL_FILE.tmp" || die channel_write_failed
-    $BB chmod 0600 "$CHANNEL_FILE.tmp" && $BB mv "$CHANNEL_FILE.tmp" "$CHANNEL_FILE" || die channel_commit_failed
-    rm -f "$CHECK_STATUS"
+    write_channel "$channel"
+    rm -f "$CHECK_STATUS.tmp"
     printf 'UPDATE_CHANNEL channel=%s\n' "$channel"
 }
 
