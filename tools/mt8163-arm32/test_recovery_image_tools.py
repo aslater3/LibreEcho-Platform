@@ -1772,7 +1772,7 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("update_channel", updater)
         self.assertIn("dev|stable", updater)
         self.assertIn("manifest_update_channel_mismatch", updater)
-        self.assertIn("CHANNEL_FILE=/etc/libreecho/update-channel", updater)
+        self.assertIn("CHANNEL_FILE=/data/libreecho/update/channel", updater)
         verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
         self.assertIn("args.expected_update_channel, args.expected_busybox_sha256", verifier)
         self.assertIn("die manifest_service_profile", updater)
