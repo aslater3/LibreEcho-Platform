@@ -6,7 +6,7 @@ UPDATE=/usr/local/sbin/libreecho-update
 CONFIG=/etc/libreecho/ota-source.conf
 PROFILE=/etc/libreecho/image-profile
 ROOT=/data/libreecho/update
-CHANNEL_FILE=$ROOT/check-status
+CHANNEL_FILE=$ROOT/installed
 PACKAGED_CHANNEL_FILE=/etc/libreecho/update-channel
 INCOMING=$ROOT/incoming
 PACKAGE=$INCOMING/github-update.ota.tar
@@ -45,7 +45,7 @@ check_status_write()
             last_success=$now
             ;;
     esac
-    channel=$($BB sed -n 's/^channel=//p' "$CHANNEL_FILE" 2>/dev/null)
+    channel=$(channel_value)
     [ "$channel" = dev ] || [ "$channel" = stable ] || channel=$(config_value channel)
     [ "$channel" = dev ] || [ "$channel" = stable ] || channel=dev
     {
@@ -182,9 +182,22 @@ set_channel()
     [ "$($BB cat "$PROFILE" 2>/dev/null)" = ota ] || die ota_profile_required
     $BB grep -q ' /data ' /proc/mounts 2>/dev/null || die userdata_not_mounted
     $BB mkdir -p "$ROOT" || die update_directory_failed
+    fetch_lock
     migrate_pending_channel
     write_channel "$channel"
-    rm -f "$CHECK_STATUS.tmp"
+    {
+        echo schema=1
+        echo "channel=$channel"
+        echo status=not-checked
+        echo source_reachable=unknown
+        echo latest_version=
+        echo last_check_epoch=0
+        echo last_success_epoch=0
+        echo error=
+    } > "$CHECK_STATUS.tmp" || die channel_status_write
+    $BB mv "$CHECK_STATUS.tmp" "$CHECK_STATUS" || die channel_status_commit
+    $BB rmdir "$LOCK" 2>/dev/null || die channel_lock_release
+    trap - EXIT
     printf 'UPDATE_CHANNEL channel=%s\n' "$channel"
 }
 

@@ -1764,7 +1764,7 @@ class PolicyTests(unittest.TestCase):
 
     def test_ota_manual_installer_seeds_persistent_channel(self) -> None:
         updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
-        self.assertIn("CHANNEL_FILE=/data/libreecho/update/check-status", updater)
+        self.assertIn("CHANNEL_FILE=$UPDATE_ROOT/installed", updater)
         self.assertIn("channel_value()", updater)
         self.assertIn("write_channel()", updater)
         setup = updater[updater.index("require_userdata()"):updater.index("target_device_for_slot()")]
@@ -1959,8 +1959,9 @@ class PolicyTests(unittest.TestCase):
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
         cleanup = (TOOLS_DIR / "initramfs/libreecho-data-cleanup").read_text()
 
-        self.assertIn("CHANNEL_FILE=$ROOT/check-status", fetcher)
-        self.assertIn("PACKAGED_CHANNEL_FILE=/etc/libreecho/update-channel", fetcher)
+        self.assertIn("CHANNEL_FILE=$ROOT/installed", fetcher)
+        self.assertIn("fetch_lock", fetcher[fetcher.index("set_channel()"):])
+        self.assertIn("status=not-checked", fetcher)
         self.assertIn("channel_value()", fetcher)
         self.assertIn("write_channel()", fetcher)
         self.assertIn("seed_channel()", fetcher)
