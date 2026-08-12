@@ -12,6 +12,7 @@ VERIFY=/usr/local/libexec/libreecho-update-verify
 BOOTCTL=/usr/local/sbin/libreecho-bootctl
 PUBLIC_KEY=/etc/libreecho/ota-public-key.hex
 CHANNEL_FILE=/data/libreecho/update/channel
+PACKAGED_CHANNEL_FILE=/etc/libreecho/update-channel
 BOOT_SIZE=16777216
 BOOT_SECTORS=32768
 
@@ -31,6 +32,20 @@ require_userdata()
         die userdata_identity_or_mount_failed
     $BB mkdir -p "$INCOMING" "$UPDATE_ROOT" || die update_directory_failed
     $BB chmod 0700 /data/libreecho "$UPDATE_ROOT" "$INCOMING" 2>/dev/null
+    seed_channel
+}
+
+seed_channel()
+{
+    [ -e "$CHANNEL_FILE" ] && return 0
+    channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
+    case "$channel" in
+        dev|stable) ;;
+        *) die packaged_update_channel ;;
+    esac
+    printf '%s\n' "$channel" > "$CHANNEL_FILE.tmp" || die channel_seed_write
+    $BB chmod 0600 "$CHANNEL_FILE.tmp" || die channel_seed_mode
+    $BB mv "$CHANNEL_FILE.tmp" "$CHANNEL_FILE" || die channel_seed_commit
 }
 
 target_device_for_slot()

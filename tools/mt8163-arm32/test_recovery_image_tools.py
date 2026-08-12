@@ -1762,7 +1762,14 @@ class PolicyTests(unittest.TestCase):
             updater.rindex('dd if="$target_device" bs=4096 count=4096'),
         )
 
-    def test_ota_manifest_accepts_and_validates_service_profile(self) -> None:
+    def test_ota_manual_installer_seeds_persistent_channel(self) -> None:
+        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
+        self.assertIn("PACKAGED_CHANNEL_FILE=/etc/libreecho/update-channel", updater)
+        self.assertIn("seed_channel()", updater)
+        setup = updater[updater.index("require_userdata()"):updater.index("target_device_for_slot()")]
+        self.assertIn("seed_channel", setup)
+        self.assertIn('[ -e "$CHANNEL_FILE" ] && return 0', updater)
+
         updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
         self.assertIn(
             "boot_sha256 feature_policy image_profile service_profile update_channel'",
