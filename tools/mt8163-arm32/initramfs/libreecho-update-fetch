@@ -147,8 +147,9 @@ migrate_pending_channel()
             pending_channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
             [ "$pending_channel" = dev ] || [ "$pending_channel" = stable ] ||
                 die pending_update_channel
+            [ -r "$PENDING" ] || die pending_channel_race
             {
-                $BB cat "$PENDING"
+                $BB cat "$PENDING" || die pending_channel_race
                 printf '%s\n' "update_channel=$pending_channel"
             } > "$PENDING.tmp" || die pending_channel_migration
             $BB mv "$PENDING.tmp" "$PENDING" || die pending_channel_migration
