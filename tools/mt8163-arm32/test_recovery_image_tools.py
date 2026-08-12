@@ -1932,6 +1932,59 @@ class PolicyTests(unittest.TestCase):
         )
         self.assertNotIn("LibreEcho-Platform/releases", source + fetcher)
 
+    def test_ota_channel_persistence_selection_and_cleanup_contract(self) -> None:
+        fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
+        cleanup = (TOOLS_DIR / "initramfs/libreecho-data-cleanup").read_text()
+
+        self.assertIn("CHANNEL_FILE=$ROOT/channel", fetcher)
+        self.assertIn("PACKAGED_CHANNEL_FILE=/etc/libreecho/update-channel", fetcher)
+        self.assertIn("seed_channel()", fetcher)
+        self.assertIn('[ -e "$CHANNEL_FILE" ] && return 0', fetcher)
+        self.assertIn('channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)', fetcher)
+        self.assertLess(fetcher.index("seed_channel"), fetcher.index("validate_source"))
+        self.assertLess(fetcher.index("seed_channel"), fetcher.index("check_or_install()"))
+
+        expected_url = (
+            'expected_url="https://github.com/aslater3/LibreEcho/releases/latest/download/'
+            'libreecho-radar-puffin-$channel.ota.tar"'
+        )
+        self.assertIn(expected_url, fetcher)
+        self.assertIn("url=$expected_url", fetcher)
+        self.assertNotIn('url=$(config_value url)', fetcher)
+
+        self.assertIn('set-channel)', fetcher)
+        self.assertIn('[ "$#" -eq 2 ] || die usage', fetcher)
+        self.assertIn('set_channel "$2"', fetcher)
+        self.assertIn('printf \'%s\\n\' "$channel" > "$CHANNEL_FILE.tmp"', fetcher)
+        self.assertIn('$BB chmod 0600 "$CHANNEL_FILE.tmp"', fetcher)
+        self.assertIn('$BB mv "$CHANNEL_FILE.tmp" "$CHANNEL_FILE"', fetcher)
+        self.assertIn(
+            'check_children "$DATA_ROOT/libreecho/update" \\\n    channel incoming',
+            cleanup,
+        )
+
+    def test_userdata_cleanup_preserves_persisted_ota_channel(self) -> None:
+        cleanup = TOOLS_DIR / "initramfs/libreecho-data-cleanup"
+        with tempfile.TemporaryDirectory() as temporary:
+            data = Path(temporary) / "data"
+            channel = data / "libreecho/update/channel"
+            channel.parent.mkdir(parents=True)
+            channel.write_text("stable\\n")
+            result = subprocess.run(
+                ["/bin/sh", str(cleanup)],
+                env={
+                    **os.environ,
+                    "LIBREECHO_DATA_TEST_MODE": "1",
+                    "DATA_ROOT": str(data),
+                },
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(channel.read_text(), "stable\\n")
+            self.assertIn("DATA_CLEANUP_OK", result.stdout)
+
     def test_schema2_disabled_record_is_exact(self) -> None:
         record = {
             "id": verifier.CONNECTIVITY_BUNDLE_ID,

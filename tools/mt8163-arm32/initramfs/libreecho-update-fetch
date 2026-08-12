@@ -7,6 +7,7 @@ CONFIG=/etc/libreecho/ota-source.conf
 PROFILE=/etc/libreecho/image-profile
 ROOT=/data/libreecho/update
 CHANNEL_FILE=$ROOT/channel
+PACKAGED_CHANNEL_FILE=/etc/libreecho/update-channel
 INCOMING=$ROOT/incoming
 PACKAGE=$INCOMING/github-update.ota.tar
 PART=$PACKAGE.part
@@ -104,6 +105,16 @@ require_environment()
     $BB chmod 0700 /data/libreecho "$ROOT" "$INCOMING" 2>/dev/null
 }
 
+seed_channel()
+{
+    [ -e "$CHANNEL_FILE" ] && return 0
+    channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
+    [ "$channel" = dev ] || [ "$channel" = stable ] || die source_channel
+    printf '%s\n' "$channel" > "$CHANNEL_FILE.tmp" || die channel_write_failed
+    $BB chmod 0600 "$CHANNEL_FILE.tmp" &&
+        $BB mv "$CHANNEL_FILE.tmp" "$CHANNEL_FILE" || die channel_commit_failed
+}
+
 config_value()
 {
     $BB sed -n "s/^$1=//p" "$CONFIG"
@@ -116,8 +127,7 @@ validate_source()
     [ "$expected_channel" = dev ] || [ "$expected_channel" = stable ] || die source_channel
     channel=$expected_channel
     expected_url="https://github.com/aslater3/LibreEcho/releases/latest/download/libreecho-radar-puffin-$channel.ota.tar"
-    url=$(config_value url)
-    [ "$url" = "$expected_url" ] || true
+    url=$expected_url
 }
 
 set_channel()
@@ -229,6 +239,7 @@ check_or_install()
 {
     action=$1
     require_environment
+    seed_channel
     validate_source
     fetch_lock
     version=$(download_and_inspect) || return 1
