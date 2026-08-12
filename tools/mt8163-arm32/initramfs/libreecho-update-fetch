@@ -174,6 +174,7 @@ set_channel()
     [ "$($BB cat "$PROFILE" 2>/dev/null)" = ota ] || die ota_profile_required
     $BB grep -q ' /data ' /proc/mounts 2>/dev/null || die userdata_not_mounted
     $BB mkdir -p "$ROOT" || die update_directory_failed
+    fetch_lock
     install_lock
     migrate_pending_channel
     write_channel "$channel"
