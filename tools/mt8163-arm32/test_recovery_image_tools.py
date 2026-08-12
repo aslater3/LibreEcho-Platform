@@ -1798,6 +1798,8 @@ class PolicyTests(unittest.TestCase):
         self.assertLess(fetcher.index("migrate_pending_channel", set_channel), fetcher.index('write_channel "$channel"', set_channel))
         verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
         self.assertIn("args.expected_update_channel, args.expected_busybox_sha256", verifier)
+        self.assertIn("pending_channel_preserve", updater)
+        self.assertIn("printf '%s\\n' \"channel=$selected_channel\"", updater)
         self.assertIn("die manifest_service_profile", updater)
 
     def test_host_ota_path_is_explicit_and_uses_guarded_updater(self) -> None:

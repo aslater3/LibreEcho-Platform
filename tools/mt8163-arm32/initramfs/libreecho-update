@@ -322,6 +322,16 @@ confirm_pending()
     actual=$($BB dd if="$target_device" bs=4096 count=4096 2>/dev/null |
         $BB sha256sum | $BB awk '{print $1}')
     [ "$actual" = "$expected" ] || die pending_boot_hash
+    selected_channel=$(channel_value)
+    case "$selected_channel" in
+        dev|stable)
+            {
+                $BB sed '/^channel=/d' "$PENDING"
+                printf '%s\n' "channel=$selected_channel"
+            } > "$PENDING.tmp" || die pending_channel_preserve
+            $BB mv "$PENDING.tmp" "$PENDING" || die pending_channel_preserve
+            ;;
+    esac
     "$BOOTCTL" confirm "$slot" > "$UPDATE_ROOT/bootctl.confirm" ||
         die boot_control_confirm
     $BB mv "$PENDING" "$UPDATE_ROOT/installed"
