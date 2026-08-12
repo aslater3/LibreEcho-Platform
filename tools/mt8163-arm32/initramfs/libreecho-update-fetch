@@ -244,13 +244,15 @@ check_or_install()
     fetch_lock
     version=$(download_and_inspect) || return 1
     installed=$($BB sed -n 's/^version=//p' "$ROOT/installed" 2>/dev/null)
+    installed_channel=$($BB sed -n 's/^update_channel=//p' "$ROOT/installed" 2>/dev/null)
     rolled_back=$($BB sed -n 's/^version=//p' "$ROOT/rolled-back" 2>/dev/null)
-    if [ "$version" = "$installed" ]; then
+    rolled_back_channel=$($BB sed -n 's/^update_channel=//p' "$ROOT/rolled-back" 2>/dev/null)
+    if [ "$version" = "$installed" ] && [ "$channel" = "$installed_channel" ]; then
         check_status_write up-to-date "$version" "" true
         echo "UPDATE_CURRENT version=$version"
         return 0
     fi
-    if [ -n "$rolled_back" ] && [ "$version" = "$rolled_back" ]; then
+    if [ -n "$rolled_back" ] && [ "$version" = "$rolled_back" ] && [ "$channel" = "$rolled_back_channel" ]; then
         check_status_write update-held-after-rollback "$version" "" true
         echo "UPDATE_HELD version=$version"
         return 0

@@ -272,6 +272,7 @@ install_package()
         echo "version=$version"
         echo "slot=$target"
         echo "boot_sha256=$boot_sha"
+        echo "update_channel=$UPDATE_CHANNEL"
         echo "feature_policy=$FEATURE_POLICY"
     } > "$PENDING.tmp" || die pending_write
     $BB mv "$PENDING.tmp" "$PENDING" || die pending_commit

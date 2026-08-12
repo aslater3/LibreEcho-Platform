@@ -1778,8 +1778,10 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("diagnostic|production", updater)
         self.assertIn("update_channel", updater)
         self.assertIn("dev|stable", updater)
-        self.assertIn("manifest_update_channel_mismatch", updater)
-        self.assertIn("CHANNEL_FILE=/data/libreecho/update/channel", updater)
+        self.assertIn("update_channel=$UPDATE_CHANNEL", updater)
+        fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
+        self.assertIn("installed_channel", fetcher)
+        self.assertIn("rolled_back_channel", fetcher)
         verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
         self.assertIn("args.expected_update_channel, args.expected_busybox_sha256", verifier)
         self.assertIn("die manifest_service_profile", updater)
@@ -1905,7 +1907,7 @@ class PolicyTests(unittest.TestCase):
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
         self.assertIn("version=$(download_and_inspect) || return 1", fetcher)
         self.assertIn(
-            'if [ -n "$rolled_back" ] && [ "$version" = "$rolled_back" ]; then',
+            'if [ -n "$rolled_back" ] && [ "$version" = "$rolled_back" ] && [ "$channel" = "$rolled_back_channel" ]; then',
             fetcher,
         )
         self.assertIn("check_status_write error", fetcher)
