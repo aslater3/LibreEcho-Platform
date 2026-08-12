@@ -1964,6 +1964,7 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("cleanup_locks\n    trap - EXIT", fetcher)
         self.assertIn("record_channel()", fetcher)
         self.assertIn("record_channel \"$ROOT/installed\"", fetcher)
+        self.assertIn("install_lock\n    seed_channel\n    validate_source\n    install_unlock", fetcher)
         automatic = fetcher[fetcher.index("set_automatic_updates()"):fetcher.index("die()")]
         self.assertIn("fetch_lock\n    install_lock", automatic)
 

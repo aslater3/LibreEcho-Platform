@@ -267,6 +267,13 @@ install_lock()
     trap cleanup_locks EXIT
 }
 
+install_unlock()
+{
+    [ "$INSTALL_LOCK_HELD" -eq 1 ] || return 0
+    $BB rmdir "$INSTALL_LOCK" 2>/dev/null || die update_lock_release
+    INSTALL_LOCK_HELD=0
+}
+
 download_and_inspect()
 {
     [ ! -r "$ROOT/pending" ] || die update_already_pending
@@ -306,8 +313,10 @@ check_or_install()
     action=$1
     require_environment
     fetch_lock
+    install_lock
     seed_channel
     validate_source
+    install_unlock
     version=$(download_and_inspect) || return 1
     installed=$($BB sed -n 's/^version=//p' "$ROOT/installed" 2>/dev/null)
     installed_channel=$(record_channel "$ROOT/installed")
