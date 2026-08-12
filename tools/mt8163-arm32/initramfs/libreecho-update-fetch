@@ -151,8 +151,7 @@ validate_source()
 migrate_pending_channel()
 {
     [ -r "$PENDING" ] || return 0
-    pending_channel=$($BB sed -n 's/^update_channel=//p' "$PENDING" 2>/dev/null)
-    $BB mkdir "$INSTALL_LOCK" 2>/dev/null || die update_busy
+    install_lock
     pending_channel=$($BB sed -n 's/^update_channel=//p' "$PENDING" 2>/dev/null)
     if [ -n "$pending_channel" ]; then
         [ "$pending_channel" = dev ] || [ "$pending_channel" = stable ] || die pending_update_channel
@@ -175,7 +174,7 @@ set_channel()
     [ "$($BB cat "$PROFILE" 2>/dev/null)" = ota ] || die ota_profile_required
     $BB grep -q ' /data ' /proc/mounts 2>/dev/null || die userdata_not_mounted
     $BB mkdir -p "$ROOT" || die update_directory_failed
-    fetch_lock
+    install_lock
     migrate_pending_channel
     write_channel "$channel"
     {
@@ -248,10 +247,28 @@ prepare_https_client()
         die https_client_missing
 }
 
+FETCH_LOCK_HELD=0
+INSTALL_LOCK_HELD=0
+
+cleanup_locks()
+{
+    [ "$FETCH_LOCK_HELD" -eq 1 ] && $BB rmdir "$LOCK" 2>/dev/null
+    [ "$INSTALL_LOCK_HELD" -eq 1 ] && $BB rmdir "$INSTALL_LOCK" 2>/dev/null
+}
+
 fetch_lock()
 {
     $BB mkdir "$LOCK" 2>/dev/null || die download_busy
-    trap '$BB rmdir "$LOCK" "$INSTALL_LOCK" 2>/dev/null' EXIT
+    FETCH_LOCK_HELD=1
+    trap cleanup_locks EXIT
+}
+
+install_lock()
+{
+    [ "$INSTALL_LOCK_HELD" -eq 1 ] && return 0
+    $BB mkdir "$INSTALL_LOCK" 2>/dev/null || die update_busy
+    INSTALL_LOCK_HELD=1
+    trap cleanup_locks EXIT
 }
 
 download_and_inspect()
@@ -292,9 +309,10 @@ check_or_install()
 {
     action=$1
     require_environment
+    fetch_lock
+    install_lock
     seed_channel
     validate_source
-    fetch_lock
     version=$(download_and_inspect) || return 1
     installed=$($BB sed -n 's/^version=//p' "$ROOT/installed" 2>/dev/null)
     installed_channel=$($BB sed -n 's/^update_channel=//p' "$ROOT/installed" 2>/dev/null)
