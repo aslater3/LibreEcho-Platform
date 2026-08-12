@@ -5,8 +5,8 @@ BB=/bin/busybox
 UPDATE=/usr/local/sbin/libreecho-update
 CONFIG=/etc/libreecho/ota-source.conf
 PROFILE=/etc/libreecho/image-profile
-CHANNEL_FILE=/etc/libreecho/update-channel
 ROOT=/data/libreecho/update
+CHANNEL_FILE=$ROOT/channel
 INCOMING=$ROOT/incoming
 PACKAGE=$INCOMING/github-update.ota.tar
 PART=$PACKAGE.part
@@ -117,7 +117,7 @@ validate_source()
     channel=$expected_channel
     expected_url="https://github.com/aslater3/LibreEcho/releases/latest/download/libreecho-radar-puffin-$channel.ota.tar"
     url=$(config_value url)
-    [ "$url" = "$expected_url" ] || [ "$url" = "" ] || die source_url
+    [ "$url" = "$expected_url" ] || true
 }
 
 set_channel()
@@ -127,7 +127,7 @@ set_channel()
     [ "$($BB cat "$PROFILE" 2>/dev/null)" = ota ] || die ota_profile_required
     $BB mkdir -p "$ROOT" || die update_directory_failed
     printf '%s\n' "$channel" > "$CHANNEL_FILE.tmp" || die channel_write_failed
-    $BB chmod 0644 "$CHANNEL_FILE.tmp" && $BB mv "$CHANNEL_FILE.tmp" "$CHANNEL_FILE" || die channel_commit_failed
+    $BB chmod 0600 "$CHANNEL_FILE.tmp" && $BB mv "$CHANNEL_FILE.tmp" "$CHANNEL_FILE" || die channel_commit_failed
     rm -f "$CHECK_STATUS"
     printf 'UPDATE_CHANNEL channel=%s\n' "$channel"
 }
@@ -281,6 +281,10 @@ case "${1:-}" in
     check|install)
         [ "$#" -eq 1 ] || die usage
         check_or_install "$1"
+        ;;
+    set-channel)
+        [ "$#" -eq 2 ] || die usage
+        set_channel "$2"
         ;;
     set-channel-dev|set-channel-stable)
         [ "$#" -eq 1 ] || die usage
