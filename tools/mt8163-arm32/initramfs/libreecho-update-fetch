@@ -6,7 +6,7 @@ UPDATE=/usr/local/sbin/libreecho-update
 CONFIG=/etc/libreecho/ota-source.conf
 PROFILE=/etc/libreecho/image-profile
 ROOT=/data/libreecho/update
-CHANNEL_FILE=$ROOT/installed
+CHANNEL_FILE=$ROOT/automatic-updates
 PACKAGED_CHANNEL_FILE=/etc/libreecho/update-channel
 INCOMING=$ROOT/incoming
 PACKAGE=$INCOMING/github-update.ota.tar
@@ -231,8 +231,6 @@ record_channel()
 {
     record=$1
     record_channel_value=$($BB sed -n 's/^update_channel=//p' "$record" 2>/dev/null)
-    [ "$record_channel_value" = dev ] || [ "$record_channel_value" = stable ] ||
-        record_channel_value=$($BB sed -n 's/^channel=//p' "$record" 2>/dev/null)
     [ "$record_channel_value" = dev ] || [ "$record_channel_value" = stable ] ||
         record_channel_value=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
     printf '%s\n' "$record_channel_value"
