@@ -1962,7 +1962,7 @@ class PolicyTests(unittest.TestCase):
         cleanup = (TOOLS_DIR / "initramfs/libreecho-data-cleanup").read_text()
 
         self.assertIn("CHANNEL_FILE=$ROOT/installed", fetcher)
-        self.assertIn("fetch_lock", fetcher[fetcher.index("set_channel()"):])
+        self.assertNotIn("check_or_install()\n{\n    action=$1\n    require_environment\n    fetch_lock\n    install_lock", fetcher)
         self.assertIn("trap cleanup_locks EXIT", fetcher)
         self.assertIn("cleanup_locks()", fetcher)
         self.assertIn("channel_value()", fetcher)

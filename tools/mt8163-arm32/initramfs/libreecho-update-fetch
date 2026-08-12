@@ -189,7 +189,6 @@ set_channel()
     } > "$CHECK_STATUS.tmp" || die channel_status_write
     $BB mv "$CHECK_STATUS.tmp" "$CHECK_STATUS" || die channel_status_commit
     $BB rmdir "$INSTALL_LOCK" 2>/dev/null || die channel_lock_release
-    $BB rmdir "$LOCK" 2>/dev/null || die channel_lock_release
     trap - EXIT
     printf 'UPDATE_CHANNEL channel=%s\n' "$channel"
 }
@@ -310,7 +309,6 @@ check_or_install()
     action=$1
     require_environment
     fetch_lock
-    install_lock
     seed_channel
     validate_source
     version=$(download_and_inspect) || return 1
