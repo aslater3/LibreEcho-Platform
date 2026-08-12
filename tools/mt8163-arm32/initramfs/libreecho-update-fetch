@@ -80,8 +80,13 @@ set_automatic_updates()
     [ "$($BB cat "$PROFILE" 2>/dev/null)" = ota ] || die ota_profile_required
     $BB mkdir -p "$ROOT" || die update_directory_failed
     $BB chmod 0700 /data/libreecho "$ROOT" 2>/dev/null
+    channel=$(channel_value)
+    [ "$channel" = dev ] || [ "$channel" = stable ] ||
+        channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
+    [ "$channel" = dev ] || [ "$channel" = stable ] || die source_channel
     {
         echo schema=1
+        echo "channel=$channel"
         echo "enabled=$enabled"
     } > "$AUTOMATIC.tmp" &&
         $BB chmod 0600 "$AUTOMATIC.tmp" &&

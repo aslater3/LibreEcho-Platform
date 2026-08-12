@@ -1964,8 +1964,9 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("cleanup_locks\n    trap - EXIT", fetcher)
         self.assertIn("record_channel()", fetcher)
         self.assertIn("record_channel \"$ROOT/installed\"", fetcher)
-        self.assertIn("seed_channel()", fetcher)
-        self.assertLess(fetcher.index("seed_channel"), fetcher.index("validate_source"))
+        automatic = fetcher[fetcher.index("set_automatic_updates()"):fetcher.index("die()")]
+        self.assertIn('echo "channel=$channel"', automatic)
+
         self.assertLess(fetcher.index("seed_channel"), fetcher.index("check_or_install()"))
 
         expected_url = (
