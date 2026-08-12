@@ -32,7 +32,6 @@ require_userdata()
         die userdata_identity_or_mount_failed
     $BB mkdir -p "$INCOMING" "$UPDATE_ROOT" || die update_directory_failed
     $BB chmod 0700 /data/libreecho "$UPDATE_ROOT" "$INCOMING" 2>/dev/null
-    seed_channel
 }
 
 channel_value()
@@ -267,6 +266,7 @@ install_package()
     package=$1
     require_userdata
     lock_take
+    seed_channel
     state_write verifying 5 package
     extract_and_verify "$package"
     state_write verified 20 "$version"

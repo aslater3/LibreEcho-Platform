@@ -1965,7 +1965,7 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("record_channel()", fetcher)
         self.assertIn("record_channel \"$ROOT/installed\"", fetcher)
         automatic = fetcher[fetcher.index("set_automatic_updates()"):fetcher.index("die()")]
-        self.assertIn('echo "channel=$channel"', automatic)
+        self.assertIn("fetch_lock\n    install_lock", automatic)
 
         self.assertLess(fetcher.index("seed_channel"), fetcher.index("check_or_install()"))
 
