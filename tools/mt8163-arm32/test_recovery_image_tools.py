@@ -1920,6 +1920,8 @@ class PolicyTests(unittest.TestCase):
             "libreecho-radar-puffin-dev.ota.tar"
         )
         source = (TOOLS_DIR / "initramfs/ota-source.conf").read_text()
+        self.assertIn("channel=dev", source)
+        self.assertIn("libreecho-radar-puffin-dev.ota.tar", source)
         builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
         self.assertIn('r"libreecho-radar-puffin-(?:dev|stable)\\.ota\\.tar"', builder)
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()

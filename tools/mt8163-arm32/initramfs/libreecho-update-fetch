@@ -42,8 +42,8 @@ check_status_write()
             last_success=$now
             ;;
     esac
-    channel=$(config_value channel)
-    [ "$channel" = dev ] || [ "$channel" = stable ] || channel=$($BB cat "$CHANNEL_FILE" 2>/dev/null)
+    channel=$($BB cat "$CHANNEL_FILE" 2>/dev/null)
+    [ "$channel" = dev ] || [ "$channel" = stable ] || channel=$(config_value channel)
     [ "$channel" = dev ] || [ "$channel" = stable ] || channel=dev
     {
         echo schema=1
@@ -112,13 +112,24 @@ config_value()
 validate_source()
 {
     [ "$(config_value schema)" = 1 ] || die source_schema
-    channel=$(config_value channel)
     expected_channel=$($BB cat "$CHANNEL_FILE" 2>/dev/null)
-    [ "$channel" = dev ] || [ "$channel" = stable ] || die source_channel
-    [ "$channel" = "$expected_channel" ] || die source_channel_mismatch
-    url=$(config_value url)
+    [ "$expected_channel" = dev ] || [ "$expected_channel" = stable ] || die source_channel
+    channel=$expected_channel
     expected_url="https://github.com/aslater3/LibreEcho/releases/latest/download/libreecho-radar-puffin-$channel.ota.tar"
-    [ "$url" = "$expected_url" ] || die source_url
+    url=$(config_value url)
+    [ "$url" = "$expected_url" ] || [ "$url" = "" ] || die source_url
+}
+
+set_channel()
+{
+    channel=${1:-}
+    [ "$channel" = dev ] || [ "$channel" = stable ] || die source_channel
+    [ "$($BB cat "$PROFILE" 2>/dev/null)" = ota ] || die ota_profile_required
+    $BB mkdir -p "$ROOT" || die update_directory_failed
+    printf '%s\n' "$channel" > "$CHANNEL_FILE.tmp" || die channel_write_failed
+    $BB chmod 0644 "$CHANNEL_FILE.tmp" && $BB mv "$CHANNEL_FILE.tmp" "$CHANNEL_FILE" || die channel_commit_failed
+    rm -f "$CHECK_STATUS"
+    printf 'UPDATE_CHANNEL channel=%s\n' "$channel"
 }
 
 manifest_payload_value()
@@ -271,6 +282,10 @@ case "${1:-}" in
         [ "$#" -eq 1 ] || die usage
         check_or_install "$1"
         ;;
+    set-channel-dev|set-channel-stable)
+        [ "$#" -eq 1 ] || die usage
+        set_channel "${1#set-channel-}"
+        ;;
     watch)
         [ "$#" -eq 1 ] || die usage
         watch_updates
@@ -284,7 +299,7 @@ case "${1:-}" in
         set_automatic_updates 0
         ;;
     *)
-        echo "Usage: libreecho-update-fetch check | install | watch | enable-automatic | disable-automatic" >&2
+        echo "Usage: libreecho-update-fetch check | install | set-channel dev|stable | watch | enable-automatic | disable-automatic" >&2
         exit 2
         ;;
 esac
