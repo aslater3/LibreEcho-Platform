@@ -1963,8 +1963,7 @@ class PolicyTests(unittest.TestCase):
 
         self.assertIn("CHANNEL_FILE=$ROOT/installed", fetcher)
         self.assertIn("fetch_lock\n    install_lock\n    migrate_pending_channel", fetcher)
-        self.assertIn("trap cleanup_locks EXIT", fetcher)
-        self.assertIn("cleanup_locks()", fetcher)
+        self.assertIn("cleanup_locks\n    trap - EXIT", fetcher)
         self.assertIn("channel_value()", fetcher)
         self.assertIn("write_channel()", fetcher)
         self.assertIn("seed_channel()", fetcher)

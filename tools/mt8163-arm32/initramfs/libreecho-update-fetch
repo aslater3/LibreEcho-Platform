@@ -189,7 +189,7 @@ set_channel()
         echo error=
     } > "$CHECK_STATUS.tmp" || die channel_status_write
     $BB mv "$CHECK_STATUS.tmp" "$CHECK_STATUS" || die channel_status_commit
-    $BB rmdir "$INSTALL_LOCK" 2>/dev/null || die channel_lock_release
+    cleanup_locks
     trap - EXIT
     printf 'UPDATE_CHANNEL channel=%s\n' "$channel"
 }
