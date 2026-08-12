@@ -130,12 +130,26 @@ validate_source()
     url=$expected_url
 }
 
+migrate_pending_channel()
+{
+    [ -r "$PENDING" ] || return 0
+    pending_channel=$($BB sed -n 's/^update_channel=//p' "$PENDING" 2>/dev/null)
+    [ "$pending_channel" = dev ] || [ "$pending_channel" = stable ] || {
+        pending_channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
+        [ "$pending_channel" = dev ] || [ "$pending_channel" = stable ] ||
+            die pending_update_channel
+        printf '%s\n' "update_channel=$pending_channel" >> "$PENDING" ||
+            die pending_channel_migration
+    }
+}
+
 set_channel()
 {
     channel=${1:-}
     [ "$channel" = dev ] || [ "$channel" = stable ] || die source_channel
     [ "$($BB cat "$PROFILE" 2>/dev/null)" = ota ] || die ota_profile_required
     $BB mkdir -p "$ROOT" || die update_directory_failed
+    migrate_pending_channel
     printf '%s\n' "$channel" > "$CHANNEL_FILE.tmp" || die channel_write_failed
     $BB chmod 0600 "$CHANNEL_FILE.tmp" && $BB mv "$CHANNEL_FILE.tmp" "$CHANNEL_FILE" || die channel_commit_failed
     rm -f "$CHECK_STATUS"
