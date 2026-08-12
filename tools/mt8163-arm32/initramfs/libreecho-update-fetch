@@ -148,25 +148,6 @@ validate_source()
     url=$expected_url
 }
 
-migrate_pending_channel()
-{
-    [ -r "$PENDING" ] || return 0
-    install_lock
-    pending_channel=$($BB sed -n 's/^update_channel=//p' "$PENDING" 2>/dev/null)
-    if [ -n "$pending_channel" ]; then
-        [ "$pending_channel" = dev ] || [ "$pending_channel" = stable ] || die pending_update_channel
-    else
-        pending_channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
-        [ "$pending_channel" = dev ] || [ "$pending_channel" = stable ] || die pending_update_channel
-        [ -r "$PENDING" ] || die pending_channel_race
-        {
-            $BB cat "$PENDING" || die pending_channel_race
-            printf '%s\n' "update_channel=$pending_channel"
-        } > "$PENDING.tmp" || die pending_channel_migration
-        $BB mv "$PENDING.tmp" "$PENDING" || die pending_channel_migration
-    fi
-}
-
 set_channel()
 {
     channel=${1:-}
@@ -176,7 +157,6 @@ set_channel()
     $BB mkdir -p "$ROOT" || die update_directory_failed
     fetch_lock
     install_lock
-    migrate_pending_channel
     write_channel "$channel"
     {
         echo schema=1
@@ -247,6 +227,17 @@ prepare_https_client()
         die https_client_missing
 }
 
+record_channel()
+{
+    record=$1
+    record_channel_value=$($BB sed -n 's/^update_channel=//p' "$record" 2>/dev/null)
+    [ "$record_channel_value" = dev ] || [ "$record_channel_value" = stable ] ||
+        record_channel_value=$($BB sed -n 's/^channel=//p' "$record" 2>/dev/null)
+    [ "$record_channel_value" = dev ] || [ "$record_channel_value" = stable ] ||
+        record_channel_value=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
+    printf '%s\n' "$record_channel_value"
+}
+
 FETCH_LOCK_HELD=0
 INSTALL_LOCK_HELD=0
 
@@ -314,9 +305,9 @@ check_or_install()
     validate_source
     version=$(download_and_inspect) || return 1
     installed=$($BB sed -n 's/^version=//p' "$ROOT/installed" 2>/dev/null)
-    installed_channel=$($BB sed -n 's/^update_channel=//p' "$ROOT/installed" 2>/dev/null)
+    installed_channel=$(record_channel "$ROOT/installed")
     rolled_back=$($BB sed -n 's/^version=//p' "$ROOT/rolled-back" 2>/dev/null)
-    rolled_back_channel=$($BB sed -n 's/^update_channel=//p' "$ROOT/rolled-back" 2>/dev/null)
+    rolled_back_channel=$(record_channel "$ROOT/rolled-back")
     if [ "$version" = "$installed" ] && [ "$channel" = "$installed_channel" ]; then
         check_status_write up-to-date "$version" "" true
         echo "UPDATE_CURRENT version=$version"
