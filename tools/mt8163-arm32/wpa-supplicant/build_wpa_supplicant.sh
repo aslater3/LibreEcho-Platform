@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  printf '%s\n' 'usage: build_wpa_supplicant.sh --archive FILE --output DIR --cc COMPILER --sysroot DIR --kernel-headers DIR'
+  printf '%s\n' 'usage: build_wpa_supplicant.sh --archive FILE --libnl-archive FILE --output DIR --cc COMPILER --sysroot DIR --kernel-headers DIR'
 }
 
 ARCHIVE=
@@ -10,6 +10,7 @@ OUTPUT=
 CC=
 SYSROOT=
 KERNEL_HEADERS=
+LIBNL_ARCHIVE=
 while (($#)); do
   case "$1" in
     --archive) shift; (($#)) || { usage >&2; exit 2; }; ARCHIVE=$1 ;;
@@ -17,12 +18,13 @@ while (($#)); do
     --cc) shift; (($#)) || { usage >&2; exit 2; }; CC=$1 ;;
     --sysroot) shift; (($#)) || { usage >&2; exit 2; }; SYSROOT=$1 ;;
     --kernel-headers) shift; (($#)) || { usage >&2; exit 2; }; KERNEL_HEADERS=$1 ;;
+    --libnl-archive) shift; (($#)) || { usage >&2; exit 2; }; LIBNL_ARCHIVE=$1 ;;
     -h|--help) usage; exit 0 ;;
     *) printf 'ERROR: unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
   shift
 done
-[[ -n "$ARCHIVE" && -n "$OUTPUT" && -n "$CC" && -n "$SYSROOT" &&
+[[ -n "$ARCHIVE" && -n "$LIBNL_ARCHIVE" && -n "$OUTPUT" && -n "$CC" && -n "$SYSROOT" &&
    -n "$KERNEL_HEADERS" ]] || { usage >&2; exit 2; }
 # Host archive, checksum, and build tools must not load target-chroot libraries.
 # The generated compiler wrapper restores the pmbootstrap runtime privately.
@@ -39,6 +41,7 @@ for header_tree in linux asm asm-generic; do
   }
 done
 [[ -f "$ARCHIVE" && ! -L "$ARCHIVE" ]] || { printf 'ERROR: unsafe wpa_supplicant archive\n' >&2; exit 1; }
+[[ -f "$LIBNL_ARCHIVE" && ! -L "$LIBNL_ARCHIVE" ]] || { printf 'ERROR: unsafe libnl archive\n' >&2; exit 1; }
 [[ -x "$CC" ]] || { printf 'ERROR: cross compiler is unavailable\n' >&2; exit 1; }
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd -P)
@@ -50,6 +53,12 @@ actual=$(sha256sum "$ARCHIVE" | awk '{print $1}')
   printf 'ERROR: wpa_supplicant source hash mismatch: expected=%s actual=%s\n' "$expected" "$actual" >&2
   exit 1
 }
+libnl_expected=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["libnl_source_sha256"])' "$LOCK")
+libnl_actual=$(sha256sum "$LIBNL_ARCHIVE" | awk '{print $1}')
+[[ "$libnl_actual" == "$libnl_expected" ]] || {
+  printf 'ERROR: libnl source hash mismatch: expected=%s actual=%s\n' "$libnl_expected" "$libnl_actual" >&2
+  exit 1
+}
 [[ -f "$CONFIG" && ! -L "$CONFIG" ]] || { printf 'ERROR: wpa_supplicant config is unavailable\n' >&2; exit 1; }
 
 OUTPUT=$(mkdir -p "$OUTPUT" && cd -- "$OUTPUT" && pwd -P)
@@ -57,8 +66,10 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/libreecho-wpa-build.XXXXXX")
 cleanup() { rm -rf "$work"; }
 trap cleanup EXIT
 src="$work/wpa_supplicant-2.10"
-mkdir -p "$src"
+libnl_src="$work/libnl-3.11.0"
+mkdir -p "$src" "$libnl_src"
 tar -xf "$ARCHIVE" -C "$src" --strip-components=1
+tar -xf "$LIBNL_ARCHIVE" -C "$libnl_src" --strip-components=1
 cp "$CONFIG" "$src/wpa_supplicant/.config"
 
 cc_dir=$(cd -- "$(dirname -- "$CC")" && pwd -P)
@@ -78,15 +89,30 @@ pathlib.Path(out).chmod(0o755)
 PY
 export SOURCE_DATE_EPOCH=0
 canonical=/usr/src/wpa_supplicant-2.10
+libnl_out="$work/libnl-install"
+mkdir -p "$libnl_out"
+make -C "$libnl_src" distclean >/dev/null 2>&1 || true
+  (cd "$libnl_src" && env CC="$cc_wrapper" AR="${CC%gcc}gcc-ar" RANLIB="${CC%gcc}gcc-ranlib" \
+    CFLAGS="-Os -march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard -include time.h -idirafter $KERNEL_HEADERS" \
+    ./configure --host=armv7-alpine-linux-musleabihf --prefix=/usr \
+      --disable-cli --disable-pthreads --disable-route --disable-nf --disable-xfrm \
+      --disable-idiag --enable-static --disable-shared --with-pkgconfigdir=/usr/lib/pkgconfig) >/dev/null
+make -C "$libnl_src" -j"${LIBREECHO_BUILD_JOBS:-2}" >/dev/null
+make -C "$libnl_src" DESTDIR="$libnl_out" install >/dev/null
+export PKG_CONFIG_PATH="$libnl_out/usr/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+libnl_cflags="-I$libnl_out/usr/include/libnl3"
+libnl_libs="-L$libnl_out/usr/lib -lnl-genl-3 -lnl-3"
 cflags=(
   -Os -march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard
   "-idirafter" "$KERNEL_HEADERS"
+  $libnl_cflags
   "-ffile-prefix-map=$work=$canonical"
   "-fdebug-prefix-map=$work=$canonical"
   "-fmacro-prefix-map=$work=$canonical"
 )
 make -C "$src/wpa_supplicant" -j"${LIBREECHO_BUILD_JOBS:-2}" \
-  CC="$cc_wrapper" EXTRA_CFLAGS="${cflags[*]}" LDFLAGS='-static -no-pie -s -Wl,--build-id=none' \
+  CC="$cc_wrapper" EXTRA_CFLAGS="${cflags[*]}" \
+  LDFLAGS="-static -no-pie -s -Wl,--build-id=none $libnl_libs" \
   wpa_supplicant >/dev/null
 
 binary="$OUTPUT/wpa_supplicant"
@@ -134,9 +160,9 @@ for path in sorted(root.rglob("*")):
 print(digest.hexdigest())
 PY
 )
-python3 - "$OUTPUT/wpa-supplicant-source.json" "$binary_sha" "$binary_size" "$config_sha" "$compiler" "$kernel_uapi_sha" <<'PY'
+python3 - "$OUTPUT/wpa-supplicant-source.json" "$binary_sha" "$binary_size" "$config_sha" "$compiler" "$kernel_uapi_sha" "$libnl_expected" <<'PY'
 import json, pathlib, sys
-out, binary_sha, binary_size, config_sha, compiler, kernel_uapi_sha = sys.argv[1:]
+out, binary_sha, binary_size, config_sha, compiler, kernel_uapi_sha, libnl_expected = sys.argv[1:]
 pathlib.Path(out).write_text(json.dumps({
     "binary_sha256": binary_sha,
     "binary_size": int(binary_size),
@@ -145,7 +171,9 @@ pathlib.Path(out).write_text(json.dumps({
     "config_path": "tools/mt8163-arm32/wpa-supplicant/wpa_supplicant-2.10.config",
     "config_sha256": config_sha,
     "crypto": "internal",
-    "drivers": ["wext"],
+    "drivers": ["nl80211", "wext"],
+    "libnl_version": "3.11.0",
+    "libnl_source_sha256": libnl_expected,
     "kernel_uapi_sha256": kernel_uapi_sha,
     "license": "BSD-3-Clause",
     "source_sha256": "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f",

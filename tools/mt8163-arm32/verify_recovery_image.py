@@ -44,6 +44,9 @@ CONNECTIVITY_EVIDENCE_MANIFEST_SHA256 = "d1eedd04efe0dbc78853f2b0f9357c092b4ca66
 WPA_SUPPLICANT_VERSION = "2.10"
 WPA_SOURCE_SHA256 = "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f"
 WPA_SOURCE_URL = "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz"
+LIBNL_VERSION = "3.11.0"
+LIBNL_SOURCE_SHA256 = "2a56e1edefa3e68a7c00879496736fdbf62fc94ed3232c0baba127ecfa76874d"
+LIBNL_SOURCE_URL = "https://github.com/thom311/libnl/releases/download/libnl3_11_0/libnl-3.11.0.tar.gz"
 WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
@@ -1091,6 +1094,7 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         required_source = {
             "binary_sha256", "binary_size", "build_epoch", "compiler", "config_path",
             "config_sha256", "crypto", "drivers", "kernel_uapi_sha256", "license",
+            "libnl_source_sha256", "libnl_version",
             "source_sha256", "source_url", "static", "version",
         }
         if (not isinstance(source_record, dict) or set(source_record) != required_source or
@@ -1100,6 +1104,8 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                 source_record.get("source_url") != WPA_SOURCE_URL or
                 source_record.get("license") != "BSD-3-Clause" or
                 source_record.get("version") != WPA_SUPPLICANT_VERSION or
+                source_record.get("libnl_version") != LIBNL_VERSION or
+                source_record.get("libnl_source_sha256") != LIBNL_SOURCE_SHA256 or
                 source_record.get("static") is not True or
                 not re.fullmatch(r"[0-9a-f]{64}", str(source_record.get("config_sha256", ""))) or
                 not re.fullmatch(r"[0-9a-f]{64}", str(source_record.get("kernel_uapi_sha256", "")))):

@@ -48,6 +48,9 @@ CONNECTIVITY_IMPORTER_SHA256 = "27f20efb39825333838df76eb843e4af537864f326a96487
 WPA_SUPPLICANT_VERSION = "2.10"
 WPA_SOURCE_SHA256 = "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f"
 WPA_SOURCE_URL = "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz"
+LIBNL_VERSION = "3.11.0"
+LIBNL_SOURCE_SHA256 = "2a56e1edefa3e68a7c00879496736fdbf62fc94ed3232c0baba127ecfa76874d"
+LIBNL_SOURCE_URL = "https://github.com/thom311/libnl/releases/download/libnl3_11_0/libnl-3.11.0.tar.gz"
 WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
@@ -1440,6 +1443,7 @@ def add_network_bundle(stage: Path, wpa_supplicant: Path, wpa_metadata_path: Pat
     required_metadata = {
         "binary_sha256", "binary_size", "build_epoch", "compiler", "config_path",
         "config_sha256", "crypto", "drivers", "kernel_uapi_sha256", "license",
+        "libnl_source_sha256", "libnl_version",
         "source_sha256", "source_url", "static", "version",
     }
     if not isinstance(wpa_metadata, dict) or set(wpa_metadata) != required_metadata:
@@ -1451,6 +1455,8 @@ def add_network_bundle(stage: Path, wpa_supplicant: Path, wpa_metadata_path: Pat
             wpa_metadata["source_url"] != WPA_SOURCE_URL or
             wpa_metadata["license"] != "BSD-3-Clause" or
             wpa_metadata["version"] != WPA_SUPPLICANT_VERSION or
+            wpa_metadata["libnl_version"] != LIBNL_VERSION or
+            wpa_metadata["libnl_source_sha256"] != LIBNL_SOURCE_SHA256 or
             wpa_metadata["static"] is not True or
             not isinstance(wpa_metadata["kernel_uapi_sha256"], str) or
             not re.fullmatch(r"[0-9a-f]{64}", wpa_metadata["kernel_uapi_sha256"])):

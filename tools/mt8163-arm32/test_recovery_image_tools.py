@@ -701,7 +701,7 @@ class SourceTests(unittest.TestCase):
         builder = (
             TOOLS_DIR / "wpa-supplicant" / "build_wpa_supplicant.sh"
         ).read_text()
-        self.assertIn("LDFLAGS='-static -no-pie", builder)
+        self.assertIn("-static -no-pie -s -Wl,--build-id=none", builder)
         self.assertIn("Type:[[:space:]]+EXEC", builder)
 
     def test_wpa_builder_requires_exported_linux_uapi_headers(self) -> None:
@@ -712,9 +712,12 @@ class SourceTests(unittest.TestCase):
         self.assertIn("KERNEL_HEADERS=", builder)
         self.assertIn('"-idirafter" "$KERNEL_HEADERS"', builder)
         self.assertIn("kernel_uapi_sha256", builder)
-        self.assertNotIn("/usr/arm-linux-gnueabihf/include", builder)
+        self.assertIn("--libnl-archive FILE", builder)
         image_builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
         verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        self.assertIn("libnl_source_sha256", builder)
+        self.assertIn("libnl_source_sha256", image_builder)
+        self.assertIn("libnl_source_sha256", verifier)
         self.assertIn("--wpa-source-metadata", image_builder)
         self.assertIn("wpa source provenance is missing or mismatched", verifier)
 
