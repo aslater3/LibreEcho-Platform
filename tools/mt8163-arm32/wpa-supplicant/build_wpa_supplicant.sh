@@ -92,7 +92,7 @@ canonical=/usr/src/wpa_supplicant-2.10
 libnl_out="$work/libnl-install"
 mkdir -p "$libnl_out"
 make -C "$libnl_src" distclean >/dev/null 2>&1 || true
-  (cd "$libnl_src" && env CC="$cc_wrapper" AR="${CC%gcc}gcc-ar" RANLIB="${CC%gcc}gcc-ranlib" \
+  (cd "$libnl_src" && env CC="$cc_wrapper" AR="${AR:-ar}" RANLIB="${RANLIB:-ranlib}" \
     CFLAGS="-Os -march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard -include time.h -idirafter $KERNEL_HEADERS" \
     ./configure --host=armv7-alpine-linux-musleabihf --prefix=/usr \
       --disable-cli --disable-pthreads --disable-route --disable-nf --disable-xfrm \
