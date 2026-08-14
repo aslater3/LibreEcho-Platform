@@ -1947,6 +1947,7 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("libreecho-radar-puffin-dev.ota.tar", source)
         builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
         self.assertIn('r"libreecho-radar-puffin-(?:dev|stable)\\.ota\\.tar"', builder)
+        self.assertIn('overlay_manifest["ota-source.conf"]', builder)
         verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
         self.assertIn('f"channel={expected_update_channel}"', verifier)
         self.assertIn('f"libreecho-radar-puffin-{expected_update_channel}.ota.tar"', verifier)

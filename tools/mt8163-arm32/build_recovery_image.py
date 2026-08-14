@@ -547,6 +547,13 @@ def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
             f"libreecho-radar-puffin-{update_channel}.ota.tar", source_text,
         )
         ota_source.write_text(source_text)
+        overlay_manifest = manifest.get("overlay")
+        if not isinstance(overlay_manifest, dict):
+            raise SystemExit("ERROR: OTA source rewrite requires overlay manifest")
+        source_data = source_text.encode()
+        overlay_manifest["ota-source.conf"] = {
+            "sha256": sha256(source_data), "size": len(source_data), "mode": "0644",
+        }
     manifest["image_profile"] = image_profile
     manifest["service_profile"] = service_profile
     manifest["feature_policy"] = feature_policy
