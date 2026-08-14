@@ -83,6 +83,13 @@
       "version": "1.0.18"
     },
     {
+      "id": "bluez-sbc",
+      "license": "LGPL-2.1-or-later",
+      "source": "https://git.kernel.org/pub/scm/bluetooth/sbc.git",
+      "version": "b3deb8a5dcfb42d8c10ba1f2f1ac9bd7bf7271cc",
+      "note": "vendored into LibreEcho-UI src/adapter/bt-sbc for the A2DP-SINK profile"
+    },
+    {
       "binary_sha256": "77a558bacdaaf9e343f02f2d74f27a5f2bb2dc8b6d66cc2499b60ed14ef62fe6",
       "id": "mt8163-audio-fpga",
       "included_in_public_artifact": true,

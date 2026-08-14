@@ -41,6 +41,12 @@ recorded in `COMPONENTS.json`, the image manifest, and the release SPDX SBOM.
   the image; the materializer verifies both output hashes before packaging.
 - **TinyALSA e43025bbf702eb7dd8edd48c1eb50530c60f1de8** — BSD-3-Clause.
 - **libsodium 1.0.18** — ISC, statically linked into the OTA verifier.
+- **BlueZ SBC codec** — LGPL-2.1-or-later. The Bluetooth A2DP-SINK profile
+  service in `libreecho-btd` statically links the vendored BlueZ SBC library
+  (`sbc`, upstream `b3deb8a5dcfb42d8c10ba1f2f1ac9bd7bf7271cc`). The complete
+  corresponding source ships with the LibreEcho UI source offer; the
+  LGPL-2.1 text accompanies this bundle. Relinking instructions are in the
+  UI `Makefile`.
 
 ## Compiler/runtime closure
 
