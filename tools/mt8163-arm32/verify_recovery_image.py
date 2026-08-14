@@ -1672,6 +1672,18 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     verified_overlay: dict[str, Entry] = {}
     for name, mode in OVERLAY_FILES.items():
         expected = read(overlay_dir / name)
+        if name == "ota-source.conf":
+            source_text = expected.decode()
+            source_text = re.sub(
+                r"^channel=.*$", f"channel={expected_update_channel}",
+                source_text, count=1, flags=re.MULTILINE,
+            )
+            source_text = re.sub(
+                r"libreecho-radar-puffin-(?:dev|stable)\.ota\.tar",
+                f"libreecho-radar-puffin-{expected_update_channel}.ota.tar",
+                source_text,
+            )
+            expected = source_text.encode()
         target_name = OVERLAY_TARGETS.get(name, name)
         entry = require_member(entries, target_name, sha256(expected), mode)
         record = overlay_manifest.get(name, {})
