@@ -1679,7 +1679,7 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                 source_text, count=1, flags=re.MULTILINE,
             )
             source_text = re.sub(
-                r"libreecho-radar-puffin-(?:dev|stable)\\.ota\\.tar",
+                r"libreecho-radar-puffin-(?:dev|stable)\.ota\.tar",
                 f"libreecho-radar-puffin-{expected_update_channel}.ota.tar",
                 source_text,
             )
