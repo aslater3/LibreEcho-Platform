@@ -939,14 +939,23 @@ ota_health_confirm_worker()
     $BB sleep 45
     attempt=0
     passed=0
+    last_check=unknown
     while [ "$attempt" -lt 6 ] && [ "$passed" -lt 3 ]; do
         attempt=$((attempt + 1))
-        if ! $BB grep -q ' /data ' /proc/mounts 2>/dev/null ||
-           [ "${ffs_ready:-0}" -ne 1 ] ||
-           ! /etc/init.d/libreecho-web.init status >/dev/null 2>&1 ||
-           ! ota_health_services_ready; then
+        if ! $BB grep -q ' /data ' /proc/mounts 2>/dev/null; then
+            last_check=data-mount
+        elif [ "${ffs_ready:-0}" -ne 1 ]; then
+            last_check=ffs-ready
+        elif ! /etc/init.d/libreecho-web.init status >/dev/null 2>&1; then
+            last_check=web-status
+        elif ! ota_health_services_ready; then
+            last_check=services-ready
+        else
+            last_check=none
+        fi
+        if [ "$last_check" != none ]; then
             passed=0
-            log "ota-health-probe-failed:$attempt"
+            log "ota-health-probe-failed:$attempt:$last_check"
             $BB sleep 30
             continue
         fi
@@ -961,6 +970,30 @@ ota_health_confirm_worker()
         return 0
     fi
     log ota-health-confirm-failed-rebooting
+    # Issue #41: leave persistent evidence for why this worker restarted the
+    # device.  The record lives on the persistent userdata filesystem (not
+    # tmpfs), is written atomically and synced before the reboot, and is
+    # surfaced by `libreecho-update status`.  This keeps a health-worker
+    # restart distinguishable from a genuine hardware watchdog reset.
+    {
+        echo schema=1
+        echo reason=ota-health-confirm-failed
+        echo last_check=$last_check
+        echo attempts=$attempt
+        echo passed=$passed
+        echo pending_slot=$pending_slot
+        echo selected_slot=$selected_slot
+        echo epoch=$(date -u +%s)
+    } > /data/libreecho/update/restart-record.tmp &&
+        $BB mv /data/libreecho/update/restart-record.tmp \
+            /data/libreecho/update/restart-record
+    {
+        echo schema=1
+        echo state=restarting
+        echo progress=0
+        echo detail=health-confirm-failed:$last_check
+    } > /data/libreecho/update/state.tmp &&
+        $BB mv /data/libreecho/update/state.tmp /data/libreecho/update/state
     $BB sync
     $BB sleep 2
     $BB reboot -f
