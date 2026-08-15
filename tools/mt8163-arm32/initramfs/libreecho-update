@@ -354,6 +354,11 @@ case "${1:-}" in
         "$BOOTCTL" status
         [ ! -r "$STATE" ] || $BB cat "$STATE"
         [ ! -r "$PENDING" ] || $BB cat "$PENDING"
+        # Issue #41: surface the persistent health-worker restart record so a
+        # worker-forced reboot is distinguishable from a hardware watchdog
+        # reset during OTA triage.
+        [ ! -r "$UPDATE_ROOT/restart-record" ] ||
+            { echo restart_record=1; $BB cat "$UPDATE_ROOT/restart-record"; }
         ;;
     install)
         [ "$#" -eq 2 ] || die usage

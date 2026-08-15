@@ -821,6 +821,38 @@ class SourceTests(unittest.TestCase):
             source = (TOOLS_DIR / name).read_text()
             self.assertIn(f'{constant} = "{init_hash}"', source)
 
+    def test_health_confirm_restart_record_is_persistent(self) -> None:
+        # Issue #41: the OTA health-confirm worker must leave persistent
+        # evidence before forcing a reboot, so a worker restart is
+        # distinguishable from a hardware watchdog reset.
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
+        # The record is written atomically to the persistent userdata
+        # filesystem (not tmpfs) and synced before the reboot.
+        self.assertIn("/data/libreecho/update/restart-record", init)
+        self.assertIn("restart-record.tmp", init)
+        self.assertIn("reason=ota-health-confirm-failed", init)
+        # The failing check, attempt count, and slot state are recorded so the
+        # restart can be triaged after the fact.
+        self.assertIn("last_check=", init)
+        self.assertIn("attempts=$attempt", init)
+        self.assertIn("pending_slot=$pending_slot", init)
+        self.assertIn("selected_slot=$selected_slot", init)
+        # The state file reflects the restart so OTA status is truthful.
+        self.assertIn("state=restarting", init)
+        self.assertIn("detail=health-confirm-failed:$last_check", init)
+        # The record must be written BEFORE the worker's reboot, not after.
+        # Scope to the worker function: earlier unrelated reboot paths must
+        # not satisfy the ordering check.
+        worker_start = init.index("ota_health_confirm_worker()")
+        worker = init[worker_start:worker_start + 6000]
+        restart_idx = worker.index("$BB reboot -f")
+        record_idx = worker.index("/data/libreecho/update/restart-record")
+        self.assertLess(record_idx, restart_idx)
+        # libreecho-update status surfaces the persistent record.
+        self.assertIn("restart-record", updater)
+        self.assertIn("restart_record=1", updater)
+
     def test_ota_bundle_signs_redistributable_policy(self) -> None:
         from nacl.signing import SigningKey
         with tempfile.TemporaryDirectory() as temporary:
