@@ -214,6 +214,27 @@ class SourceTests(unittest.TestCase):
         }
         return importer, data, source, firmware, environment, records
 
+    def test_platform_root_documentation_is_project_specific(self) -> None:
+        repo_root = TOOLS_DIR.parents[1]
+        readme = repo_root / "README.md"
+        historical = repo_root / "docs/historical/upstream-linux-3x-README"
+        self.assertTrue(readme.is_file())
+        self.assertTrue(historical.is_file())
+        source = readme.read_text()
+        normalized = source.casefold()
+        for required in (
+            "libreecho-platform",
+            "libreecho-linux-6.1",
+            "libreecho-ui",
+            "libreecho-build",
+            "owner-local firmware",
+            "historical linux 3.18",
+            "libreecho_pipeline_root",
+        ):
+            self.assertIn(required, normalized)
+        self.assertNotIn("/home/andy/", source)
+        self.assertIn("Linux kernel release 3.x", historical.read_text())
+
     def test_release_tools_cannot_bundle_startup_audio(self) -> None:
         for name in ("build_recovery_image.py", "verify_recovery_image.py"):
             source = (TOOLS_DIR / name).read_text()
