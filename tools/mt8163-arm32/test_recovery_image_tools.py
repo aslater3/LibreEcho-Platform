@@ -241,6 +241,52 @@ class SourceTests(unittest.TestCase):
         )
         self.assertIn('RE2_ARCHIVE="$RE2_ARCHIVE"', source)
 
+    def test_wakeword_runtime_maps_paths_for_reproducible_archives(self) -> None:
+        # ORT logging macros expand __FILE__ into compiled objects.  Without
+        # canonical path prefixes, every per-run build directory produces
+        # different bytes for identical inputs, and the fail-closed wake-ort
+        # component cache refuses to store over its own key.  Both the build
+        # directory and the source checkout must be rewritten to stable
+        # prefixes on every reduced-ORT build.
+        source = (TOOLS_DIR / "wakeword/build_runtime.sh").read_text()
+        self.assertIn(
+            'ort_repro_flags="-ffile-prefix-map=$ORT_BUILD=ort-build '
+            '-ffile-prefix-map=$ORT_SOURCE=ort-src"',
+            source,
+        )
+        self.assertIn(
+            "-DCMAKE_C_FLAGS=\"-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard "
+            "-ffunction-sections -fdata-sections $ort_repro_flags\"",
+            source,
+        )
+        self.assertIn(
+            "-DCMAKE_CXX_FLAGS=\"-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard "
+            "-ffunction-sections -fdata-sections $ort_repro_flags\"",
+            source,
+        )
+        # The reduced-ORT build must never run without the reproducibility
+        # flags attached to the compile lines.
+        self.assertNotIn(
+            '-DCMAKE_C_FLAGS="-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard '
+            '-ffunction-sections -fdata-sections"',
+            source,
+        )
+
+    def test_wakeword_speex_metadata_uses_canonical_prefix(self) -> None:
+        # The cached wake-runtime payload includes the SpeexDSP install prefix,
+        # which is a per-run directory.  The static archive and headers carry
+        # no path bytes, but libtool/pkg-config metadata does; rewrite it to a
+        # canonical prefix so identical inputs keep identical output bytes.
+        source = (TOOLS_DIR / "wakeword/build_runtime.sh").read_text()
+        self.assertIn(
+            "prefix=/opt/libreecho/speexdsp", source
+        )
+        self.assertIn(
+            "libdir='/opt/libreecho/speexdsp/lib'", source
+        )
+        self.assertIn('$SPEEX_PREFIX/lib/pkgconfig/speexdsp.pc', source)
+        self.assertIn('$SPEEX_PREFIX/lib/libspeexdsp.la', source)
+
     def test_wakeword_runtime_snapshots_relink_objects(self) -> None:
         source = (TOOLS_DIR / "wakeword/build_runtime.sh").read_text()
         self.assertIn(
