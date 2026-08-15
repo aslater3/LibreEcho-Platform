@@ -85,6 +85,16 @@ if [[ ! -f "$SPEEX_PREFIX/lib/libspeexdsp.a" ]]; then
     make -j"$JOBS"
     make install
   )
+  # The install prefix is a per-run path, but the cached wake-runtime payload
+  # must stay byte-identical for identical inputs.  Only the static archive,
+  # headers, and docs are consumed downstream; rewrite the libtool/pkg-config
+  # metadata to a canonical prefix so it cannot leak the run path.
+  sed -i \
+    -e "s|^prefix=.*|prefix=/opt/libreecho/speexdsp|" \
+    "$SPEEX_PREFIX/lib/pkgconfig/speexdsp.pc"
+  sed -i \
+    -e "s|^libdir=.*|libdir='/opt/libreecho/speexdsp/lib'|" \
+    "$SPEEX_PREFIX/lib/libspeexdsp.la"
 fi
 
 required_ort_archives=(
@@ -156,6 +166,12 @@ reduce_ops(
     is_extended_minimal_build_or_higher=True,
 )
 PY
+  # ORT logging macros expand __FILE__ into compiled objects, so a build that
+  # records its own per-run directory would produce different bytes for the
+  # same inputs on every run.  Rewrite both the build directory and the source
+  # checkout to canonical prefixes so the reduced archives are reproducible
+  # and the wake-ort component cache can store them without collisions.
+  ort_repro_flags="-ffile-prefix-map=$ORT_BUILD=ort-build -ffile-prefix-map=$ORT_SOURCE=ort-src"
   cmake -S "$ort_source_for_cmake/cmake" -B "$ORT_BUILD" \
     -DPython_EXECUTABLE="$ort_python" \
     -DCMAKE_BUILD_TYPE=MinSizeRel \
@@ -164,8 +180,8 @@ PY
     -DCMAKE_CXX_COMPILER="${CROSS}g++" \
     -DCMAKE_AR="${CROSS}ar" -DCMAKE_RANLIB="${CROSS}ranlib" \
     -DCMAKE_STRIP="${CROSS}strip" \
-    -DCMAKE_C_FLAGS="-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard -ffunction-sections -fdata-sections" \
-    -DCMAKE_CXX_FLAGS="-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard -ffunction-sections -fdata-sections" \
+    -DCMAKE_C_FLAGS="-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard -ffunction-sections -fdata-sections $ort_repro_flags" \
+    -DCMAKE_CXX_FLAGS="-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard -ffunction-sections -fdata-sections $ort_repro_flags" \
     -Donnxruntime_CROSS_COMPILING=ON \
     -Donnxruntime_BUILD_SHARED_LIB=OFF \
     -Donnxruntime_BUILD_UNIT_TESTS=OFF \
