@@ -2042,7 +2042,7 @@ class PolicyTests(unittest.TestCase):
             "6) die download_dns false",
             "7) die download_connect false",
             "28) die download_timeout false",
-            "35) die download_tls false",
+            "35|51|53|54|58|59|60|64|66|77) die download_tls false",
             "4??|5??) die download_http true",
             "*) die download_status true",
         ):

@@ -344,19 +344,20 @@ download_and_inspect()
     $BB rm -f "$CURL_STDERR"
     if [ "$curl_rc" -ne 0 ]; then
         case "$curl_rc" in
+            22)
+                case "$http_code" in
+                    404) die asset_missing true "$curl_rc" "$curl_detail" "$http_code" ;;
+                    401|403) die asset_access_denied true "$curl_rc" "$curl_detail" "$http_code" ;;
+                    4??|5??) die download_http true "$curl_rc" "$curl_detail" "$http_code" ;;
+                    *) die download_status true "$curl_rc" "$curl_detail" "$http_code" ;;
+                esac
+                ;;
             5|6) die download_dns false "$curl_rc" "$curl_detail" "$http_code" ;;
             7) die download_connect false "$curl_rc" "$curl_detail" "$http_code" ;;
             28) die download_timeout false "$curl_rc" "$curl_detail" "$http_code" ;;
-            35) die download_tls false "$curl_rc" "$curl_detail" "$http_code" ;;
-            51|53|54|58|59|60|64|66|77) die download_tls false "$curl_rc" "$curl_detail" "$http_code" ;;
+            35|51|53|54|58|59|60|64|66|77) die download_tls false "$curl_rc" "$curl_detail" "$http_code" ;;
+            *) die download_transport false "$curl_rc" "$curl_detail" "$http_code" ;;
         esac
-        case "$http_code" in
-            404) die asset_missing true "$curl_rc" "$curl_detail" "$http_code" ;;
-            401|403) die asset_access_denied true "$curl_rc" "$curl_detail" "$http_code" ;;
-            4??|5??) die download_http true "$curl_rc" "$curl_detail" "$http_code" ;;
-            3??) die download_status true "$curl_rc" "$curl_detail" "$http_code" ;;
-        esac
-        die download_transport false "$curl_rc" "$curl_detail" "$http_code"
     fi
     case "$http_code" in
         2??) ;;
