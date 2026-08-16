@@ -2031,7 +2031,7 @@ class PolicyTests(unittest.TestCase):
         """Host-visible OTA failures identify the curl failure without leaking paths."""
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
         for expected in (
-            "CURL_STDERR=$ROOT/curl.stderr",
+            "CURL_STDERR=/run/libreecho/ota-curl.stderr",
             "CURL_DIAGNOSTIC_MAX=160",
             '"$CURL" --fail --location --silent --show-error',
             '--stderr "$CURL_STDERR"',

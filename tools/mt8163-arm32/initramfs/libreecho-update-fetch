@@ -20,7 +20,7 @@ ASSISTANT_PAYLOAD=/data/libreecho/features/assistant/payload.squashfs
 ASSISTANT_MANIFEST=/data/libreecho/features/assistant/manifest.json
 CLIENT_ROOT=/run/libreecho/ota-client
 MAX_BYTES=33554432
-CURL_STDERR=$ROOT/curl.stderr
+CURL_STDERR=/run/libreecho/ota-curl.stderr
 CURL_DIAGNOSTIC_MAX=160
 
 sanitize_status_value()
