@@ -1919,6 +1919,8 @@ class PolicyTests(unittest.TestCase):
         ):
             self.assertIn(f"feature_${{feature}}_{field}", updater)
         self.assertIn("feature_status()", updater)
+        self.assertIn("printf '%s\\n' \"$digest\"", updater)
+        self.assertNotIn("printf '%s\\\\n' \"$digest\"", updater)
         self.assertIn('"/proc/$pid/exe"', updater)
         status_block = updater[updater.index("    status)"):]
         self.assertIn("feature_status", status_block)

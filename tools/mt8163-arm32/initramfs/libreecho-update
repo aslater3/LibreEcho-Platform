@@ -248,7 +248,7 @@ feature_file_sha256()
     fi
     digest=$($BB sha256sum "$path" 2>/dev/null | $BB awk '{print $1}')
     [ -n "$digest" ] || digest=unavailable
-    printf '%s\\n' "$digest"
+    printf '%s\n' "$digest"
 }
 
 feature_status()
