@@ -2046,6 +2046,7 @@ class PolicyTests(unittest.TestCase):
             "35|51|53|54|58|59|60|64|66|77) die download_tls false",
             "47) die download_status true",
             "63) die download_size true",
+            "*) die download_transport unknown",
             "4??|5??) die download_http true",
             "*) die download_status true",
             "if ! check_status_write error",
