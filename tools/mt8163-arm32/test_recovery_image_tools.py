@@ -2045,6 +2045,8 @@ class PolicyTests(unittest.TestCase):
             "35|51|53|54|58|59|60|64|66|77) die download_tls false",
             "4??|5??) die download_http true",
             "*) die download_status true",
+            "if ! check_status_write error",
+            'echo "ERROR_DETAIL:$error_detail" >&2',
         ):
             self.assertIn(expected, fetcher)
         self.assertIn("tr '\\r\\n' '  '", fetcher)

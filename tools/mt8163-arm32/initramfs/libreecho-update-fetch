@@ -139,8 +139,10 @@ die()
     error_exit=${3:-}
     error_detail=${4:-}
     http_status=${5:-}
-    check_status_write error "" "$reason" "$reachable" \
-        "$error_exit" "$error_detail" "$http_status"
+    if ! check_status_write error "" "$reason" "$reachable" \
+        "$error_exit" "$error_detail" "$http_status"; then
+        [ -n "$error_detail" ] && echo "ERROR_DETAIL:$error_detail" >&2
+    fi
     echo "ERROR:$1" >&2
     exit 1
 }
