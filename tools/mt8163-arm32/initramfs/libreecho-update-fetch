@@ -356,6 +356,7 @@ download_and_inspect()
                 ;;
             5|6) die download_dns false "$curl_rc" "$curl_detail" "$http_code" ;;
             7) die download_connect false "$curl_rc" "$curl_detail" "$http_code" ;;
+            23) die download_write unknown "$curl_rc" "$curl_detail" "$http_code" ;;
             28) die download_timeout false "$curl_rc" "$curl_detail" "$http_code" ;;
             35|51|53|54|58|59|60|64|66|77) die download_tls false "$curl_rc" "$curl_detail" "$http_code" ;;
             *) die download_transport false "$curl_rc" "$curl_detail" "$http_code" ;;
