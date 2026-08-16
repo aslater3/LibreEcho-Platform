@@ -2051,6 +2051,7 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("https\\?://", fetcher)
         self.assertIn('cut -c 1-"$CURL_DIAGNOSTIC_MAX"', fetcher)
         self.assertLess(fetcher.index('--stderr "$CURL_STDERR"'), fetcher.index("curl_rc=$?"))
+        self.assertLess(fetcher.index('case "$curl_rc" in'), fetcher.index('case "$http_code" in'))
         self.assertLess(fetcher.index("sanitize_status_value()"), fetcher.index("check_status_write()"))
         self.assertNotIn('echo "error=$curl_stderr"', fetcher)
 
