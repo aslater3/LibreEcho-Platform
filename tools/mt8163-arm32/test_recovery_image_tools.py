@@ -1899,6 +1899,32 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("printf '%s\\n' \"channel=$selected_channel\"", updater)
         self.assertIn("die manifest_service_profile", updater)
 
+    def test_ota_status_reports_effective_feature_payload_identity(self) -> None:
+        """Status must expose preserved payload and running-daemon identities."""
+        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
+        for feature, daemon in (
+            ("airplay2", "libreecho-airplayd"),
+            ("tts", "libreecho-ttsd"),
+            ("wakeword", "libreecho-waked"),
+            ("stt", "libreecho-sttd"),
+            ("assistant", "libreecho-agentd"),
+        ):
+            self.assertIn(f"{feature}) daemon={daemon}", updater)
+        self.assertIn("feature_root=/data/libreecho/features/$feature", updater)
+        self.assertIn("payload=$feature_root/payload.squashfs", updater)
+        self.assertIn("manifest=$feature_root/manifest.json", updater)
+        for field in (
+            "payload_sha256", "payload_size", "manifest_sha256",
+            "running_daemon_sha256", "effective",
+        ):
+            self.assertIn(f"feature_${{feature}}_{field}", updater)
+        self.assertIn("feature_status()", updater)
+        self.assertIn("printf '%s\\n' \"$digest\"", updater)
+        self.assertNotIn("printf '%s\\\\n' \"$digest\"", updater)
+        self.assertIn('"/proc/$pid/exe"', updater)
+        status_block = updater[updater.index("    status)"):]
+        self.assertIn("feature_status", status_block)
+
     def test_host_ota_path_is_explicit_and_uses_guarded_updater(self) -> None:
         host = pipeline_file("ota.sh").read_text()
         preflight = pipeline_file("ota-preflight-root.sh").read_text()

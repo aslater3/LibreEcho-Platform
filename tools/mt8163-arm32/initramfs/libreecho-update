@@ -237,6 +237,62 @@ bootctl_status()
     target_device_for_slot "$target"
 }
 
+feature_file_sha256()
+{
+    path=$1
+    allow_symlink=${2:-0}
+    [ -f "$path" ] || { echo unavailable; return 0; }
+    if [ "$allow_symlink" -ne 1 ] && [ -L "$path" ]; then
+        echo unavailable
+        return 0
+    fi
+    digest=$($BB sha256sum "$path" 2>/dev/null | $BB awk '{print $1}')
+    [ -n "$digest" ] || digest=unavailable
+    printf '%s\n' "$digest"
+}
+
+feature_status()
+{
+    for feature in airplay2 tts wakeword stt assistant; do
+        case "$feature" in
+            airplay2) daemon=libreecho-airplayd ;;
+            tts) daemon=libreecho-ttsd ;;
+            wakeword) daemon=libreecho-waked ;;
+            stt) daemon=libreecho-sttd ;;
+            assistant) daemon=libreecho-agentd ;;
+        esac
+        feature_root=/data/libreecho/features/$feature
+        payload=$feature_root/payload.squashfs
+        manifest=$feature_root/manifest.json
+        payload_sha=$(feature_file_sha256 "$payload")
+        payload_size=unavailable
+        if [ -f "$payload" ] && [ ! -L "$payload" ]; then
+            payload_size=$($BB stat -c %s "$payload" 2>/dev/null)
+            [ -n "$payload_size" ] || payload_size=unavailable
+        fi
+        manifest_sha=$(feature_file_sha256 "$manifest")
+        running_daemon_sha256=not-running
+        pid=$($BB pidof "$daemon" 2>/dev/null | $BB awk '{print $1}')
+        case "$pid" in
+            ''|*[!0-9]*) ;;
+            *)
+                if [ -r "/proc/$pid/exe" ]; then
+                    running_daemon_sha256=$(feature_file_sha256 "/proc/$pid/exe" 1)
+                fi
+                ;;
+        esac
+        effective=present
+        [ "$payload_sha" != unavailable ] &&
+            [ "$manifest_sha" != unavailable ] || effective=missing
+        echo "feature_${feature}_payload_sha256=$payload_sha"
+        echo "feature_${feature}_payload_size=$payload_size"
+        echo "feature_${feature}_manifest_sha256=$manifest_sha"
+        echo "feature_${feature}_running_daemon=$daemon"
+        echo "feature_${feature}_running_daemon_sha256=$running_daemon_sha256"
+        echo "feature_${feature}_effective=$effective"
+    done
+}
+
 clear_exact_development_marker()
 {
     expdb=/dev/mmcblk0p7
@@ -359,6 +415,7 @@ case "${1:-}" in
         # reset during OTA triage.
         [ ! -r "$UPDATE_ROOT/restart-record" ] ||
             { echo restart_record=1; $BB cat "$UPDATE_ROOT/restart-record"; }
+        feature_status
         ;;
     install)
         [ "$#" -eq 2 ] || die usage
