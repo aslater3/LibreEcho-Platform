@@ -359,6 +359,7 @@ download_and_inspect()
             23) die download_write unknown "$curl_rc" "$curl_detail" "$http_code" ;;
             28) die download_timeout false "$curl_rc" "$curl_detail" "$http_code" ;;
             35|51|53|54|58|59|60|64|66|77) die download_tls false "$curl_rc" "$curl_detail" "$http_code" ;;
+            47) die download_status true "$curl_rc" "$curl_detail" "$http_code" ;;
             63) die download_size true "$curl_rc" "$curl_detail" "$http_code" ;;
             *) die download_transport false "$curl_rc" "$curl_detail" "$http_code" ;;
         esac
