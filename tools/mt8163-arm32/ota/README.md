@@ -76,6 +76,32 @@ five-payload graph with the separately licensed CC-BY-NC-SA wakeword model;
 with AirPlay, STT, TTS, and assistant present and wakeword absent; `exclude`
 remains the diagnostic payload-free graph.
 
+### Preserved payload identity and acceptance boundary
+
+The `preserve` policy retains the existing feature payloads under
+`/data/libreecho/features/<feature>/` while an OTA transaction replaces only the
+inactive boot image. A successful boot, signature check, or `bootctl confirm`
+therefore does **not** prove that the running feature daemons came from the
+candidate that supplied the boot image; a candidate can be a deliberate hybrid
+until its payload identities are separately reconciled.
+
+`libreecho-update status` reports the effective on-device identity for each
+feature (`airplay2`, `tts`, `wakeword`, `stt`, and `assistant`): the persisted
+`squashfs` SHA-256 and size, the persisted feature-manifest SHA-256, and the
+SHA-256 of the running daemon executable when its process is present. Missing
+payloads are reported as `effective=missing`; a stopped daemon is reported as
+`running_daemon_sha256=not-running`. These fields are diagnostic evidence, not
+an automatic claim that the candidate and runtime match.
+
+The release/publisher gate must compare the candidate's payload and feature
+manifest identities against the identities inherited by a `preserve` candidate.
+Runtime acceptance must also compare each `running_daemon_sha256` against the
+corresponding candidate file hash, or record an explicit waiver. A mismatch
+must fail acceptance rather than being silently hidden by the boot-image
+version. A future payload-refresh transaction may replace this preserve-only
+boundary, but it must preserve models/configuration atomically and verify a
+rollback-safe post-apply hash before changing the policy.
+
 Manual browser upload streams the tar to `/data/libreecho/update/incoming` and
 invokes the target installer. OTA-profile images also check the stable public
 GitHub Release asset in `aslater3/LibreEcho`, configured in
