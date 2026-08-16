@@ -20,6 +20,20 @@ ASSISTANT_PAYLOAD=/data/libreecho/features/assistant/payload.squashfs
 ASSISTANT_MANIFEST=/data/libreecho/features/assistant/manifest.json
 CLIENT_ROOT=/run/libreecho/ota-client
 MAX_BYTES=33554432
+CURL_STDERR=$ROOT/curl.stderr
+CURL_DIAGNOSTIC_MAX=160
+
+sanitize_status_value()
+{
+    value=$1
+    printf '%s' "$value" |
+        $BB tr '\r\n' '  ' |
+        $BB sed \
+            -e 's#https\?://[^[:space:]]*#URL#g' \
+            -e 's#/[^[:space:]]*#PATH#g' \
+            -e 's/[^[:alnum:] .,():_+~-]/_/g' |
+        $BB cut -c 1-"$CURL_DIAGNOSTIC_MAX"
+}
 
 check_value()
 {
@@ -32,6 +46,25 @@ check_status_write()
     latest=$2
     error=$3
     reachable=$4
+    error_exit=${5:-}
+    error_detail=${6:-}
+    http_status=${7:-}
+    status=$(sanitize_status_value "$status")
+    latest=$(sanitize_status_value "$latest")
+    error=$(sanitize_status_value "$error")
+    error_detail=$(sanitize_status_value "$error_detail")
+    case "$reachable" in
+        true|false|unknown) ;;
+        *) reachable=unknown ;;
+    esac
+    case "$error_exit" in
+        ''|*[!0-9]*) error_exit= ;;
+    esac
+    case "$http_status" in
+        000) http_status= ;;
+        [0-9][0-9][0-9]) ;;
+        *) http_status= ;;
+    esac
     now=$($BB date +%s 2>/dev/null)
     case "$now" in
         ''|*[!0-9]*) now=0 ;;
@@ -58,6 +91,9 @@ check_status_write()
         echo "last_check_epoch=$now"
         echo "last_success_epoch=$last_success"
         echo "error=$error"
+        echo "error_exit=$error_exit"
+        echo "error_detail=$error_detail"
+        echo "http_status=$http_status"
     } > "$CHECK_STATUS.tmp" &&
         $BB mv "$CHECK_STATUS.tmp" "$CHECK_STATUS"
 }
@@ -100,7 +136,11 @@ die()
 {
     reason=$1
     reachable=${2:-unknown}
-    check_status_write error "" "$reason" "$reachable"
+    error_exit=${3:-}
+    error_detail=${4:-}
+    http_status=${5:-}
+    check_status_write error "" "$reason" "$reachable" \
+        "$error_exit" "$error_detail" "$http_status"
     echo "ERROR:$1" >&2
     exit 1
 }
@@ -174,6 +214,9 @@ set_channel()
         echo last_check_epoch=0
         echo last_success_epoch=0
         echo error=
+        echo error_exit=
+        echo error_detail=
+        echo http_status=
     } > "$CHECK_STATUS.tmp" || die channel_status_write
     $BB mv "$CHECK_STATUS.tmp" "$CHECK_STATUS" || die channel_status_commit
     cleanup_locks
@@ -274,26 +317,54 @@ install_unlock()
     INSTALL_LOCK_HELD=0
 }
 
+downloader_stderr()
+{
+    detail=$($BB sed -n \
+        's/^[[:space:]]*curl:[[:space:]]*([0-9][0-9]*)[[:space:]]*//p' \
+        "$CURL_STDERR" 2>/dev/null | $BB head -n 1)
+    [ -n "$detail" ] || detail=$($BB sed -n '1p' "$CURL_STDERR" 2>/dev/null)
+    sanitize_status_value "$detail"
+}
+
 download_and_inspect()
 {
     [ ! -r "$ROOT/pending" ] || die update_already_pending
     check_status_write checking "" "" unknown
     prepare_https_client
     check_status_write downloading "" "" true
-    $BB rm -f "$PART"
+    $BB rm -f "$PART" "$CURL_STDERR"
     http_code=$("$CURL" --fail --location --silent --show-error \
         --proto '=https' --proto-redir '=https' --tlsv1.2 \
         --cacert "$CA" --connect-timeout 20 --max-time 1800 \
         --max-filesize "$MAX_BYTES" --output "$PART" \
+        --stderr "$CURL_STDERR" \
         --write-out '%{http_code}' "$url")
     curl_rc=$?
+    curl_detail=$(downloader_stderr)
+    $BB rm -f "$CURL_STDERR"
     if [ "$curl_rc" -ne 0 ]; then
         case "$http_code" in
-            404) die asset_missing true ;;
-            401|403) die asset_access_denied true ;;
-            *) die download_transport false ;;
+            404) die asset_missing true "$curl_rc" "$curl_detail" "$http_code" ;;
+            401|403) die asset_access_denied true "$curl_rc" "$curl_detail" "$http_code" ;;
+            4??|5??) die download_http true "$curl_rc" "$curl_detail" "$http_code" ;;
+            3??) die download_status true "$curl_rc" "$curl_detail" "$http_code" ;;
+        esac
+        case "$curl_rc" in
+            5|6) die download_dns false "$curl_rc" "$curl_detail" "$http_code" ;;
+            7) die download_connect false "$curl_rc" "$curl_detail" "$http_code" ;;
+            28) die download_timeout false "$curl_rc" "$curl_detail" "$http_code" ;;
+            35) die download_tls false "$curl_rc" "$curl_detail" "$http_code" ;;
+            51|53|54|58|59|60|64|66|77) die download_tls false "$curl_rc" "$curl_detail" "$http_code" ;;
+            *) die download_transport false "$curl_rc" "$curl_detail" "$http_code" ;;
         esac
     fi
+    case "$http_code" in
+        2??) ;;
+        404) die asset_missing true "$curl_rc" "$curl_detail" "$http_code" ;;
+        401|403) die asset_access_denied true "$curl_rc" "$curl_detail" "$http_code" ;;
+        4??|5??) die download_http true "$curl_rc" "$curl_detail" "$http_code" ;;
+        *) die download_status true "$curl_rc" "$curl_detail" "$http_code" ;;
+    esac
     [ -f "$PART" ] && [ ! -L "$PART" ] || die download_type
     size=$($BB stat -c %s "$PART" 2>/dev/null)
     [ "$size" -gt 0 ] && [ "$size" -le "$MAX_BYTES" ] || die download_size

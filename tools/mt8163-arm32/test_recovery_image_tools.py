@@ -2027,6 +2027,33 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("404) die asset_missing true", fetcher)
         self.assertNotIn("state_write update-held-after-rollback", fetcher)
 
+    def test_ota_fetch_status_preserves_bounded_sanitized_curl_diagnostics(self) -> None:
+        """Host-visible OTA failures identify the curl failure without leaking paths."""
+        fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
+        for expected in (
+            "CURL_STDERR=$ROOT/curl.stderr",
+            "CURL_DIAGNOSTIC_MAX=160",
+            '"$CURL" --fail --location --silent --show-error',
+            '--stderr "$CURL_STDERR"',
+            "sanitize_status_value()",
+            "error_exit=",
+            "error_detail=",
+            "http_status=",
+            "6) die download_dns false",
+            "7) die download_connect false",
+            "28) die download_timeout false",
+            "35) die download_tls false",
+            "4??|5??) die download_http true",
+            "*) die download_status true",
+        ):
+            self.assertIn(expected, fetcher)
+        self.assertIn("tr '\\r\\n' '  '", fetcher)
+        self.assertIn("https\\?://", fetcher)
+        self.assertIn('cut -c 1-"$CURL_DIAGNOSTIC_MAX"', fetcher)
+        self.assertLess(fetcher.index('--stderr "$CURL_STDERR"'), fetcher.index("curl_rc=$?"))
+        self.assertLess(fetcher.index("sanitize_status_value()"), fetcher.index("check_status_write()"))
+        self.assertNotIn('echo "error=$curl_stderr"', fetcher)
+
     def test_ota_watcher_checks_and_requires_automatic_update_opt_in(self) -> None:
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
         self.assertIn('"$0" check >/tmp/ota-check.log 2>&1', fetcher)
