@@ -852,9 +852,10 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		    enable_output_controls(card) < 0) {
 			fprintf(stderr, "audio-engine: playback start failed: %s\n",
 				pcm_get_error(pcm));
-			(void)disable_output_controls(card,
-				airplay_session ? saved_volume : -1);
+			(void)disable_output_controls(card, -1);
 			pcm_close(pcm);
+			if (airplay_session && saved_volume >= 0)
+				(void)set_pcm_volume(card, saved_volume);
 			clear_source_activity(sources, &announcement_led_active,
 					      &visualizer, &status);
 			continue;
@@ -888,9 +889,10 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		}
 		clear_source_activity(sources, &announcement_led_active,
 				      &visualizer, &status);
-		(void)disable_output_controls(card,
-			airplay_session ? saved_volume : -1);
+		(void)disable_output_controls(card, -1);
 		pcm_close(pcm);
+		if (airplay_session && saved_volume >= 0)
+			(void)set_pcm_volume(card, saved_volume);
 	}
 	result = stopping ? 0 : -1;
 out:

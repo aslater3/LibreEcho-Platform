@@ -50,6 +50,23 @@ def main() -> None:
     if not pcm_open < startup_apply < first_write:
         raise SystemExit("startup volume must be applied after PCM open and before first write")
 
+    failure_start = engine.index("playback start failed")
+    failure_end = engine.index("process_music_visualizer", failure_start)
+    failure = engine[failure_start:failure_end]
+    if not failure.index("disable_output_controls") < failure.index("pcm_close"):
+        raise SystemExit("partial-start failure must mute before PCM close")
+    normal_start = engine.index(
+        "\n\t\tclear_source_activity(sources",
+        engine.index("while (!stopping && sources_active(sources))"),
+    )
+    normal_end = engine.index("\n\t}\n\tresult", normal_start)
+    normal = engine[normal_start:normal_end]
+    normal_disable = normal.index("disable_output_controls")
+    normal_close = normal.index("pcm_close")
+    normal_restore = normal.index("set_pcm_volume(card, saved_volume)")
+    if not normal_disable < normal_close < normal_restore:
+        raise SystemExit("normal teardown must mute, close PCM, then restore volume")
+
     missing = [
         f"airplay_audio.c: {fragment}"
         for fragment in producer_required
