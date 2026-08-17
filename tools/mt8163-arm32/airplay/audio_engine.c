@@ -815,14 +815,11 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				sync_playback_status(sources, &status);
 				continue;
 			}
-			/* Keep system, announcement, and alarm audio live without
-			 * allowing uninitialized AirPlay media to reach the speaker. */
-			sources[SOURCE_MEDIA].gain_q15 = 0;
-			puffin_dynamics_init(&dynamics);
-			render_period(sources, output, &dynamics);
-			first_activity = source_activity_mask(sources);
-			render_period(sources, second, &dynamics);
-			second_activity = source_activity_mask(sources);
+			/* Keep system, announcement, and alarm audio live.  The
+			 * read_sources() gate already muted only AirPlay media. */
+			fprintf(stderr,
+				"audio-engine: priority audio continues while AirPlay "
+				"volume is unavailable\n");
 		}
 		if (arm_output_controls(card, airplay_volume, &saved_volume) < 0) {
 			fprintf(stderr, "audio-engine: output arm failed\n");

@@ -27,12 +27,15 @@ def main() -> None:
         "airplay volume unavailable; deferring media",
         "airplay_volume < 0",
         "higher_priority_active(sources)",
-        "sources[SOURCE_MEDIA].gain_q15 = 0",
+        "? (airplay_volume_to_mixer(root) >= 0 ? 32768 : 0)",
+        "priority audio continues while AirPlay",
     )
     gate = engine[engine.index("if (airplay_session && airplay_volume < 0)"):engine.index(
         "if (arm_output_controls", engine.index("if (airplay_session && airplay_volume < 0)"))]
     if "clear_source_activity(sources" in gate:
         raise SystemExit("missing AirPlay volume must not clear priority buses")
+    if "render_period(sources" in gate:
+        raise SystemExit("priority-bus gate must preserve the already rendered periods")
     missing = [
         f"airplay_audio.c: {fragment}"
         for fragment in producer_required
