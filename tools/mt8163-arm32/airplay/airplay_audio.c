@@ -153,7 +153,8 @@ static int forward_stream(const char *input_path, const char *output_path)
 		goto out;
 	/* A producer process can outlive a real AirPlay connection.  Publish the
 	 * session only after both ends of the bridge are actually connected. */
-	if (set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 1) != 0)
+	if (clear_session_state() != 0 ||
+	    set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 1) != 0)
 		goto out;
 	active = 1;
 	while (!stopping) {

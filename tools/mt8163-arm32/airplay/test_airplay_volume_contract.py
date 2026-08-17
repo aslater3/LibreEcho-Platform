@@ -11,6 +11,13 @@ AUDIO_ENGINE = Path(__file__).with_name("audio_engine.c")
 def main() -> None:
     producer = AIRPLAY_AUDIO.read_text(encoding="utf-8")
     engine = AUDIO_ENGINE.read_text(encoding="utf-8")
+    bridge = producer.index("/* A producer process can outlive")
+    bridge_start = producer.index("clear_session_state()", bridge)
+    active_publish = producer.index(
+        "set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 1)", bridge
+    )
+    if bridge_start > active_publish:
+        raise SystemExit("new bridge must clear stale session state before active")
     producer_required = (
         "unlink(DEFAULT_AIRPLAY_VOLUME_FILE)",
         "clear_session_state",
