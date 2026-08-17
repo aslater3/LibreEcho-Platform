@@ -11,6 +11,7 @@ AUDIO_ENGINE = Path(__file__).with_name("audio_engine.c")
 def main() -> None:
     producer = AIRPLAY_AUDIO.read_text(encoding="utf-8")
     engine = AUDIO_ENGINE.read_text(encoding="utf-8")
+
     bridge = producer.index("static int forward_stream")
     main = producer.index("int main")
     if "clear_session_state()" in producer[bridge:main]:
@@ -19,6 +20,7 @@ def main() -> None:
     main_loop = producer.index("while (!stopping)", main)
     if main_state_clear > main_loop:
         raise SystemExit("daemon must clear stale session state before its stream loop")
+
     producer_required = (
         "unlink(DEFAULT_AIRPLAY_VOLUME_FILE)",
         "clear_session_state",
@@ -29,13 +31,25 @@ def main() -> None:
         "higher_priority_active(sources)",
         "? (airplay_volume_to_mixer(root) >= 0 ? 32768 : 0)",
         "priority audio continues while AirPlay",
+        "arm_output_controls(card, -1, &saved_volume)",
+        "int startup_volume = airplay_volume >= 0",
+        "set_pcm_volume(card, startup_volume)",
     )
-    gate = engine[engine.index("if (airplay_session && airplay_volume < 0)"):engine.index(
-        "if (arm_output_controls", engine.index("if (airplay_session && airplay_volume < 0)"))]
+
+    gate_start = engine.index("if (airplay_session && airplay_volume < 0)")
+    gate_end = engine.index("if (arm_output_controls", gate_start)
+    gate = engine[gate_start:gate_end]
     if "clear_source_activity(sources" in gate:
         raise SystemExit("missing AirPlay volume must not clear priority buses")
     if "render_period(sources" in gate:
         raise SystemExit("priority-bus gate must preserve the already rendered periods")
+
+    pcm_open = engine.index("pcm = pcm_open")
+    startup_apply = engine.index("set_pcm_volume(card, startup_volume)")
+    first_write = engine.index("write_period(pcm, output", pcm_open)
+    if not pcm_open < startup_apply < first_write:
+        raise SystemExit("startup volume must be applied after PCM open and before first write")
+
     missing = [
         f"airplay_audio.c: {fragment}"
         for fragment in producer_required
