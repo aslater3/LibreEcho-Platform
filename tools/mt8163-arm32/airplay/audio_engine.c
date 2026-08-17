@@ -821,7 +821,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				"audio-engine: priority audio continues while AirPlay "
 				"volume is unavailable\n");
 		}
-		if (arm_output_controls(card, airplay_volume, &saved_volume) < 0) {
+		if (arm_output_controls(card, -1, &saved_volume) < 0) {
 			fprintf(stderr, "audio-engine: output arm failed\n");
 			clear_source_activity(sources, &announcement_led_active,
 					      &visualizer, &status);
@@ -841,7 +841,12 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			usleep(250000);
 			continue;
 		}
+		int startup_volume = airplay_volume >= 0
+			? airplay_volume : saved_volume;
+
 		if (pcm_prepare(pcm) < 0 ||
+		    (startup_volume >= 0 &&
+		     set_pcm_volume(card, startup_volume) < 0) ||
 		    write_period(pcm, output, &reference, first_activity) < 0 ||
 		    write_period(pcm, second, &reference, second_activity) < 0 ||
 		    enable_output_controls(card) < 0) {
