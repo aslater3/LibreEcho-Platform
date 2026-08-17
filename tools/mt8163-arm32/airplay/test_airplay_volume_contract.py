@@ -11,22 +11,28 @@ AUDIO_ENGINE = Path(__file__).with_name("audio_engine.c")
 def main() -> None:
     producer = AIRPLAY_AUDIO.read_text(encoding="utf-8")
     engine = AUDIO_ENGINE.read_text(encoding="utf-8")
-    bridge = producer.index("/* A producer process can outlive")
-    bridge_start = producer.index("clear_session_state()", bridge)
-    active_publish = producer.index(
-        "set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 1)", bridge
-    )
-    if bridge_start > active_publish:
-        raise SystemExit("new bridge must clear stale session state before active")
+    bridge = producer.index("static int forward_stream")
+    main = producer.index("int main")
+    if "clear_session_state()" in producer[bridge:main]:
+        raise SystemExit("bridge must not clear a callback that arrived after --start")
+    main_state_clear = producer.index("if (clear_session_state() != 0)", main)
+    main_loop = producer.index("while (!stopping)", main)
+    if main_state_clear > main_loop:
+        raise SystemExit("daemon must clear stale session state before its stream loop")
     producer_required = (
         "unlink(DEFAULT_AIRPLAY_VOLUME_FILE)",
         "clear_session_state",
     )
     engine_required = (
-        "wait_for_airplay_volume",
-        "airplay volume unavailable; deferring playback",
+        "airplay volume unavailable; deferring media",
         "airplay_volume < 0",
+        "higher_priority_active(sources)",
+        "sources[SOURCE_MEDIA].gain_q15 = 0",
     )
+    gate = engine[engine.index("if (airplay_session && airplay_volume < 0)"):engine.index(
+        "if (arm_output_controls", engine.index("if (airplay_session && airplay_volume < 0)"))]
+    if "clear_source_activity(sources" in gate:
+        raise SystemExit("missing AirPlay volume must not clear priority buses")
     missing = [
         f"airplay_audio.c: {fragment}"
         for fragment in producer_required

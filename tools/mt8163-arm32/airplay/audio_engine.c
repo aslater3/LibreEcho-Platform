@@ -39,8 +39,6 @@
 #define DEFAULT_CARD 0U
 #define DEFAULT_DEVICE 23U
 #define DEFAULT_RATE 48000U
-#define AIRPLAY_VOLUME_WAIT_ATTEMPTS 100U
-#define AIRPLAY_VOLUME_WAIT_US 10000U
 #define INPUT_CHANNELS 2U
 #define OUTPUT_CHANNELS 2U
 #define PERIOD_SIZE 2048U
@@ -508,23 +506,6 @@ static int airplay_volume_to_mixer(const char *root)
 	return (int)lround(127.0 + (db * 2.0));
 }
 
-static int wait_for_airplay_volume(const char *root, int *volume)
-{
-	unsigned int attempt;
-
-	if (!volume)
-		return -1;
-	*volume = -1;
-	for (attempt = 0; attempt < AIRPLAY_VOLUME_WAIT_ATTEMPTS && !stopping;
-	     ++attempt) {
-		*volume = airplay_volume_to_mixer(root);
-		if (*volume >= 0)
-			return 0;
-		usleep(AIRPLAY_VOLUME_WAIT_US);
-	}
-	return -1;
-}
-
 static int set_pcm_volume(unsigned int card, int volume)
 {
 	struct mixer *mixer;
@@ -663,7 +644,8 @@ static int read_sources(struct source_bus *sources, const char *root)
 	/* During an AirPlay session the codec volume is the authoritative phone
 	 * volume.  Do not attenuate the media bus a second time. */
 	sources[SOURCE_MEDIA].gain_q15 = airplay_is_active(root)
-		? 32768 : read_media_gain(root);
+		? (airplay_volume_to_mixer(root) >= 0 ? 32768 : 0)
+		: read_media_gain(root);
 	return received_any;
 }
 
@@ -820,15 +802,27 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 
 		saved_volume = -1;
 		airplay_session = airplay_is_active(root);
-		airplay_volume = -1;
-		if (airplay_session &&
-		    (wait_for_airplay_volume(root, &airplay_volume) < 0 ||
-		     airplay_volume < 0)) {
-			fprintf(stderr,
-				"audio-engine: airplay volume unavailable; deferring playback\n");
-			clear_source_activity(sources, &announcement_led_active,
-					      &visualizer, &status);
-			continue;
+		airplay_volume = airplay_session
+			? airplay_volume_to_mixer(root) : -1;
+		if (airplay_session && airplay_volume < 0) {
+			if (!higher_priority_active(sources)) {
+				/* Defer only AirPlay media.  Do not clear priority buses while
+				 * waiting for the sender's first volume callback. */
+				fprintf(stderr,
+					"audio-engine: airplay volume unavailable; deferring media\n");
+				sources[SOURCE_MEDIA].idle_periods = 0;
+				stop_music_visualizer(&visualizer);
+				sync_playback_status(sources, &status);
+				continue;
+			}
+			/* Keep system, announcement, and alarm audio live without
+			 * allowing uninitialized AirPlay media to reach the speaker. */
+			sources[SOURCE_MEDIA].gain_q15 = 0;
+			puffin_dynamics_init(&dynamics);
+			render_period(sources, output, &dynamics);
+			first_activity = source_activity_mask(sources);
+			render_period(sources, second, &dynamics);
+			second_activity = source_activity_mask(sources);
 		}
 		if (arm_output_controls(card, airplay_volume, &saved_volume) < 0) {
 			fprintf(stderr, "audio-engine: output arm failed\n");
