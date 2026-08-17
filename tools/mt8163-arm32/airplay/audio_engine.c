@@ -644,7 +644,8 @@ static int read_sources(struct source_bus *sources, const char *root)
 	/* During an AirPlay session the codec volume is the authoritative phone
 	 * volume.  Do not attenuate the media bus a second time. */
 	sources[SOURCE_MEDIA].gain_q15 = airplay_is_active(root)
-		? 32768 : read_media_gain(root);
+		? (airplay_volume_to_mixer(root) >= 0 ? 32768 : 0)
+		: read_media_gain(root);
 	return received_any;
 }
 
@@ -803,6 +804,23 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		airplay_session = airplay_is_active(root);
 		airplay_volume = airplay_session
 			? airplay_volume_to_mixer(root) : -1;
+		if (airplay_session && airplay_volume < 0) {
+			if (!higher_priority_active(sources)) {
+				/* Defer only AirPlay media.  Do not clear priority buses while
+				 * waiting for the sender's first volume callback. */
+				fprintf(stderr,
+					"audio-engine: airplay volume unavailable; deferring media\n");
+				sources[SOURCE_MEDIA].idle_periods = 0;
+				stop_music_visualizer(&visualizer);
+				sync_playback_status(sources, &status);
+				continue;
+			}
+			/* Keep system, announcement, and alarm audio live.  The
+			 * read_sources() gate already muted only AirPlay media. */
+			fprintf(stderr,
+				"audio-engine: priority audio continues while AirPlay "
+				"volume is unavailable\n");
+		}
 		if (arm_output_controls(card, airplay_volume, &saved_volume) < 0) {
 			fprintf(stderr, "audio-engine: output arm failed\n");
 			clear_source_activity(sources, &announcement_led_active,

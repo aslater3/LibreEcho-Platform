@@ -108,12 +108,27 @@ static int set_volume(const char *path, const char *text)
 	return 0;
 }
 
+static int clear_session_state(void)
+{
+	int result = 0;
+
+	if (unlink(DEFAULT_AIRPLAY_ACTIVE_FILE) < 0 && errno != ENOENT)
+		result = 1;
+	/* The volume file is session state.  Do not let a new connection
+	 * inherit the previous phone's volume before its first callback. */
+	if (unlink(DEFAULT_AIRPLAY_VOLUME_FILE) < 0 && errno != ENOENT)
+		result = 1;
+	return result;
+}
+
 static int set_active(const char *path, int active)
 {
 	int fd;
 
 	if (!active)
-		return unlink(path) < 0 && errno != ENOENT ? 1 : 0;
+		return !strcmp(path, DEFAULT_AIRPLAY_ACTIVE_FILE)
+			? clear_session_state()
+			: (unlink(path) < 0 && errno != ENOENT ? 1 : 0);
 	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0640);
 	if (fd < 0)
 		return 1;
@@ -206,6 +221,8 @@ int main(int argc, char **argv)
 	(void)sigaction(SIGINT, &action, NULL);
 	signal(SIGPIPE, SIG_IGN);
 
+	if (clear_session_state() != 0)
+		return 1;
 	while (!stopping) {
 		if (forward_stream(input_path, output_path) < 0 && !stopping)
 			usleep(250000);
