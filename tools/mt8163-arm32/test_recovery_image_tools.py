@@ -866,7 +866,7 @@ class SourceTests(unittest.TestCase):
         # Scope to the worker function: earlier unrelated reboot paths must
         # not satisfy the ordering check.
         worker_start = init.index("ota_health_confirm_worker()")
-        worker = init[worker_start:worker_start + 6000]
+        worker = init[worker_start:worker_start + 9000]
         restart_idx = worker.index("$BB reboot -f")
         record_idx = worker.index("/data/libreecho/update/restart-record")
         self.assertLess(record_idx, restart_idx)
@@ -1843,6 +1843,39 @@ class PolicyTests(unittest.TestCase):
             self.assertIn("libreecho-ttsd-wyoming", source)
             self.assertIn("/lib/ld-musl-armhf.so.1", source)
             self.assertIn("libc.musl-armv7.so.1", source)
+
+    def test_fresh_install_confirms_its_own_boot_slot(self) -> None:
+        # A clean install (BROM/Amonet or factory) writes no update record.
+        # The bootloader still decrements the slot try counter every boot and
+        # refuses the slot once it reaches zero while success is 0, so the
+        # health worker must confirm the running slot rather than returning
+        # early when there is no pending OTA.
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertNotIn(
+            "[ -r /data/libreecho/update/pending ] || return 0", init
+        )
+        self.assertIn("CONFIRM_MODE=first-boot", init)
+        self.assertIn("CONFIRM_MODE=ota", init)
+        self.assertIn(
+            'libreecho-bootctl confirm "$selected_slot"', init
+        )
+        self.assertIn("first-boot-slot-confirmed", init)
+        self.assertIn("first-boot-slot-already-confirmed", init)
+        # The confirmation must sit behind the same health gate the OTA path
+        # uses, never in front of it.
+        self.assertLess(
+            init.index('log "first-boot-confirm-pending:$selected_slot"'),
+            init.index('[ "$passed" -eq 3 ]'),
+        )
+        # A first boot must never reboot: there is no previously confirmed
+        # slot to fall back to.
+        self.assertLess(
+            init.index('log "first-boot-confirm-failed:$last_check"'),
+            init.index("ota-health-confirm-failed-rebooting"),
+        )
+        self.assertIn(
+            'if [ "$CONFIRM_MODE" = ota ]; then', init
+        )
 
     def test_ota_target_slots_are_identity_checked_before_block_io(self) -> None:
         updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
