@@ -439,8 +439,16 @@ case "${1:-}" in
         [ "$#" -eq 1 ] || die usage
         confirm_pending
         ;;
+    capabilities)
+        # Machine-readable feature list (one token per line) so the web daemon
+        # can advertise only what this tool actually supports. Older tools lack
+        # this subcommand and fall through to the usage/exit-2 case, which the
+        # daemon reads as "unsupported" -- a safe default.
+        [ "$#" -eq 1 ] || die usage
+        echo allow-unsigned
+        ;;
     *)
-        echo "Usage: libreecho-update status | inspect PACKAGE.tar | install [--allow-unsigned] PACKAGE.tar | confirm" >&2
+        echo "Usage: libreecho-update status | inspect PACKAGE.tar | install [--allow-unsigned] PACKAGE.tar | confirm | capabilities" >&2
         exit 2
         ;;
 esac
