@@ -13,6 +13,10 @@ BOOTCTL=/usr/local/sbin/libreecho-bootctl
 PUBLIC_KEY=/etc/libreecho/ota-public-key.hex
 CHANNEL_FILE=$UPDATE_ROOT/automatic-updates
 PACKAGED_CHANNEL_FILE=/etc/libreecho/update-channel
+# Set to 1 only by the manual-upload install path via the --allow-unsigned flag.
+# The GitHub fetch path (libreecho-update-fetch) never passes it, so fetched and
+# automatic updates always verify signatures.
+ALLOW_UNSIGNED=0
 BOOT_SIZE=16777216
 BOOT_SECTORS=32768
 
@@ -208,8 +212,12 @@ boot.img" ] || die package_member_contract
         [ "$($BB stat -c %h "$STAGING/manifest.sig" 2>/dev/null)" = 1 ] &&
         [ "$($BB stat -c %h "$STAGING/boot.img" 2>/dev/null)" = 1 ] ||
         die package_extracted_links
-    "$VERIFY" "$PUBLIC_KEY" "$STAGING/manifest" "$STAGING/manifest.sig" ||
-        die package_signature
+    if [ "$ALLOW_UNSIGNED" = 1 ]; then
+        $BB printf 'libreecho-update: WARNING signature verification skipped (--allow-unsigned)\n' >&2
+    else
+        "$VERIFY" "$PUBLIC_KEY" "$STAGING/manifest" "$STAGING/manifest.sig" ||
+            die package_signature
+    fi
     verify_manifest
     [ "$($BB stat -c %s "$STAGING/boot.img" 2>/dev/null)" = "$BOOT_SIZE" ] ||
         die boot_size
@@ -418,8 +426,10 @@ case "${1:-}" in
         feature_status
         ;;
     install)
-        [ "$#" -eq 2 ] || die usage
-        install_package "$2"
+        shift
+        if [ "${1:-}" = "--allow-unsigned" ]; then ALLOW_UNSIGNED=1; shift; fi
+        [ "$#" -eq 1 ] || die usage
+        install_package "$1"
         ;;
     inspect)
         [ "$#" -eq 2 ] || die usage
@@ -430,7 +440,7 @@ case "${1:-}" in
         confirm_pending
         ;;
     *)
-        echo "Usage: libreecho-update status | inspect PACKAGE.tar | install PACKAGE.tar | confirm" >&2
+        echo "Usage: libreecho-update status | inspect PACKAGE.tar | install [--allow-unsigned] PACKAGE.tar | confirm" >&2
         exit 2
         ;;
 esac
