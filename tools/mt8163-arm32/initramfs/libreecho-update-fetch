@@ -249,10 +249,38 @@ prepare_https_client()
     [ "$($BB stat -c %u "$ASSISTANT_PAYLOAD" 2>/dev/null)" = 0 ] &&
         [ "$($BB stat -c %u "$ASSISTANT_MANIFEST" 2>/dev/null)" = 0 ] ||
         die https_payload_owner
+    # The manifest must not be group/world writable, or an unprivileged writer
+    # could redirect which payload we mount.  Feature installation has shipped
+    # these files as 0666 in practice, which used to abort the update check
+    # entirely -- before any network I/O -- and surfaced only as the opaque
+    # "https_payload_manifest_mode".  Both files are already confirmed to be
+    # root-owned regular files above, so tightening the mode ourselves is safe
+    # and strictly reduces exposure; only fail if we cannot.
     manifest_mode=$($BB stat -c %a "$ASSISTANT_MANIFEST" 2>/dev/null)
     case "$manifest_mode" in
         600|640|644) ;;
-        *) die https_payload_manifest_mode ;;
+        *)
+            $BB chmod 0644 "$ASSISTANT_MANIFEST" 2>/dev/null || true
+            manifest_mode=$($BB stat -c %a "$ASSISTANT_MANIFEST" 2>/dev/null)
+            case "$manifest_mode" in
+                600|640|644) ;;
+                *) die feature_manifest_permissions ;;
+            esac
+            ;;
+    esac
+    # Same reasoning for the payload we are about to loop-mount: refuse it if
+    # anyone but root can rewrite it, but normalise rather than abort first.
+    payload_mode=$($BB stat -c %a "$ASSISTANT_PAYLOAD" 2>/dev/null)
+    case "$payload_mode" in
+        600|640|644) ;;
+        *)
+            $BB chmod 0644 "$ASSISTANT_PAYLOAD" 2>/dev/null || true
+            payload_mode=$($BB stat -c %a "$ASSISTANT_PAYLOAD" 2>/dev/null)
+            case "$payload_mode" in
+                600|640|644) ;;
+                *) die feature_payload_permissions ;;
+            esac
+            ;;
     esac
     expected_size=$(manifest_payload_value size)
     expected_sha=$(manifest_payload_value sha256)
