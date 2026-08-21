@@ -39,7 +39,7 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "63f055c85f2adacfd99a7212d8c28e4e6bc09901290009f6dd80da4353f1f647"
+RECOVERY_INIT_SHA256 = "773ce2f04695f69bb0f5d74c53369019178b0d2982530ca0cfaa9dce82ccd459"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
@@ -535,6 +535,11 @@ def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
     update_channel_target = stage / "etc/libreecho/update-channel"
     update_channel_target.write_text(update_channel + "\n")
     update_channel_target.chmod(0o644)
+    first_install_target = stage / "etc/libreecho/first-install-confirm"
+    first_install_target.write_text(
+        "schema=1\nmode=first-install\nboard=radar_puffin\n"
+    )
+    first_install_target.chmod(0o644)
     ota_source = stage / "etc/libreecho/ota-source.conf"
     if ota_source.is_file() and not ota_source.is_symlink():
         source_text = ota_source.read_text()

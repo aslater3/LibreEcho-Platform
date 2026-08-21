@@ -192,7 +192,8 @@ check_children "$DATA_ROOT/libreecho/secrets" openai-codex.json
 
 check_children "$DATA_ROOT/libreecho/update" \
     channel incoming staging state pending installed rolled-back check-status \
-    automatic-updates install.lock bootctl.confirm
+    automatic-updates install.lock bootctl.confirm first-install.pending \
+    first-install.confirmed
 
 if [ -d "$DATA_ROOT/libreecho/features" ]; then
     for feature_dir in "$DATA_ROOT/libreecho/features"/*; do
