@@ -947,26 +947,31 @@ ota_health_confirm_worker()
         $BB sync
     fi
 
-    # True when the operator has pointed the voice pipeline at off-device
-    # Wyoming endpoints.  Parsed from the persisted web config with the same
-    # tolerant string matching the rest of this script uses for JSON, so a
-    # missing or malformed config reads as "not remote" and the strict
-    # local-socket requirement still applies.
-    voice_pipeline_is_remote()
+    # True when this device has no local voice stack to wait for.
+    #
+    # Deliberately derived from the mounted feature set rather than from
+    # configuration: the health worker starts before the web daemon, so any
+    # check that reads a service-managed config file is racing service startup.
+    # The feature mounts are established by this script itself, before the
+    # worker runs, so they are a stable signal at probe time.
+    #
+    # If the stt/tts/assistant payloads are not mounted, libreecho-sttd,
+    # libreecho-ttsd and libreecho-agentd cannot run and their sockets can
+    # never appear -- so waiting for them only guarantees a rollback.  The
+    # persisted config is consulted second, purely to log intent.
+    voice_stack_absent()
     {
+        for vs_feature in stt tts assistant; do
+            [ -d "/run/libreecho/features/$vs_feature/root" ] && return 1
+        done
         vp_config=/data/libreecho/config/web-config.json
-        [ -r "$vp_config" ] || return 1
-        vp_mode=$($BB sed -n \
-            's/.*"voice_pipeline_mode"[[:space:]]*:[[:space:]]*"\([a-z_-]*\)".*/\1/p' \
-            "$vp_config" 2>/dev/null | $BB head -n 1)
-        case "$vp_mode" in
-            custom|remote|external) ;;
-            *) return 1 ;;
-        esac
-        # Only credit a remote pipeline that is actually configured; an empty
-        # URI means the operator selected the mode but never filled it in.
-        $BB grep -q '"\(stt\|tts\)_wyoming_uri"[[:space:]]*:[[:space:]]*"[^"]\+"' \
-            "$vp_config" 2>/dev/null || return 1
+        vp_mode=
+        if [ -r "$vp_config" ]; then
+            vp_mode=$($BB sed -n \
+                's/.*"voice_pipeline_mode"[[:space:]]*:[[:space:]]*"\([a-z_-]*\)".*/\1/p' \
+                "$vp_config" 2>/dev/null | $BB head -n 1)
+        fi
+        log "ota-health-voice-stack-absent:${vp_mode:-unknown}"
         return 0
     }
 
@@ -999,10 +1004,8 @@ ota_health_confirm_worker()
         # them would make every OTA on such a device fail confirmation and roll
         # back, even when the image is completely healthy.  Voice is not what
         # makes a slot recoverable -- /data, networking and the web/API plane
-        # are, and those are already checked -- so treat voice as satisfied
-        # when the operator has configured the pipeline off-device.
-        if voice_pipeline_is_remote; then
-            log ota-health-voice-remote-pipeline-ok
+        # are, and those are already checked.
+        if voice_stack_absent; then
             return 0
         fi
         log ota-health-services-not-ready:voice-sockets
