@@ -535,6 +535,11 @@ def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
     update_channel_target = stage / "etc/libreecho/update-channel"
     update_channel_target.write_text(update_channel + "\n")
     update_channel_target.chmod(0o644)
+    first_install_target = stage / "etc/libreecho/first-install-confirm"
+    first_install_target.write_text(
+        "schema=1\nmode=first-install\nboard=radar_puffin\n"
+    )
+    first_install_target.chmod(0o644)
     ota_source = stage / "etc/libreecho/ota-source.conf"
     if ota_source.is_file() and not ota_source.is_symlink():
         source_text = ota_source.read_text()

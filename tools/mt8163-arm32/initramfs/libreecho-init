@@ -29,6 +29,7 @@ esac
 # accidentally selected.
 FEATURE_POLICY_VALUE=$($BB cat /etc/libreecho/feature-policy 2>/dev/null)
 FEATURE_POLICY=exclude
+FIRST_INSTALL_MARKER=/etc/libreecho/first-install-confirm
 case "$FEATURE_POLICY_VALUE" in
     preserve|redistributable|community-noncommercial|exclude)
         FEATURE_POLICY=$FEATURE_POLICY_VALUE
@@ -911,19 +912,18 @@ ota_health_confirm_worker()
             ;;
     esac
 
-    # A clean install (BROM/Amonet or factory) never writes an update record,
-    # so the OTA transaction handling below does not apply to it.  The
-    # bootloader still decrements the slot try counter on every boot and
-    # refuses the slot once that counter reaches zero while success is 0, so a
-    # healthy fresh install becomes unbootable after a few reboots unless the
-    # running slot is confirmed.  Confirm it on the same health evidence the
-    # OTA path requires, and never reboot on failure: a first boot has no
-    # previously confirmed slot to fall back to.
     if [ -r /data/libreecho/update/pending ]; then
         CONFIRM_MODE=ota
         log ota-health-confirm-pending
         pending_slot=$($BB sed -n 's/^slot=//p' /data/libreecho/update/pending)
     else
+        if [ ! -r "$FIRST_INSTALL_MARKER" ] ||
+           [ "$($BB sed -n 's/^schema=//p' "$FIRST_INSTALL_MARKER")" != 1 ] ||
+           [ "$($BB sed -n 's/^mode=//p' "$FIRST_INSTALL_MARKER")" != first-install ] ||
+           [ "$($BB sed -n 's/^board=//p' "$FIRST_INSTALL_MARKER")" != radar_puffin ]; then
+            log first-install-marker-absent-or-invalid
+            return 0
+        fi
         CONFIRM_MODE=first-boot
         case "$selected_slot" in
             a|b) ;;
@@ -936,6 +936,42 @@ ota_health_confirm_worker()
             $BB sed -n "s/^slot_${selected_slot}_success=//p")" = 1 ]; then
             log "first-boot-slot-already-confirmed:$selected_slot"
             return 0
+        fi
+        if [ "$selected_slot" = a ]; then
+            payload_device=/dev/mmcblk0p10
+        else
+            payload_device=/dev/mmcblk0p11
+        fi
+        payload_hash=$($BB sha256sum "$payload_device" 2>/dev/null |
+            $BB awk '{print $1}')
+        case "$payload_hash" in
+            ''|*[!0-9a-f]*)
+                log first-install-payload-hash-unavailable
+                return 0
+                ;;
+        esac
+        first_install_pending=/data/libreecho/update/first-install.pending
+        if [ -r "$first_install_pending" ]; then
+            recorded_slot=$($BB sed -n 's/^slot=//p' "$first_install_pending")
+            recorded_hash=$($BB sed -n 's/^boot_sha256=//p' "$first_install_pending")
+            if [ "$recorded_slot" != "$selected_slot" ] || [ "$recorded_hash" != "$payload_hash" ]; then
+                log first-install-transaction-invalid
+                return 0
+            fi
+        else
+            {
+                echo schema=1
+                echo state=pending
+                echo mode=first-install
+                echo "slot=$selected_slot"
+                echo "boot_sha256=$payload_hash"
+            } > "$first_install_pending.tmp" &&
+                $BB mv "$first_install_pending.tmp" "$first_install_pending" || {
+                    log first-install-transaction-write-failed
+                    return 0
+                }
+            $BB sync
+            log "first-install-transaction-created:$selected_slot:$payload_hash"
         fi
         log "first-boot-confirm-pending:$selected_slot"
         pending_slot=$selected_slot
@@ -1081,6 +1117,13 @@ ota_health_confirm_worker()
         if [ "$passed" -eq 3 ] &&
            /usr/local/sbin/libreecho-bootctl confirm "$selected_slot" \
                >/tmp/first-boot-confirm.log 2>&1; then
+            first_install_confirmed=/data/libreecho/update/first-install.confirmed.tmp
+            $BB sed 's/^state=pending$/state=confirmed/' \
+                /data/libreecho/update/first-install.pending > "$first_install_confirmed" &&
+                $BB mv "$first_install_confirmed" \
+                    /data/libreecho/update/first-install.confirmed
+            $BB rm -f /data/libreecho/update/first-install.pending
+            $BB sync
             log "first-boot-slot-confirmed:$selected_slot"
             return 0
         fi
