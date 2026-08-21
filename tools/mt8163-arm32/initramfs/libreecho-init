@@ -961,8 +961,13 @@ ota_health_confirm_worker()
     # persisted config is consulted second, purely to log intent.
     voice_stack_absent()
     {
+        # Test the mount, not the directory: the per-feature init scripts run
+        # mkdir -p "$RUNTIME_ROOT" before attempting to mount the payload, so
+        # the directory exists even when the mount never succeeded and the
+        # daemon never started.
         for vs_feature in stt tts assistant; do
-            [ -d "/run/libreecho/features/$vs_feature/root" ] && return 1
+            $BB grep -q " /run/libreecho/features/$vs_feature/root " \
+                /proc/mounts 2>/dev/null && return 1
         done
         vp_config=/data/libreecho/config/web-config.json
         vp_mode=
