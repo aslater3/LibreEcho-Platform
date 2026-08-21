@@ -1897,6 +1897,15 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("first-install.confirmed", cleanup)
         self.assertNotIn("no pending OTA", init)
 
+    def test_fresh_install_finalization_preserves_pending_on_commit_failure(self) -> None:
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        finalization = init[init.index("first_install_confirmed="):init.index("fi\n        # Never restart", init.index("first_install_confirmed="))]
+        self.assertIn("if $BB sed", finalization)
+        self.assertIn("$BB mv", finalization)
+        self.assertIn("$BB rm -f \"$first_install_confirmed\"", finalization)
+        self.assertIn("first-install-confirmation-record-finalization-failed", finalization)
+        self.assertLess(finalization.index("$BB mv"), finalization.index("$BB rm -f /data/libreecho/update/first-install.pending"))
+
     def test_ota_vm_asserts_each_phase_and_resets_bcb(self) -> None:
         vm = TOOLS_DIR / "ota-test-vm"
         init = (vm / "build-initramfs.sh").read_text()

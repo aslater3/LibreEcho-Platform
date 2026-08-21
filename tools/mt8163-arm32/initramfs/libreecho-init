@@ -1118,13 +1118,17 @@ ota_health_confirm_worker()
            /usr/local/sbin/libreecho-bootctl confirm "$selected_slot" \
                >/tmp/first-boot-confirm.log 2>&1; then
             first_install_confirmed=/data/libreecho/update/first-install.confirmed.tmp
-            $BB sed 's/^state=pending$/state=confirmed/' \
-                /data/libreecho/update/first-install.pending > "$first_install_confirmed" &&
-                $BB mv "$first_install_confirmed" \
-                    /data/libreecho/update/first-install.confirmed
-            $BB rm -f /data/libreecho/update/first-install.pending
-            $BB sync
-            log "first-boot-slot-confirmed:$selected_slot"
+            if $BB sed 's/^state=pending$/state=confirmed/' \
+                    /data/libreecho/update/first-install.pending > "$first_install_confirmed" &&
+               $BB mv "$first_install_confirmed" \
+                    /data/libreecho/update/first-install.confirmed; then
+                $BB rm -f /data/libreecho/update/first-install.pending
+                $BB sync
+                log "first-boot-slot-confirmed:$selected_slot"
+                return 0
+            fi
+            $BB rm -f "$first_install_confirmed"
+            log first-install-confirmation-record-finalization-failed
             return 0
         fi
         # Never restart after a failed first boot: there is no previously

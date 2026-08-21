@@ -1034,6 +1034,10 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         entries, "etc/libreecho/update-channel",
         sha256((expected_update_channel + "\n").encode()), 0o644,
     )
+    require_member(
+        entries, "etc/libreecho/first-install-confirm",
+        sha256(b"schema=1\nmode=first-install\nboard=radar_puffin\n"), 0o644,
+    )
     ota = manifest.get("ota")
     if not isinstance(ota, dict) or ota.get("format") != "libreecho-ota-v1":
         fail("OTA manifest record is missing or malformed")
