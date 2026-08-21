@@ -1565,7 +1565,7 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("production)", init_source)
         self.assertIn('services="logd timed web"', init_source)
         self.assertIn(
-            'services="logd networkd timed audiod micd waked sttd ledd btd airplayd ttsd agentd web"',
+            'services="logd networkd timed audiod micd waked sttd ledd buttond btd airplayd ttsd agentd web"',
             init_source,
         )
         self.assertIn("--service-profile", builder_source)
@@ -1587,10 +1587,12 @@ class PolicyTests(unittest.TestCase):
     def test_streaming_voice_services_start_warm_in_dependency_order(self) -> None:
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
         service_line = (
-            'services="logd networkd timed audiod micd waked sttd ledd btd '
+            'services="logd networkd timed audiod micd waked sttd ledd buttond btd '
             'airplayd ttsd agentd web"'
         )
         self.assertIn(service_line, init_script)
+        self.assertLess(service_line.index("audiod"), service_line.index("buttond"))
+        self.assertLess(service_line.index("ledd"), service_line.index("buttond"))
         self.assertLess(service_line.index("waked"), service_line.index("sttd"))
         self.assertLess(service_line.index("sttd"), service_line.index("agentd"))
         self.assertLess(service_line.index("ttsd"), service_line.index("agentd"))
