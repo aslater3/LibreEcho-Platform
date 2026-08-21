@@ -787,12 +787,38 @@ fi
 # audiod only opens the adapter and never initiates playback.  micd starts
 # with capture idle and opens the microphone endpoint only for an explicit
 # stream request.
+# Export the owner's timezone so every daemon renders local time.
+#
+# The image carries no /usr/share/zoneinfo and busybox ignores /etc/TZ, so the
+# only mechanism that works here is the TZ environment variable holding a
+# POSIX TZ string (verified on-device: TZ=CST6CDT,M3.2.0,M11.1.0 yields CDT).
+# Inherited by the whole service graph because this runs before it starts.
+apply_timezone()
+{
+    tz_config=/data/libreecho/config/web-config.json
+    tz_value=
+    if [ -r "$tz_config" ]; then
+        tz_value=$($BB sed -n \
+            's/.*"timezone"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            "$tz_config" 2>/dev/null | $BB head -n 1)
+    fi
+    case "$tz_value" in
+        # Only a plain POSIX TZ string; anything else falls back to UTC so a
+        # malformed config cannot inject arbitrary environment content.
+        ''|*[!A-Za-z0-9,.:+/-]*) tz_value=UTC ;;
+    esac
+    TZ=$tz_value
+    export TZ
+    log "timezone-applied:$tz_value"
+}
+
 start_ui_services()
 {
     [ -x /usr/local/sbin/libreecho-web ] || {
         log ui-services-not-installed
         return 0
     }
+    apply_timezone
     $BB mkdir -p /var/run /var/log /var/log/libreecho /run/libreecho
     if [ "$SERVICE_PROFILE" = production ] && [ "${DATA_CLEANUP_OK:-0}" -ne 1 ]; then
         log ui-services-blocked-by-data-contract
@@ -821,18 +847,18 @@ start_ui_services()
             [ "$FEATURE_POLICY" = community-noncommercial ]; then
         if [ "$ha_enabled" -eq 1 ]; then
             log ui-home-assistant-mode-enabled
-            services="logd networkd timed audiod micd waked ledd btd airplayd wyomingd web"
+            services="logd networkd timed audiod micd waked ledd buttond btd airplayd wyomingd web"
         else
-            services="logd networkd timed audiod micd waked sttd ledd btd airplayd ttsd agentd web"
+            services="logd networkd timed audiod micd waked sttd ledd buttond btd airplayd ttsd agentd web"
         fi
         if [ "$FEATURE_POLICY" = community-noncommercial ]; then
             log ui-services-community-noncommercial-with-wakeword
         fi
     else
         if [ "$ha_enabled" -eq 1 ]; then
-            services="logd networkd timed audiod micd ledd btd airplayd wyomingd web"
+            services="logd networkd timed audiod micd ledd buttond btd airplayd wyomingd web"
         else
-            services="logd networkd timed audiod micd sttd ledd btd airplayd ttsd agentd web"
+            services="logd networkd timed audiod micd sttd ledd buttond btd airplayd ttsd agentd web"
         fi
         log ui-services-redistributable-without-wakeword
     fi
@@ -947,6 +973,42 @@ ota_health_confirm_worker()
         $BB sync
     fi
 
+    # True when this device has no local voice stack to wait for.
+    #
+    # Deliberately derived from the mounted feature set rather than from
+    # configuration: the health worker starts before the web daemon, so any
+    # check that reads a service-managed config file is racing service startup.
+    # The feature mounts are established by this script itself, before the
+    # worker runs, so they are a stable signal at probe time.
+    #
+    # If the stt/tts/assistant payloads are not mounted, libreecho-sttd,
+    # libreecho-ttsd and libreecho-agentd cannot run and their sockets can
+    # never appear -- so waiting for them only guarantees a rollback.  The
+    # persisted config is consulted second, purely to log intent.
+    voice_stack_absent()
+    {
+        # Test the mount, not the directory: the per-feature init scripts run
+        # mkdir -p "$RUNTIME_ROOT" before attempting to mount the payload, so
+        # the directory exists even when the mount never succeeded and the
+        # daemon never started.
+        for vs_feature in stt tts assistant; do
+            if $BB grep -q " /run/libreecho/features/$vs_feature/root " \
+                    /proc/mounts 2>/dev/null; then
+                log "ota-health-voice-stack-present:$vs_feature"
+                return 1
+            fi
+        done
+        vp_config=/data/libreecho/config/web-config.json
+        vp_mode=
+        if [ -r "$vp_config" ]; then
+            vp_mode=$($BB sed -n \
+                's/.*"voice_pipeline_mode"[[:space:]]*:[[:space:]]*"\([a-z_-]*\)".*/\1/p' \
+                "$vp_config" 2>/dev/null | $BB head -n 1)
+        fi
+        log "ota-health-voice-stack-absent:${vp_mode:-unknown}"
+        return 0
+    }
+
     ota_health_services_ready()
     {
         [ "$SERVICE_PROFILE" = production ] || return 0
@@ -968,6 +1030,16 @@ ota_health_confirm_worker()
             return 0
         fi
         if [ -S /run/libreecho/wyoming.sock ]; then
+            return 0
+        fi
+        # A device whose voice pipeline is served by remote Wyoming endpoints
+        # never mounts the local stt/tts/assistant features, so none of the
+        # sockets above can exist and neither branch can ever pass.  Requiring
+        # them would make every OTA on such a device fail confirmation and roll
+        # back, even when the image is completely healthy.  Voice is not what
+        # makes a slot recoverable -- /data, networking and the web/API plane
+        # are, and those are already checked.
+        if voice_stack_absent; then
             return 0
         fi
         log ota-health-services-not-ready:voice-sockets

@@ -165,6 +165,18 @@ unknown_item() {
     unknown=1
 }
 
+# Non-fatal variant.  An unrecognised *regular file* directly under
+# libreecho/update/ is bookkeeping residue written by some other build of the
+# OS -- /data is shared between the A and B slots, so a newer image that adds a
+# record file would otherwise fail this contract on every older slot.  Because
+# a contract failure blocks the whole production service graph (including
+# networking), that turns a cosmetic forward-compatibility gap into a device
+# that cannot be reached over the network at all.  Report it, preserve it, and
+# keep going -- which is what this script's header has always promised.
+tolerated_item() {
+    printf 'DATA_CLEANUP_TOLERATED=%s\n' "${1#"$DATA_ROOT"/}" >&2
+}
+
 check_children() {
     directory=$1
     shift
@@ -177,9 +189,19 @@ check_children() {
         for expected in "$@"; do
             [ "$name" = "$expected" ] && allowed=1
         done
-        [ "$allowed" -eq 1 ] || unknown_item "$child"
+        [ "$allowed" -eq 1 ] && continue
+        # Symlinks and directories are still hard failures everywhere; only a
+        # plain file in the tolerant set is downgraded.
+        if [ "$TOLERATE_UNKNOWN_FILES" = 1 ] && [ -f "$child" ]; then
+            tolerated_item "$child"
+        else
+            unknown_item "$child"
+        fi
     done
 }
+
+# Directories whose unrecognised regular files are reported but not fatal.
+TOLERATE_UNKNOWN_FILES=0
 
 # Steady-state allowlist.  Feature IDs are checked separately below because
 # they are extensible; the files inside each feature remain fixed.
@@ -190,9 +212,11 @@ check_children "$DATA_ROOT/libreecho/config" \
     agent.json agent.json.bak tts-voice vad-floor-rms
 check_children "$DATA_ROOT/libreecho/secrets" openai-codex.json
 
+TOLERATE_UNKNOWN_FILES=1
 check_children "$DATA_ROOT/libreecho/update" \
     channel incoming staging state pending installed rolled-back check-status \
-    automatic-updates install.lock bootctl.confirm
+    automatic-updates install.lock bootctl.confirm restart-record
+TOLERATE_UNKNOWN_FILES=0
 
 if [ -d "$DATA_ROOT/libreecho/features" ]; then
     for feature_dir in "$DATA_ROOT/libreecho/features"/*; do

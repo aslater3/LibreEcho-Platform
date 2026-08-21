@@ -20,9 +20,28 @@ ALLOW_UNSIGNED=0
 BOOT_SIZE=16777216
 BOOT_SECTORS=32768
 
+# Set once an install has begun writing progress to $STATE, so die() knows the
+# status file is mid-transaction and must not be left there.
+STATE_DIRTY=0
+
 die()
 {
     echo "ERROR:$1" >&2
+    # An aborted install used to leave $STATE at whatever step it reached
+    # (typically "verifying" / 5), which makes the update subsystem report a
+    # transfer in progress forever and blocks the next attempt. Record the
+    # failure and the reason instead, so `status` and the web API can explain
+    # what happened rather than showing a phantom running install.
+    if [ "${STATE_DIRTY:-0}" = 1 ] && [ -n "${STATE:-}" ]; then
+        {
+            echo schema=1
+            echo state=failed
+            echo progress=0
+            echo "detail=$1"
+        } > "$STATE.tmp" 2>/dev/null &&
+            $BB mv "$STATE.tmp" "$STATE" 2>/dev/null || $BB rm -f "$STATE.tmp" 2>/dev/null
+        $BB sync 2>/dev/null || true
+    fi
     exit 1
 }
 
@@ -331,6 +350,7 @@ install_package()
     require_userdata
     lock_take
     seed_channel
+    STATE_DIRTY=1
     state_write verifying 5 package
     extract_and_verify "$package"
     state_write verified 20 "$version"
