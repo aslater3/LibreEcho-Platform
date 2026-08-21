@@ -866,7 +866,11 @@ class SourceTests(unittest.TestCase):
         # Scope to the worker function: earlier unrelated reboot paths must
         # not satisfy the ordering check.
         worker_start = init.index("ota_health_confirm_worker()")
-        worker = init[worker_start:worker_start + 9000]
+        # Slice to the function's own closing brace rather than a fixed byte
+        # count: a fixed window silently falls out of scope as soon as the
+        # worker grows, which turns an ordering assertion into a length test.
+        worker_end = init.index("\n}", worker_start) + 2
+        worker = init[worker_start:worker_end]
         restart_idx = worker.index("$BB reboot -f")
         record_idx = worker.index("/data/libreecho/update/restart-record")
         self.assertLess(record_idx, restart_idx)
