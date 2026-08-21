@@ -1883,6 +1883,29 @@ class PolicyTests(unittest.TestCase):
             'if [ "$CONFIRM_MODE" = ota ]; then', init
         )
 
+    def test_fresh_install_requires_marker_and_persistent_hash_transaction(self) -> None:
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        cleanup = (TOOLS_DIR / "initramfs/libreecho-data-cleanup").read_text()
+        self.assertIn("first-install-confirm", builder)
+        self.assertIn("first-install-marker-absent-or-invalid", init)
+        self.assertIn("first-install.pending", init)
+        self.assertIn("boot_sha256=", init)
+        self.assertIn("first-install.confirmed", init)
+        self.assertIn("$BB sync", init)
+        self.assertIn("first-install.pending", cleanup)
+        self.assertIn("first-install.confirmed", cleanup)
+        self.assertNotIn("no pending OTA", init)
+
+    def test_fresh_install_finalization_preserves_pending_on_commit_failure(self) -> None:
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        finalization = init[init.index("first_install_confirmed="):init.index("fi\n        # Never restart", init.index("first_install_confirmed="))]
+        self.assertIn("if $BB sed", finalization)
+        self.assertIn("$BB mv", finalization)
+        self.assertIn("$BB rm -f \"$first_install_confirmed\"", finalization)
+        self.assertIn("first-install-confirmation-record-finalization-failed", finalization)
+        self.assertLess(finalization.index("$BB mv"), finalization.index("$BB rm -f /data/libreecho/update/first-install.pending"))
+
     def test_ota_vm_asserts_each_phase_and_resets_bcb(self) -> None:
         vm = TOOLS_DIR / "ota-test-vm"
         init = (vm / "build-initramfs.sh").read_text()
