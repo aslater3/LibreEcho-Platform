@@ -13,7 +13,7 @@ import json
 import os
 import struct
 import subprocess
-import tempfile
+import sys
 import uuid
 from pathlib import Path
 
@@ -64,8 +64,11 @@ def _guid_bytes(value: uuid.UUID) -> bytes:
 
 def write_gpt(image: Path, entries: dict[int, tuple[int, int, str]]) -> None:
     image.parent.mkdir(parents=True, exist_ok=True)
-    with image.open("wb") as f:
-        f.truncate(DISK_SECTORS * SECTOR)
+    if not image.exists():
+        with image.open("wb") as f:
+            f.truncate(DISK_SECTORS * SECTOR)
+    elif image.stat().st_size != DISK_SECTORS * SECTOR:
+        raise ValueError(f"existing eMMC has unexpected size: {image.stat().st_size}")
     disk_guid = uuid.UUID("ed000d32-77b3-42df-a111-2ce3f85a2610")
     type_guid = uuid.UUID("0fc63daf-8483-4772-8e79-3d69d8477de4")
     raw = bytearray(128 * 128)
@@ -139,10 +142,13 @@ def write_partition(image: Path, entry: tuple[int, int, str], data: bytes) -> No
 
 
 def make_boot(path: Path) -> None:
-    data = bytearray(BOOT_BYTES)
-    data[:8] = ANDROID_MAGIC
-    struct.pack_into("<I", data, 8, 1)
-    data[64:64 + len(BOOTOPT)] = BOOTOPT
+    tools = Path(__file__).resolve().parent.parent
+    if str(tools) not in sys.path:
+        sys.path.insert(0, str(tools))
+    from generate_boot_envelope import generate
+    data = generate()
+    if len(data) != BOOT_BYTES:
+        raise ValueError("canonical boot envelope has unexpected size")
     path.write_bytes(data)
 
 
@@ -234,14 +240,13 @@ def verify(image: Path, boot: Path, state_path: Path) -> dict[str, object]:
 def prepare_qemu_initramfs(base: Path, root: Path, expected: str) -> Path:
     initroot = root / "qemu-initramfs"
     initroot.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        f"gzip -dc {base} | cpio -idmu",
-        shell=True,
-        cwd=initroot,
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    gzip_process = subprocess.Popen(["gzip", "-dc", str(base)], stdout=subprocess.PIPE)
+    assert gzip_process.stdout is not None
+    extract = subprocess.run(["cpio", "-idmu"], cwd=initroot, stdin=gzip_process.stdout,
+                             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    gzip_process.stdout.close()
+    if gzip_process.wait() != 0:
+        raise RuntimeError("cannot unpack base initramfs")
     (initroot / "expected").mkdir(exist_ok=True)
     (initroot / "expected" / "boot.sha256").write_text(expected + "\n")
     (initroot / "init").write_text(
@@ -265,12 +270,16 @@ def prepare_qemu_initramfs(base: Path, root: Path, expected: str) -> Path:
     )
     (initroot / "init").chmod(0o755)
     output = root / "qemu-initramfs.cpio.gz"
-    subprocess.run(
-        f"find . -print | cpio -o -H newc 2>/dev/null | gzip -c > {output}",
-        shell=True,
-        cwd=initroot,
-        check=True,
-    )
+    members = [str(path.relative_to(initroot)) for path in initroot.rglob("*")]
+    cpio = subprocess.Popen(["cpio", "-o", "-H", "newc"], cwd=initroot,
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL)
+    assert cpio.stdin is not None and cpio.stdout is not None
+    archive, _ = cpio.communicate((".\n" + "\n".join(members) + "\n").encode())
+    if cpio.returncode != 0:
+        raise RuntimeError("cannot create QEMU initramfs")
+    compressed = subprocess.run(["gzip", "-c"], input=archive, capture_output=True, check=True).stdout
+    output.write_bytes(compressed)
     return output
 
 

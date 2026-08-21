@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import importlib.util
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,37 @@ SPEC.loader.exec_module(VM)
 
 
 class InitialInstallVmTests(unittest.TestCase):
+    def test_brom_gpt_rewrite_preserves_existing_device_contents(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            image = root / "emmc.img"
+            state = root / "transaction.json"
+            VM.create_physical(image)
+            gpt = VM.read_gpt(image)
+            sentinel = b"PERSISTENT-DEVICE-STATE"
+            with image.open("r+b") as stream:
+                stream.seek(gpt[16][0] * VM.SECTOR + 4096)
+                stream.write(sentinel)
+            VM.brom_install(image, state)
+            with image.open("rb") as stream:
+                stream.seek(gpt[16][0] * VM.SECTOR + 4096)
+                self.assertEqual(stream.read(len(sentinel)), sentinel)
+
+    def test_default_boot_uses_canonical_android_v0_geometry(self):
+        with tempfile.TemporaryDirectory() as td:
+            boot = Path(td) / "boot.img"
+            VM.make_boot(boot)
+            header = boot.read_bytes()[:64]
+            kernel_size, kernel_addr, ramdisk_size, ramdisk_addr, _, second_addr, tags_addr, page_size, _, _ = struct.unpack("<10I", header[8:48])
+            self.assertEqual(boot.stat().st_size, VM.BOOT_BYTES)
+            self.assertEqual(kernel_size, 0)
+            self.assertEqual(kernel_addr, 0x40008000)
+            self.assertEqual(ramdisk_size, 0)
+            self.assertEqual(ramdisk_addr, 0x43478000)
+            self.assertEqual(second_addr, 0x40F00000)
+            self.assertEqual(tags_addr, 0x48000000)
+            self.assertEqual(page_size, 0x800)
+
     def test_physical_gpt_transforms_and_both_payloads_read_back(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
