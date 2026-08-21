@@ -39,7 +39,7 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "773ce2f04695f69bb0f5d74c53369019178b0d2982530ca0cfaa9dce82ccd459"
+RECOVERY_INIT_SHA256 = "8c67693de713c77348f1b7d292174686b625c50a237fba9e70919b182554597d"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
@@ -1515,6 +1515,7 @@ def validate_stage(stage: Path) -> None:
         "etc/libreecho/ota-public-key.hex", "etc/libreecho/ota-source.conf",
         "etc/libreecho/image-profile", "etc/libreecho/service-profile",
         "etc/libreecho/feature-policy",
+        "etc/libreecho/first-install-confirm",
         "usr/local/share/licenses/libreecho-core/THIRD_PARTY_NOTICES.md",
         "usr/local/share/licenses/libreecho-core/COMPONENTS.json",
         "usr/local/share/licenses/libreecho-core/GPL-2.0-only.txt",
