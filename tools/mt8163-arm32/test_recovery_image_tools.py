@@ -866,7 +866,7 @@ class SourceTests(unittest.TestCase):
         # Scope to the worker function: earlier unrelated reboot paths must
         # not satisfy the ordering check.
         worker_start = init.index("ota_health_confirm_worker()")
-        worker = init[worker_start:worker_start + 6000]
+        worker = init[worker_start:worker_start + 9000]
         restart_idx = worker.index("$BB reboot -f")
         record_idx = worker.index("/data/libreecho/update/restart-record")
         self.assertLess(record_idx, restart_idx)
@@ -1843,6 +1843,75 @@ class PolicyTests(unittest.TestCase):
             self.assertIn("libreecho-ttsd-wyoming", source)
             self.assertIn("/lib/ld-musl-armhf.so.1", source)
             self.assertIn("libc.musl-armv7.so.1", source)
+
+    def test_fresh_install_confirms_its_own_boot_slot(self) -> None:
+        # A clean install (BROM/Amonet or factory) writes no update record.
+        # The bootloader still decrements the slot try counter every boot and
+        # refuses the slot once it reaches zero while success is 0, so the
+        # health worker must confirm the running slot rather than returning
+        # early when there is no pending OTA.
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertNotIn(
+            "[ -r /data/libreecho/update/pending ] || return 0", init
+        )
+        self.assertIn("CONFIRM_MODE=first-boot", init)
+        self.assertIn("CONFIRM_MODE=ota", init)
+        self.assertIn(
+            'libreecho-bootctl confirm "$selected_slot"', init
+        )
+        self.assertIn("first-boot-slot-confirmed", init)
+        self.assertIn("first-boot-slot-already-confirmed", init)
+        # The confirmation must sit behind the same health gate the OTA path
+        # uses, never in front of it.
+        self.assertLess(
+            init.index('log "first-boot-confirm-pending:$selected_slot"'),
+            init.index('[ "$passed" -eq 3 ]'),
+        )
+        # A first boot must never reboot: there is no previously confirmed
+        # slot to fall back to.
+        self.assertLess(
+            init.index('log "first-boot-confirm-failed:$last_check"'),
+            init.index("ota-health-confirm-failed-rebooting"),
+        )
+        self.assertIn(
+            'if [ "$CONFIRM_MODE" = ota ]; then', init
+        )
+
+    def test_ota_vm_asserts_each_phase_and_resets_bcb(self) -> None:
+        vm = TOOLS_DIR / "ota-test-vm"
+        init = (vm / "build-initramfs.sh").read_text()
+        boot = (vm / "boot-test.sh").read_text()
+        self.assertIn("R=/work/initramfs", init)
+        self.assertIn("data,tmp,tools", init)
+        self.assertIn("reset_bcb()", init)
+        self.assertGreaterEqual(init.count("reset_bcb"), 3)
+        self.assertIn("assert_rc", init)
+        self.assertIn("assert_output", init)
+        self.assertNotIn("| $B head", init)
+        self.assertNotIn("| $B tail", init)
+        self.assertIn("qemu_rc=$?", boot)
+        self.assertIn("wait $QPID", boot)
+        self.assertNotIn('echo "qemu exited rc=$?"', boot)
+
+    def test_bootctl_can_report_running_slot_from_bootloader_hint(self) -> None:
+        bootctl = (TOOLS_DIR / "ota/libreecho_bootctl.c").read_text()
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertIn("running_slot", bootctl)
+        self.assertIn("status [a|b]", bootctl)
+        self.assertIn("androidboot.slot_suffix", init)
+        self.assertIn('libreecho-bootctl status "$running_slot"', init)
+        self.assertIn("running-slot", init)
+
+    def test_emulation_defaults_to_loopback_published_authenticated_web(self) -> None:
+        emulation = TOOLS_DIR / "emulation"
+        for name in ("entrypoint.sh", "entrypoint-mock.sh"):
+            source = (emulation / name).read_text()
+            self.assertIn("--listen 0.0.0.0:8080", source)
+            self.assertNotIn("--allow-insecure-lan", source)
+        for name in ("README.md", "build.sh"):
+            source = (emulation / name).read_text()
+            self.assertIn("127.0.0.1:8080:8080", source)
+            self.assertNotIn("-p 8080:8080", source)
 
     def test_ota_target_slots_are_identity_checked_before_block_io(self) -> None:
         updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()

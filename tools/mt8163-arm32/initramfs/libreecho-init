@@ -870,11 +870,50 @@ ota_health_confirm_worker()
         log ota-health-feature-validation-skipped-by-exclusion-policy
         return 0
     }
-    [ -r /data/libreecho/update/pending ] || return 0
-    log ota-health-confirm-pending
-    pending_slot=$($BB sed -n 's/^slot=//p' /data/libreecho/update/pending)
-    selected_slot=$(/usr/local/sbin/libreecho-bootctl status 2>/dev/null |
-        $BB sed -n 's/^selected_slot=//p')
+    running_slot=$($BB sed -n \
+        's/.*androidboot.slot_suffix=_\([ab]\).*/\1/p' /proc/cmdline)
+    case "$running_slot" in
+        a|b)
+            log "running-slot:$running_slot"
+            selected_slot=$(/usr/local/sbin/libreecho-bootctl status "$running_slot" 2>/dev/null |
+                $BB sed -n 's/^selected_slot=//p')
+            ;;
+        *)
+            log running-slot-not-reported
+            selected_slot=$(/usr/local/sbin/libreecho-bootctl status 2>/dev/null |
+                $BB sed -n 's/^selected_slot=//p')
+            ;;
+    esac
+
+    # A clean install (BROM/Amonet or factory) never writes an update record,
+    # so the OTA transaction handling below does not apply to it.  The
+    # bootloader still decrements the slot try counter on every boot and
+    # refuses the slot once that counter reaches zero while success is 0, so a
+    # healthy fresh install becomes unbootable after a few reboots unless the
+    # running slot is confirmed.  Confirm it on the same health evidence the
+    # OTA path requires, and never reboot on failure: a first boot has no
+    # previously confirmed slot to fall back to.
+    if [ -r /data/libreecho/update/pending ]; then
+        CONFIRM_MODE=ota
+        log ota-health-confirm-pending
+        pending_slot=$($BB sed -n 's/^slot=//p' /data/libreecho/update/pending)
+    else
+        CONFIRM_MODE=first-boot
+        case "$selected_slot" in
+            a|b) ;;
+            *)
+                log "first-boot-slot-unknown:$selected_slot"
+                return 0
+                ;;
+        esac
+        if [ "$(/usr/local/sbin/libreecho-bootctl status 2>/dev/null |
+            $BB sed -n "s/^slot_${selected_slot}_success=//p")" = 1 ]; then
+            log "first-boot-slot-already-confirmed:$selected_slot"
+            return 0
+        fi
+        log "first-boot-confirm-pending:$selected_slot"
+        pending_slot=$selected_slot
+    fi
     case "$pending_slot:$selected_slot" in
         a:a|b:b) ;;
         a:b|b:a)
@@ -897,14 +936,16 @@ ota_health_confirm_worker()
             return 0
             ;;
     esac
-    {
-        echo schema=1
-        echo state=boot-validating
-        echo progress=95
-        echo detail=health-checks
-    } > /data/libreecho/update/state.tmp &&
-        $BB mv /data/libreecho/update/state.tmp /data/libreecho/update/state
-    $BB sync
+    if [ "$CONFIRM_MODE" = ota ]; then
+        {
+            echo schema=1
+            echo state=boot-validating
+            echo progress=95
+            echo detail=health-checks
+        } > /data/libreecho/update/state.tmp &&
+            $BB mv /data/libreecho/update/state.tmp /data/libreecho/update/state
+        $BB sync
+    fi
 
     ota_health_services_ready()
     {
@@ -963,6 +1004,20 @@ ota_health_confirm_worker()
         log "ota-health-probe-passed:$passed"
         [ "$passed" -lt 3 ] && $BB sleep 15
     done
+
+    if [ "$CONFIRM_MODE" = first-boot ]; then
+        if [ "$passed" -eq 3 ] &&
+           /usr/local/sbin/libreecho-bootctl confirm "$selected_slot" \
+               >/tmp/first-boot-confirm.log 2>&1; then
+            log "first-boot-slot-confirmed:$selected_slot"
+            return 0
+        fi
+        # Never restart after a failed first boot: there is no previously
+        # confirmed slot to fall back to, so a reboot could only repeat this
+        # outcome and would burn the remaining try counter.
+        log "first-boot-confirm-failed:$last_check"
+        return 0
+    fi
 
     if [ "$passed" -eq 3 ] &&
        /usr/local/sbin/libreecho-update confirm >/tmp/ota-confirm.log 2>&1; then

@@ -1,0 +1,9 @@
+# Built/supplied artifacts — never commit binaries or release packages.
+emmc.img
+vmlinuz
+initrd.img
+initramfs.cpio.gz
+initramfs/
+stage/
+*.log
+*.bak
