@@ -870,8 +870,20 @@ ota_health_confirm_worker()
         log ota-health-feature-validation-skipped-by-exclusion-policy
         return 0
     }
-    selected_slot=$(/usr/local/sbin/libreecho-bootctl status 2>/dev/null |
-        $BB sed -n 's/^selected_slot=//p')
+    running_slot=$($BB sed -n \
+        's/.*androidboot.slot_suffix=_\([ab]\).*/\1/p' /proc/cmdline)
+    case "$running_slot" in
+        a|b)
+            log "running-slot:$running_slot"
+            selected_slot=$(/usr/local/sbin/libreecho-bootctl status "$running_slot" 2>/dev/null |
+                $BB sed -n 's/^selected_slot=//p')
+            ;;
+        *)
+            log running-slot-not-reported
+            selected_slot=$(/usr/local/sbin/libreecho-bootctl status 2>/dev/null |
+                $BB sed -n 's/^selected_slot=//p')
+            ;;
+    esac
 
     # A clean install (BROM/Amonet or factory) never writes an update record,
     # so the OTA transaction handling below does not apply to it.  The

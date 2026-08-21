@@ -16,4 +16,4 @@ fi
 exec /usr/local/sbin/libreecho-web --backend linux \
   --config /data/libreecho/config/web-config.json \
   --web-root /usr/local/share/libreecho/web --listen 0.0.0.0:8080 \
-  --users-file /data/libreecho/config/users --allow-insecure-lan
+  --users-file /data/libreecho/config/users

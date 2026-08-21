@@ -163,9 +163,9 @@ static int write_sector(const uint8_t *sector)
            !memcmp(sector, verify, SECTOR_SIZE) ? 0 : -1;
 }
 
-static void print_status(const uint8_t *bcb)
+static void print_status(const uint8_t *bcb, int running_slot)
 {
-    int selected = selected_slot(bcb);
+    int selected = running_slot >= 0 ? running_slot : selected_slot(bcb);
 
     printf("schema=1\n");
     printf("selected_slot=%c\n", selected < 0 ? '-' : 'a' + selected);
@@ -221,7 +221,7 @@ static int confirm(uint8_t *bcb, int target)
 
 static void usage(const char *program)
 {
-    fprintf(stderr, "Usage: %s status | activate <a|b> | confirm <a|b>\n",
+    fprintf(stderr, "Usage: %s status [a|b] | activate <a|b> | confirm <a|b>\n",
             program);
 }
 
@@ -230,6 +230,7 @@ int main(int argc, char **argv)
     uint8_t sector[SECTOR_SIZE];
     uint8_t *bcb = sector + BCB_IN_SECTOR;
     int slot;
+    int running_slot = -1;
 
     if (validate_layout() || read_sector(sector)) {
         fprintf(stderr, "ERROR: cannot validate/read Biscuit boot control\n");
@@ -239,8 +240,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "ERROR: invalid Amazon BCB record\n");
         return 1;
     }
-    if (argc == 2 && !strcmp(argv[1], "status")) {
-        print_status(bcb);
+    if (argc >= 2 && !strcmp(argv[1], "status") &&
+        (argc == 2 || (argc == 3 && (running_slot = parse_slot(argv[2])) >= 0))) {
+        print_status(bcb, running_slot);
         return 0;
     }
     if (argc != 3 || (slot = parse_slot(argv[2])) < 0) {
@@ -261,6 +263,6 @@ int main(int argc, char **argv)
         fprintf(stderr, "ERROR: BCB update/readback failed\n");
         return 1;
     }
-    print_status(bcb);
+    print_status(bcb, -1);
     return 0;
 }

@@ -13,5 +13,8 @@ QPID=$!
 ( sleep 220; kill $QPID 2>/dev/null ) &
 GUARD=$!
 wait $QPID 2>/dev/null
-kill $GUARD 2>/dev/null
-echo "qemu exited rc=$?"
+qemu_rc=$?
+kill $GUARD 2>/dev/null || true
+wait $GUARD 2>/dev/null || true
+echo "qemu exited rc=$qemu_rc"
+exit "$qemu_rc"

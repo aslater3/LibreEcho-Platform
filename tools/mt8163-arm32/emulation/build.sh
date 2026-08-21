@@ -24,6 +24,6 @@ fi
 docker build --platform linux/arm/v7 -t "$IMAGE" .
 echo
 echo "Built $IMAGE. Run it with:"
-echo "  docker run -d --name libreecho-emu --platform linux/arm/v7 --memory 485m -p 8080:8080 $IMAGE"
+echo "  docker run -d --name libreecho-emu --platform linux/arm/v7 --memory 485m -p 127.0.0.1:8080:8080 $IMAGE"
 echo "For the simulated-hardware (mock) backend, override the entrypoint:"
-echo "  docker run -d --platform linux/arm/v7 -p 8080:8080 --entrypoint /bin/busybox $IMAGE sh /entrypoint-mock.sh"
+echo "  docker run -d --platform linux/arm/v7 -p 127.0.0.1:8080:8080 --entrypoint /bin/busybox $IMAGE sh /entrypoint-mock.sh"

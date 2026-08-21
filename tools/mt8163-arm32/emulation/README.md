@@ -25,10 +25,10 @@ and — for the assistant feature — `unsquashfs`.
 
 ```sh
 # linux backend (real daemon sockets; hardware adapters unavailable unless run)
-docker run -d --name libreecho-emu --platform linux/arm/v7 --memory 485m -p 8080:8080 libreecho-emu:latest
+docker run -d --name libreecho-emu --platform linux/arm/v7 --memory 485m -p 127.0.0.1:8080:8080 libreecho-emu:latest
 
 # mock backend (simulated hardware for every adapter — best for UI tests)
-docker run -d --platform linux/arm/v7 -p 8080:8080 \
+docker run -d --platform linux/arm/v7 -p 127.0.0.1:8080:8080 \
   --entrypoint /bin/busybox libreecho-emu:latest sh /entrypoint-mock.sh
 ```
 

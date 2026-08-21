@@ -1877,6 +1877,42 @@ class PolicyTests(unittest.TestCase):
             'if [ "$CONFIRM_MODE" = ota ]; then', init
         )
 
+    def test_ota_vm_asserts_each_phase_and_resets_bcb(self) -> None:
+        vm = TOOLS_DIR / "ota-test-vm"
+        init = (vm / "build-initramfs.sh").read_text()
+        boot = (vm / "boot-test.sh").read_text()
+        self.assertIn("R=/work/initramfs", init)
+        self.assertIn("data,tmp,tools", init)
+        self.assertIn("reset_bcb()", init)
+        self.assertGreaterEqual(init.count("reset_bcb"), 3)
+        self.assertIn("assert_rc", init)
+        self.assertIn("assert_output", init)
+        self.assertNotIn("| $B head", init)
+        self.assertNotIn("| $B tail", init)
+        self.assertIn("qemu_rc=$?", boot)
+        self.assertIn("wait $QPID", boot)
+        self.assertNotIn('echo "qemu exited rc=$?"', boot)
+
+    def test_bootctl_can_report_running_slot_from_bootloader_hint(self) -> None:
+        bootctl = (TOOLS_DIR / "ota/libreecho_bootctl.c").read_text()
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertIn("running_slot", bootctl)
+        self.assertIn("status [a|b]", bootctl)
+        self.assertIn("androidboot.slot_suffix", init)
+        self.assertIn('libreecho-bootctl status "$running_slot"', init)
+        self.assertIn("running-slot", init)
+
+    def test_emulation_defaults_to_loopback_published_authenticated_web(self) -> None:
+        emulation = TOOLS_DIR / "emulation"
+        for name in ("entrypoint.sh", "entrypoint-mock.sh"):
+            source = (emulation / name).read_text()
+            self.assertIn("--listen 0.0.0.0:8080", source)
+            self.assertNotIn("--allow-insecure-lan", source)
+        for name in ("README.md", "build.sh"):
+            source = (emulation / name).read_text()
+            self.assertIn("127.0.0.1:8080:8080", source)
+            self.assertNotIn("-p 8080:8080", source)
+
     def test_ota_target_slots_are_identity_checked_before_block_io(self) -> None:
         updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
         self.assertIn("target_device_for_slot()", updater)

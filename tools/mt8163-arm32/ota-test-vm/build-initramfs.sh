@@ -11,7 +11,7 @@ KVER=$(ls /lib/modules | head -1); MODS=/lib/modules/$KVER
 # version (a stale vmlinuz makes every virtio/ext4 module fail vermagic).
 cp /boot/vmlinuz-$KVER /work/vmlinuz
 echo "exported kernel: $KVER"
-R=/work/initramfs; rm -rf $R; mkdir -p $R/{bin,sbin,proc,sys,dev,data,tools,mods,fakesys}
+R=/work/initramfs; rm -rf $R; mkdir -p $R/{bin,sbin,proc,sys,dev,data,tmp,tools,mods,fakesys}
 cp /bin/busybox $R/bin/busybox
 # static-ish e2fs tools for on-boot format (dynamic; add libs)
 cp /sbin/mke2fs $R/sbin/ 2>/dev/null; cp /sbin/mkfs.ext4 $R/sbin/ 2>/dev/null || true
@@ -49,23 +49,58 @@ $B mount --bind /fakesys /sys/class/block
 $B mount -t ext4 /dev/mmcblk0p16 /data 2>/dev/null
 UPD=/usr/local/sbin/libreecho-update
 BC=/usr/local/sbin/libreecho-bootctl
+run_expect(){
+  name=$1; expected_rc=$2; expected_text=$3; shift 3
+  out=/tmp/ota-$name.log
+  set +e
+  "$@" >$out 2>&1
+  rc=$?
+  set -e
+  assert_rc "$name" "$rc" "$expected_rc" "$out"
+  assert_output $out "$expected_text"
+  $B cat $out
+}
+assert_rc(){
+  name=$1; actual=$2; expected=$3; file=$4
+  [ "$actual" -eq "$expected" ] || { $B cat "$file"; echo "ASSERT:$name:rc=$actual expected=$expected"; exit 1; }
+}
+assert_output(){
+  file=$1; expected_text=$2
+  $B grep -q "$expected_text" "$file" || { $B cat "$file"; echo "ASSERT:missing=$expected_text"; exit 1; }
+}
+assert_bcb(){
+  selected=$1; success=$2
+  status=$($BC status) || { echo "ASSERT:bcb:status"; exit 1; }
+  echo "$status" | $B grep -q "^selected_slot=$selected$" || { echo "$status"; exit 1; }
+  echo "$status" | $B grep -q "^slot_${selected}_success=$success$" || { echo "$status"; exit 1; }
+}
+reset_bcb(){
+  $B printf '\000ABB\001\217\000' >/tmp/fresh-bcb
+  $B dd if=/tmp/fresh-bcb of=/dev/mmcblk0p8 bs=1 seek=864 conv=notrunc 2>/dev/null || exit 1
+  assert_bcb a 1
+}
 echo "===PHASE0 capabilities (expect: allow-unsigned)==="
-$UPD capabilities 2>&1
-$UPD bogus 2>&1 | $B head -1; echo "bogus_rc=$?"
+run_expect phase0-capabilities 0 allow-unsigned $UPD capabilities
+run_expect phase0-unknown 2 Usage: $UPD bogus
 echo "===PHASE0_END==="
 $B rm -rf /data/libreecho/update 2>/dev/null
+reset_bcb
 echo "===PHASE1 signed package.tar (expect ota_manifest_signature=PASS + UPDATE_READY)==="
-$UPD install /tools/package.tar 2>&1 | $B tail -6
-echo "BCB:"; $BC status 2>&1 | $B tail -4
+run_expect phase1 0 UPDATE_READY $UPD install /tools/package.tar
+assert_output /tmp/ota-phase1.log ota_manifest_signature=PASS
+assert_bcb b 0
 echo "===PHASE1_END==="
 $B rm -rf /data/libreecho/update 2>/dev/null
+reset_bcb
 echo "===PHASE2 unsigned.tar, NO flag (expect package_signature reject)==="
-$UPD install /tools/unsigned.tar 2>&1 | $B tail -3
+run_expect phase2 1 ERROR:package_signature $UPD install /tools/unsigned.tar
+assert_bcb a 1
 echo "===PHASE2_END==="
 $B rm -rf /data/libreecho/update 2>/dev/null
+reset_bcb
 echo "===PHASE3 unsigned.tar, --allow-unsigned (expect skipped + UPDATE_READY)==="
-$UPD install --allow-unsigned /tools/unsigned.tar 2>&1 | $B tail -5
-echo "BCB:"; $BC status 2>&1 | $B tail -4
+run_expect phase3 0 UPDATE_READY $UPD install --allow-unsigned /tools/unsigned.tar
+assert_bcb b 0
 echo "===PHASE3_END==="
 $B poweroff -f
 INIT
