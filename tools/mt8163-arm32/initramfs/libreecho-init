@@ -787,12 +787,38 @@ fi
 # audiod only opens the adapter and never initiates playback.  micd starts
 # with capture idle and opens the microphone endpoint only for an explicit
 # stream request.
+# Export the owner's timezone so every daemon renders local time.
+#
+# The image carries no /usr/share/zoneinfo and busybox ignores /etc/TZ, so the
+# only mechanism that works here is the TZ environment variable holding a
+# POSIX TZ string (verified on-device: TZ=CST6CDT,M3.2.0,M11.1.0 yields CDT).
+# Inherited by the whole service graph because this runs before it starts.
+apply_timezone()
+{
+    tz_config=/data/libreecho/config/web-config.json
+    tz_value=
+    if [ -r "$tz_config" ]; then
+        tz_value=$($BB sed -n \
+            's/.*"timezone"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            "$tz_config" 2>/dev/null | $BB head -n 1)
+    fi
+    case "$tz_value" in
+        # Only a plain POSIX TZ string; anything else falls back to UTC so a
+        # malformed config cannot inject arbitrary environment content.
+        ''|*[!A-Za-z0-9,.:+/-]*) tz_value=UTC ;;
+    esac
+    TZ=$tz_value
+    export TZ
+    log "timezone-applied:$tz_value"
+}
+
 start_ui_services()
 {
     [ -x /usr/local/sbin/libreecho-web ] || {
         log ui-services-not-installed
         return 0
     }
+    apply_timezone
     $BB mkdir -p /var/run /var/log /var/log/libreecho /run/libreecho
     if [ "$SERVICE_PROFILE" = production ] && [ "${DATA_CLEANUP_OK:-0}" -ne 1 ]; then
         log ui-services-blocked-by-data-contract
