@@ -46,6 +46,25 @@ The runner prints a JSON result and leaves:
 Use `--boot <verified-16MiB-boot.img>` to test a real release image instead of
 the generated contract image. No release or hardware pointer is modified.
 
+## Driving the released installer
+
+The Build installer has an explicit `--emulator-root` mode. Point it at a copy
+of `emulator_tool.py`, provide the matching ARM QEMU kernel/initramfs, and keep
+`--slots both` to exercise both redirected writes:
+
+```sh
+python3 libreecho-radar-puffin-v0.13.7-installer.py one-shot \\
+  --release-dir <release-dir> --release-tag radar-puffin-v0.13.7 \\
+  --emulator-root <this-directory> \\
+  --emulator-kernel <ota-test-vm>/vmlinuz \\
+  --emulator-initramfs <ota-test-vm>/initramfs.cpio.gz \\
+  --no-open-browser --slots both
+```
+
+This preserves the installer state machine and command sequence. The emulator
+provides command-compatible BROM, fastboot, and ADB adapters, and writes
+`uart.log` with the GPT/LK/fastboot markers captured from the real device.
+
 ## Optional QEMU boot
 
 The existing `ota-test-vm` build produces a matching ARM kernel and initramfs.
