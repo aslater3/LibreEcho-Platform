@@ -966,8 +966,11 @@ ota_health_confirm_worker()
         # the directory exists even when the mount never succeeded and the
         # daemon never started.
         for vs_feature in stt tts assistant; do
-            $BB grep -q " /run/libreecho/features/$vs_feature/root " \
-                /proc/mounts 2>/dev/null && return 1
+            if $BB grep -q " /run/libreecho/features/$vs_feature/root " \
+                    /proc/mounts 2>/dev/null; then
+                log "ota-health-voice-stack-present:$vs_feature"
+                return 1
+            fi
         done
         vp_config=/data/libreecho/config/web-config.json
         vp_mode=
