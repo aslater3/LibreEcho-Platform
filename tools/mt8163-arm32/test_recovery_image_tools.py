@@ -1058,6 +1058,21 @@ class SourceTests(unittest.TestCase):
         self.assertIn("Apache License", notice.read_text())
         self.assertIn("source_commit=", source_lock.read_text())
 
+    def test_adbd_compat_header_coexists_with_kernel_uapi_prctl(self) -> None:
+        # musl's <sys/prctl.h> re-declares struct prctl_mm_map and PR_*
+        # macros that the exported kernel UAPI <linux/prctl.h> also defines,
+        # and adb.c includes the UAPI header directly. The compat header is
+        # force-included into every translation unit, so it must not pull in
+        # musl's sys/prctl.h; it declares prctl() directly instead. A
+        # reintroduction of that include breaks every musl-based adbd build
+        # with a hard redefinition error (regression from the hosted public
+        # build lane).
+        adbd_dir = TOOLS_DIR / "adbd"
+        compat = adbd_dir / "compat/libreecho-adbd-compat.h"
+        compat_text = compat.read_text()
+        self.assertNotIn("#include <sys/prctl.h>", compat_text)
+        self.assertIn("int prctl(", compat_text)
+
     def test_pipeline_builds_adbd_without_stock_root(self) -> None:
         pipeline_root = pipeline_file("build.sh").parent
         source = (pipeline_root / "build.sh").read_text()
