@@ -841,7 +841,29 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			usleep(250000);
 			continue;
 		}
-		int startup_volume = airplay_volume >= 0
+		/*
+		 * The sender's volume applies to AirPlay media, not to everything
+		 * the device plays.  Applying it unconditionally meant a system
+		 * tone, an announcement or a spoken assistant reply was played at
+		 * the AirPlay sender's level: with a sender at 0 dB that is a raw
+		 * 127, the codec's unity point, so any local playback silently
+		 * pushed the device to full volume and left it there.
+		 *
+		 * Observed on hardware with a plain test tone -- no AirPlay
+		 * streaming involved -- via audiod's guard:
+		 *
+		 *   volume changed underneath us: requested 25%, control now
+		 *   reads 100% (raw 127 of 0..175)
+		 *
+		 * 127 is only ever produced by airplay_volume_to_mixer(), which
+		 * returns it for any sender volume at or above 0 dB.  Use the
+		 * sender's level only when AirPlay media is actually one of the
+		 * sources being rendered; otherwise keep the level the device was
+		 * already at, which is what audiod and the physical buttons set.
+		 */
+		int airplay_media_playing =
+			(second_activity & PLAYBACK_BUS_MEDIA) != 0;
+		int startup_volume = (airplay_volume >= 0 && airplay_media_playing)
 			? airplay_volume : saved_volume;
 
 		if (pcm_prepare(pcm) < 0 ||
@@ -863,7 +885,9 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		process_music_visualizer(&visualizer, sources, second);
 
 		while (!stopping && sources_active(sources)) {
-			if (airplay_session && airplay_is_active(root)) {
+			/* Same scoping for live volume changes from the sender. */
+			if (airplay_session && airplay_is_active(root) &&
+			    (source_activity_mask(sources) & PLAYBACK_BUS_MEDIA)) {
 				int requested = airplay_volume_to_mixer(root);
 
 				if (requested >= 0 && requested != airplay_volume &&
@@ -891,7 +915,8 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				      &visualizer, &status);
 		(void)disable_output_controls(card, -1);
 		pcm_close(pcm);
-		if (airplay_session && saved_volume >= 0)
+		/* Only undo a level this engine actually imposed. */
+		if (airplay_session && airplay_media_playing && saved_volume >= 0)
 			(void)set_pcm_volume(card, saved_volume);
 	}
 	result = stopping ? 0 : -1;
