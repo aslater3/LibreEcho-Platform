@@ -848,18 +848,18 @@ start_ui_services()
             [ "$FEATURE_POLICY" = community-noncommercial ]; then
         if [ "$ha_enabled" -eq 1 ]; then
             log ui-home-assistant-mode-enabled
-            services="logd networkd timed audiod micd waked ledd buttond btd airplayd wyomingd web"
+            services="logd networkd timed audiod micd waked ledd buttond btd airplayd radiod wyomingd web"
         else
-            services="logd networkd timed audiod micd waked sttd ledd buttond btd airplayd ttsd agentd web"
+            services="logd networkd timed audiod micd waked sttd ledd buttond btd airplayd radiod ttsd agentd web"
         fi
         if [ "$FEATURE_POLICY" = community-noncommercial ]; then
             log ui-services-community-noncommercial-with-wakeword
         fi
     else
         if [ "$ha_enabled" -eq 1 ]; then
-            services="logd networkd timed audiod micd ledd buttond btd airplayd wyomingd web"
+            services="logd networkd timed audiod micd ledd buttond btd airplayd radiod wyomingd web"
         else
-            services="logd networkd timed audiod micd sttd ledd buttond btd airplayd ttsd agentd web"
+            services="logd networkd timed audiod micd sttd ledd buttond btd airplayd radiod ttsd agentd web"
         fi
         log ui-services-redistributable-without-wakeword
     fi
