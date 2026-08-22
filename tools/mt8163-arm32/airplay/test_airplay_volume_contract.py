@@ -32,7 +32,14 @@ def main() -> None:
         "? (airplay_volume_to_mixer(root) >= 0 ? 32768 : 0)",
         "priority audio continues while AirPlay",
         "arm_output_controls(card, -1, &saved_volume)",
-        "int startup_volume = airplay_volume >= 0",
+        # The sender's level belongs to AirPlay media, not to every source.
+        # Applying it unconditionally put a system tone, an announcement or a
+        # spoken reply out at the sender's volume, which for a sender at 0 dB
+        # is a raw 127 -- the codec's unity point -- so any local playback
+        # pushed the device to full volume and left it there.
+        "int airplay_media_playing =",
+        "(second_activity & PLAYBACK_BUS_MEDIA) != 0",
+        "int startup_volume = (airplay_volume >= 0 && airplay_media_playing)",
         "set_pcm_volume(card, startup_volume)",
     )
 
@@ -66,6 +73,11 @@ def main() -> None:
     normal_restore = normal.index("set_pcm_volume(card, saved_volume)")
     if not normal_disable < normal_close < normal_restore:
         raise SystemExit("normal teardown must mute, close PCM, then restore volume")
+    # The engine must only undo a level it actually imposed, so the restore is
+    # gated on the same condition as the apply.
+    if "airplay_media_playing" not in normal:
+        raise SystemExit(
+            "teardown restore must be scoped to AirPlay media, like the apply")
 
     missing = [
         f"airplay_audio.c: {fragment}"
