@@ -209,7 +209,8 @@ check_children "$DATA_ROOT" libreecho lost+found
 check_children "$DATA_ROOT/libreecho" config secrets features update data-manifest.json
 check_children "$DATA_ROOT/libreecho/config" \
     web-config.json web-config.json.bak users wpa_supplicant.conf ntp.conf \
-    agent.json agent.json.bak tts-voice vad-floor-rms
+    agent.json agent.json.bak tts-voice vad-floor-rms \
+    led-state.json led-state.json.tmp
 check_children "$DATA_ROOT/libreecho/secrets" openai-codex.json
 
 TOLERATE_UNKNOWN_FILES=1
