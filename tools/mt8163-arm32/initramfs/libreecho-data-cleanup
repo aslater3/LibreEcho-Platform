@@ -207,10 +207,26 @@ TOLERATE_UNKNOWN_FILES=0
 # they are extensible; the files inside each feature remain fixed.
 check_children "$DATA_ROOT" libreecho lost+found
 check_children "$DATA_ROOT/libreecho" config secrets features update data-manifest.json
+# /data is shared between the A and B slots, so a configuration file written
+# by a newer image is still present after a rollback to an older one.  With a
+# strict allowlist that file is an unknown item and the older image blocks
+# every service at boot -- a rollback, the one recovery path that is supposed
+# to be safe, is turned into a brick by a file the device wrote itself.
+#
+# Observed: a newer image added led-state.json here; the device rolled back
+# to a slot that predated the allowlist entry and came up with
+# ui-services-blocked-by-data-contract and no network, recoverable only over
+# adb.
+#
+# Tolerate an unrecognised regular file here, the same way update/ already
+# does.  Symlinks and directories remain hard failures, so the check still
+# catches the shapes that indicate tampering rather than a version skew.
+TOLERATE_UNKNOWN_FILES=1
 check_children "$DATA_ROOT/libreecho/config" \
     web-config.json web-config.json.bak users wpa_supplicant.conf ntp.conf \
     agent.json agent.json.bak tts-voice vad-floor-rms \
     led-state.json led-state.json.tmp
+TOLERATE_UNKNOWN_FILES=0
 check_children "$DATA_ROOT/libreecho/secrets" openai-codex.json
 
 TOLERATE_UNKNOWN_FILES=1
