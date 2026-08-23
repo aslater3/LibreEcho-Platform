@@ -32,8 +32,11 @@ def main() -> None:
         "? (airplay_volume_to_mixer(root) >= 0 ? 32768 : 0)",
         "priority audio continues while AirPlay",
         "arm_output_controls(card, -1, &saved_volume)",
-        "int startup_volume = airplay_volume >= 0",
+        "int airplay_volume_applied = 0",
+        "int startup_volume = saved_volume",
         "set_pcm_volume(card, startup_volume)",
+        "airplay_volume_applied = 1",
+        "!airplay_volume_applied || requested != airplay_volume",
     )
 
     gate_start = engine.index("if (airplay_session && airplay_volume < 0)")
@@ -66,6 +69,8 @@ def main() -> None:
     normal_restore = normal.index("set_pcm_volume(card, saved_volume)")
     if not normal_disable < normal_close < normal_restore:
         raise SystemExit("normal teardown must mute, close PCM, then restore volume")
+    if "airplay_volume_applied && saved_volume >= 0" not in normal:
+        raise SystemExit("normal teardown must restore only after AirPlay volume was applied")
 
     missing = [
         f"airplay_audio.c: {fragment}"

@@ -740,6 +740,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	int saved_volume = -1;
 	int airplay_volume = -1;
 	int airplay_session = 0;
+	int airplay_volume_applied = 0;
 	unsigned int i;
 
 	memset(sources, 0, sizeof(sources));
@@ -801,6 +802,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		second_activity = source_activity_mask(sources);
 
 		saved_volume = -1;
+		airplay_volume_applied = 0;
 		airplay_session = airplay_is_active(root);
 		airplay_volume = airplay_session
 			? airplay_volume_to_mixer(root) : -1;
@@ -863,8 +865,9 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		 */
 		int airplay_media_playing =
 			(second_activity & PLAYBACK_BUS_MEDIA) != 0;
-		int startup_volume = (airplay_volume >= 0 && airplay_media_playing)
-			? airplay_volume : saved_volume;
+		int startup_volume = saved_volume;
+		if (airplay_volume >= 0 && airplay_media_playing)
+			startup_volume = airplay_volume;
 
 		if (pcm_prepare(pcm) < 0 ||
 		    (startup_volume >= 0 &&
@@ -882,6 +885,8 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 					      &visualizer, &status);
 			continue;
 		}
+		if (airplay_volume >= 0 && airplay_media_playing)
+			airplay_volume_applied = 1;
 		process_music_visualizer(&visualizer, sources, second);
 
 		while (!stopping && sources_active(sources)) {
@@ -890,9 +895,13 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			    (source_activity_mask(sources) & PLAYBACK_BUS_MEDIA)) {
 				int requested = airplay_volume_to_mixer(root);
 
-				if (requested >= 0 && requested != airplay_volume &&
+				if (requested >= 0 &&
+				    (!airplay_volume_applied || requested != airplay_volume) &&
 				    set_pcm_volume(card, requested) == 0)
+				{
 					airplay_volume = requested;
+					airplay_volume_applied = 1;
+				}
 			}
 			(void)poll_sources(sources, 20);
 			if (read_sources(sources, root) < 0) {
@@ -916,7 +925,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		(void)disable_output_controls(card, -1);
 		pcm_close(pcm);
 		/* Only undo a level this engine actually imposed. */
-		if (airplay_session && airplay_media_playing && saved_volume >= 0)
+		if (airplay_session && airplay_volume_applied && saved_volume >= 0)
 			(void)set_pcm_volume(card, saved_volume);
 	}
 	result = stopping ? 0 : -1;
