@@ -718,7 +718,12 @@ def validate_ui_startup_contract(bundle: Path) -> None:
     contracts = (
         (
             "etc/init.d/libreecho-ledd.init",
-            ("--startup-animation", "--startup-ready $STARTUP_READY"),
+            (
+                "--startup-animation",
+                "--startup-ready $STARTUP_READY",
+                'start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- $ARGS',
+                "start) start_service",
+            ),
         ),
         (
             "etc/init.d/libreecho-web.init",
@@ -728,6 +733,8 @@ def validate_ui_startup_contract(bundle: Path) -> None:
                 "mark_startup_ready()",
                 'tmp="$STARTUP_READY.tmp"',
                 'mv -f "$tmp" "$STARTUP_READY"',
+                "if startup_services_ready; then",
+                "start_service\n        mark_startup_ready >/dev/null 2>&1 &",
             ),
         ),
     )

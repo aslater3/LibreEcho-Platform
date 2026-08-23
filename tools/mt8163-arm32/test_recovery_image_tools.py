@@ -1601,10 +1601,18 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("log audio-startup-disabled", init_script)
 
     def test_ui_bundle_startup_contract_is_fail_closed(self) -> None:
-        valid_led = (
-            "ARGS=${ARGS:---foreground --socket $SOCKET "
-            "--startup-animation --startup-ready $STARTUP_READY}\n"
-        )
+        valid_led = "\n".join((
+            "DAEMON=/usr/local/sbin/libreecho-ledd",
+            "PIDFILE=/var/run/libreecho-ledd.pid",
+            "STARTUP_READY=/run/libreecho/startup-ready",
+            "ARGS=${ARGS:---foreground --socket $SOCKET --startup-animation --startup-ready $STARTUP_READY}",
+            "start_service() {",
+            '    start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- $ARGS',
+            "}",
+            "case \"${1:-}\" in",
+            "    start) start_service ;;",
+            "esac",
+        )) + "\n"
         valid_web = "\n".join((
             "startup_services_ready() {",
             "    for socket in network audio mic led bluetooth airplay; do",
@@ -1612,9 +1620,15 @@ class PolicyTests(unittest.TestCase):
             "    done",
             "}",
             "mark_startup_ready() {",
-            '    tmp="$STARTUP_READY.tmp"',
-            '    mv -f "$tmp" "$STARTUP_READY"',
+            "    if startup_services_ready; then",
+            '        tmp="$STARTUP_READY.tmp"',
+            '        mv -f "$tmp" "$STARTUP_READY"',
+            "    fi",
             "}",
+            "start_service() { :; }",
+            "case \"${1:-}\" in",
+            "    start) start_service\n        mark_startup_ready >/dev/null 2>&1 & ;;",
+            "esac",
         )) + "\n"
         with tempfile.TemporaryDirectory() as temporary:
             bundle = Path(temporary)
