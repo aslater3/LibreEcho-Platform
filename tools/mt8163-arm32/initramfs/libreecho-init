@@ -445,6 +445,53 @@ log wmt-nodes-created
 # The network stack is build-time opt-in, but activation remains an explicit
 # operator request after ADB.  This preserves the USB diagnostic control plane
 # across the historical WMT/WLAN failure boundary.
+# The Wi-Fi driver generates an address when nothing supplies one, and it is
+# not the same address every boot -- the device lands on a new DHCP lease and
+# cannot be found where it was. idme records the address this board was built
+# with, so prefer that. A value in the config overrides it, for anyone who
+# wants to choose; an empty or absent value means "use the board's".
+#
+# Applied here, before wpa_supplicant associates: changing a MAC on an
+# associated interface drops the link, and doing it from the web daemon would
+# drop the connection carrying the request.
+idme_value()
+{
+    for candidate in "/proc/idme/$1" "/sys/firmware/devicetree/base/idme/$1/value"; do
+        [ -r "$candidate" ] || continue
+        value=$($BB tr -d '\0\r\n' < "$candidate" 2>/dev/null)
+        [ -n "$value" ] && { printf '%s' "$value"; return 0; }
+    done
+    return 1
+}
+
+normalise_mac()
+{
+    printf '%s' "$1" | $BB tr 'A-F' 'a-f' | $BB tr -d ':-' |
+        $BB sed -n 's/^\([0-9a-f]\{2\}\)\([0-9a-f]\{2\}\)\([0-9a-f]\{2\}\)\([0-9a-f]\{2\}\)\([0-9a-f]\{2\}\)\([0-9a-f]\{2\}\)$/\1:\2:\3:\4:\5:\6/p'
+}
+
+apply_wifi_mac()
+{
+    configured=$($BB sed -n 's/.*"mac_wifi"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        /data/libreecho/config/web-config.json 2>/dev/null | $BB head -1)
+    mac=$(normalise_mac "$configured")
+    source=config
+    if [ -z "$mac" ]; then
+        mac=$(normalise_mac "$(idme_value mac_addr 2>/dev/null)")
+        source=idme
+    fi
+    [ -n "$mac" ] || { log wifi-mac-unavailable; return 0; }
+    current=$($BB cat /sys/class/net/wlan0/address 2>/dev/null)
+    [ "$current" = "$mac" ] && { log "wifi-mac-already:$mac"; return 0; }
+    $BB ip link set dev wlan0 down 2>/dev/null
+    if $BB ip link set dev wlan0 address "$mac" 2>/dev/null; then
+        log "wifi-mac-set:$source:$mac"
+    else
+        log "wifi-mac-set-failed:$source:$mac"
+    fi
+    $BB ip link set dev wlan0 up 2>/dev/null
+}
+
 start_wifi_network_sequence()
 {
     packaged_wifi=/etc/wifi/wpa_supplicant.conf
@@ -536,6 +583,9 @@ start_wifi_network_sequence()
         i=$((i + 1))
     done
     [ -e /sys/class/net/wlan0 ] || { log wlan0-registration-timeout; return 1; }
+    # wlan0 exists but has not associated yet -- the only safe moment to change
+    # its address.
+    apply_wifi_mac
     WIFI_CONF="$wifi_profile" /sbin/libreecho-wifi start \
         >/tmp/wifi-client.log 2>&1
     client_rc=$?
