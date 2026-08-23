@@ -1615,6 +1615,7 @@ class PolicyTests(unittest.TestCase):
         )) + "\n"
         valid_web = "\n".join((
             "STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}",
+            "STARTUP_READY_TIMEOUT_TICKS=${STARTUP_READY_TIMEOUT_TICKS:-600}",
             "startup_services_ready() {",
             "    for socket in network audio mic led bluetooth airplay; do",
             '        [ -S "/run/libreecho/$socket.sock" ] || return 1',
@@ -1622,11 +1623,18 @@ class PolicyTests(unittest.TestCase):
             "    done",
             "}",
             "mark_startup_ready() {",
-            "    if startup_services_ready; then",
-            '        tmp="$STARTUP_READY.tmp"',
-            "        printf 'schema=1\\n' >\"$tmp\"",
-            '        mv -f "$tmp" "$STARTUP_READY"',
-            "    fi",
+            "    count=0",
+            "    while :; do",
+            "        if startup_services_ready; then",
+            '            tmp="$STARTUP_READY.tmp"',
+            "            printf 'schema=1\\n' >\"$tmp\"",
+            '            mv -f "$tmp" "$STARTUP_READY"',
+            "            return 0",
+            "        fi",
+            "        sleep 0.1",
+            "        count=$((count + 1))",
+            '        [ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0',
+            "    done",
             "}",
             "start_service() { :; }",
             "case \"${1:-}\" in",
@@ -1643,6 +1651,46 @@ class PolicyTests(unittest.TestCase):
 
             builder.validate_ui_startup_contract(bundle)
 
+            one_shot_web = valid_web
+            for marker in (
+                "STARTUP_READY_TIMEOUT_TICKS=${STARTUP_READY_TIMEOUT_TICKS:-600}\n",
+                "    while :; do\n",
+                "        sleep 0.1\n",
+                "        count=$((count + 1))\n",
+                '        [ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0\n',
+            ):
+                one_shot_web = one_shot_web.replace(marker, "")
+            loop_done = one_shot_web.rfind("    done\n")
+            self.assertGreater(loop_done, -1)
+            one_shot_web = one_shot_web[:loop_done] + one_shot_web[loop_done + len("    done\n"):]
+            web.write_text(one_shot_web)
+            with self.assertRaisesRegex(SystemExit, "STARTUP_READY_TIMEOUT_TICKS"):
+                builder.validate_ui_startup_contract(bundle)
+            web.write_text(valid_web)
+
+            noncanonical_led = valid_led.replace(
+                "/run/libreecho/startup-ready", "/tmp/startup-ready"
+            )
+            noncanonical_web = valid_web.replace(
+                "/run/libreecho/startup-ready", "/tmp/startup-ready"
+            )
+            led.write_text(noncanonical_led)
+            web.write_text(noncanonical_web)
+            with self.assertRaisesRegex(SystemExit, "canonical readiness path"):
+                builder.validate_ui_startup_contract(bundle)
+            led.write_text(valid_led)
+            web.write_text(valid_web)
+
+            malformed_web = valid_web.replace(
+                '        [ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0\n'
+                "    done\n",
+                '        [ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0\n',
+            )
+            web.write_text(malformed_web)
+            with self.assertRaisesRegex(SystemExit, "invalid shell syntax"):
+                builder.validate_ui_startup_contract(bundle)
+            web.write_text(valid_web)
+
             web.write_text(valid_web.replace(
                 '        [ -S "/run/libreecho/$socket.sock" ] || return 1\n',
                 "",
@@ -1652,10 +1700,12 @@ class PolicyTests(unittest.TestCase):
             web.write_text(valid_web)
 
             web.write_text(valid_web.replace(
-                '        printf \'schema=1\\n\' >"$tmp"\n        mv -f "$tmp" "$STARTUP_READY"\n',
-                '        mv -f "$tmp" "$STARTUP_READY"\n        printf \'schema=1\\n\' >"$tmp"\n',
+                '            printf \'schema=1\\n\' >"$tmp"\n'
+                '            mv -f "$tmp" "$STARTUP_READY"\n',
+                '            mv -f "$tmp" "$STARTUP_READY"\n'
+                '            printf \'schema=1\\n\' >"$tmp"\n',
             ))
-            with self.assertRaisesRegex(SystemExit, "write must precede"):
+            with self.assertRaisesRegex(SystemExit, "ordering is invalid"):
                 builder.validate_ui_startup_contract(bundle)
             web.write_text(valid_web)
 

@@ -728,13 +728,19 @@ def validate_ui_startup_contract(bundle: Path) -> None:
         (
             "etc/init.d/libreecho-web.init",
             (
+                "STARTUP_READY_TIMEOUT_TICKS=${STARTUP_READY_TIMEOUT_TICKS:-600}",
                 "startup_services_ready()",
                 "for socket in network audio mic led bluetooth airplay; do",
                 "mark_startup_ready()",
+                "count=0",
+                "while :; do",
+                "if startup_services_ready; then",
                 'tmp="$STARTUP_READY.tmp"',
                 "printf 'schema=1\\n' >\"$tmp\"",
                 'mv -f "$tmp" "$STARTUP_READY"',
-                "if startup_services_ready; then",
+                "sleep 0.1",
+                "count=$((count + 1))",
+                '[ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0',
                 "for socket in network audio mic led bluetooth airplay; do",
                 '[ -S "/run/libreecho/$socket.sock" ] || return 1',
                 "start_service\n        mark_startup_ready >/dev/null 2>&1 &",
@@ -764,16 +770,49 @@ def validate_ui_startup_contract(bundle: Path) -> None:
                     f"ERROR: UI startup contract missing {marker!r} in {relative}"
                 )
         if relative.endswith("libreecho-web.init"):
-            if text.index("printf 'schema=1\\n' >\"$tmp\"") > text.index('mv -f "$tmp" "$STARTUP_READY"'):
-                raise SystemExit("ERROR: UI startup readiness write must precede atomic move")
+            readiness_start = text.index("mark_startup_ready()")
+            dispatch_start = text.index('case "${1:-}" in')
+            readiness_body = text[readiness_start:dispatch_start]
+            ordered = (
+                "mark_startup_ready()",
+                "count=0",
+                "while :; do",
+                "if startup_services_ready; then",
+                'tmp="$STARTUP_READY.tmp"',
+                "printf 'schema=1\\n' >\"$tmp\"",
+                'mv -f "$tmp" "$STARTUP_READY"',
+                "sleep 0.1",
+                "count=$((count + 1))",
+                '[ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0',
+            )
+            positions = [readiness_body.index(marker) for marker in ordered]
+            if positions != sorted(positions):
+                raise SystemExit(
+                    "ERROR: UI startup readiness polling/write ordering is invalid"
+                )
+            start_case = re.search(
+                r"(?ms)^\s*start\)\s*(.*?)\s*;;", text[dispatch_start:]
+            )
+            if not start_case:
+                raise SystemExit("ERROR: UI startup start case is not executable")
+            start_body = start_case.group(1)
+            if "start_service" not in start_body or "mark_startup_ready" not in start_body:
+                raise SystemExit("ERROR: UI startup start case does not run readiness")
+            if "&" not in start_body:
+                raise SystemExit("ERROR: UI startup readiness polling must run in background")
 
     led_text = contract_paths["etc/init.d/libreecho-ledd.init"]
     web_text = contract_paths["etc/init.d/libreecho-web.init"]
     path_pattern = re.compile(r"STARTUP_READY=\$\{STARTUP_READY:-([^}]+)\}")
     led_path = path_pattern.search(led_text)
     web_path = path_pattern.search(web_text)
+    canonical_path = "/run/libreecho/startup-ready"
     if not led_path or not web_path or led_path.group(1) != web_path.group(1):
         raise SystemExit("ERROR: UI startup scripts use different readiness paths")
+    if led_path.group(1) != canonical_path:
+        raise SystemExit(
+            f"ERROR: UI startup scripts must use canonical readiness path {canonical_path}"
+        )
 
 
 def add_ui_bundle(stage: Path, bundle: Path, source: Path,
