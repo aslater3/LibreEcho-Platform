@@ -163,6 +163,7 @@ verify_manifest()
     [ "$(manifest_value format)" = libreecho-ota-v1 ] ||
         die manifest_format
     [ "$(manifest_value manifest_version)" = 1 ] ||
+        [ "$(manifest_value manifest_version)" = 2 ] ||
         die manifest_version
     [ "$(manifest_value board)" = radar_puffin ] || die manifest_board
     [ "$(manifest_value soc)" = mt8163 ] || die manifest_soc
@@ -338,6 +339,7 @@ feature_status()
 feature_daemon_required()
 {
     feature=$1
+    [ "${SERVICE_PROFILE:-production}" != diagnostic ] || return 1
     case "$feature" in
         airplay2|wakeword) return 0 ;;
         tts|stt|assistant)

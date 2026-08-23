@@ -141,7 +141,7 @@ def main() -> None:
 
     manifest = (
         "format=libreecho-ota-v1\n"
-        "manifest_version=1\n"
+        "manifest_version=" + ("2" if args.feature_policy == "preserve" else "1") + "\n"
         "board=radar_puffin\n"
         "soc=mt8163\n"
         "architecture=armv7\n"
