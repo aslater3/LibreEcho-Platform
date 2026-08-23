@@ -221,11 +221,21 @@ check_children "$DATA_ROOT/libreecho" config secrets features update data-manife
 # Tolerate an unrecognised regular file here, the same way update/ already
 # does.  Symlinks and directories remain hard failures, so the check still
 # catches the shapes that indicate tampering rather than a version skew.
+#
+# The directory half of that rule has teeth: a self-signed HTTPS certificate
+# was first written to config/tls/, and because tolerance covers files but not
+# directories, the next boot failed the contract and came up with no network
+# and no UI.  Anything persisted under config/ must therefore be a plain file
+# at this level -- hence https-cert.pem and https-key.pem rather than a tls/
+# directory -- and should be listed here so it is known rather than merely
+# tolerated.
 TOLERATE_UNKNOWN_FILES=1
 check_children "$DATA_ROOT/libreecho/config" \
     web-config.json web-config.json.bak users wpa_supplicant.conf ntp.conf \
     agent.json agent.json.bak tts-voice vad-floor-rms \
-    led-state.json led-state.json.tmp
+    led-state.json led-state.json.tmp \
+    users.sessions radio-stations.json radio-stations.json.bak \
+    https-cert.pem https-key.pem
 TOLERATE_UNKNOWN_FILES=0
 check_children "$DATA_ROOT/libreecho/secrets" openai-codex.json
 
