@@ -52,12 +52,24 @@ def main() -> None:
     first_write = engine.index("write_period(pcm, output", pcm_open)
     if not pcm_open < startup_apply < first_write:
         raise SystemExit("startup volume must be applied after PCM open and before first write")
+    startup = engine[engine.index("int airplay_media_playing ="):first_write]
+    if "int startup_volume = saved_volume" not in startup:
+        raise SystemExit("non-AirPlay playback must retain the shared device volume")
+    if "if (airplay_volume >= 0 && airplay_media_playing)" not in startup:
+        raise SystemExit("sender volume must be scoped to AirPlay media at startup")
+    if "startup_volume = airplay_volume" not in startup:
+        raise SystemExit("AirPlay media must still receive the sender volume")
 
     failure_start = engine.index("playback start failed")
     failure_end = engine.index("process_music_visualizer", failure_start)
     failure = engine[failure_start:failure_end]
     if not failure.index("disable_output_controls") < failure.index("pcm_close"):
         raise SystemExit("partial-start failure must mute before PCM close")
+    if "airplay_volume_applied && saved_volume >= 0" not in failure:
+        raise SystemExit("partial-start failure must restore only an applied AirPlay level")
+    pcm_failure = engine[engine.index("PCM %u,%u unavailable"):failure_start]
+    if "airplay_volume_applied ? saved_volume : -1" not in pcm_failure:
+        raise SystemExit("PCM-open failure must not restore an unowned device volume")
     normal_start = engine.index(
         "\n\t\tclear_source_activity(sources",
         engine.index("while (!stopping && sources_active(sources))"),
@@ -71,6 +83,10 @@ def main() -> None:
         raise SystemExit("normal teardown must mute, close PCM, then restore volume")
     if "airplay_volume_applied && saved_volume >= 0" not in normal:
         raise SystemExit("normal teardown must restore only after AirPlay volume was applied")
+
+    cleanup = engine[engine.index("out:"):]
+    if "if (airplay_volume_applied && saved_volume >= 0)" not in cleanup:
+        raise SystemExit("final cleanup must not restore an unowned device volume")
 
     missing = [
         f"airplay_audio.c: {fragment}"

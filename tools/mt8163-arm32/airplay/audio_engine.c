@@ -837,7 +837,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			if (pcm)
 				pcm_close(pcm);
 			(void)disable_output_controls(card,
-				airplay_session ? saved_volume : -1);
+				airplay_volume_applied ? saved_volume : -1);
 			clear_source_activity(sources, &announcement_led_active,
 					      &visualizer, &status);
 			usleep(250000);
@@ -866,27 +866,36 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		int airplay_media_playing =
 			(second_activity & PLAYBACK_BUS_MEDIA) != 0;
 		int startup_volume = saved_volume;
+		int playback_start_failed = 0;
 		if (airplay_volume >= 0 && airplay_media_playing)
 			startup_volume = airplay_volume;
 
-		if (pcm_prepare(pcm) < 0 ||
-		    (startup_volume >= 0 &&
-		     set_pcm_volume(card, startup_volume) < 0) ||
-		    write_period(pcm, output, &reference, first_activity) < 0 ||
-		    write_period(pcm, second, &reference, second_activity) < 0 ||
-		    enable_output_controls(card) < 0) {
+		if (pcm_prepare(pcm) < 0)
+			playback_start_failed = 1;
+		else if (startup_volume >= 0 &&
+			 set_pcm_volume(card, startup_volume) < 0)
+			playback_start_failed = 1;
+		else {
+			/* Mark ownership immediately after a successful sender write so
+			 * any later start failure can restore exactly what we changed. */
+			if (airplay_volume >= 0 && airplay_media_playing)
+				airplay_volume_applied = 1;
+			if (write_period(pcm, output, &reference, first_activity) < 0 ||
+			    write_period(pcm, second, &reference, second_activity) < 0 ||
+			    enable_output_controls(card) < 0)
+				playback_start_failed = 1;
+		}
+		if (playback_start_failed) {
 			fprintf(stderr, "audio-engine: playback start failed: %s\n",
 				pcm_get_error(pcm));
 			(void)disable_output_controls(card, -1);
 			pcm_close(pcm);
-			if (airplay_session && saved_volume >= 0)
+			if (airplay_volume_applied && saved_volume >= 0)
 				(void)set_pcm_volume(card, saved_volume);
 			clear_source_activity(sources, &announcement_led_active,
 					      &visualizer, &status);
 			continue;
 		}
-		if (airplay_volume >= 0 && airplay_media_playing)
-			airplay_volume_applied = 1;
 		process_music_visualizer(&visualizer, sources, second);
 
 		while (!stopping && sources_active(sources)) {
@@ -941,7 +950,7 @@ out:
 	le_aec_reference_close(&reference);
 	free(output);
 	close_sources(sources);
-	if (airplay_session && saved_volume >= 0)
+	if (airplay_volume_applied && saved_volume >= 0)
 		(void)disable_output_controls(card, saved_volume);
 	return result;
 }
