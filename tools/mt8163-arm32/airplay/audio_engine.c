@@ -914,7 +914,8 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				if (requested >= 0 &&
 				    (!airplay_volume_applied || requested != airplay_volume))
 				{
-					int previous_airplay_volume = airplay_volume;
+					int previous_airplay_volume =
+						airplay_volume_applied ? airplay_volume : -1;
 					if (set_pcm_volume(card, requested) == 0) {
 						airplay_volume = requested;
 						airplay_volume_applied = 1;

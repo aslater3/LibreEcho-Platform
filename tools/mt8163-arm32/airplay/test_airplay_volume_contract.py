@@ -77,6 +77,16 @@ def main() -> None:
     loop_start = engine.index("while (!stopping && sources_active(sources))")
     loop_end = engine.index("\n\t\tclear_source_activity(sources", loop_start)
     live = engine[loop_start:loop_end]
+    if "int previous_airplay_volume =\n\t\t\t\t\t\tairplay_volume_applied ? airplay_volume : -1;" not in live:
+        raise SystemExit(
+            "live sender failure must gate rollback on applied AirPlay ownership"
+        )
+    if "int previous_airplay_volume = airplay_volume;" in live:
+        raise SystemExit("observed sender volume must not count as owned")
+    prior_restore = live.index("set_pcm_volume(card, previous_airplay_volume)")
+    saved_restore = live.index("set_pcm_volume(card, saved_volume)")
+    if prior_restore > saved_restore:
+        raise SystemExit("owned AirPlay level must be restored before saved_volume fallback")
     if "previous_airplay_volume >= 0" not in live:
         raise SystemExit("live sender failure must restore the prior AirPlay level")
     normal_start = loop_end
