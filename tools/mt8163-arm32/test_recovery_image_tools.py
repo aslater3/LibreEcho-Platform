@@ -1616,6 +1616,7 @@ class PolicyTests(unittest.TestCase):
         valid_web = "\n".join((
             "startup_services_ready() {",
             "    for socket in network audio mic led bluetooth airplay; do",
+            '        [ -S "/run/libreecho/$socket.sock" ] || return 1',
             "        : \"$socket\"",
             "    done",
             "}",
@@ -1640,8 +1641,11 @@ class PolicyTests(unittest.TestCase):
 
             builder.validate_ui_startup_contract(bundle)
 
-            web.write_text(valid_web + "if [ 1 -eq 1; then\n")
-            with self.assertRaisesRegex(SystemExit, "invalid shell syntax"):
+            web.write_text(valid_web.replace(
+                '        [ -S "/run/libreecho/$socket.sock" ] || return 1\n',
+                "",
+            ))
+            with self.assertRaisesRegex(SystemExit, "startup contract missing"):
                 builder.validate_ui_startup_contract(bundle)
             web.write_text(valid_web)
 

@@ -734,6 +734,8 @@ def validate_ui_startup_contract(bundle: Path) -> None:
                 'tmp="$STARTUP_READY.tmp"',
                 'mv -f "$tmp" "$STARTUP_READY"',
                 "if startup_services_ready; then",
+                "for socket in network audio mic led bluetooth airplay; do",
+                '[ -S "/run/libreecho/$socket.sock" ] || return 1',
                 "start_service\n        mark_startup_ready >/dev/null 2>&1 &",
             ),
         ),
