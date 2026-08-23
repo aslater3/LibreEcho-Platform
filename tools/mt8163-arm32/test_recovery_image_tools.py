@@ -1597,6 +1597,7 @@ class PolicyTests(unittest.TestCase):
     def test_startup_audio_is_disabled_by_default(self) -> None:
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
         self.assertNotIn("startup_audio_worker", init_script)
+        self.assertNotIn("--startup-audio", init_script)
         self.assertIn("log audio-startup-disabled", init_script)
 
     def test_ui_bundle_startup_contract_is_fail_closed(self) -> None:
