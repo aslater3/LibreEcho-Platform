@@ -335,6 +335,28 @@ feature_status()
     done
 }
 
+feature_daemon_required()
+{
+    feature=$1
+    case "$feature" in
+        airplay2|wakeword) return 0 ;;
+        tts|stt|assistant)
+            integrations=0
+            config=/data/libreecho/config/web-config.json
+            if [ -r "$config" ]; then
+                integrations=$($BB sed -n \
+                    's/^[[:space:]]*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*$/\1/p' \
+                    "$config" 2>/dev/null | $BB head -n 1)
+                case "$integrations" in
+                    ''|*[!0-9]*) integrations=0 ;;
+                esac
+            fi
+            [ $((integrations & 1)) -eq 0 ]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 verify_preserved_feature_identity()
 {
     for feature in airplay2 tts wakeword stt assistant; do
@@ -361,6 +383,9 @@ verify_preserved_feature_identity()
         actual_manifest=$(feature_file_sha256 "$manifest")
         [ "$actual_manifest" = "$expected_manifest" ] ||
             die preserve_feature_manifest_mismatch
+        if ! feature_daemon_required "$feature"; then
+            continue
+        fi
         pid=$($BB pidof "$daemon" 2>/dev/null | $BB awk '{print $1}')
         case "$pid" in
             ''|*[!0-9]*) die preserve_feature_daemon_not_running ;;

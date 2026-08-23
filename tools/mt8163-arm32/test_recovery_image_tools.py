@@ -2102,6 +2102,9 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("verify_preserved_feature_identity()", updater)
         self.assertIn("preserve_feature_payload_mismatch", updater)
         self.assertIn("preserve_feature_daemon_mismatch", updater)
+        self.assertIn("feature_daemon_required()", updater)
+        self.assertIn("integrations & 1", updater)
+        self.assertIn("if ! feature_daemon_required \"$feature\"; then", updater)
         install = updater[updater.index('install_package()'):]
         verify_call = install.index('verify_preserved_feature_identity')
         boot_write = install.index('dd if="$STAGING/boot.img" of="$target_device"')
