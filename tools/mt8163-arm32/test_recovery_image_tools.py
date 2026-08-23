@@ -2054,6 +2054,7 @@ class PolicyTests(unittest.TestCase):
             ], check=True, capture_output=True, text=True)
             with tarfile.open(output, "r:") as archive:
                 manifest = archive.extractfile("manifest").read().decode()
+            self.assertIn("manifest_version=2\n", manifest)
             for feature in daemon_paths:
                 self.assertIn(f"feature_{feature}_payload_sha256={'a' * 64}\n", manifest)
                 self.assertIn(f"feature_{feature}_payload_size=123\n", manifest)
