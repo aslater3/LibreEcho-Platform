@@ -1623,6 +1623,7 @@ class PolicyTests(unittest.TestCase):
             "mark_startup_ready() {",
             "    if startup_services_ready; then",
             '        tmp="$STARTUP_READY.tmp"',
+            "        printf 'schema=1\\n' >\"$tmp\"",
             '        mv -f "$tmp" "$STARTUP_READY"',
             "    fi",
             "}",

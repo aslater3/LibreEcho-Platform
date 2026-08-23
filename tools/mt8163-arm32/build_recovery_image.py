@@ -732,6 +732,7 @@ def validate_ui_startup_contract(bundle: Path) -> None:
                 "for socket in network audio mic led bluetooth airplay; do",
                 "mark_startup_ready()",
                 'tmp="$STARTUP_READY.tmp"',
+                "printf 'schema=1\\n' >\"$tmp\"",
                 'mv -f "$tmp" "$STARTUP_READY"',
                 "if startup_services_ready; then",
                 "for socket in network audio mic led bluetooth airplay; do",
