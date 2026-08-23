@@ -107,8 +107,13 @@ the signed manifest carries payload, feature-manifest, and supervised-daemon
 hashes for all five retained features. The on-device installer compares those
 identities, including each running `/proc/<pid>/exe`, before writing the
 inactive boot payload and rejects a missing, stopped, or mismatched daemon.
-This does not refresh payloads or models; it prevents a candidate from being
-installed when preserve would leave a different runtime behind.
+The expected identities are also copied into the persistent `pending`
+transaction at `UPDATE_READY`; confirmation rereads those values and repeats
+the checks immediately before `bootctl confirm`, so a feature staging operation
+between reboot boundaries cannot silently produce a hybrid. A mismatch leaves
+the slot unconfirmed and therefore rollback-eligible. This does not refresh
+payloads or models; it prevents a candidate from being installed or confirmed
+when preserve would leave a different runtime behind.
 
 Manual browser upload streams the tar to `/data/libreecho/update/incoming` and
 invokes the target installer. OTA-profile images also check the stable public

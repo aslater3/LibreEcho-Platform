@@ -23,6 +23,8 @@ BOOT_SECTORS=32768
 # Set once an install has begun writing progress to $STATE, so die() knows the
 # status file is mid-transaction and must not be left there.
 STATE_DIRTY=0
+CURRENT_SERVICE_PROFILE=
+IDENTITY_SOURCE=
 
 die()
 {
@@ -132,6 +134,35 @@ manifest_value()
 {
     key=$1
     $BB sed -n "s/^${key}=//p" "$STAGING/manifest"
+}
+
+preserved_identity_value()
+{
+    key=$1
+    case "$IDENTITY_SOURCE" in
+        manifest)
+            manifest_value "$key"
+            ;;
+        pending)
+            $BB sed -n "s/^${key}=//p" "$PENDING"
+            ;;
+        *)
+            die preserve_identity_source
+            ;;
+    esac
+}
+
+current_service_profile()
+{
+    current=$($BB cat /etc/libreecho/service-profile 2>/dev/null)
+    case "$current" in
+        diagnostic|production)
+            CURRENT_SERVICE_PROFILE=$current
+            ;;
+        *)
+            die current_service_profile_unavailable
+            ;;
+    esac
 }
 
 verify_manifest()
@@ -339,7 +370,7 @@ feature_status()
 feature_daemon_required()
 {
     feature=$1
-    [ "${SERVICE_PROFILE:-production}" != diagnostic ] || return 1
+    [ "$CURRENT_SERVICE_PROFILE" != diagnostic ] || return 1
     case "$feature" in
         airplay2|wakeword) return 0 ;;
         tts|stt|assistant)
@@ -359,8 +390,23 @@ feature_daemon_required()
     esac
 }
 
+write_preserved_feature_identity()
+{
+    for feature in airplay2 tts wakeword stt assistant; do
+        for field in payload_sha256 payload_size manifest_sha256 daemon_sha256; do
+            value=$(manifest_value "feature_${feature}_${field}")
+            [ -n "$value" ] || die pending_feature_identity_missing
+            printf '%s\n' "feature_${feature}_${field}=$value"
+        done
+    done
+}
+
 verify_preserved_feature_identity()
 {
+    IDENTITY_SOURCE=$1
+    [ "$IDENTITY_SOURCE" = manifest ] || [ "$IDENTITY_SOURCE" = pending ] ||
+        die preserve_identity_source
+    current_service_profile
     for feature in airplay2 tts wakeword stt assistant; do
         case "$feature" in
             airplay2) daemon=libreecho-audio-engine ;;
@@ -372,10 +418,10 @@ verify_preserved_feature_identity()
         feature_root=/data/libreecho/features/$feature
         payload=$feature_root/payload.squashfs
         manifest=$feature_root/manifest.json
-        expected_payload=$(manifest_value "feature_${feature}_payload_sha256")
-        expected_size=$(manifest_value "feature_${feature}_payload_size")
-        expected_manifest=$(manifest_value "feature_${feature}_manifest_sha256")
-        expected_daemon=$(manifest_value "feature_${feature}_daemon_sha256")
+        expected_payload=$(preserved_identity_value "feature_${feature}_payload_sha256")
+        expected_size=$(preserved_identity_value "feature_${feature}_payload_size")
+        expected_manifest=$(preserved_identity_value "feature_${feature}_manifest_sha256")
+        expected_daemon=$(preserved_identity_value "feature_${feature}_daemon_sha256")
         actual_payload=$(feature_file_sha256 "$payload")
         [ "$actual_payload" = "$expected_payload" ] ||
             die preserve_feature_payload_mismatch
@@ -435,7 +481,7 @@ install_package()
     state_write verified 20 "$version"
     bootctl_status
     if [ "$FEATURE_POLICY" = preserve ]; then
-        verify_preserved_feature_identity
+        verify_preserved_feature_identity manifest
     fi
 
     state_write writing 30 "$target"
@@ -453,6 +499,9 @@ install_package()
         echo "boot_sha256=$boot_sha"
         echo "update_channel=$UPDATE_CHANNEL"
         echo "feature_policy=$FEATURE_POLICY"
+        if [ "$FEATURE_POLICY" = preserve ]; then
+            write_preserved_feature_identity
+        fi
     } > "$PENDING.tmp" || die pending_write
     $BB mv "$PENDING.tmp" "$PENDING" || die pending_commit
     $BB sync
@@ -475,6 +524,11 @@ confirm_pending()
     slot=$($BB sed -n 's/^slot=//p' "$PENDING")
     version=$($BB sed -n 's/^version=//p' "$PENDING")
     expected=$($BB sed -n 's/^boot_sha256=//p' "$PENDING")
+    feature_policy=$($BB sed -n 's/^feature_policy=//p' "$PENDING")
+    case "$feature_policy" in
+        preserve|redistributable|community-noncommercial|exclude) ;;
+        *) die pending_feature_policy ;;
+    esac
     update_channel=$($BB sed -n 's/^update_channel=//p' "$PENDING")
     if [ "$update_channel" != dev ] && [ "$update_channel" != stable ]; then
         update_channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
@@ -488,6 +542,12 @@ confirm_pending()
     actual=$($BB dd if="$target_device" bs=4096 count=4096 2>/dev/null |
         $BB sha256sum | $BB awk '{print $1}')
     [ "$actual" = "$expected" ] || die pending_boot_hash
+    if [ "$feature_policy" = preserve ]; then
+        # Feature staging is independent of the boot write. Recheck the
+        # identities captured in the pending transaction before confirmation,
+        # so a changed payload cannot be confirmed with the new boot image.
+        verify_preserved_feature_identity pending
+    fi
     selected_channel=$(channel_value)
     case "$selected_channel" in
         dev|stable)

@@ -2111,6 +2111,45 @@ class PolicyTests(unittest.TestCase):
         boot_write = install.index('dd if="$STAGING/boot.img" of="$target_device"')
         self.assertLess(verify_call, boot_write)
 
+    def test_preserve_installer_uses_installed_profile_for_transitions(self) -> None:
+        """Daemon requirements must describe the running image, not the candidate."""
+        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
+        self.assertIn(
+            'current=$($BB cat /etc/libreecho/service-profile 2>/dev/null)',
+            updater,
+        )
+        self.assertIn("CURRENT_SERVICE_PROFILE=$current", updater)
+        self.assertIn('[ "$CURRENT_SERVICE_PROFILE" != diagnostic ] || return 1', updater)
+        self.assertNotIn('[ "${SERVICE_PROFILE:-production}" != diagnostic ] || return 1', updater)
+        # A diagnostic -> production install must validate retained files but
+        # must not require production daemons before the reboot boundary.
+        self.assertIn('SERVICE_PROFILE=$(manifest_value service_profile)', updater)
+        daemon_guard = updater[updater.index("feature_daemon_required()"):updater.index("write_preserved_feature_identity()")]
+        self.assertNotIn("SERVICE_PROFILE=", daemon_guard)
+
+    def test_preserve_pending_transaction_revalidates_after_staging(self) -> None:
+        """Confirmation must use identities persisted before feature staging."""
+        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
+        install = updater[updater.index("install_package()"):updater.index("confirm_pending()")]
+        writer = updater[updater.index("write_preserved_feature_identity()"):updater.index("verify_preserved_feature_identity()")]
+        confirm = updater[updater.index("confirm_pending()"):]
+        self.assertIn("write_preserved_feature_identity", install)
+        for field in ("payload_sha256", "payload_size", "manifest_sha256", "daemon_sha256"):
+            self.assertIn(f"feature_${{feature}}_${{field}}", writer)
+        self.assertIn(
+            "feature_policy=$($BB sed -n 's/^feature_policy=//p' \"$PENDING\")",
+            confirm,
+        )
+        self.assertIn("verify_preserved_feature_identity pending", confirm)
+        verify = updater[updater.index("verify_preserved_feature_identity()"):updater.index("clear_exact_development_marker()")]
+        self.assertIn("preserved_identity_value", verify)
+        self.assertIn("preserve_feature_payload_mismatch", verify)
+        self.assertIn("preserve_feature_manifest_mismatch", verify)
+        self.assertLess(
+            confirm.index("verify_preserved_feature_identity pending"),
+            confirm.index('"$BOOTCTL" confirm'),
+        )
+
     def test_host_ota_path_is_explicit_and_uses_guarded_updater(self) -> None:
         host = pipeline_file("ota.sh").read_text()
         preflight = pipeline_file("ota-preflight-root.sh").read_text()
