@@ -867,31 +867,38 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			(second_activity & PLAYBACK_BUS_MEDIA) != 0;
 		int startup_volume = saved_volume;
 		int playback_start_failed = 0;
+		int airplay_volume_attempted = 0;
 		if (airplay_volume >= 0 && airplay_media_playing)
 			startup_volume = airplay_volume;
 
 		if (pcm_prepare(pcm) < 0)
 			playback_start_failed = 1;
-		else if (startup_volume >= 0 &&
-			 set_pcm_volume(card, startup_volume) < 0)
-			playback_start_failed = 1;
 		else {
-			/* Mark ownership immediately after a successful sender write so
-			 * any later start failure can restore exactly what we changed. */
-			if (airplay_volume >= 0 && airplay_media_playing)
-				airplay_volume_applied = 1;
-			if (write_period(pcm, output, &reference, first_activity) < 0 ||
-			    write_period(pcm, second, &reference, second_activity) < 0 ||
-			    enable_output_controls(card) < 0)
-				playback_start_failed = 1;
+			if (startup_volume >= 0) {
+				if (airplay_volume >= 0 && airplay_media_playing)
+					airplay_volume_attempted = 1;
+				if (set_pcm_volume(card, startup_volume) < 0)
+					playback_start_failed = 1;
+			}
+			if (!playback_start_failed) {
+				/* Mark ownership immediately after a successful sender write so
+				 * any later start failure can restore exactly what we changed. */
+				if (airplay_volume >= 0 && airplay_media_playing)
+					airplay_volume_applied = 1;
+				if (write_period(pcm, output, &reference, first_activity) < 0 ||
+				    write_period(pcm, second, &reference, second_activity) < 0 ||
+				    enable_output_controls(card) < 0)
+					playback_start_failed = 1;
+			}
 		}
 		if (playback_start_failed) {
 			fprintf(stderr, "audio-engine: playback start failed: %s\n",
 				pcm_get_error(pcm));
 			(void)disable_output_controls(card, -1);
 			pcm_close(pcm);
-			if (airplay_volume_applied && saved_volume >= 0)
-				(void)set_pcm_volume(card, saved_volume);
+			if (airplay_volume_attempted || airplay_volume_applied)
+				if (saved_volume >= 0)
+					(void)set_pcm_volume(card, saved_volume);
 			clear_source_activity(sources, &announcement_led_active,
 					      &visualizer, &status);
 			continue;
@@ -905,11 +912,14 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				int requested = airplay_volume_to_mixer(root);
 
 				if (requested >= 0 &&
-				    (!airplay_volume_applied || requested != airplay_volume) &&
-				    set_pcm_volume(card, requested) == 0)
+				    (!airplay_volume_applied || requested != airplay_volume))
 				{
-					airplay_volume = requested;
-					airplay_volume_applied = 1;
+					if (set_pcm_volume(card, requested) == 0) {
+						airplay_volume = requested;
+						airplay_volume_applied = 1;
+					} else if (saved_volume >= 0) {
+						(void)set_pcm_volume(card, saved_volume);
+					}
 				}
 			}
 			(void)poll_sources(sources, 20);

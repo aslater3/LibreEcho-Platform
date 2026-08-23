@@ -32,8 +32,12 @@ def main() -> None:
         "? (airplay_volume_to_mixer(root) >= 0 ? 32768 : 0)",
         "priority audio continues while AirPlay",
         "arm_output_controls(card, -1, &saved_volume)",
+        "int airplay_volume_attempted = 0",
         "int airplay_volume_applied = 0",
         "int startup_volume = saved_volume",
+        "airplay_volume_attempted = 1",
+        "if (airplay_volume_attempted || airplay_volume_applied)",
+        "else if (saved_volume >= 0)",
         "set_pcm_volume(card, startup_volume)",
         "airplay_volume_applied = 1",
         "!airplay_volume_applied || requested != airplay_volume",
@@ -65,8 +69,8 @@ def main() -> None:
     failure = engine[failure_start:failure_end]
     if not failure.index("disable_output_controls") < failure.index("pcm_close"):
         raise SystemExit("partial-start failure must mute before PCM close")
-    if "airplay_volume_applied && saved_volume >= 0" not in failure:
-        raise SystemExit("partial-start failure must restore only an applied AirPlay level")
+    if "if (airplay_volume_attempted || airplay_volume_applied)" not in failure:
+        raise SystemExit("partial-start failure must restore after any sender-volume attempt")
     pcm_failure = engine[engine.index("PCM %u,%u unavailable"):failure_start]
     if "airplay_volume_applied ? saved_volume : -1" not in pcm_failure:
         raise SystemExit("PCM-open failure must not restore an unowned device volume")
