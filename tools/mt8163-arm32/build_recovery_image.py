@@ -713,6 +713,39 @@ def add_network_tools(stage: Path, iwconfig: Path, iwconfig_metadata_path: Path,
     }
 
 
+def validate_ui_startup_contract(bundle: Path) -> None:
+    """Reject UI bundles that cannot drive the packaged startup hand-off."""
+    contracts = (
+        (
+            "etc/init.d/libreecho-ledd.init",
+            ("--startup-animation", "--startup-ready $STARTUP_READY"),
+        ),
+        (
+            "etc/init.d/libreecho-web.init",
+            (
+                "startup_services_ready()",
+                "for socket in network audio mic led bluetooth airplay; do",
+                "mark_startup_ready()",
+                'tmp="$STARTUP_READY.tmp"',
+                'mv -f "$tmp" "$STARTUP_READY"',
+            ),
+        ),
+    )
+    for relative, required in contracts:
+        source = pinned_source(bundle, relative, f"UI startup contract {relative}")
+        try:
+            text = read(source).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SystemExit(
+                f"ERROR: UI startup contract is not UTF-8: {relative}"
+            ) from exc
+        for marker in required:
+            if marker not in text:
+                raise SystemExit(
+                    f"ERROR: UI startup contract missing {marker!r} in {relative}"
+                )
+
+
 def add_ui_bundle(stage: Path, bundle: Path, source: Path,
                   expected_commit: str, expected_diff_sha256: str,
                   manifest: dict[str, object]) -> None:
@@ -759,6 +792,7 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
     )
     if actual_bundle_files != sorted(bundled_files):
         raise SystemExit("ERROR: UI file manifest does not cover the complete bundle")
+    validate_ui_startup_contract(bundle)
 
     files: dict[str, object] = {}
 

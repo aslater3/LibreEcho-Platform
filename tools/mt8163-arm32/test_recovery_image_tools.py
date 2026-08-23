@@ -1599,6 +1599,32 @@ class PolicyTests(unittest.TestCase):
         self.assertNotIn("startup_audio_worker", init_script)
         self.assertIn("log audio-startup-disabled", init_script)
 
+    def test_ui_bundle_startup_contract_is_fail_closed(self) -> None:
+        valid_led = (
+            "ARGS=${ARGS:---foreground --socket $SOCKET "
+            "--startup-animation --startup-ready $STARTUP_READY}\n"
+        )
+        valid_web = "\n".join((
+            "startup_services_ready() {",
+            "    for socket in network audio mic led bluetooth airplay; do",
+            "mark_startup_ready() {",
+            '    tmp="$STARTUP_READY.tmp"',
+            '    mv -f "$tmp" "$STARTUP_READY"',
+        )) + "\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            led = bundle / "etc/init.d/libreecho-ledd.init"
+            web = bundle / "etc/init.d/libreecho-web.init"
+            led.parent.mkdir(parents=True)
+            led.write_text(valid_led)
+            web.write_text(valid_web)
+
+            builder.validate_ui_startup_contract(bundle)
+
+            led.write_text(valid_led.replace("--startup-animation ", ""))
+            with self.assertRaisesRegex(SystemExit, "startup-animation"):
+                builder.validate_ui_startup_contract(bundle)
+
     def test_streaming_voice_services_start_warm_in_dependency_order(self) -> None:
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
         service_line = (
