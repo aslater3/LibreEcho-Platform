@@ -15,6 +15,13 @@ from nacl.signing import SigningKey
 
 BOOT_SIZE = 16 * 1024 * 1024
 VALUE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~-]{0,95}\Z")
+PRESERVED_FEATURE_DAEMONS = {
+    "airplay2": ("airplay", "usr/local/sbin/libreecho-audio-engine"),
+    "tts": ("tts", "usr/local/sbin/libreecho-ttsd"),
+    "wakeword": ("wakeword", "usr/local/sbin/libreecho-waked"),
+    "stt": ("stt", "usr/local/sbin/libreecho-sttd"),
+    "assistant": ("assistant", "usr/local/sbin/libreecho-agentd"),
+}
 
 
 def read_signing_key(path: Path) -> SigningKey:
@@ -32,6 +39,44 @@ def tar_record(archive: tarfile.TarFile, name: str, data: bytes, mode: int) -> N
     record.uname = record.gname = "root"
     record.mtime = 0
     archive.addfile(record, io.BytesIO(data))
+
+
+def preserved_feature_identities(build_manifest: dict[str, object]) -> dict[str, dict[str, object]]:
+    """Return the daemon/payload identities a preserve OTA will retain."""
+    identities: dict[str, dict[str, object]] = {}
+    for feature, (manifest_feature, daemon_path) in PRESERVED_FEATURE_DAEMONS.items():
+        feature_record = build_manifest.get(manifest_feature)
+        payload = feature_record.get("payload") if isinstance(feature_record, dict) else None
+        files = payload.get("files") if isinstance(payload, dict) else None
+        daemon = files.get(daemon_path) if isinstance(files, dict) else None
+        if not isinstance(payload, dict) or not isinstance(files, dict) or not isinstance(daemon, dict):
+            raise SystemExit(
+                "ERROR: preserve policy requires candidate feature identities for "
+                f"{feature}"
+            )
+        payload_sha256 = payload.get("sha256")
+        payload_size = payload.get("size")
+        manifest_sha256 = payload.get("manifest_sha256")
+        daemon_sha256 = daemon.get("sha256")
+        if (not isinstance(payload_sha256, str) or
+                not re.fullmatch(r"[0-9a-f]{64}", payload_sha256) or
+                not isinstance(payload_size, int) or isinstance(payload_size, bool) or
+                payload_size < 0 or
+                not isinstance(manifest_sha256, str) or
+                not re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) or
+                not isinstance(daemon_sha256, str) or
+                not re.fullmatch(r"[0-9a-f]{64}", daemon_sha256)):
+            raise SystemExit(
+                "ERROR: preserve policy candidate feature identity is malformed for "
+                f"{feature}"
+            )
+        identities[feature] = {
+            "payload_sha256": payload_sha256,
+            "payload_size": payload_size,
+            "manifest_sha256": manifest_sha256,
+            "daemon_sha256": daemon_sha256,
+        }
+    return identities
 
 
 def main() -> None:
@@ -90,9 +135,13 @@ def main() -> None:
     if build_manifest.get("update_channel") != args.update_channel:
         raise SystemExit("ERROR: update channel does not match build manifest")
 
+    preserved_identities = {}
+    if args.feature_policy == "preserve":
+        preserved_identities = preserved_feature_identities(build_manifest)
+
     manifest = (
         "format=libreecho-ota-v1\n"
-        "manifest_version=1\n"
+        "manifest_version=" + ("2" if args.feature_policy == "preserve" else "1") + "\n"
         "board=radar_puffin\n"
         "soc=mt8163\n"
         "architecture=armv7\n"
@@ -101,7 +150,12 @@ def main() -> None:
         f"boot_size={len(boot)}\n"
         f"boot_sha256={digest}\n"
         f"feature_policy={args.feature_policy}\n"
-        "image_profile=ota\n"
+        + "".join(
+            f"feature_{feature}_{field}={identity[field]}\n"
+            for feature, identity in preserved_identities.items()
+            for field in ("payload_sha256", "payload_size", "manifest_sha256", "daemon_sha256")
+        )
+        + "image_profile=ota\n"
         f"service_profile={args.service_profile}\n"
         f"update_channel={args.update_channel}\n"
     ).encode("ascii")
