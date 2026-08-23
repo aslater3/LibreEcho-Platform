@@ -717,6 +717,21 @@ if $BB grep -q ' /sys/kernel/config ' /proc/mounts 2>/dev/null; then
             done
             if [ -n "$udc" ] && echo "$udc" > "$G/UDC" 2>/tmp/configfs-udc-bind.err; then
                 log "configfs-udc-bound:$udc"
+                # The port is dr_mode="otg" so the role can be switched at
+                # runtime, which the storage toggle needs.  The cost is that the
+                # boot role is otherwise decided by ID/VBUS detection, and that
+                # proved unreliable -- ADB came up on some boots and not others,
+                # which is unacceptable for the only recovery path this device
+                # has.  Pin it to device so the gadget is unconditional; the
+                # toggle moves it to host later, and every boot resets it here.
+                for role_sx in /sys/class/usb_role/*/role; do
+                    [ -w "$role_sx" ] || continue
+                    if printf device > "$role_sx" 2>/dev/null; then
+                        log "usb-role-pinned-device:${role_sx#/sys/class/usb_role/}"
+                    else
+                        log "usb-role-pin-failed:${role_sx#/sys/class/usb_role/}"
+                    fi
+                done
                 # Capture one bounded userspace snapshot after the host has had
                 # time to send CNXN.  Never loop: repeated ADB reconnects would
                 # otherwise flood the authoritative UART record.
