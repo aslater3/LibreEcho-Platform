@@ -1597,7 +1597,129 @@ class PolicyTests(unittest.TestCase):
     def test_startup_audio_is_disabled_by_default(self) -> None:
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
         self.assertNotIn("startup_audio_worker", init_script)
+        self.assertNotIn("--startup-audio", init_script)
         self.assertIn("log audio-startup-disabled", init_script)
+
+    def test_ui_bundle_startup_contract_is_fail_closed(self) -> None:
+        valid_led = "\n".join((
+            "DAEMON=/usr/local/sbin/libreecho-ledd",
+            "PIDFILE=/var/run/libreecho-ledd.pid",
+            "STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}",
+            "ARGS=${ARGS:---foreground --socket $SOCKET --startup-animation --startup-ready $STARTUP_READY}",
+            "start_service() {",
+            '    start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- $ARGS',
+            "}",
+            "case \"${1:-}\" in",
+            "    start) start_service ;;",
+            "esac",
+        )) + "\n"
+        valid_web = "\n".join((
+            "STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}",
+            "STARTUP_READY_TIMEOUT_TICKS=${STARTUP_READY_TIMEOUT_TICKS:-600}",
+            "startup_services_ready() {",
+            "    for socket in network audio mic led bluetooth airplay; do",
+            '        [ -S "/run/libreecho/$socket.sock" ] || return 1',
+            "        : \"$socket\"",
+            "    done",
+            "}",
+            "mark_startup_ready() {",
+            "    count=0",
+            "    while :; do",
+            "        if startup_services_ready; then",
+            '            tmp="$STARTUP_READY.tmp"',
+            "            printf 'schema=1\\n' >\"$tmp\"",
+            '            mv -f "$tmp" "$STARTUP_READY"',
+            "            return 0",
+            "        fi",
+            "        sleep 0.1",
+            "        count=$((count + 1))",
+            '        [ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0',
+            "    done",
+            "}",
+            "start_service() { :; }",
+            "case \"${1:-}\" in",
+            "    start) start_service\n        mark_startup_ready >/dev/null 2>&1 & ;;",
+            "esac",
+        )) + "\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            led = bundle / "etc/init.d/libreecho-ledd.init"
+            web = bundle / "etc/init.d/libreecho-web.init"
+            led.parent.mkdir(parents=True)
+            led.write_text(valid_led)
+            web.write_text(valid_web)
+
+            builder.validate_ui_startup_contract(bundle)
+
+            one_shot_web = valid_web
+            for marker in (
+                "STARTUP_READY_TIMEOUT_TICKS=${STARTUP_READY_TIMEOUT_TICKS:-600}\n",
+                "    while :; do\n",
+                "        sleep 0.1\n",
+                "        count=$((count + 1))\n",
+                '        [ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0\n',
+            ):
+                one_shot_web = one_shot_web.replace(marker, "")
+            loop_done = one_shot_web.rfind("    done\n")
+            self.assertGreater(loop_done, -1)
+            one_shot_web = one_shot_web[:loop_done] + one_shot_web[loop_done + len("    done\n"):]
+            web.write_text(one_shot_web)
+            with self.assertRaisesRegex(SystemExit, "STARTUP_READY_TIMEOUT_TICKS"):
+                builder.validate_ui_startup_contract(bundle)
+            web.write_text(valid_web)
+
+            noncanonical_led = valid_led.replace(
+                "/run/libreecho/startup-ready", "/tmp/startup-ready"
+            )
+            noncanonical_web = valid_web.replace(
+                "/run/libreecho/startup-ready", "/tmp/startup-ready"
+            )
+            led.write_text(noncanonical_led)
+            web.write_text(noncanonical_web)
+            with self.assertRaisesRegex(SystemExit, "canonical readiness path"):
+                builder.validate_ui_startup_contract(bundle)
+            led.write_text(valid_led)
+            web.write_text(valid_web)
+
+            malformed_web = valid_web.replace(
+                '        [ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0\n'
+                "    done\n",
+                '        [ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0\n',
+            )
+            web.write_text(malformed_web)
+            with self.assertRaisesRegex(SystemExit, "invalid shell syntax"):
+                builder.validate_ui_startup_contract(bundle)
+            web.write_text(valid_web)
+
+            web.write_text(valid_web.replace(
+                '        [ -S "/run/libreecho/$socket.sock" ] || return 1\n',
+                "",
+            ))
+            with self.assertRaisesRegex(SystemExit, "startup contract missing"):
+                builder.validate_ui_startup_contract(bundle)
+            web.write_text(valid_web)
+
+            web.write_text(valid_web.replace(
+                '            printf \'schema=1\\n\' >"$tmp"\n'
+                '            mv -f "$tmp" "$STARTUP_READY"\n',
+                '            mv -f "$tmp" "$STARTUP_READY"\n'
+                '            printf \'schema=1\\n\' >"$tmp"\n',
+            ))
+            with self.assertRaisesRegex(SystemExit, "ordering is invalid"):
+                builder.validate_ui_startup_contract(bundle)
+            web.write_text(valid_web)
+
+            led.write_text(valid_led.replace(
+                "/run/libreecho/startup-ready",
+                "/run/libreecho/other-ready",
+            ))
+            with self.assertRaisesRegex(SystemExit, "different readiness paths"):
+                builder.validate_ui_startup_contract(bundle)
+            led.write_text(valid_led)
+
+            led.write_text(valid_led.replace("--startup-animation ", ""))
+            with self.assertRaisesRegex(SystemExit, "startup-animation"):
+                builder.validate_ui_startup_contract(bundle)
 
     def test_streaming_voice_services_start_warm_in_dependency_order(self) -> None:
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
