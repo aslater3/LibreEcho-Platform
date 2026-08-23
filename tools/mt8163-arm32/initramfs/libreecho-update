@@ -136,11 +136,12 @@ manifest_value()
 
 verify_manifest()
 {
-    expected_keys='format manifest_version board soc architecture version boot_filename boot_size boot_sha256 feature_policy image_profile service_profile update_channel'
+    required_keys='format manifest_version board soc architecture version boot_filename boot_size boot_sha256 feature_policy image_profile service_profile update_channel'
+    allowed_keys="$required_keys feature_airplay2_payload_sha256 feature_airplay2_payload_size feature_airplay2_manifest_sha256 feature_airplay2_daemon_sha256 feature_tts_payload_sha256 feature_tts_payload_size feature_tts_manifest_sha256 feature_tts_daemon_sha256 feature_wakeword_payload_sha256 feature_wakeword_payload_size feature_wakeword_manifest_sha256 feature_wakeword_daemon_sha256 feature_stt_payload_sha256 feature_stt_payload_size feature_stt_manifest_sha256 feature_stt_daemon_sha256 feature_assistant_payload_sha256 feature_assistant_payload_size feature_assistant_manifest_sha256 feature_assistant_daemon_sha256"
     seen=
     while IFS='=' read -r key value; do
         [ -n "$key" ] && [ -n "$value" ] || die manifest_syntax
-        case " $expected_keys " in
+        case " $allowed_keys " in
             *" $key "*) ;;
             *) die manifest_unknown_key ;;
         esac
@@ -152,7 +153,7 @@ verify_manifest()
             *[!A-Za-z0-9._+~:/-]*) die manifest_value_characters ;;
         esac
     done < "$STAGING/manifest"
-    for key in $expected_keys; do
+    for key in $required_keys; do
         case " $seen " in
             *" $key "*) ;;
             *) die manifest_missing_key ;;
@@ -176,6 +177,20 @@ verify_manifest()
         preserve|redistributable|community-noncommercial|exclude) ;;
         *) die manifest_feature_policy ;;
     esac
+    if [ "$FEATURE_POLICY" = preserve ]; then
+        for feature in airplay2 tts wakeword stt assistant; do
+            for field in payload_sha256 payload_size manifest_sha256 daemon_sha256; do
+                value=$(manifest_value "feature_${feature}_${field}")
+                [ -n "$value" ] || die manifest_preserve_feature_identity_missing
+                case "$field:$value" in
+                    payload_sha256:[0-9a-f][0-9a-f]*|manifest_sha256:[0-9a-f][0-9a-f]*|daemon_sha256:[0-9a-f][0-9a-f]*)
+                        [ "${#value}" -eq 64 ] || die manifest_preserve_feature_identity_hash ;;
+                    payload_size:[0-9]*) ;;
+                    *) die manifest_preserve_feature_identity_value ;;
+                esac
+            done
+        done
+    fi
     [ "$(manifest_value image_profile)" = ota ] ||
         die manifest_image_profile
     SERVICE_PROFILE=$(manifest_value service_profile)
@@ -320,6 +335,43 @@ feature_status()
     done
 }
 
+verify_preserved_feature_identity()
+{
+    for feature in airplay2 tts wakeword stt assistant; do
+        case "$feature" in
+            airplay2) daemon=libreecho-airplayd ;;
+            tts) daemon=libreecho-ttsd ;;
+            wakeword) daemon=libreecho-waked ;;
+            stt) daemon=libreecho-sttd ;;
+            assistant) daemon=libreecho-agentd ;;
+        esac
+        feature_root=/data/libreecho/features/$feature
+        payload=$feature_root/payload.squashfs
+        manifest=$feature_root/manifest.json
+        expected_payload=$(manifest_value "feature_${feature}_payload_sha256")
+        expected_size=$(manifest_value "feature_${feature}_payload_size")
+        expected_manifest=$(manifest_value "feature_${feature}_manifest_sha256")
+        expected_daemon=$(manifest_value "feature_${feature}_daemon_sha256")
+        actual_payload=$(feature_file_sha256 "$payload")
+        [ "$actual_payload" = "$expected_payload" ] ||
+            die preserve_feature_payload_mismatch
+        actual_size=$($BB stat -c %s "$payload" 2>/dev/null)
+        [ "$actual_size" = "$expected_size" ] ||
+            die preserve_feature_payload_size_mismatch
+        actual_manifest=$(feature_file_sha256 "$manifest")
+        [ "$actual_manifest" = "$expected_manifest" ] ||
+            die preserve_feature_manifest_mismatch
+        pid=$($BB pidof "$daemon" 2>/dev/null | $BB awk '{print $1}')
+        case "$pid" in
+            ''|*[!0-9]*) die preserve_feature_daemon_not_running ;;
+        esac
+        running_daemon=$(feature_file_sha256 "/proc/$pid/exe" 1)
+        [ "$running_daemon" != unavailable ] || die preserve_feature_daemon_unavailable
+        [ "$running_daemon" = "$expected_daemon" ] ||
+            die preserve_feature_daemon_mismatch
+    done
+}
+
 clear_exact_development_marker()
 {
     expdb=/dev/mmcblk0p7
@@ -355,6 +407,9 @@ install_package()
     extract_and_verify "$package"
     state_write verified 20 "$version"
     bootctl_status
+    if [ "$FEATURE_POLICY" = preserve ]; then
+        verify_preserved_feature_identity
+    fi
 
     state_write writing 30 "$target"
     $BB dd if="$STAGING/boot.img" of="$target_device" bs=4096 \

@@ -97,10 +97,18 @@ The release/publisher gate must compare the candidate's payload and feature
 manifest identities against the identities inherited by a `preserve` candidate.
 Runtime acceptance must also compare each `running_daemon_sha256` against the
 corresponding candidate file hash, or record an explicit waiver. A mismatch
-must fail acceptance rather than being silently hidden by the boot-image
-version. A future payload-refresh transaction may replace this preserve-only
-boundary, but it must preserve models/configuration atomically and verify a
-rollback-safe post-apply hash before changing the policy.
+must fail acceptance rather than being silently hidden by the boot-image version.
+A future payload-refresh transaction may replace this preserve-only boundary, but
+it must preserve models/configuration atomically and verify a rollback-safe
+post-apply hash before changing the policy.
+
+For OTA v1, the preserve policy is fail-closed rather than an implicit hybrid:
+the signed manifest carries payload, feature-manifest, and supervised-daemon
+hashes for all five retained features. The on-device installer compares those
+identities, including each running `/proc/<pid>/exe`, before writing the
+inactive boot payload and rejects a missing, stopped, or mismatched daemon.
+This does not refresh payloads or models; it prevents a candidate from being
+installed when preserve would leave a different runtime behind.
 
 Manual browser upload streams the tar to `/data/libreecho/update/incoming` and
 invokes the target installer. OTA-profile images also check the stable public

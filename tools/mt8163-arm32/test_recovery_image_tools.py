@@ -2000,6 +2000,113 @@ class PolicyTests(unittest.TestCase):
         status_block = updater[updater.index("    status)"):]
         self.assertIn("feature_status", status_block)
 
+    def test_preserve_ota_manifest_binds_payload_and_daemon_identities(self) -> None:
+        """A preserve OTA must carry every identity that the device retains."""
+        from nacl.signing import SigningKey
+
+        daemon_paths = {
+            "airplay2": ("airplay", "usr/local/sbin/libreecho-airplayd"),
+            "tts": ("tts", "usr/local/sbin/libreecho-ttsd"),
+            "wakeword": ("wakeword", "usr/local/sbin/libreecho-waked"),
+            "stt": ("stt", "usr/local/sbin/libreecho-sttd"),
+            "assistant": ("assistant", "usr/local/sbin/libreecho-agentd"),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            boot = root / "boot.img"
+            boot_bytes = b"ANDROID!" + bytes((16 * 1024 * 1024) - 8)
+            boot.write_bytes(boot_bytes)
+            key = SigningKey.generate()
+            private = root / "private.hex"
+            public = root / "public.hex"
+            build_manifest = root / "build-manifest.json"
+            private.write_text(key.encode().hex() + "\n")
+            public.write_text(key.verify_key.encode().hex() + "\n")
+            features = {}
+            for feature, (manifest_feature, daemon) in daemon_paths.items():
+                features[manifest_feature] = {
+                    "payload": {
+                        "sha256": "a" * 64,
+                        "size": 123,
+                        "manifest_sha256": "b" * 64,
+                        "files": {daemon: {"sha256": "c" * 64}},
+                    },
+                }
+            build_manifest.write_text(json.dumps({
+                "image_profile": "ota",
+                "service_profile": "production",
+                "feature_policy": "preserve",
+                "update_channel": "dev",
+                "output": {
+                    "sha256": hashlib.sha256(boot_bytes).hexdigest(),
+                    "size": len(boot_bytes),
+                },
+                **features,
+            }))
+            output = root / "update.ota.tar"
+            subprocess.run([
+                sys.executable, str(TOOLS_DIR / "ota/make_ota_bundle.py"),
+                "--boot-image", str(boot), "--build-manifest", str(build_manifest),
+                "--version", "test-v1", "--signing-key", str(private),
+                "--public-key", str(public), "--service-profile", "production",
+                "--feature-policy", "preserve", "--update-channel", "dev",
+                "--output", str(output),
+            ], check=True, capture_output=True, text=True)
+            with tarfile.open(output, "r:") as archive:
+                manifest = archive.extractfile("manifest").read().decode()
+            for feature in daemon_paths:
+                self.assertIn(f"feature_{feature}_payload_sha256={'a' * 64}\n", manifest)
+                self.assertIn(f"feature_{feature}_payload_size=123\n", manifest)
+                self.assertIn(f"feature_{feature}_manifest_sha256={'b' * 64}\n", manifest)
+                self.assertIn(f"feature_{feature}_daemon_sha256={'c' * 64}\n", manifest)
+
+    def test_preserve_ota_bundle_rejects_missing_retained_identity(self) -> None:
+        """A preserve OTA without candidate daemon identities must fail closed."""
+        from nacl.signing import SigningKey
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            boot = root / "boot.img"
+            boot_bytes = b"ANDROID!" + bytes((16 * 1024 * 1024) - 8)
+            boot.write_bytes(boot_bytes)
+            key = SigningKey.generate()
+            private = root / "private.hex"
+            public = root / "public.hex"
+            build_manifest = root / "build-manifest.json"
+            private.write_text(key.encode().hex() + "\n")
+            public.write_text(key.verify_key.encode().hex() + "\n")
+            build_manifest.write_text(json.dumps({
+                "image_profile": "ota",
+                "service_profile": "production",
+                "feature_policy": "preserve",
+                "update_channel": "dev",
+                "output": {
+                    "sha256": hashlib.sha256(boot_bytes).hexdigest(),
+                    "size": len(boot_bytes),
+                },
+            }))
+            result = subprocess.run([
+                sys.executable, str(TOOLS_DIR / "ota/make_ota_bundle.py"),
+                "--boot-image", str(boot), "--build-manifest", str(build_manifest),
+                "--version", "test-v1", "--signing-key", str(private),
+                "--public-key", str(public), "--service-profile", "production",
+                "--feature-policy", "preserve", "--update-channel", "dev",
+                "--output", str(root / "update.ota.tar"),
+            ], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("preserve policy requires candidate feature identities", result.stderr)
+
+    def test_preserve_installer_fails_before_boot_write_on_identity_mismatch(self) -> None:
+        """The updater must gate retained daemon identity before any block write."""
+        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
+        self.assertIn("verify_preserved_feature_identity()", updater)
+        self.assertIn("preserve_feature_payload_mismatch", updater)
+        self.assertIn("preserve_feature_daemon_mismatch", updater)
+        install = updater[updater.index('install_package()'):]
+        verify_call = install.index('verify_preserved_feature_identity')
+        boot_write = install.index('dd if="$STAGING/boot.img" of="$target_device"')
+        self.assertLess(verify_call, boot_write)
+
     def test_host_ota_path_is_explicit_and_uses_guarded_updater(self) -> None:
         host = pipeline_file("ota.sh").read_text()
         preflight = pipeline_file("ota-preflight-root.sh").read_text()
