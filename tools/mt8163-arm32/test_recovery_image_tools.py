@@ -1608,9 +1608,13 @@ class PolicyTests(unittest.TestCase):
         valid_web = "\n".join((
             "startup_services_ready() {",
             "    for socket in network audio mic led bluetooth airplay; do",
+            "        : \"$socket\"",
+            "    done",
+            "}",
             "mark_startup_ready() {",
             '    tmp="$STARTUP_READY.tmp"',
             '    mv -f "$tmp" "$STARTUP_READY"',
+            "}",
         )) + "\n"
         with tempfile.TemporaryDirectory() as temporary:
             bundle = Path(temporary)
@@ -1621,6 +1625,11 @@ class PolicyTests(unittest.TestCase):
             web.write_text(valid_web)
 
             builder.validate_ui_startup_contract(bundle)
+
+            web.write_text(valid_web + "if [ 1 -eq 1; then\n")
+            with self.assertRaisesRegex(SystemExit, "invalid shell syntax"):
+                builder.validate_ui_startup_contract(bundle)
+            web.write_text(valid_web)
 
             led.write_text(valid_led.replace("--startup-animation ", ""))
             with self.assertRaisesRegex(SystemExit, "startup-animation"):

@@ -739,6 +739,13 @@ def validate_ui_startup_contract(bundle: Path) -> None:
             raise SystemExit(
                 f"ERROR: UI startup contract is not UTF-8: {relative}"
             ) from exc
+        syntax = subprocess.run(
+            ["sh", "-n", str(source)], capture_output=True, text=True,
+        )
+        if syntax.returncode != 0:
+            raise SystemExit(
+                f"ERROR: UI startup contract has invalid shell syntax: {relative}"
+            )
         for marker in required:
             if marker not in text:
                 raise SystemExit(
