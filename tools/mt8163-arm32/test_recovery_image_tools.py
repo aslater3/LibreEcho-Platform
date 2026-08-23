@@ -1604,7 +1604,7 @@ class PolicyTests(unittest.TestCase):
         valid_led = "\n".join((
             "DAEMON=/usr/local/sbin/libreecho-ledd",
             "PIDFILE=/var/run/libreecho-ledd.pid",
-            "STARTUP_READY=/run/libreecho/startup-ready",
+            "STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}",
             "ARGS=${ARGS:---foreground --socket $SOCKET --startup-animation --startup-ready $STARTUP_READY}",
             "start_service() {",
             '    start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- $ARGS',
@@ -1614,6 +1614,7 @@ class PolicyTests(unittest.TestCase):
             "esac",
         )) + "\n"
         valid_web = "\n".join((
+            "STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}",
             "startup_services_ready() {",
             "    for socket in network audio mic led bluetooth airplay; do",
             '        [ -S "/run/libreecho/$socket.sock" ] || return 1',
@@ -1649,6 +1650,22 @@ class PolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "startup contract missing"):
                 builder.validate_ui_startup_contract(bundle)
             web.write_text(valid_web)
+
+            web.write_text(valid_web.replace(
+                '        printf \'schema=1\\n\' >"$tmp"\n        mv -f "$tmp" "$STARTUP_READY"\n',
+                '        mv -f "$tmp" "$STARTUP_READY"\n        printf \'schema=1\\n\' >"$tmp"\n',
+            ))
+            with self.assertRaisesRegex(SystemExit, "write must precede"):
+                builder.validate_ui_startup_contract(bundle)
+            web.write_text(valid_web)
+
+            led.write_text(valid_led.replace(
+                "/run/libreecho/startup-ready",
+                "/run/libreecho/other-ready",
+            ))
+            with self.assertRaisesRegex(SystemExit, "different readiness paths"):
+                builder.validate_ui_startup_contract(bundle)
+            led.write_text(valid_led)
 
             led.write_text(valid_led.replace("--startup-animation ", ""))
             with self.assertRaisesRegex(SystemExit, "startup-animation"):

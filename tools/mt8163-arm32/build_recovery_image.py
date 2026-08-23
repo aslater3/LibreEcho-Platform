@@ -741,6 +741,7 @@ def validate_ui_startup_contract(bundle: Path) -> None:
             ),
         ),
     )
+    contract_paths = {}
     for relative, required in contracts:
         source = pinned_source(bundle, relative, f"UI startup contract {relative}")
         try:
@@ -756,11 +757,23 @@ def validate_ui_startup_contract(bundle: Path) -> None:
             raise SystemExit(
                 f"ERROR: UI startup contract has invalid shell syntax: {relative}"
             )
+        contract_paths[relative] = text
         for marker in required:
             if marker not in text:
                 raise SystemExit(
                     f"ERROR: UI startup contract missing {marker!r} in {relative}"
                 )
+        if relative.endswith("libreecho-web.init"):
+            if text.index("printf 'schema=1\\n' >\"$tmp\"") > text.index('mv -f "$tmp" "$STARTUP_READY"'):
+                raise SystemExit("ERROR: UI startup readiness write must precede atomic move")
+
+    led_text = contract_paths["etc/init.d/libreecho-ledd.init"]
+    web_text = contract_paths["etc/init.d/libreecho-web.init"]
+    path_pattern = re.compile(r"STARTUP_READY=\$\{STARTUP_READY:-([^}]+)\}")
+    led_path = path_pattern.search(led_text)
+    web_path = path_pattern.search(web_text)
+    if not led_path or not web_path or led_path.group(1) != web_path.group(1):
+        raise SystemExit("ERROR: UI startup scripts use different readiness paths")
 
 
 def add_ui_bundle(stage: Path, bundle: Path, source: Path,
