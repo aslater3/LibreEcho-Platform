@@ -74,10 +74,12 @@ def main() -> None:
     pcm_failure = engine[engine.index("PCM %u,%u unavailable"):failure_start]
     if "airplay_volume_applied ? saved_volume : -1" not in pcm_failure:
         raise SystemExit("PCM-open failure must not restore an unowned device volume")
-    normal_start = engine.index(
-        "\n\t\tclear_source_activity(sources",
-        engine.index("while (!stopping && sources_active(sources))"),
-    )
+    loop_start = engine.index("while (!stopping && sources_active(sources))")
+    loop_end = engine.index("\n\t\tclear_source_activity(sources", loop_start)
+    live = engine[loop_start:loop_end]
+    if "previous_airplay_volume >= 0" not in live:
+        raise SystemExit("live sender failure must restore the prior AirPlay level")
+    normal_start = loop_end
     normal_end = engine.index("\n\t}\n\tresult", normal_start)
     normal = engine[normal_start:normal_end]
     normal_disable = normal.index("disable_output_controls")
