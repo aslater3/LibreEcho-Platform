@@ -297,7 +297,7 @@ feature_status()
 {
     for feature in airplay2 tts wakeword stt assistant; do
         case "$feature" in
-            airplay2) daemon=libreecho-airplayd ;;
+            airplay2) daemon=libreecho-audio-engine ;;
             tts) daemon=libreecho-ttsd ;;
             wakeword) daemon=libreecho-waked ;;
             stt) daemon=libreecho-sttd ;;
@@ -339,7 +339,7 @@ verify_preserved_feature_identity()
 {
     for feature in airplay2 tts wakeword stt assistant; do
         case "$feature" in
-            airplay2) daemon=libreecho-airplayd ;;
+            airplay2) daemon=libreecho-audio-engine ;;
             tts) daemon=libreecho-ttsd ;;
             wakeword) daemon=libreecho-waked ;;
             stt) daemon=libreecho-sttd ;;

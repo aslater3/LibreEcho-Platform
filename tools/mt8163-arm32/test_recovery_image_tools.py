@@ -1978,7 +1978,7 @@ class PolicyTests(unittest.TestCase):
         """Status must expose preserved payload and running-daemon identities."""
         updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
         for feature, daemon in (
-            ("airplay2", "libreecho-airplayd"),
+            ("airplay2", "libreecho-audio-engine"),
             ("tts", "libreecho-ttsd"),
             ("wakeword", "libreecho-waked"),
             ("stt", "libreecho-sttd"),
@@ -2005,7 +2005,7 @@ class PolicyTests(unittest.TestCase):
         from nacl.signing import SigningKey
 
         daemon_paths = {
-            "airplay2": ("airplay", "usr/local/sbin/libreecho-airplayd"),
+            "airplay2": ("airplay", "usr/local/sbin/libreecho-audio-engine"),
             "tts": ("tts", "usr/local/sbin/libreecho-ttsd"),
             "wakeword": ("wakeword", "usr/local/sbin/libreecho-waked"),
             "stt": ("stt", "usr/local/sbin/libreecho-sttd"),

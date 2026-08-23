@@ -16,7 +16,7 @@ from nacl.signing import SigningKey
 BOOT_SIZE = 16 * 1024 * 1024
 VALUE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~-]{0,95}\Z")
 PRESERVED_FEATURE_DAEMONS = {
-    "airplay2": ("airplay", "usr/local/sbin/libreecho-airplayd"),
+    "airplay2": ("airplay", "usr/local/sbin/libreecho-audio-engine"),
     "tts": ("tts", "usr/local/sbin/libreecho-ttsd"),
     "wakeword": ("wakeword", "usr/local/sbin/libreecho-waked"),
     "stt": ("stt", "usr/local/sbin/libreecho-sttd"),
