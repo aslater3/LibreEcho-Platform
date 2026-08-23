@@ -740,6 +740,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	int saved_volume = -1;
 	int airplay_volume = -1;
 	int airplay_session = 0;
+	int airplay_volume_applied = 0;
 	unsigned int i;
 
 	memset(sources, 0, sizeof(sources));
@@ -801,6 +802,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		second_activity = source_activity_mask(sources);
 
 		saved_volume = -1;
+		airplay_volume_applied = 0;
 		airplay_session = airplay_is_active(root);
 		airplay_volume = airplay_session
 			? airplay_volume_to_mixer(root) : -1;
@@ -835,27 +837,68 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			if (pcm)
 				pcm_close(pcm);
 			(void)disable_output_controls(card,
-				airplay_session ? saved_volume : -1);
+				airplay_volume_applied ? saved_volume : -1);
 			clear_source_activity(sources, &announcement_led_active,
 					      &visualizer, &status);
 			usleep(250000);
 			continue;
 		}
-		int startup_volume = airplay_volume >= 0
-			? airplay_volume : saved_volume;
+		/*
+		 * The sender's volume applies to AirPlay media, not to everything
+		 * the device plays.  Applying it unconditionally meant a system
+		 * tone, an announcement or a spoken assistant reply was played at
+		 * the AirPlay sender's level: with a sender at 0 dB that is a raw
+		 * 127, the codec's unity point, so any local playback silently
+		 * pushed the device to full volume and left it there.
+		 *
+		 * Observed on hardware with a plain test tone -- no AirPlay
+		 * streaming involved -- via audiod's guard:
+		 *
+		 *   volume changed underneath us: requested 25%, control now
+		 *   reads 100% (raw 127 of 0..175)
+		 *
+		 * 127 is only ever produced by airplay_volume_to_mixer(), which
+		 * returns it for any sender volume at or above 0 dB.  Use the
+		 * sender's level only when AirPlay media is actually one of the
+		 * sources being rendered; otherwise keep the level the device was
+		 * already at, which is what audiod and the physical buttons set.
+		 */
+		int airplay_media_playing =
+			(second_activity & PLAYBACK_BUS_MEDIA) != 0;
+		int startup_volume = saved_volume;
+		int playback_start_failed = 0;
+		int airplay_volume_attempted = 0;
+		if (airplay_volume >= 0 && airplay_media_playing)
+			startup_volume = airplay_volume;
 
-		if (pcm_prepare(pcm) < 0 ||
-		    (startup_volume >= 0 &&
-		     set_pcm_volume(card, startup_volume) < 0) ||
-		    write_period(pcm, output, &reference, first_activity) < 0 ||
-		    write_period(pcm, second, &reference, second_activity) < 0 ||
-		    enable_output_controls(card) < 0) {
+		if (pcm_prepare(pcm) < 0)
+			playback_start_failed = 1;
+		else {
+			if (startup_volume >= 0) {
+				if (airplay_volume >= 0 && airplay_media_playing)
+					airplay_volume_attempted = 1;
+				if (set_pcm_volume(card, startup_volume) < 0)
+					playback_start_failed = 1;
+			}
+			if (!playback_start_failed) {
+				/* Mark ownership immediately after a successful sender write so
+				 * any later start failure can restore exactly what we changed. */
+				if (airplay_volume >= 0 && airplay_media_playing)
+					airplay_volume_applied = 1;
+				if (write_period(pcm, output, &reference, first_activity) < 0 ||
+				    write_period(pcm, second, &reference, second_activity) < 0 ||
+				    enable_output_controls(card) < 0)
+					playback_start_failed = 1;
+			}
+		}
+		if (playback_start_failed) {
 			fprintf(stderr, "audio-engine: playback start failed: %s\n",
 				pcm_get_error(pcm));
 			(void)disable_output_controls(card, -1);
 			pcm_close(pcm);
-			if (airplay_session && saved_volume >= 0)
-				(void)set_pcm_volume(card, saved_volume);
+			if (airplay_volume_attempted || airplay_volume_applied)
+				if (saved_volume >= 0)
+					(void)set_pcm_volume(card, saved_volume);
 			clear_source_activity(sources, &announcement_led_active,
 					      &visualizer, &status);
 			continue;
@@ -863,12 +906,25 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		process_music_visualizer(&visualizer, sources, second);
 
 		while (!stopping && sources_active(sources)) {
-			if (airplay_session && airplay_is_active(root)) {
+			/* Same scoping for live volume changes from the sender. */
+			if (airplay_session && airplay_is_active(root) &&
+			    (source_activity_mask(sources) & PLAYBACK_BUS_MEDIA)) {
 				int requested = airplay_volume_to_mixer(root);
 
-				if (requested >= 0 && requested != airplay_volume &&
-				    set_pcm_volume(card, requested) == 0)
-					airplay_volume = requested;
+				if (requested >= 0 &&
+				    (!airplay_volume_applied || requested != airplay_volume))
+				{
+					int previous_airplay_volume =
+						airplay_volume_applied ? airplay_volume : -1;
+					if (set_pcm_volume(card, requested) == 0) {
+						airplay_volume = requested;
+						airplay_volume_applied = 1;
+					} else if (previous_airplay_volume >= 0) {
+						(void)set_pcm_volume(card, previous_airplay_volume);
+					} else if (saved_volume >= 0) {
+						(void)set_pcm_volume(card, saved_volume);
+					}
+				}
 			}
 			(void)poll_sources(sources, 20);
 			if (read_sources(sources, root) < 0) {
@@ -891,7 +947,8 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				      &visualizer, &status);
 		(void)disable_output_controls(card, -1);
 		pcm_close(pcm);
-		if (airplay_session && saved_volume >= 0)
+		/* Only undo a level this engine actually imposed. */
+		if (airplay_session && airplay_volume_applied && saved_volume >= 0)
 			(void)set_pcm_volume(card, saved_volume);
 	}
 	result = stopping ? 0 : -1;
@@ -907,7 +964,7 @@ out:
 	le_aec_reference_close(&reference);
 	free(output);
 	close_sources(sources);
-	if (airplay_session && saved_volume >= 0)
+	if (airplay_volume_applied && saved_volume >= 0)
 		(void)disable_output_controls(card, saved_volume);
 	return result;
 }
