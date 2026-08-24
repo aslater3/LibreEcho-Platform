@@ -866,7 +866,11 @@ class SourceTests(unittest.TestCase):
         # Scope to the worker function: earlier unrelated reboot paths must
         # not satisfy the ordering check.
         worker_start = init.index("ota_health_confirm_worker()")
-        worker = init[worker_start:worker_start + 9000]
+        # Slice to the function's own closing brace rather than a fixed byte
+        # count: a fixed window silently falls out of scope as soon as the
+        # worker grows, which turns an ordering assertion into a length test.
+        worker_end = init.index("\n}", worker_start) + 2
+        worker = init[worker_start:worker_end]
         restart_idx = worker.index("$BB reboot -f")
         record_idx = worker.index("/data/libreecho/update/restart-record")
         self.assertLess(record_idx, restart_idx)
@@ -1053,6 +1057,21 @@ class SourceTests(unittest.TestCase):
         self.assertNotIn("stock-root", builder_text)
         self.assertIn("Apache License", notice.read_text())
         self.assertIn("source_commit=", source_lock.read_text())
+
+    def test_adbd_compat_header_coexists_with_kernel_uapi_prctl(self) -> None:
+        # musl's <sys/prctl.h> re-declares struct prctl_mm_map and PR_*
+        # macros that the exported kernel UAPI <linux/prctl.h> also defines,
+        # and adb.c includes the UAPI header directly. The compat header is
+        # force-included into every translation unit, so it must not pull in
+        # musl's sys/prctl.h; it declares prctl() directly instead. A
+        # reintroduction of that include breaks every musl-based adbd build
+        # with a hard redefinition error (regression from the hosted public
+        # build lane).
+        adbd_dir = TOOLS_DIR / "adbd"
+        compat = adbd_dir / "compat/libreecho-adbd-compat.h"
+        compat_text = compat.read_text()
+        self.assertNotIn("#include <sys/prctl.h>", compat_text)
+        self.assertIn("int prctl(", compat_text)
 
     def test_pipeline_builds_adbd_without_stock_root(self) -> None:
         pipeline_root = pipeline_file("build.sh").parent
@@ -1592,7 +1611,7 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("production)", init_source)
         self.assertIn('services="logd timed web"', init_source)
         self.assertIn(
-            'services="logd networkd timed audiod micd waked sttd ledd btd airplayd ttsd agentd web"',
+            'services="logd networkd timed audiod micd waked sttd ledd buttond btd airplayd ttsd agentd web"',
             init_source,
         )
         self.assertIn("--service-profile", builder_source)
@@ -1609,15 +1628,139 @@ class PolicyTests(unittest.TestCase):
     def test_startup_audio_is_disabled_by_default(self) -> None:
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
         self.assertNotIn("startup_audio_worker", init_script)
+        self.assertNotIn("--startup-audio", init_script)
         self.assertIn("log audio-startup-disabled", init_script)
+
+    def test_ui_bundle_startup_contract_is_fail_closed(self) -> None:
+        valid_led = "\n".join((
+            "DAEMON=/usr/local/sbin/libreecho-ledd",
+            "PIDFILE=/var/run/libreecho-ledd.pid",
+            "STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}",
+            "ARGS=${ARGS:---foreground --socket $SOCKET --startup-animation --startup-ready $STARTUP_READY}",
+            "start_service() {",
+            '    start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- $ARGS',
+            "}",
+            "case \"${1:-}\" in",
+            "    start) start_service ;;",
+            "esac",
+        )) + "\n"
+        valid_web = "\n".join((
+            "STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}",
+            "STARTUP_READY_TIMEOUT_TICKS=${STARTUP_READY_TIMEOUT_TICKS:-600}",
+            "startup_services_ready() {",
+            "    for socket in network audio mic led bluetooth airplay; do",
+            '        [ -S "/run/libreecho/$socket.sock" ] || return 1',
+            "        : \"$socket\"",
+            "    done",
+            "}",
+            "mark_startup_ready() {",
+            "    count=0",
+            "    while :; do",
+            "        if startup_services_ready; then",
+            '            tmp="$STARTUP_READY.tmp"',
+            "            printf 'schema=1\\n' >\"$tmp\"",
+            '            mv -f "$tmp" "$STARTUP_READY"',
+            "            return 0",
+            "        fi",
+            "        sleep 0.1",
+            "        count=$((count + 1))",
+            '        [ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0',
+            "    done",
+            "}",
+            "start_service() { :; }",
+            "case \"${1:-}\" in",
+            "    start) start_service\n        mark_startup_ready >/dev/null 2>&1 & ;;",
+            "esac",
+        )) + "\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Path(temporary)
+            led = bundle / "etc/init.d/libreecho-ledd.init"
+            web = bundle / "etc/init.d/libreecho-web.init"
+            led.parent.mkdir(parents=True)
+            led.write_text(valid_led)
+            web.write_text(valid_web)
+
+            builder.validate_ui_startup_contract(bundle)
+
+            one_shot_web = valid_web
+            for marker in (
+                "STARTUP_READY_TIMEOUT_TICKS=${STARTUP_READY_TIMEOUT_TICKS:-600}\n",
+                "    while :; do\n",
+                "        sleep 0.1\n",
+                "        count=$((count + 1))\n",
+                '        [ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0\n',
+            ):
+                one_shot_web = one_shot_web.replace(marker, "")
+            loop_done = one_shot_web.rfind("    done\n")
+            self.assertGreater(loop_done, -1)
+            one_shot_web = one_shot_web[:loop_done] + one_shot_web[loop_done + len("    done\n"):]
+            web.write_text(one_shot_web)
+            with self.assertRaisesRegex(SystemExit, "STARTUP_READY_TIMEOUT_TICKS"):
+                builder.validate_ui_startup_contract(bundle)
+            web.write_text(valid_web)
+
+            noncanonical_led = valid_led.replace(
+                "/run/libreecho/startup-ready", "/tmp/startup-ready"
+            )
+            noncanonical_web = valid_web.replace(
+                "/run/libreecho/startup-ready", "/tmp/startup-ready"
+            )
+            led.write_text(noncanonical_led)
+            web.write_text(noncanonical_web)
+            with self.assertRaisesRegex(SystemExit, "canonical readiness path"):
+                builder.validate_ui_startup_contract(bundle)
+            led.write_text(valid_led)
+            web.write_text(valid_web)
+
+            malformed_web = valid_web.replace(
+                '        [ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0\n'
+                "    done\n",
+                '        [ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0\n',
+            )
+            web.write_text(malformed_web)
+            with self.assertRaisesRegex(SystemExit, "invalid shell syntax"):
+                builder.validate_ui_startup_contract(bundle)
+            web.write_text(valid_web)
+
+            web.write_text(valid_web.replace(
+                '        [ -S "/run/libreecho/$socket.sock" ] || return 1\n',
+                "",
+            ))
+            with self.assertRaisesRegex(SystemExit, "startup contract missing"):
+                builder.validate_ui_startup_contract(bundle)
+            web.write_text(valid_web)
+
+            web.write_text(valid_web.replace(
+                '            printf \'schema=1\\n\' >"$tmp"\n'
+                '            mv -f "$tmp" "$STARTUP_READY"\n',
+                '            mv -f "$tmp" "$STARTUP_READY"\n'
+                '            printf \'schema=1\\n\' >"$tmp"\n',
+            ))
+            with self.assertRaisesRegex(SystemExit, "ordering is invalid"):
+                builder.validate_ui_startup_contract(bundle)
+            web.write_text(valid_web)
+
+            led.write_text(valid_led.replace(
+                "/run/libreecho/startup-ready",
+                "/run/libreecho/other-ready",
+            ))
+            with self.assertRaisesRegex(SystemExit, "different readiness paths"):
+                builder.validate_ui_startup_contract(bundle)
+            led.write_text(valid_led)
+
+            led.write_text(valid_led.replace("--startup-animation ", ""))
+            with self.assertRaisesRegex(SystemExit, "startup-animation"):
+                builder.validate_ui_startup_contract(bundle)
 
     def test_streaming_voice_services_start_warm_in_dependency_order(self) -> None:
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
         service_line = (
-            'services="logd networkd timed audiod micd waked sttd ledd btd '
+            'services="logd networkd timed audiod micd waked sttd ledd buttond btd '
             'airplayd ttsd agentd web"'
         )
         self.assertIn(service_line, init_script)
+        self.assertLess(service_line.index("audiod"), service_line.index("buttond"))
+        self.assertLess(service_line.index("ledd"), service_line.index("buttond"))
         self.assertLess(service_line.index("waked"), service_line.index("sttd"))
         self.assertLess(service_line.index("sttd"), service_line.index("agentd"))
         self.assertLess(service_line.index("ttsd"), service_line.index("agentd"))
@@ -1909,6 +2052,29 @@ class PolicyTests(unittest.TestCase):
             'if [ "$CONFIRM_MODE" = ota ]; then', init
         )
 
+    def test_fresh_install_requires_marker_and_persistent_hash_transaction(self) -> None:
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        cleanup = (TOOLS_DIR / "initramfs/libreecho-data-cleanup").read_text()
+        self.assertIn("first-install-confirm", builder)
+        self.assertIn("first-install-marker-absent-or-invalid", init)
+        self.assertIn("first-install.pending", init)
+        self.assertIn("boot_sha256=", init)
+        self.assertIn("first-install.confirmed", init)
+        self.assertIn("$BB sync", init)
+        self.assertIn("first-install.pending", cleanup)
+        self.assertIn("first-install.confirmed", cleanup)
+        self.assertNotIn("no pending OTA", init)
+
+    def test_fresh_install_finalization_preserves_pending_on_commit_failure(self) -> None:
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        finalization = init[init.index("first_install_confirmed="):init.index("fi\n        # Never restart", init.index("first_install_confirmed="))]
+        self.assertIn("if $BB sed", finalization)
+        self.assertIn("$BB mv", finalization)
+        self.assertIn("$BB rm -f \"$first_install_confirmed\"", finalization)
+        self.assertIn("first-install-confirmation-record-finalization-failed", finalization)
+        self.assertLess(finalization.index("$BB mv"), finalization.index("$BB rm -f /data/libreecho/update/first-install.pending"))
+
     def test_ota_vm_asserts_each_phase_and_resets_bcb(self) -> None:
         vm = TOOLS_DIR / "ota-test-vm"
         init = (vm / "build-initramfs.sh").read_text()
@@ -2004,7 +2170,7 @@ class PolicyTests(unittest.TestCase):
         """Status must expose preserved payload and running-daemon identities."""
         updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
         for feature, daemon in (
-            ("airplay2", "libreecho-airplayd"),
+            ("airplay2", "libreecho-audio-engine"),
             ("tts", "libreecho-ttsd"),
             ("wakeword", "libreecho-waked"),
             ("stt", "libreecho-sttd"),
@@ -2025,6 +2191,156 @@ class PolicyTests(unittest.TestCase):
         self.assertIn('"/proc/$pid/exe"', updater)
         status_block = updater[updater.index("    status)"):]
         self.assertIn("feature_status", status_block)
+
+    def test_preserve_ota_manifest_binds_payload_and_daemon_identities(self) -> None:
+        """A preserve OTA must carry every identity that the device retains."""
+        from nacl.signing import SigningKey
+
+        daemon_paths = {
+            "airplay2": ("airplay", "usr/local/sbin/libreecho-audio-engine"),
+            "tts": ("tts", "usr/local/sbin/libreecho-ttsd"),
+            "wakeword": ("wakeword", "usr/local/sbin/libreecho-waked"),
+            "stt": ("stt", "usr/local/sbin/libreecho-sttd"),
+            "assistant": ("assistant", "usr/local/sbin/libreecho-agentd"),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            boot = root / "boot.img"
+            boot_bytes = b"ANDROID!" + bytes((16 * 1024 * 1024) - 8)
+            boot.write_bytes(boot_bytes)
+            key = SigningKey.generate()
+            private = root / "private.hex"
+            public = root / "public.hex"
+            build_manifest = root / "build-manifest.json"
+            private.write_text(key.encode().hex() + "\n")
+            public.write_text(key.verify_key.encode().hex() + "\n")
+            features = {}
+            for feature, (manifest_feature, daemon) in daemon_paths.items():
+                features[manifest_feature] = {
+                    "payload": {
+                        "sha256": "a" * 64,
+                        "size": 123,
+                        "manifest_sha256": "b" * 64,
+                        "files": {daemon: {"sha256": "c" * 64}},
+                    },
+                }
+            build_manifest.write_text(json.dumps({
+                "image_profile": "ota",
+                "service_profile": "production",
+                "feature_policy": "preserve",
+                "update_channel": "dev",
+                "output": {
+                    "sha256": hashlib.sha256(boot_bytes).hexdigest(),
+                    "size": len(boot_bytes),
+                },
+                **features,
+            }))
+            output = root / "update.ota.tar"
+            subprocess.run([
+                sys.executable, str(TOOLS_DIR / "ota/make_ota_bundle.py"),
+                "--boot-image", str(boot), "--build-manifest", str(build_manifest),
+                "--version", "test-v1", "--signing-key", str(private),
+                "--public-key", str(public), "--service-profile", "production",
+                "--feature-policy", "preserve", "--update-channel", "dev",
+                "--output", str(output),
+            ], check=True, capture_output=True, text=True)
+            with tarfile.open(output, "r:") as archive:
+                manifest = archive.extractfile("manifest").read().decode()
+            self.assertIn("manifest_version=2\n", manifest)
+            for feature in daemon_paths:
+                self.assertIn(f"feature_{feature}_payload_sha256={'a' * 64}\n", manifest)
+                self.assertIn(f"feature_{feature}_payload_size=123\n", manifest)
+                self.assertIn(f"feature_{feature}_manifest_sha256={'b' * 64}\n", manifest)
+                self.assertIn(f"feature_{feature}_daemon_sha256={'c' * 64}\n", manifest)
+
+    def test_preserve_ota_bundle_rejects_missing_retained_identity(self) -> None:
+        """A preserve OTA without candidate daemon identities must fail closed."""
+        from nacl.signing import SigningKey
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            boot = root / "boot.img"
+            boot_bytes = b"ANDROID!" + bytes((16 * 1024 * 1024) - 8)
+            boot.write_bytes(boot_bytes)
+            key = SigningKey.generate()
+            private = root / "private.hex"
+            public = root / "public.hex"
+            build_manifest = root / "build-manifest.json"
+            private.write_text(key.encode().hex() + "\n")
+            public.write_text(key.verify_key.encode().hex() + "\n")
+            build_manifest.write_text(json.dumps({
+                "image_profile": "ota",
+                "service_profile": "production",
+                "feature_policy": "preserve",
+                "update_channel": "dev",
+                "output": {
+                    "sha256": hashlib.sha256(boot_bytes).hexdigest(),
+                    "size": len(boot_bytes),
+                },
+            }))
+            result = subprocess.run([
+                sys.executable, str(TOOLS_DIR / "ota/make_ota_bundle.py"),
+                "--boot-image", str(boot), "--build-manifest", str(build_manifest),
+                "--version", "test-v1", "--signing-key", str(private),
+                "--public-key", str(public), "--service-profile", "production",
+                "--feature-policy", "preserve", "--update-channel", "dev",
+                "--output", str(root / "update.ota.tar"),
+            ], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("preserve policy requires candidate feature identities", result.stderr)
+
+    def test_preserve_installer_fails_before_boot_write_on_identity_mismatch(self) -> None:
+        """The updater must gate retained daemon identity before any block write."""
+        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
+        self.assertIn("verify_preserved_feature_identity()", updater)
+        self.assertIn("preserve_feature_payload_mismatch", updater)
+        self.assertIn("preserve_feature_daemon_mismatch", updater)
+        self.assertIn("feature_daemon_required()", updater)
+        self.assertIn("integrations & 1", updater)
+        self.assertIn("if ! feature_daemon_required \"$feature\"; then", updater)
+        install = updater[updater.index('install_package()'):]
+        verify_call = install.index('verify_preserved_feature_identity')
+        boot_write = install.index('dd if="$STAGING/boot.img" of="$target_device"')
+        self.assertLess(verify_call, boot_write)
+
+    def test_preserve_installer_uses_installed_profile_for_transitions(self) -> None:
+        """Daemon requirements must describe the running image, not the candidate."""
+        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
+        self.assertIn(
+            'current=$($BB cat /etc/libreecho/service-profile 2>/dev/null)',
+            updater,
+        )
+        self.assertIn("CURRENT_SERVICE_PROFILE=$current", updater)
+        self.assertIn('[ "$CURRENT_SERVICE_PROFILE" != diagnostic ] || return 1', updater)
+        self.assertNotIn('[ "${SERVICE_PROFILE:-production}" != diagnostic ] || return 1', updater)
+        # A diagnostic -> production install must validate retained files but
+        # must not require production daemons before the reboot boundary.
+        self.assertIn('SERVICE_PROFILE=$(manifest_value service_profile)', updater)
+        daemon_guard = updater[updater.index("feature_daemon_required()"):updater.index("write_preserved_feature_identity()")]
+        self.assertNotIn("SERVICE_PROFILE=", daemon_guard)
+
+    def test_preserve_pending_transaction_revalidates_after_staging(self) -> None:
+        """Confirmation must use identities persisted before feature staging."""
+        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
+        install = updater[updater.index("install_package()"):updater.index("confirm_pending()")]
+        writer = updater[updater.index("write_preserved_feature_identity()"):updater.index("verify_preserved_feature_identity()")]
+        confirm = updater[updater.index("confirm_pending()"):]
+        self.assertIn("write_preserved_feature_identity", install)
+        for field in ("payload_sha256", "payload_size", "manifest_sha256", "daemon_sha256"):
+            self.assertIn(f"feature_${{feature}}_${{field}}", writer)
+        self.assertIn(
+            "feature_policy=$($BB sed -n 's/^feature_policy=//p' \"$PENDING\")",
+            confirm,
+        )
+        self.assertIn("verify_preserved_feature_identity pending", confirm)
+        verify = updater[updater.index("verify_preserved_feature_identity()"):updater.index("clear_exact_development_marker()")]
+        self.assertIn("preserved_identity_value", verify)
+        self.assertIn("preserve_feature_payload_mismatch", verify)
+        self.assertIn("preserve_feature_manifest_mismatch", verify)
+        self.assertLess(
+            confirm.index("verify_preserved_feature_identity pending"),
+            confirm.index('"$BOOTCTL" confirm'),
+        )
 
     def test_host_ota_path_is_explicit_and_uses_guarded_updater(self) -> None:
         host = pipeline_file("ota.sh").read_text()
