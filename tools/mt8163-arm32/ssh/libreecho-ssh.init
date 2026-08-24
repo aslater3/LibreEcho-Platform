@@ -98,12 +98,40 @@ sync_accounts()
     umask 077
     account_list="$STATE_ROOT/accounts"
     account_tmp="$STATE_ROOT/accounts.tmp"
+    uid_map="$STATE_ROOT/uids"
+    uid_map_tmp="$STATE_ROOT/uids.tmp"
+    [ -e "$account_list" ] || {
+        : > "$account_list" || return 1
+        $BB chmod 0600 "$account_list" || return 1
+    }
+    [ -e "$uid_map" ] || {
+        : > "$uid_map" || return 1
+        $BB chmod 0600 "$uid_map" || return 1
+    }
+    $BB cp "$uid_map" "$uid_map_tmp" || return 1
     {
         printf 'root:x:0:0:root:/root:/bin/sh\n'
-        $BB awk -F: -v home_root="$HOME_ROOT" -v list="$account_tmp" '
+        $BB awk -F: -v old="$uid_map" -v home_root="$HOME_ROOT" \
+                -v list="$account_tmp" -v map="$uid_map_tmp" '
+            FILENAME == old {
+                if (NF == 2 && $2 ~ /^[0-9]+$/) {
+                    known[tolower($1)] = $2
+                    if ($2 >= next_uid) next_uid = $2 + 1
+                }
+                next
+            }
+            BEGIN { next_uid = 1000 }
             $0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/ { next }
-            { n++; printf "%s:x:%d:1000:LibreEcho SSH:%s/%s:/bin/sh\n", $1, 999 + n, home_root, $1; printf "%s:%d\n", $1, 999 + n > list }
-        ' "$USERS_FILE"
+            {
+                if (!(tolower($1) in known)) {
+                    known[tolower($1)] = next_uid++
+                    printf "%s:%d\n", tolower($1), known[tolower($1)] >> map
+                }
+                uid = known[tolower($1)]
+                printf "%s:x:%d:1000:LibreEcho SSH:%s/%s:/bin/sh\n", $1, uid, home_root, $1
+                printf "%s:%d\n", $1, uid > list
+            }
+        ' "$account_list" "$USERS_FILE"
     } > "$PASSWD_FILE.le.tmp" || return 1
     {
         printf 'root:x:0:\n'
@@ -116,7 +144,7 @@ sync_accounts()
     if $BB cmp -s "$account_tmp" "$account_list" 2>/dev/null &&
             $BB cmp -s "$PASSWD_FILE.le.tmp" "$PASSWD_FILE" 2>/dev/null &&
             $BB cmp -s "$GROUP_FILE.le.tmp" "$GROUP_FILE" 2>/dev/null; then
-        $BB rm -f "$PASSWD_FILE.le.tmp" "$GROUP_FILE.le.tmp" "$account_tmp"
+        $BB rm -f "$PASSWD_FILE.le.tmp" "$GROUP_FILE.le.tmp" "$account_tmp" "$uid_map_tmp"
         return 0
     fi
 
@@ -138,7 +166,8 @@ sync_accounts()
 
     $BB mv -f "$PASSWD_FILE.le.tmp" "$PASSWD_FILE" || return 1
     $BB mv -f "$GROUP_FILE.le.tmp" "$GROUP_FILE" || return 1
-    $BB mv -f "$account_tmp" "$account_list"
+    $BB mv -f "$account_tmp" "$account_list" || return 1
+    $BB mv -f "$uid_map_tmp" "$uid_map"
 }
 
 dropbear_running()
@@ -173,12 +202,12 @@ start_dropbear()
     $BB chmod 0700 "$HOSTKEY_ROOT" || return 1
     if [ ! -s "$HOSTKEY_ROOT/dropbear_ed25519_host_key" ]; then
         $DROPBEARKEY -t ed25519 -f "$HOSTKEY_ROOT/dropbear_ed25519_host_key" \
-            >/tmp/libreecho-ssh-keygen.log 2>&1 || return 1
+            >/run/libreecho-ssh/keygen.log 2>&1 || return 1
         $BB chmod 0600 "$HOSTKEY_ROOT/dropbear_ed25519_host_key" || return 1
     fi
     $DROPBEAR -F -E -P "$DROPBEAR_PIDFILE" \
         -r "$HOSTKEY_ROOT/dropbear_ed25519_host_key" -p 0.0.0.0:22 \
-        >/tmp/libreecho-dropbear.log 2>&1 &
+        >/run/libreecho-ssh/dropbear.log 2>&1 &
     $BB sleep 1
     dropbear_running
 }
