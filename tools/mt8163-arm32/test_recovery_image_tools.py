@@ -1423,27 +1423,58 @@ class SourceTests(unittest.TestCase):
         self.assertIn("wireless-tools-COPYING", image_builder)
         self.assertIn("wireless-tools-COPYING", verifier)
 
-    def test_ssh_password_hash_is_salted_and_private(self) -> None:
+    def test_ssh_uses_deferred_webui_auth_and_packages_scp_server(self) -> None:
         dropbear_builder = TOOLS_DIR / "ssh/build_dropbear.sh"
-        self.assertIn("-DUSE_DEV_PTMX", dropbear_builder.read_text())
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            valid = root / "hash"
-            valid.write_text("$6$LibreEchoTest$0123456789012345678901234567890123456789012\n")
-            valid.chmod(0o600)
-            self.assertEqual(
-                builder.read_ssh_password_hash(valid),
-                "$6$LibreEchoTest$0123456789012345678901234567890123456789012",
-            )
-            for value in ("password\n", "!locked\n", "\n", "$6$missing-checksum\n"):
-                invalid = root / ("invalid-" + str(len(value)))
-                invalid.write_text(value)
-                invalid.chmod(0o600)
-                with self.subTest(value=value), self.assertRaises(SystemExit):
-                    builder.read_ssh_password_hash(invalid)
-            valid.chmod(0o622)
-            with self.assertRaises(SystemExit):
-                builder.read_ssh_password_hash(valid)
+        image_builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        image_verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        supervisor = (TOOLS_DIR / "ssh/libreecho-ssh.init").read_text()
+        recovery_init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        auth_source = (TOOLS_DIR / "ssh/libreecho-auth.c").read_text()
+        localoptions = (TOOLS_DIR / "ssh/localoptions.h").read_text()
+        patch_source = (TOOLS_DIR / "ssh/patches/0002-webui-users-password-auth.patch").read_text()
+        self.assertIn('PROGRAMS="dropbear dropbearkey scp"', dropbear_builder.read_text())
+        self.assertIn("dbutil.o", patch_source)
+        self.assertIn("scp_sha256", dropbear_builder.read_text())
+        self.assertIn('"usr/bin/scp"', image_builder)
+        self.assertIn('"usr/bin/scp"', image_verifier)
+        self.assertIn("--expected-scp-sha256", image_verifier)
+        self.assertNotIn("--ssh-root-password-hash", image_builder)
+        self.assertNotIn("/etc/shadow", image_builder)
+        self.assertNotIn('"root_login": True', image_builder)
+        self.assertIn('"authentication": "webui-users-sha256"', image_builder)
+        self.assertIn('"privilege_policy": "non-root-ephemeral-users"', image_builder)
+        self.assertIn("/data/libreecho/config/users", supervisor)
+        self.assertIn("waiting-for-valid-webui-users", supervisor)
+        self.assertIn("stop_dropbear", supervisor)
+        self.assertIn("-t ed25519", supervisor)
+        self.assertIn('name == "root"', supervisor)
+        self.assertIn('name == "."', supervisor)
+        self.assertIn('name == ".."', supervisor)
+        self.assertIn('STATE_ROOT=/run/libreecho-ssh', supervisor)
+        self.assertIn('chmod 0700 "$STATE_ROOT"', supervisor)
+        self.assertIn('uid_map="$STATE_ROOT/uids"', supervisor)
+        self.assertIn('known[tolower($1)] = $2', supervisor)
+        self.assertIn('printf "%s:%d\\n", tolower($1), known[tolower($1)] >> map', supervisor)
+        self.assertIn('>/run/libreecho-ssh/keygen.log 2>&1', supervisor)
+        self.assertIn('>/run/libreecho-ssh/dropbear.log 2>&1', supervisor)
+        self.assertIn('/run/libreecho-control/runme', recovery_init)
+        self.assertNotIn('/tmp/runme.active', recovery_init)
+        self.assertNotIn('/tmp/result', recovery_init)
+        self.assertIn('chmod 0700 /run/libreecho-control', recovery_init)
+        self.assertIn('strcmp(folded, "root") == 0', auth_source)
+        self.assertIn('strcmp(folded, ".") == 0', auth_source)
+        self.assertIn('memset(&users[users_count]', auth_source)
+        self.assertIn("digest[i] =", auth_source)
+        self.assertIn("web_users_file_ready()", recovery_init)
+        self.assertIn("if web_users_file_ready; then", recovery_init)
+        self.assertNotIn("[ ! -x /etc/init.d/libreecho-ssh.init ] ||", recovery_init)
+        sync_accounts = supervisor.split("sync_accounts()", 1)[1].split("dropbear_running()", 1)[0]
+        self.assertIn('chmod 0711 "$HOME_ROOT"', sync_accounts)
+        self.assertIn('cmp -s "$account_tmp" "$account_list"', sync_accounts)
+        self.assertIn("old_username", sync_accounts)
+        self.assertNotIn('$BB rm -rf "$HOME_ROOT"', sync_accounts)
+        self.assertIn("scp", image_verifier)
+        self.assertIn("DROPBEAR_SVR_PUBKEY_AUTH 0", localoptions)
 
 
 class VendorAssetContractTests(unittest.TestCase):
@@ -1986,7 +2017,8 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("reboot-supervisor-started", source)
         self.assertIn("/tmp/reboot.request", source)
         self.assertIn("runme-timeout", source)
-        self.assertIn("/tmp/runme.cancel", source)
+        self.assertIn("/run/libreecho-control/runme.cancel", source)
+        self.assertNotIn("/tmp/runme.cancel", source)
         self.assertIn("wmt_stock_compat", source)
         self.assertIn("--no-function-on", source)
         self.assertIn("--ok --once", source)

@@ -39,7 +39,7 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "9ecdb024c95c2e5cc32d02eb7ed625f1e20b78aa6e3d11670ce6b35a78380b5b"
+RECOVERY_INIT_SHA256 = "aaf587b382c83af4883b7585fc92ff88441f0539b88d56e5e56c1ec1f53c2b90"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
@@ -51,9 +51,6 @@ WPA_SOURCE_URL = "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz"
 WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
-SSH_PASSWORD_HASH_RE = re.compile(
-    r"\$(?:1|5|6|2[abxy]?|y|gy)\$[^$:\r\n]{1,64}\$[^:\r\n]{1,512}\Z"
-)
 
 CONNECTIVITY_ASSET_REQUIREMENTS = {
     "ROMv2_lm_patch_1_0_hdr.bin": {
@@ -1451,89 +1448,69 @@ def add_assistant_external_payload(payload: Path, payload_manifest: Path,
     }
 
 
-def read_ssh_password_hash(path: Path) -> str:
-    """Read one build-local crypt(3) hash without accepting a plaintext secret."""
-    if path.is_symlink() or not path.is_file():
-        raise SystemExit(f"ERROR: SSH password hash is not a regular file: {path}")
-    if path.stat().st_mode & 0o022:
-        raise SystemExit(f"ERROR: SSH password hash is group/world-writable: {path}")
-    data = read(path)
-    if data.endswith(b"\n"):
-        data = data[:-1]
-    if not data or b"\n" in data or b"\r" in data:
-        raise SystemExit("ERROR: SSH password hash must be exactly one line")
-    try:
-        value = data.decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise SystemExit("ERROR: SSH password hash is not ASCII") from exc
-    if not SSH_PASSWORD_HASH_RE.fullmatch(value):
-        raise SystemExit("ERROR: SSH password hash is not a supported salted crypt(3) hash")
-    return value
-
-
-def add_ssh_bundle(stage: Path, dropbear: Path, dropbearkey: Path,
-                   password_hash: Path, manifest: dict[str, object]) -> None:
-    """Install the opt-in password-only root SSH bundle."""
-    hash_value = read_ssh_password_hash(password_hash)
+def add_ssh_bundle(stage: Path, dropbear: Path, dropbearkey: Path, scp: Path,
+                   manifest: dict[str, object]) -> None:
+    """Install the opt-in deferred WebUI-account SSH bundle."""
     files: dict[str, object] = {}
-
-    (stage / "root").mkdir(parents=True, exist_ok=True)
-    (stage / "root").chmod(0o755)
-    (stage / "etc/dropbear").mkdir(parents=True, exist_ok=True)
-    (stage / "etc/dropbear").chmod(0o700)
+    ssh_init = Path(__file__).resolve().parent / "ssh/libreecho-ssh.init"
+    if ssh_init.is_symlink() or not ssh_init.is_file():
+        raise SystemExit(f"ERROR: SSH supervisor is not a regular file: {ssh_init}")
 
     account_files = {
         "etc/passwd": (b"root:x:0:0:root:/root:/bin/sh\n", 0o644),
-        "etc/group": (b"root:x:0:\n", 0o644),
+        "etc/group": (b"root:x:0:\nlibreecho-ssh:x:1000:\n", 0o644),
         "etc/shells": (b"/bin/sh\n", 0o644),
-        "etc/shadow": (f"root:{hash_value}:0:0:99999:7:::\n".encode("ascii"), 0o600),
     }
     for relative, (data, mode) in account_files.items():
         target = stage / relative
         if target.exists() or target.is_symlink():
             raise SystemExit(f"ERROR: SSH account file collides with {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
         target.chmod(mode)
-        record: dict[str, object] = {
+        files[relative] = {
             "path": "/" + relative,
+            "sha256": sha256(data),
             "size": len(data),
             "mode": f"{mode:04o}",
         }
-        if relative == "etc/shadow":
-            record["secret_content_not_recorded"] = True
-        else:
-            record["sha256"] = sha256(data)
-        files[relative] = record
 
     for relative, source in (
         ("sbin/dropbear", dropbear),
         ("sbin/dropbearkey", dropbearkey),
+        ("usr/bin/scp", scp),
+        ("etc/init.d/libreecho-ssh.init", ssh_init),
     ):
         if source.is_symlink() or not source.is_file():
-            raise SystemExit(f"ERROR: SSH binary is not a regular file: {source}")
+            raise SystemExit(f"ERROR: SSH asset is not a regular file: {source}")
         data = read(source)
-        if b"authorized_keys" in data:
+        if relative in {"sbin/dropbear", "sbin/dropbearkey", "usr/bin/scp"} and b"authorized_keys" in data:
             raise SystemExit(f"ERROR: public-key authorization marker found in {source}")
         target = stage / relative
         if target.exists() or target.is_symlink():
-            raise SystemExit(f"ERROR: SSH binary collides with {target}")
+            raise SystemExit(f"ERROR: SSH asset collides with {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
         target.chmod(0o755)
-        files[relative] = {
+        record: dict[str, object] = {
             "path": str(source.resolve()),
             "sha256": sha256(data),
             "size": len(data),
             "mode": "0755",
-            "elf": require_elf_contract(target, 0x05000400, None, (), False),
         }
+        if relative in {"sbin/dropbear", "sbin/dropbearkey", "usr/bin/scp"}:
+            record["elf"] = require_elf_contract(target, 0x05000400, None, (), False)
+        files[relative] = record
 
     manifest["ssh"] = {
         "enabled": True,
-        "activation": "manual-only",
-        "autostart": False,
-        "authentication": "password-only",
+        "activation": "deferred-after-webui-bootstrap",
+        "autostart": True,
+        "authentication": "webui-users-sha256",
+        "account_source": "/data/libreecho/config/users",
+        "privilege_policy": "non-root-ephemeral-users",
         "public_key_auth": False,
-        "root_login": True,
+        "root_login": False,
         "host_keys": "generated-ephemerally-under-/tmp/dropbear",
         "files": files,
     }
@@ -1971,13 +1948,13 @@ def main() -> None:
                         help="manifest for the external assistant feature payload")
 
     parser.add_argument("--ssh-enabled", action="store_true",
-                        help="explicitly enable the password-only root SSH bundle")
+                        help="explicitly enable deferred WebUI-account SSH")
     parser.add_argument("--dropbear", type=Path,
-                        help="static ARM32 password-only Dropbear server")
+                        help="static ARM32 Dropbear server with WebUI auth")
     parser.add_argument("--dropbearkey", type=Path,
                         help="static ARM32 Dropbear host-key utility")
-    parser.add_argument("--ssh-root-password-hash", type=Path,
-                        help="build-local salted root crypt(3) hash file")
+    parser.add_argument("--scp", type=Path,
+                        help="static ARM32 scp server-side transfer executable")
 
     parser.add_argument("--wmt-config-helper", type=Path,
                         help="reviewed static ARM32 configure-only WMT helper")
@@ -2056,7 +2033,7 @@ def main() -> None:
     ssh_options = {
         "dropbear": args.dropbear,
         "dropbearkey": args.dropbearkey,
-        "ssh_root_password_hash": args.ssh_root_password_hash,
+        "scp": args.scp,
     }
     ssh_enabled = args.ssh_enabled
     if ssh_enabled and not all(value is not None for value in ssh_options.values()):
@@ -2274,11 +2251,13 @@ def main() -> None:
         },
         "ssh": {
             "enabled": False,
-            "activation": "manual-only",
-            "autostart": False,
-            "authentication": "password-only",
+            "activation": "deferred-after-webui-bootstrap",
+            "autostart": True,
+            "authentication": "webui-users-sha256",
+            "account_source": "/data/libreecho/config/users",
+            "privilege_policy": "non-root-ephemeral-users",
             "public_key_auth": False,
-            "root_login": True,
+            "root_login": False,
             "host_keys": "generated-ephemerally-under-/tmp/dropbear",
             "files": {},
         },
@@ -2388,7 +2367,7 @@ def main() -> None:
         if ssh_enabled:
             add_ssh_bundle(
                 stage, args.dropbear.resolve(), args.dropbearkey.resolve(),
-                args.ssh_root_password_hash.resolve(), manifest,
+                args.scp.resolve(), manifest,
             )
         if connectivity_enabled:
             add_connectivity_bundle(

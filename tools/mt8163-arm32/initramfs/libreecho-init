@@ -36,7 +36,8 @@ case "$FEATURE_POLICY_VALUE" in
         ;;
 esac
 
-$BB mkdir -p /dev/pts /dev/usb-ffs/adb /dev/socket /proc /sys /tmp
+$BB mkdir -p /dev/pts /dev/usb-ffs/adb /dev/socket /proc /sys /tmp /run/libreecho-control
+$BB chmod 0700 /run/libreecho-control
 $BB chmod 0777 /tmp
 
 # Create /dev/null before the first stderr redirection.  If it is absent, a
@@ -79,6 +80,42 @@ log()
 	# the old /dev/kmsg writer does not default to INFO.
 	printf '<6>%s\n' "$msg" > /dev/kmsg 2>/dev/null
 	printf '%s\n' "$msg" > /dev/console 2>/dev/null
+}
+
+# Production LAN exposure requires a valid WebUI account database even when
+# the optional SSH bundle is absent. Keep this validator aligned with the SSH
+# supervisor's fail-closed account contract.
+web_users_file_ready()
+{
+	users_file=/data/libreecho/config/users
+	[ -f "$users_file" ] && [ ! -L "$users_file" ] || return 1
+	[ "$($BB stat -c %u "$users_file" 2>/dev/null)" = 0 ] || return 1
+	[ "$($BB stat -c %a "$users_file" 2>/dev/null)" = 600 ] || return 1
+	$BB awk -F: '
+		function ishex(value,    rest, removed) {
+			rest = value
+			removed = gsub(/[0-9A-Fa-f]/, "", rest)
+			return removed == length(value)
+		}
+		BEGIN { good = 1; count = 0 }
+		{
+			if (length($0) > 255) { good = 0; next }
+			if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/) next
+			name = tolower($1)
+			if (NF != 4 || length($1) < 1 || length($1) > 31 ||
+				name == "root" || name == "." || name == ".." ||
+				$1 !~ /^[A-Za-z0-9._-]+$/ ||
+				$2 != "sha256" || length($3) < 16 || length($3) > 64 ||
+				!ishex($3) || length($4) != 64 || !ishex($4)) {
+				good = 0
+				next
+			}
+			if (name in seen) good = 0
+			seen[name] = 1
+			count++
+		}
+		END { exit (good && count > 0 && count <= 8) ? 0 : 1 }
+	' "$users_file"
 }
 
 if [ "$SERVICE_PROFILE_INVALID" -eq 1 ]; then
@@ -344,6 +381,14 @@ else
     log vendor-assets-import-skipped
 fi
 set_boot_hostname || true
+
+if [ -x /etc/init.d/libreecho-ssh.init ]; then
+    if /etc/init.d/libreecho-ssh.init start >/tmp/libreecho-ssh.init.log 2>&1; then
+        log ssh-supervisor-started
+    else
+        log ssh-supervisor-start-failed
+    fi
+fi
 
 expdb_devno=$($BB cat "$EXPDB_SYS/dev" 2>/dev/null)
 expdb_major=${expdb_devno%:*}
@@ -624,17 +669,19 @@ RUNME_TIMEOUT=${LIBREECHO_RUNME_TIMEOUT:-120}
 runme_loop()
 {
     while true; do
-        if [ -f /tmp/runme ] && [ ! -e /tmp/runme.active ]; then
-            $BB mv /tmp/runme /tmp/runme.active
-            $BB rm -f /tmp/runme.cancel
-            printf 'LIBREECHO_RUNME_STARTED\n' > /tmp/runme.status
-            $BB setsid $BB timeout -k 2 "$RUNME_TIMEOUT" /bin/busybox sh /tmp/runme.active > /tmp/result 2>&1 &
+        if [ -f /run/libreecho-control/runme ] &&
+                [ ! -e /run/libreecho-control/runme.active ]; then
+            $BB mv /run/libreecho-control/runme /run/libreecho-control/runme.active
+            $BB rm -f /run/libreecho-control/runme.cancel
+            printf 'LIBREECHO_RUNME_STARTED\n' > /run/libreecho-control/runme.status
+            $BB setsid $BB timeout -k 2 "$RUNME_TIMEOUT" /bin/busybox sh \
+                /run/libreecho-control/runme.active > /run/libreecho-control/result 2>&1 &
             runme_pid=$!
             cancelled=0
             while $BB kill -0 "$runme_pid" 2>/dev/null; do
-                if [ -f /tmp/runme.cancel ]; then
+                if [ -f /run/libreecho-control/runme.cancel ]; then
                     cancelled=1
-                    $BB rm -f /tmp/runme.cancel
+                    $BB rm -f /run/libreecho-control/runme.cancel
                     log runme-cancel-requested
                     $BB kill -TERM -- "-$runme_pid" 2>/dev/null
                     $BB sleep 1
@@ -647,18 +694,18 @@ runme_loop()
             runme_rc=$?
             if [ "$cancelled" -eq 1 ]; then
                 runme_rc=125
-                printf 'LIBREECHO_RUNME_CANCELLED\n' >> /tmp/result
-                printf 'LIBREECHO_RUNME_CANCELLED\n' > /tmp/runme.status
+                printf 'LIBREECHO_RUNME_CANCELLED\n' >> /run/libreecho-control/result
+                printf 'LIBREECHO_RUNME_CANCELLED\n' > /run/libreecho-control/runme.status
             elif [ "$runme_rc" -eq 124 ]; then
                 $BB kill -KILL -- "-$runme_pid" 2>/dev/null
-                printf 'LIBREECHO_RUNME_TIMEOUT=%s\n' "$RUNME_TIMEOUT" >> /tmp/result
-                printf 'LIBREECHO_RUNME_TIMEOUT=%s\n' "$RUNME_TIMEOUT" > /tmp/runme.status
+                printf 'LIBREECHO_RUNME_TIMEOUT=%s\n' "$RUNME_TIMEOUT" >> /run/libreecho-control/result
+                printf 'LIBREECHO_RUNME_TIMEOUT=%s\n' "$RUNME_TIMEOUT" > /run/libreecho-control/runme.status
                 log runme-timeout
             else
-                printf 'LIBREECHO_RUNME_RC=%s\n' "$runme_rc" >> /tmp/result
-                printf 'LIBREECHO_RUNME_RC=%s\n' "$runme_rc" > /tmp/runme.status
+                printf 'LIBREECHO_RUNME_RC=%s\n' "$runme_rc" >> /run/libreecho-control/result
+                printf 'LIBREECHO_RUNME_RC=%s\n' "$runme_rc" > /run/libreecho-control/runme.status
             fi
-            $BB rm -f /tmp/runme.active
+            $BB rm -f /run/libreecho-control/runme.active
         fi
         $BB sleep 1
     done
@@ -902,7 +949,7 @@ start_ui_services()
         if [ -x "$script" ]; then
             if [ "$service" = web ] && [ "$SERVICE_PROFILE" = production ]; then
                 web_listen=127.0.0.1:8080
-                if [ -r /data/libreecho/config/users ]; then
+                if web_users_file_ready; then
                     web_listen=0.0.0.0:8080
                     log ui-web-production-authenticated-lan
                 else
