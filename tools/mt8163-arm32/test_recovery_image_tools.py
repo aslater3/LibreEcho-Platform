@@ -1725,7 +1725,7 @@ class PolicyTests(unittest.TestCase):
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
         service_line = (
             'services="logd networkd timed audiod micd waked sttd ledd buttond btd '
-            'airplayd ttsd agentd web"'
+            'airplayd radiod ttsd agentd web"'
         )
         self.assertIn(service_line, init_script)
         self.assertLess(service_line.index("audiod"), service_line.index("buttond"))
