@@ -101,7 +101,8 @@ web_users_file_ready()
 			if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/) next
 			name = tolower($1)
 			if (NF != 4 || length($1) < 1 || length($1) > 31 ||
-				name == "root" || $1 !~ /^[A-Za-z0-9._-]+$/ ||
+				name == "root" || name == "." || name == ".." ||
+				$1 !~ /^[A-Za-z0-9._-]+$/ ||
 				$2 != "sha256" || length($3) < 16 || length($3) > 64 ||
 				!ishex($3) || length($4) != 64 || !ishex($4)) {
 				good = 0

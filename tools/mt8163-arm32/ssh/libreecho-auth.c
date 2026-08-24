@@ -232,16 +232,25 @@ static int le_parse_users(struct le_user_record users[LE_MAX_USERS], size_t *cou
 			if (!le_hex((unsigned char)fields[3][i]))
 				goto invalid;
 		le_fold_username(folded, fields[0]);
-		if (strcmp(folded, "root") == 0)
+		if (strcmp(folded, "root") == 0 || strcmp(folded, ".") == 0 ||
+			strcmp(folded, "..") == 0)
 			goto invalid;
 		for (i = 0; i < users_count; ++i)
 			if (strcmp(users[i].username, folded) == 0)
 				goto invalid;
 		if (users_count == LE_MAX_USERS)
 			goto invalid;
-		strncpy(users[users_count].username, folded, LE_USERNAME_MAX - 1);
-		strncpy(users[users_count].salt, fields[2], LE_SALT_MAX - 1);
-		strncpy(users[users_count].digest, fields[3], LE_DIGEST_MAX - 1);
+		memset(&users[users_count], 0, sizeof(users[users_count]));
+		memcpy(users[users_count].username, folded, LE_USERNAME_MAX - 1);
+		memcpy(users[users_count].salt, fields[2], LE_SALT_MAX - 1);
+		for (i = 0; i < LE_DIGEST_MAX - 1; ++i) {
+			unsigned char c = (unsigned char)fields[3][i];
+			users[users_count].digest[i] =
+				(c >= 'A' && c <= 'F') ? (char)(c - 'A' + 'a') : (char)c;
+		}
+		users[users_count].username[LE_USERNAME_MAX - 1] = '\0';
+		users[users_count].salt[LE_SALT_MAX - 1] = '\0';
+		users[users_count].digest[LE_DIGEST_MAX - 1] = '\0';
 		++users_count;
 	}
 	if (ferror(file) || users_count == 0)

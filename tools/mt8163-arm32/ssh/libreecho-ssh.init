@@ -8,6 +8,7 @@ GROUP_FILE=/etc/group
 SHELLS_FILE=/etc/shells
 HOME_ROOT=/tmp/libreecho-ssh-home
 HOSTKEY_ROOT=/tmp/dropbear
+STATE_ROOT=/run/libreecho-ssh
 SUPERVISOR_PIDFILE=/run/libreecho-ssh-supervisor.pid
 DROPBEAR_PIDFILE=/run/libreecho-dropbear.pid
 STATUS_FILE=/run/libreecho/ssh.status
@@ -58,7 +59,8 @@ users_file_ready()
             if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/) next
             name = tolower($1)
             if (NF != 4 || length($1) < 1 || length($1) > 31 ||
-                name == "root" || $1 !~ /^[A-Za-z0-9._-]+$/ || $2 != "sha256" ||
+                name == "root" || name == "." || name == ".." ||
+                $1 !~ /^[A-Za-z0-9._-]+$/ || $2 != "sha256" ||
                 length($3) < 16 || length($3) > 64 || !ishex($3) ||
                 length($4) != 64 || !ishex($4)) {
                 good = 0
@@ -94,10 +96,11 @@ sync_accounts()
     users_file_ready || return 1
     [ ! -L "$PASSWD_FILE" ] && [ ! -L "$GROUP_FILE" ] || return 1
     umask 077
-    account_list=/tmp/libreecho-ssh-accounts
+    account_list="$STATE_ROOT/accounts"
+    account_tmp="$STATE_ROOT/accounts.tmp"
     {
         printf 'root:x:0:0:root:/root:/bin/sh\n'
-        $BB awk -F: -v home_root="$HOME_ROOT" -v list="$account_list.tmp" '
+        $BB awk -F: -v home_root="$HOME_ROOT" -v list="$account_tmp" '
             $0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/ { next }
             { n++; printf "%s:x:%d:1000:LibreEcho SSH:%s/%s:/bin/sh\n", $1, 999 + n, home_root, $1; printf "%s:%d\n", $1, 999 + n > list }
         ' "$USERS_FILE"
@@ -110,10 +113,10 @@ sync_accounts()
 
     $BB mkdir -p "$HOME_ROOT" || return 1
     $BB chmod 0711 "$HOME_ROOT" || return 1
-    if $BB cmp -s "$account_list.tmp" "$account_list" 2>/dev/null &&
+    if $BB cmp -s "$account_tmp" "$account_list" 2>/dev/null &&
             $BB cmp -s "$PASSWD_FILE.le.tmp" "$PASSWD_FILE" 2>/dev/null &&
             $BB cmp -s "$GROUP_FILE.le.tmp" "$GROUP_FILE" 2>/dev/null; then
-        $BB rm -f "$PASSWD_FILE.le.tmp" "$GROUP_FILE.le.tmp" "$account_list.tmp"
+        $BB rm -f "$PASSWD_FILE.le.tmp" "$GROUP_FILE.le.tmp" "$account_tmp"
         return 0
     fi
 
@@ -121,7 +124,7 @@ sync_accounts()
         while IFS=: read -r old_username _old_uid; do
             [ -n "$old_username" ] || continue
             if ! $BB awk -F: -v user="$old_username" '$1 == user { found = 1 } END { exit found ? 0 : 1 }' \
-                    "$account_list.tmp"; then
+                    "$account_tmp"; then
                 $BB rm -rf "$HOME_ROOT/$old_username" || return 1
             fi
         done < "$account_list"
@@ -131,11 +134,11 @@ sync_accounts()
         $BB mkdir -p "$home" || return 1
         $BB chmod 0700 "$home" || return 1
         $BB chown "$uid:1000" "$home" || return 1
-    done < "$account_list.tmp"
+    done < "$account_tmp"
 
     $BB mv -f "$PASSWD_FILE.le.tmp" "$PASSWD_FILE" || return 1
     $BB mv -f "$GROUP_FILE.le.tmp" "$GROUP_FILE" || return 1
-    $BB mv -f "$account_list.tmp" "$account_list"
+    $BB mv -f "$account_tmp" "$account_list"
 }
 
 dropbear_running()
@@ -223,7 +226,8 @@ supervisor_running()
 start_service()
 {
     supervisor_running && return 0
-    $BB mkdir -p "${SUPERVISOR_PIDFILE%/*}" "${DROPBEAR_PIDFILE%/*}" || return 1
+    $BB mkdir -p "$STATE_ROOT" "${SUPERVISOR_PIDFILE%/*}" "${DROPBEAR_PIDFILE%/*}" || return 1
+    $BB chmod 0700 "$STATE_ROOT" || return 1
     write_static_accounts || return 1
     run_supervisor &
     printf '%s\n' "$!" > "$SUPERVISOR_PIDFILE"
