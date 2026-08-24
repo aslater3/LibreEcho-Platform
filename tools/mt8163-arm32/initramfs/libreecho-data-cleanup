@@ -189,7 +189,14 @@ check_children() {
         for expected in "$@"; do
             [ "$name" = "$expected" ] && allowed=1
         done
-        [ "$allowed" -eq 1 ] && continue
+        if [ "$allowed" -eq 1 ]; then
+            case "$name" in
+                https-cert.pem|https-key.pem|users.sessions|radio-stations.json)
+                    [ -f "$child" ] || { unknown_item "$child"; continue; }
+                    ;;
+            esac
+            continue
+        fi
         # Symlinks and directories are still hard failures everywhere; only a
         # plain file in the tolerant set is downgraded.
         if [ "$TOLERATE_UNKNOWN_FILES" = 1 ] && [ -f "$child" ]; then

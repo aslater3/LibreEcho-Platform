@@ -1053,7 +1053,10 @@ ota_health_confirm_worker()
     # If the stt/tts/assistant payloads are not mounted, libreecho-sttd,
     # libreecho-ttsd and libreecho-agentd cannot run and their sockets can
     # never appear -- so waiting for them only guarantees a rollback.  The
-    # persisted config is consulted second, purely to log intent.
+    # A missing local stack is only valid when the persisted configuration
+    # explicitly selects a remote voice pipeline.  Treat local, missing, and
+    # unknown modes as a failed health check so a broken local payload cannot
+    # be confirmed as a healthy OTA.
     voice_stack_absent()
     {
         # Test the mount, not the directory: the per-feature init scripts run
@@ -1074,8 +1077,20 @@ ota_health_confirm_worker()
                 's/.*"voice_pipeline_mode"[[:space:]]*:[[:space:]]*"\([a-z_-]*\)".*/\1/p' \
                 "$vp_config" 2>/dev/null | $BB head -n 1)
         fi
-        log "ota-health-voice-stack-absent:${vp_mode:-unknown}"
-        return 0
+        case "$vp_mode" in
+            custom|home-assistant)
+                log "ota-health-voice-stack-absent-remote:$vp_mode"
+                return 0
+                ;;
+            local|'')
+                log "ota-health-voice-stack-missing-local:${vp_mode:-unknown}"
+                return 1
+                ;;
+            *)
+                log "ota-health-voice-stack-mode-invalid:$vp_mode"
+                return 1
+                ;;
+        esac
     }
 
     ota_health_services_ready()

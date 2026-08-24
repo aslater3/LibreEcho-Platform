@@ -1496,6 +1496,67 @@ class VendorAssetContractTests(unittest.TestCase):
         self.assertIn("does not grant redistribution rights", text)
         self.assertIn("read-only system_a", text)
 
+    def test_data_contract_file_allowlist_rejects_directories(self) -> None:
+        cleanup = TOOLS_DIR / "initramfs/libreecho-data-cleanup"
+        file_only = (
+            "https-cert.pem", "https-key.pem", "users.sessions",
+            "radio-stations.json",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            data_root = Path(temporary) / "data"
+            config = data_root / "libreecho/config"
+            config.mkdir(parents=True)
+            environment = {
+                **os.environ,
+                "LIBREECHO_DATA_TEST_MODE": "1",
+                "DATA_ROOT": str(data_root),
+            }
+            for name in file_only:
+                path = config / name
+                path.mkdir()
+                result = subprocess.run(
+                    ["/bin/sh", str(cleanup)], env=environment,
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                self.assertEqual(result.returncode, 2, name)
+                path.rmdir()
+                path.write_text("file")
+                result = subprocess.run(
+                    ["/bin/sh", str(cleanup)], env=environment,
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                self.assertEqual(result.returncode, 0, name)
+
+    def test_ui_startup_services_are_built_packaged_and_verified(self) -> None:
+        bundle = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        for binary, script, service in (
+            ("libreecho-buttond", "libreecho-buttond.init", "buttond"),
+            ("libreecho-radiod", "libreecho-radiod.init", "radiod"),
+        ):
+            for source in (bundle, builder, verifier_source):
+                self.assertIn(binary, source)
+                self.assertIn(script, source)
+            self.assertIn(f" {service} ", init)
+
+    def test_missing_local_voice_stack_cannot_confirm_ota(self) -> None:
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        health = init[init.index("    voice_stack_absent()"):init.index(
+            "    ota_health_services_ready()"
+        )]
+        self.assertIn("custom|home-assistant)", health)
+        self.assertIn(
+            'log "ota-health-voice-stack-absent-remote:$vp_mode"', health
+        )
+        self.assertIn("local|'')", health)
+        self.assertIn(
+            'log "ota-health-voice-stack-missing-local:${vp_mode:-unknown}"',
+            health,
+        )
+        self.assertIn("ota-health-voice-stack-mode-invalid", health)
+
     def test_verifier_requires_wlan_firmware_compatibility_path(self) -> None:
         expected = {"etc/firmware": "../lib/firmware"}
         entries = {
