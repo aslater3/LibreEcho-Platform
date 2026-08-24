@@ -48,7 +48,7 @@ WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-INIT_SHA256 = "809253c633414c32058c1a850604818d8271898c4d430f93e021b3bece96f9ba"
+INIT_SHA256 = "aaf587b382c83af4883b7585fc92ff88441f0539b88d56e5e56c1ec1f53c2b90"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -90,6 +90,8 @@ UI_BINARY_NAMES = {
     "usr/local/sbin/libreecho-audiod",
     "usr/local/sbin/libreecho-micd",
     "usr/local/sbin/libreecho-ledd",
+    "usr/local/sbin/libreecho-buttond",
+    "usr/local/sbin/libreecho-radiod",
     "usr/local/sbin/libreecho-btd",
     "usr/local/sbin/libreecho-airplayd",
     "usr/local/sbin/libreecho-wyomingd",
@@ -104,6 +106,8 @@ UI_INIT_NAMES = {
     "etc/init.d/libreecho-audiod.init",
     "etc/init.d/libreecho-micd.init",
     "etc/init.d/libreecho-ledd.init",
+    "etc/init.d/libreecho-buttond.init",
+    "etc/init.d/libreecho-radiod.init",
     "etc/init.d/libreecho-btd.init",
     "etc/init.d/libreecho-airplayd.init",
     "etc/init.d/libreecho-ttsd.init",
@@ -1046,6 +1050,10 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     require_member(
         entries, "etc/libreecho/update-channel",
         sha256((expected_update_channel + "\n").encode()), 0o644,
+    )
+    require_member(
+        entries, "etc/libreecho/first-install-confirm",
+        sha256(b"schema=1\nmode=first-install\nboard=radar_puffin\n"), 0o644,
     )
     ota = manifest.get("ota")
     if not isinstance(ota, dict) or ota.get("format") != "libreecho-ota-v1":

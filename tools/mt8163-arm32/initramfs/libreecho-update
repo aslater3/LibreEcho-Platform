@@ -20,9 +20,30 @@ ALLOW_UNSIGNED=0
 BOOT_SIZE=16777216
 BOOT_SECTORS=32768
 
+# Set once an install has begun writing progress to $STATE, so die() knows the
+# status file is mid-transaction and must not be left there.
+STATE_DIRTY=0
+CURRENT_SERVICE_PROFILE=
+IDENTITY_SOURCE=
+
 die()
 {
     echo "ERROR:$1" >&2
+    # An aborted install used to leave $STATE at whatever step it reached
+    # (typically "verifying" / 5), which makes the update subsystem report a
+    # transfer in progress forever and blocks the next attempt. Record the
+    # failure and the reason instead, so `status` and the web API can explain
+    # what happened rather than showing a phantom running install.
+    if [ "${STATE_DIRTY:-0}" = 1 ] && [ -n "${STATE:-}" ]; then
+        {
+            echo schema=1
+            echo state=failed
+            echo progress=0
+            echo "detail=$1"
+        } > "$STATE.tmp" 2>/dev/null &&
+            $BB mv "$STATE.tmp" "$STATE" 2>/dev/null || $BB rm -f "$STATE.tmp" 2>/dev/null
+        $BB sync 2>/dev/null || true
+    fi
     exit 1
 }
 
@@ -115,13 +136,43 @@ manifest_value()
     $BB sed -n "s/^${key}=//p" "$STAGING/manifest"
 }
 
+preserved_identity_value()
+{
+    key=$1
+    case "$IDENTITY_SOURCE" in
+        manifest)
+            manifest_value "$key"
+            ;;
+        pending)
+            $BB sed -n "s/^${key}=//p" "$PENDING"
+            ;;
+        *)
+            die preserve_identity_source
+            ;;
+    esac
+}
+
+current_service_profile()
+{
+    current=$($BB cat /etc/libreecho/service-profile 2>/dev/null)
+    case "$current" in
+        diagnostic|production)
+            CURRENT_SERVICE_PROFILE=$current
+            ;;
+        *)
+            die current_service_profile_unavailable
+            ;;
+    esac
+}
+
 verify_manifest()
 {
-    expected_keys='format manifest_version board soc architecture version boot_filename boot_size boot_sha256 feature_policy image_profile service_profile update_channel'
+    required_keys='format manifest_version board soc architecture version boot_filename boot_size boot_sha256 feature_policy image_profile service_profile update_channel'
+    allowed_keys="$required_keys feature_airplay2_payload_sha256 feature_airplay2_payload_size feature_airplay2_manifest_sha256 feature_airplay2_daemon_sha256 feature_tts_payload_sha256 feature_tts_payload_size feature_tts_manifest_sha256 feature_tts_daemon_sha256 feature_wakeword_payload_sha256 feature_wakeword_payload_size feature_wakeword_manifest_sha256 feature_wakeword_daemon_sha256 feature_stt_payload_sha256 feature_stt_payload_size feature_stt_manifest_sha256 feature_stt_daemon_sha256 feature_assistant_payload_sha256 feature_assistant_payload_size feature_assistant_manifest_sha256 feature_assistant_daemon_sha256"
     seen=
     while IFS='=' read -r key value; do
         [ -n "$key" ] && [ -n "$value" ] || die manifest_syntax
-        case " $expected_keys " in
+        case " $allowed_keys " in
             *" $key "*) ;;
             *) die manifest_unknown_key ;;
         esac
@@ -133,7 +184,7 @@ verify_manifest()
             *[!A-Za-z0-9._+~:/-]*) die manifest_value_characters ;;
         esac
     done < "$STAGING/manifest"
-    for key in $expected_keys; do
+    for key in $required_keys; do
         case " $seen " in
             *" $key "*) ;;
             *) die manifest_missing_key ;;
@@ -143,6 +194,7 @@ verify_manifest()
     [ "$(manifest_value format)" = libreecho-ota-v1 ] ||
         die manifest_format
     [ "$(manifest_value manifest_version)" = 1 ] ||
+        [ "$(manifest_value manifest_version)" = 2 ] ||
         die manifest_version
     [ "$(manifest_value board)" = radar_puffin ] || die manifest_board
     [ "$(manifest_value soc)" = mt8163 ] || die manifest_soc
@@ -157,6 +209,20 @@ verify_manifest()
         preserve|redistributable|community-noncommercial|exclude) ;;
         *) die manifest_feature_policy ;;
     esac
+    if [ "$FEATURE_POLICY" = preserve ]; then
+        for feature in airplay2 tts wakeword stt assistant; do
+            for field in payload_sha256 payload_size manifest_sha256 daemon_sha256; do
+                value=$(manifest_value "feature_${feature}_${field}")
+                [ -n "$value" ] || die manifest_preserve_feature_identity_missing
+                case "$field:$value" in
+                    payload_sha256:[0-9a-f][0-9a-f]*|manifest_sha256:[0-9a-f][0-9a-f]*|daemon_sha256:[0-9a-f][0-9a-f]*)
+                        [ "${#value}" -eq 64 ] || die manifest_preserve_feature_identity_hash ;;
+                    payload_size:[0-9]*) ;;
+                    *) die manifest_preserve_feature_identity_value ;;
+                esac
+            done
+        done
+    fi
     [ "$(manifest_value image_profile)" = ota ] ||
         die manifest_image_profile
     SERVICE_PROFILE=$(manifest_value service_profile)
@@ -263,7 +329,7 @@ feature_status()
 {
     for feature in airplay2 tts wakeword stt assistant; do
         case "$feature" in
-            airplay2) daemon=libreecho-airplayd ;;
+            airplay2) daemon=libreecho-audio-engine ;;
             tts) daemon=libreecho-ttsd ;;
             wakeword) daemon=libreecho-waked ;;
             stt) daemon=libreecho-sttd ;;
@@ -301,6 +367,84 @@ feature_status()
     done
 }
 
+feature_daemon_required()
+{
+    feature=$1
+    [ "$CURRENT_SERVICE_PROFILE" != diagnostic ] || return 1
+    case "$feature" in
+        airplay2|wakeword) return 0 ;;
+        tts|stt|assistant)
+            integrations=0
+            config=/data/libreecho/config/web-config.json
+            if [ -r "$config" ]; then
+                integrations=$($BB sed -n \
+                    's/^[[:space:]]*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*$/\1/p' \
+                    "$config" 2>/dev/null | $BB head -n 1)
+                case "$integrations" in
+                    ''|*[!0-9]*) integrations=0 ;;
+                esac
+            fi
+            [ $((integrations & 1)) -eq 0 ]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+write_preserved_feature_identity()
+{
+    for feature in airplay2 tts wakeword stt assistant; do
+        for field in payload_sha256 payload_size manifest_sha256 daemon_sha256; do
+            value=$(manifest_value "feature_${feature}_${field}")
+            [ -n "$value" ] || die pending_feature_identity_missing
+            printf '%s\n' "feature_${feature}_${field}=$value"
+        done
+    done
+}
+
+verify_preserved_feature_identity()
+{
+    IDENTITY_SOURCE=$1
+    [ "$IDENTITY_SOURCE" = manifest ] || [ "$IDENTITY_SOURCE" = pending ] ||
+        die preserve_identity_source
+    current_service_profile
+    for feature in airplay2 tts wakeword stt assistant; do
+        case "$feature" in
+            airplay2) daemon=libreecho-audio-engine ;;
+            tts) daemon=libreecho-ttsd ;;
+            wakeword) daemon=libreecho-waked ;;
+            stt) daemon=libreecho-sttd ;;
+            assistant) daemon=libreecho-agentd ;;
+        esac
+        feature_root=/data/libreecho/features/$feature
+        payload=$feature_root/payload.squashfs
+        manifest=$feature_root/manifest.json
+        expected_payload=$(preserved_identity_value "feature_${feature}_payload_sha256")
+        expected_size=$(preserved_identity_value "feature_${feature}_payload_size")
+        expected_manifest=$(preserved_identity_value "feature_${feature}_manifest_sha256")
+        expected_daemon=$(preserved_identity_value "feature_${feature}_daemon_sha256")
+        actual_payload=$(feature_file_sha256 "$payload")
+        [ "$actual_payload" = "$expected_payload" ] ||
+            die preserve_feature_payload_mismatch
+        actual_size=$($BB stat -c %s "$payload" 2>/dev/null)
+        [ "$actual_size" = "$expected_size" ] ||
+            die preserve_feature_payload_size_mismatch
+        actual_manifest=$(feature_file_sha256 "$manifest")
+        [ "$actual_manifest" = "$expected_manifest" ] ||
+            die preserve_feature_manifest_mismatch
+        if ! feature_daemon_required "$feature"; then
+            continue
+        fi
+        pid=$($BB pidof "$daemon" 2>/dev/null | $BB awk '{print $1}')
+        case "$pid" in
+            ''|*[!0-9]*) die preserve_feature_daemon_not_running ;;
+        esac
+        running_daemon=$(feature_file_sha256 "/proc/$pid/exe" 1)
+        [ "$running_daemon" != unavailable ] || die preserve_feature_daemon_unavailable
+        [ "$running_daemon" = "$expected_daemon" ] ||
+            die preserve_feature_daemon_mismatch
+    done
+}
+
 clear_exact_development_marker()
 {
     expdb=/dev/mmcblk0p7
@@ -331,10 +475,14 @@ install_package()
     require_userdata
     lock_take
     seed_channel
+    STATE_DIRTY=1
     state_write verifying 5 package
     extract_and_verify "$package"
     state_write verified 20 "$version"
     bootctl_status
+    if [ "$FEATURE_POLICY" = preserve ]; then
+        verify_preserved_feature_identity manifest
+    fi
 
     state_write writing 30 "$target"
     $BB dd if="$STAGING/boot.img" of="$target_device" bs=4096 \
@@ -351,6 +499,9 @@ install_package()
         echo "boot_sha256=$boot_sha"
         echo "update_channel=$UPDATE_CHANNEL"
         echo "feature_policy=$FEATURE_POLICY"
+        if [ "$FEATURE_POLICY" = preserve ]; then
+            write_preserved_feature_identity
+        fi
     } > "$PENDING.tmp" || die pending_write
     $BB mv "$PENDING.tmp" "$PENDING" || die pending_commit
     $BB sync
@@ -373,6 +524,11 @@ confirm_pending()
     slot=$($BB sed -n 's/^slot=//p' "$PENDING")
     version=$($BB sed -n 's/^version=//p' "$PENDING")
     expected=$($BB sed -n 's/^boot_sha256=//p' "$PENDING")
+    feature_policy=$($BB sed -n 's/^feature_policy=//p' "$PENDING")
+    case "$feature_policy" in
+        preserve|redistributable|community-noncommercial|exclude) ;;
+        *) die pending_feature_policy ;;
+    esac
     update_channel=$($BB sed -n 's/^update_channel=//p' "$PENDING")
     if [ "$update_channel" != dev ] && [ "$update_channel" != stable ]; then
         update_channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
@@ -386,6 +542,12 @@ confirm_pending()
     actual=$($BB dd if="$target_device" bs=4096 count=4096 2>/dev/null |
         $BB sha256sum | $BB awk '{print $1}')
     [ "$actual" = "$expected" ] || die pending_boot_hash
+    if [ "$feature_policy" = preserve ]; then
+        # Feature staging is independent of the boot write. Recheck the
+        # identities captured in the pending transaction before confirmation,
+        # so a changed payload cannot be confirmed with the new boot image.
+        verify_preserved_feature_identity pending
+    fi
     selected_channel=$(channel_value)
     case "$selected_channel" in
         dev|stable)

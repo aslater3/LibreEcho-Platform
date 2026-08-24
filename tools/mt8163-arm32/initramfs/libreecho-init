@@ -29,6 +29,7 @@ esac
 # accidentally selected.
 FEATURE_POLICY_VALUE=$($BB cat /etc/libreecho/feature-policy 2>/dev/null)
 FEATURE_POLICY=exclude
+FIRST_INSTALL_MARKER=/etc/libreecho/first-install-confirm
 case "$FEATURE_POLICY_VALUE" in
     preserve|redistributable|community-noncommercial|exclude)
         FEATURE_POLICY=$FEATURE_POLICY_VALUE
@@ -489,6 +490,24 @@ log wmt-nodes-created
 # The network stack is build-time opt-in, but activation remains an explicit
 # operator request after ADB.  This preserves the USB diagnostic control plane
 # across the historical WMT/WLAN failure boundary.
+# No Wi-Fi MAC override on this hardware.
+#
+# The driver generates an address when nothing supplies one, and not the same
+# one each boot, so the device takes a new DHCP lease after most restarts. idme
+# records the address the board was built with, and applying it looked like the
+# obvious fix -- but the driver refuses it:
+#
+#     ip link set dev wlan0 address fc:a1:83:70:79:33
+#     ip: ioctl 0x8924 failed: Not supported
+#
+# SIOCSIFHWADDR is rejected with the link up or down, there is no NVRAM file or
+# module parameter exposing it, and nothing in dmesg suggests the address is
+# read from anywhere writable. Setting it would need firmware or driver work
+# rather than a boot script, so there is nothing to run here.
+#
+# The web UI still reports the board's address beside the one in use, which is
+# what makes the difference visible.
+
 start_wifi_network_sequence()
 {
     packaged_wifi=/etc/wifi/wpa_supplicant.conf
@@ -763,6 +782,21 @@ if $BB grep -q ' /sys/kernel/config ' /proc/mounts 2>/dev/null; then
             done
             if [ -n "$udc" ] && echo "$udc" > "$G/UDC" 2>/tmp/configfs-udc-bind.err; then
                 log "configfs-udc-bound:$udc"
+                # The port is dr_mode="otg" so the role can be switched at
+                # runtime, which the storage toggle needs.  The cost is that the
+                # boot role is otherwise decided by ID/VBUS detection, and that
+                # proved unreliable -- ADB came up on some boots and not others,
+                # which is unacceptable for the only recovery path this device
+                # has.  Pin it to device so the gadget is unconditional; the
+                # toggle moves it to host later, and every boot resets it here.
+                for role_sx in /sys/class/usb_role/*/role; do
+                    [ -w "$role_sx" ] || continue
+                    if printf device > "$role_sx" 2>/dev/null; then
+                        log "usb-role-pinned-device:${role_sx#/sys/class/usb_role/}"
+                    else
+                        log "usb-role-pin-failed:${role_sx#/sys/class/usb_role/}"
+                    fi
+                done
                 # Capture one bounded userspace snapshot after the host has had
                 # time to send CNXN.  Never loop: repeated ADB reconnects would
                 # otherwise flood the authoritative UART record.
@@ -834,12 +868,38 @@ fi
 # audiod only opens the adapter and never initiates playback.  micd starts
 # with capture idle and opens the microphone endpoint only for an explicit
 # stream request.
+# Export the owner's timezone so every daemon renders local time.
+#
+# The image carries no /usr/share/zoneinfo and busybox ignores /etc/TZ, so the
+# only mechanism that works here is the TZ environment variable holding a
+# POSIX TZ string (verified on-device: TZ=CST6CDT,M3.2.0,M11.1.0 yields CDT).
+# Inherited by the whole service graph because this runs before it starts.
+apply_timezone()
+{
+    tz_config=/data/libreecho/config/web-config.json
+    tz_value=
+    if [ -r "$tz_config" ]; then
+        tz_value=$($BB sed -n \
+            's/.*"timezone"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            "$tz_config" 2>/dev/null | $BB head -n 1)
+    fi
+    case "$tz_value" in
+        # Only a plain POSIX TZ string; anything else falls back to UTC so a
+        # malformed config cannot inject arbitrary environment content.
+        ''|*[!A-Za-z0-9,.:+/-]*) tz_value=UTC ;;
+    esac
+    TZ=$tz_value
+    export TZ
+    log "timezone-applied:$tz_value"
+}
+
 start_ui_services()
 {
     [ -x /usr/local/sbin/libreecho-web ] || {
         log ui-services-not-installed
         return 0
     }
+    apply_timezone
     $BB mkdir -p /var/run /var/log /var/log/libreecho /run/libreecho
     if [ "$SERVICE_PROFILE" = production ] && [ "${DATA_CLEANUP_OK:-0}" -ne 1 ]; then
         log ui-services-blocked-by-data-contract
@@ -868,18 +928,18 @@ start_ui_services()
             [ "$FEATURE_POLICY" = community-noncommercial ]; then
         if [ "$ha_enabled" -eq 1 ]; then
             log ui-home-assistant-mode-enabled
-            services="logd networkd timed audiod micd waked ledd btd airplayd wyomingd web"
+            services="logd networkd timed audiod micd waked ledd buttond btd airplayd radiod wyomingd web"
         else
-            services="logd networkd timed audiod micd waked sttd ledd btd airplayd ttsd agentd web"
+            services="logd networkd timed audiod micd waked sttd ledd buttond btd airplayd radiod ttsd agentd web"
         fi
         if [ "$FEATURE_POLICY" = community-noncommercial ]; then
             log ui-services-community-noncommercial-with-wakeword
         fi
     else
         if [ "$ha_enabled" -eq 1 ]; then
-            services="logd networkd timed audiod micd ledd btd airplayd wyomingd web"
+            services="logd networkd timed audiod micd ledd buttond btd airplayd radiod wyomingd web"
         else
-            services="logd networkd timed audiod micd sttd ledd btd airplayd ttsd agentd web"
+            services="logd networkd timed audiod micd sttd ledd buttond btd airplayd radiod ttsd agentd web"
         fi
         log ui-services-redistributable-without-wakeword
     fi
@@ -932,19 +992,18 @@ ota_health_confirm_worker()
             ;;
     esac
 
-    # A clean install (BROM/Amonet or factory) never writes an update record,
-    # so the OTA transaction handling below does not apply to it.  The
-    # bootloader still decrements the slot try counter on every boot and
-    # refuses the slot once that counter reaches zero while success is 0, so a
-    # healthy fresh install becomes unbootable after a few reboots unless the
-    # running slot is confirmed.  Confirm it on the same health evidence the
-    # OTA path requires, and never reboot on failure: a first boot has no
-    # previously confirmed slot to fall back to.
     if [ -r /data/libreecho/update/pending ]; then
         CONFIRM_MODE=ota
         log ota-health-confirm-pending
         pending_slot=$($BB sed -n 's/^slot=//p' /data/libreecho/update/pending)
     else
+        if [ ! -r "$FIRST_INSTALL_MARKER" ] ||
+           [ "$($BB sed -n 's/^schema=//p' "$FIRST_INSTALL_MARKER")" != 1 ] ||
+           [ "$($BB sed -n 's/^mode=//p' "$FIRST_INSTALL_MARKER")" != first-install ] ||
+           [ "$($BB sed -n 's/^board=//p' "$FIRST_INSTALL_MARKER")" != radar_puffin ]; then
+            log first-install-marker-absent-or-invalid
+            return 0
+        fi
         CONFIRM_MODE=first-boot
         case "$selected_slot" in
             a|b) ;;
@@ -957,6 +1016,42 @@ ota_health_confirm_worker()
             $BB sed -n "s/^slot_${selected_slot}_success=//p")" = 1 ]; then
             log "first-boot-slot-already-confirmed:$selected_slot"
             return 0
+        fi
+        if [ "$selected_slot" = a ]; then
+            payload_device=/dev/mmcblk0p10
+        else
+            payload_device=/dev/mmcblk0p11
+        fi
+        payload_hash=$($BB sha256sum "$payload_device" 2>/dev/null |
+            $BB awk '{print $1}')
+        case "$payload_hash" in
+            ''|*[!0-9a-f]*)
+                log first-install-payload-hash-unavailable
+                return 0
+                ;;
+        esac
+        first_install_pending=/data/libreecho/update/first-install.pending
+        if [ -r "$first_install_pending" ]; then
+            recorded_slot=$($BB sed -n 's/^slot=//p' "$first_install_pending")
+            recorded_hash=$($BB sed -n 's/^boot_sha256=//p' "$first_install_pending")
+            if [ "$recorded_slot" != "$selected_slot" ] || [ "$recorded_hash" != "$payload_hash" ]; then
+                log first-install-transaction-invalid
+                return 0
+            fi
+        else
+            {
+                echo schema=1
+                echo state=pending
+                echo mode=first-install
+                echo "slot=$selected_slot"
+                echo "boot_sha256=$payload_hash"
+            } > "$first_install_pending.tmp" &&
+                $BB mv "$first_install_pending.tmp" "$first_install_pending" || {
+                    log first-install-transaction-write-failed
+                    return 0
+                }
+            $BB sync
+            log "first-install-transaction-created:$selected_slot:$payload_hash"
         fi
         log "first-boot-confirm-pending:$selected_slot"
         pending_slot=$selected_slot
@@ -994,6 +1089,57 @@ ota_health_confirm_worker()
         $BB sync
     fi
 
+    # True when this device has no local voice stack to wait for.
+    #
+    # Deliberately derived from the mounted feature set rather than from
+    # configuration: the health worker starts before the web daemon, so any
+    # check that reads a service-managed config file is racing service startup.
+    # The feature mounts are established by this script itself, before the
+    # worker runs, so they are a stable signal at probe time.
+    #
+    # If the stt/tts/assistant payloads are not mounted, libreecho-sttd,
+    # libreecho-ttsd and libreecho-agentd cannot run and their sockets can
+    # never appear -- so waiting for them only guarantees a rollback.  The
+    # A missing local stack is only valid when the persisted configuration
+    # explicitly selects a remote voice pipeline.  Treat local, missing, and
+    # unknown modes as a failed health check so a broken local payload cannot
+    # be confirmed as a healthy OTA.
+    voice_stack_absent()
+    {
+        # Test the mount, not the directory: the per-feature init scripts run
+        # mkdir -p "$RUNTIME_ROOT" before attempting to mount the payload, so
+        # the directory exists even when the mount never succeeded and the
+        # daemon never started.
+        for vs_feature in stt tts assistant; do
+            if $BB grep -q " /run/libreecho/features/$vs_feature/root " \
+                    /proc/mounts 2>/dev/null; then
+                log "ota-health-voice-stack-present:$vs_feature"
+                return 1
+            fi
+        done
+        vp_config=/data/libreecho/config/web-config.json
+        vp_mode=
+        if [ -r "$vp_config" ]; then
+            vp_mode=$($BB sed -n \
+                's/.*"voice_pipeline_mode"[[:space:]]*:[[:space:]]*"\([a-z_-]*\)".*/\1/p' \
+                "$vp_config" 2>/dev/null | $BB head -n 1)
+        fi
+        case "$vp_mode" in
+            custom|home-assistant)
+                log "ota-health-voice-stack-absent-remote:$vp_mode"
+                return 0
+                ;;
+            local|'')
+                log "ota-health-voice-stack-missing-local:${vp_mode:-unknown}"
+                return 1
+                ;;
+            *)
+                log "ota-health-voice-stack-mode-invalid:$vp_mode"
+                return 1
+                ;;
+        esac
+    }
+
     ota_health_services_ready()
     {
         [ "$SERVICE_PROFILE" = production ] || return 0
@@ -1015,6 +1161,16 @@ ota_health_confirm_worker()
             return 0
         fi
         if [ -S /run/libreecho/wyoming.sock ]; then
+            return 0
+        fi
+        # A device whose voice pipeline is served by remote Wyoming endpoints
+        # never mounts the local stt/tts/assistant features, so none of the
+        # sockets above can exist and neither branch can ever pass.  Requiring
+        # them would make every OTA on such a device fail confirmation and roll
+        # back, even when the image is completely healthy.  Voice is not what
+        # makes a slot recoverable -- /data, networking and the web/API plane
+        # are, and those are already checked.
+        if voice_stack_absent; then
             return 0
         fi
         log ota-health-services-not-ready:voice-sockets
@@ -1056,7 +1212,18 @@ ota_health_confirm_worker()
         if [ "$passed" -eq 3 ] &&
            /usr/local/sbin/libreecho-bootctl confirm "$selected_slot" \
                >/tmp/first-boot-confirm.log 2>&1; then
-            log "first-boot-slot-confirmed:$selected_slot"
+            first_install_confirmed=/data/libreecho/update/first-install.confirmed.tmp
+            if $BB sed 's/^state=pending$/state=confirmed/' \
+                    /data/libreecho/update/first-install.pending > "$first_install_confirmed" &&
+               $BB mv "$first_install_confirmed" \
+                    /data/libreecho/update/first-install.confirmed; then
+                $BB rm -f /data/libreecho/update/first-install.pending
+                $BB sync
+                log "first-boot-slot-confirmed:$selected_slot"
+                return 0
+            fi
+            $BB rm -f "$first_install_confirmed"
+            log first-install-confirmation-record-finalization-failed
             return 0
         fi
         # Never restart after a failed first boot: there is no previously
