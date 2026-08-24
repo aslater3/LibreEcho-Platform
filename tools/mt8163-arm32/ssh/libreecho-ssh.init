@@ -56,8 +56,9 @@ users_file_ready()
         {
             if (length($0) > 255) { good = 0; next }
             if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/) next
+            name = tolower($1)
             if (NF != 4 || length($1) < 1 || length($1) > 31 ||
-                $1 !~ /^[A-Za-z0-9._-]+$/ || $2 != "sha256" ||
+                name == "root" || $1 !~ /^[A-Za-z0-9._-]+$/ || $2 != "sha256" ||
                 length($3) < 16 || length($3) > 64 || !ishex($3) ||
                 length($4) != 64 || !ishex($4)) {
                 good = 0
@@ -106,21 +107,35 @@ sync_accounts()
         printf 'libreecho-ssh:x:1000:\n'
     } > "$GROUP_FILE.le.tmp" || return 1
     $BB chmod 0644 "$PASSWD_FILE.le.tmp" "$GROUP_FILE.le.tmp" || return 1
-    $BB cmp -s "$PASSWD_FILE.le.tmp" "$PASSWD_FILE" 2>/dev/null ||
-        $BB mv -f "$PASSWD_FILE.le.tmp" "$PASSWD_FILE" || return 1
-    $BB cmp -s "$GROUP_FILE.le.tmp" "$GROUP_FILE" 2>/dev/null ||
-        $BB mv -f "$GROUP_FILE.le.tmp" "$GROUP_FILE" || return 1
-    $BB rm -rf "$HOME_ROOT" || return 1
+
     $BB mkdir -p "$HOME_ROOT" || return 1
-    $BB chmod 0700 "$HOME_ROOT" || return 1
+    $BB chmod 0711 "$HOME_ROOT" || return 1
+    if $BB cmp -s "$account_list.tmp" "$account_list" 2>/dev/null &&
+            $BB cmp -s "$PASSWD_FILE.le.tmp" "$PASSWD_FILE" 2>/dev/null &&
+            $BB cmp -s "$GROUP_FILE.le.tmp" "$GROUP_FILE" 2>/dev/null; then
+        $BB rm -f "$PASSWD_FILE.le.tmp" "$GROUP_FILE.le.tmp" "$account_list.tmp"
+        return 0
+    fi
+
+    if [ -r "$account_list" ]; then
+        while IFS=: read -r old_username _old_uid; do
+            [ -n "$old_username" ] || continue
+            if ! $BB awk -F: -v user="$old_username" '$1 == user { found = 1 } END { exit found ? 0 : 1 }' \
+                    "$account_list.tmp"; then
+                $BB rm -rf "$HOME_ROOT/$old_username" || return 1
+            fi
+        done < "$account_list"
+    fi
     while IFS=: read -r username uid; do
         home="$HOME_ROOT/$username"
         $BB mkdir -p "$home" || return 1
         $BB chmod 0700 "$home" || return 1
         $BB chown "$uid:1000" "$home" || return 1
     done < "$account_list.tmp"
-    $BB mv -f "$account_list.tmp" "$account_list" || return 1
-    $BB rm -f "$PASSWD_FILE.le.tmp" "$GROUP_FILE.le.tmp"
+
+    $BB mv -f "$PASSWD_FILE.le.tmp" "$PASSWD_FILE" || return 1
+    $BB mv -f "$GROUP_FILE.le.tmp" "$GROUP_FILE" || return 1
+    $BB mv -f "$account_list.tmp" "$account_list"
 }
 
 dropbear_running()

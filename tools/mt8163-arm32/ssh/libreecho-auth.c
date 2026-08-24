@@ -232,6 +232,8 @@ static int le_parse_users(struct le_user_record users[LE_MAX_USERS], size_t *cou
 			if (!le_hex((unsigned char)fields[3][i]))
 				goto invalid;
 		le_fold_username(folded, fields[0]);
+		if (strcmp(folded, "root") == 0)
+			goto invalid;
 		for (i = 0; i < users_count; ++i)
 			if (strcmp(users[i].username, folded) == 0)
 				goto invalid;

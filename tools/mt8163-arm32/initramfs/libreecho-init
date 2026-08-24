@@ -80,6 +80,41 @@ log()
 	printf '%s\n' "$msg" > /dev/console 2>/dev/null
 }
 
+# Production LAN exposure requires a valid WebUI account database even when
+# the optional SSH bundle is absent. Keep this validator aligned with the SSH
+# supervisor's fail-closed account contract.
+web_users_file_ready()
+{
+	users_file=/data/libreecho/config/users
+	[ -f "$users_file" ] && [ ! -L "$users_file" ] || return 1
+	[ "$($BB stat -c %u "$users_file" 2>/dev/null)" = 0 ] || return 1
+	[ "$($BB stat -c %a "$users_file" 2>/dev/null)" = 600 ] || return 1
+	$BB awk -F: '
+		function ishex(value,    rest, removed) {
+			rest = value
+			removed = gsub(/[0-9A-Fa-f]/, "", rest)
+			return removed == length(value)
+		}
+		BEGIN { good = 1; count = 0 }
+		{
+			if (length($0) > 255) { good = 0; next }
+			if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/) next
+			name = tolower($1)
+			if (NF != 4 || length($1) < 1 || length($1) > 31 ||
+				name == "root" || $1 !~ /^[A-Za-z0-9._-]+$/ ||
+				$2 != "sha256" || length($3) < 16 || length($3) > 64 ||
+				!ishex($3) || length($4) != 64 || !ishex($4)) {
+				good = 0
+				next
+			}
+			if (name in seen) good = 0
+			seen[name] = 1
+			count++
+		}
+		END { exit (good && count > 0 && count <= 8) ? 0 : 1 }
+	' "$users_file"
+}
+
 if [ "$SERVICE_PROFILE_INVALID" -eq 1 ]; then
     log service-profile-invalid-fallback-diagnostic
 else
@@ -850,8 +885,7 @@ start_ui_services()
         if [ -x "$script" ]; then
             if [ "$service" = web ] && [ "$SERVICE_PROFILE" = production ]; then
                 web_listen=127.0.0.1:8080
-                if [ ! -x /etc/init.d/libreecho-ssh.init ] ||
-                        /etc/init.d/libreecho-ssh.init users-ready; then
+                if web_users_file_ready; then
                     web_listen=0.0.0.0:8080
                     log ui-web-production-authenticated-lan
                 else
