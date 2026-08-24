@@ -344,6 +344,14 @@ else
 fi
 set_boot_hostname || true
 
+if [ -x /etc/init.d/libreecho-ssh.init ]; then
+    if /etc/init.d/libreecho-ssh.init start >/tmp/libreecho-ssh.init.log 2>&1; then
+        log ssh-supervisor-started
+    else
+        log ssh-supervisor-start-failed
+    fi
+fi
+
 expdb_devno=$($BB cat "$EXPDB_SYS/dev" 2>/dev/null)
 expdb_major=${expdb_devno%:*}
 expdb_minor=${expdb_devno#*:}
@@ -842,7 +850,8 @@ start_ui_services()
         if [ -x "$script" ]; then
             if [ "$service" = web ] && [ "$SERVICE_PROFILE" = production ]; then
                 web_listen=127.0.0.1:8080
-                if [ -r /data/libreecho/config/users ]; then
+                if [ ! -x /etc/init.d/libreecho-ssh.init ] ||
+                        /etc/init.d/libreecho-ssh.init users-ready; then
                     web_listen=0.0.0.0:8080
                     log ui-web-production-authenticated-lan
                 else

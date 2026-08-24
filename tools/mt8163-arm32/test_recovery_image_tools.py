@@ -1404,27 +1404,30 @@ class SourceTests(unittest.TestCase):
         self.assertIn("wireless-tools-COPYING", image_builder)
         self.assertIn("wireless-tools-COPYING", verifier)
 
-    def test_ssh_password_hash_is_salted_and_private(self) -> None:
+    def test_ssh_uses_deferred_webui_auth_and_packages_scp_server(self) -> None:
         dropbear_builder = TOOLS_DIR / "ssh/build_dropbear.sh"
-        self.assertIn("-DUSE_DEV_PTMX", dropbear_builder.read_text())
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            valid = root / "hash"
-            valid.write_text("$6$LibreEchoTest$0123456789012345678901234567890123456789012\n")
-            valid.chmod(0o600)
-            self.assertEqual(
-                builder.read_ssh_password_hash(valid),
-                "$6$LibreEchoTest$0123456789012345678901234567890123456789012",
-            )
-            for value in ("password\n", "!locked\n", "\n", "$6$missing-checksum\n"):
-                invalid = root / ("invalid-" + str(len(value)))
-                invalid.write_text(value)
-                invalid.chmod(0o600)
-                with self.subTest(value=value), self.assertRaises(SystemExit):
-                    builder.read_ssh_password_hash(invalid)
-            valid.chmod(0o622)
-            with self.assertRaises(SystemExit):
-                builder.read_ssh_password_hash(valid)
+        image_builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        image_verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        supervisor = (TOOLS_DIR / "ssh/libreecho-ssh.init").read_text()
+        localoptions = (TOOLS_DIR / "ssh/localoptions.h").read_text()
+        patch_source = (TOOLS_DIR / "ssh/patches/0002-webui-users-password-auth.patch").read_text()
+        self.assertIn('PROGRAMS="dropbear dropbearkey scp"', dropbear_builder.read_text())
+        self.assertIn("dbutil.o", patch_source)
+        self.assertIn("scp_sha256", dropbear_builder.read_text())
+        self.assertIn('"usr/bin/scp"', image_builder)
+        self.assertIn('"usr/bin/scp"', image_verifier)
+        self.assertIn("--expected-scp-sha256", image_verifier)
+        self.assertNotIn("--ssh-root-password-hash", image_builder)
+        self.assertNotIn("/etc/shadow", image_builder)
+        self.assertNotIn('"root_login": True', image_builder)
+        self.assertIn('"authentication": "webui-users-sha256"', image_builder)
+        self.assertIn('"privilege_policy": "non-root-ephemeral-users"', image_builder)
+        self.assertIn("/data/libreecho/config/users", supervisor)
+        self.assertIn("waiting-for-valid-webui-users", supervisor)
+        self.assertIn("stop_dropbear", supervisor)
+        self.assertIn("-t ed25519", supervisor)
+        self.assertIn("scp", image_verifier)
+        self.assertIn("DROPBEAR_SVR_PUBKEY_AUTH 0", localoptions)
 
 
 class VendorAssetContractTests(unittest.TestCase):

@@ -48,7 +48,7 @@ WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-INIT_SHA256 = "63f055c85f2adacfd99a7212d8c28e4e6bc09901290009f6dd80da4353f1f647"
+INIT_SHA256 = "144ac3adb35ddb79f826b1142dc1aaa019c23e85803d3b566dc062fd8036deed"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -78,12 +78,9 @@ OVERLAY_TARGETS = {
     "regulatory.db": "lib/firmware/regulatory.db",
     "regulatory.db.p7s": "lib/firmware/regulatory.db.p7s",
 }
-SSH_PASSWORD_HASH_RE = re.compile(
-    rb"\$(?:1|5|6|2[abxy]?|y|gy)\$[^$:\r\n]{1,64}\$[^:\r\n]{1,512}\Z"
-)
 SSH_MEMBER_NAMES = {
-    "sbin/dropbear", "sbin/dropbearkey", "etc/passwd", "etc/group",
-    "etc/shells", "etc/shadow", "root", "etc/dropbear",
+    "sbin/dropbear", "sbin/dropbearkey", "usr/bin/scp", "etc/passwd", "etc/group",
+    "etc/shells", "etc/init.d/libreecho-ssh.init",
 }
 UI_BINARY_NAMES = {
     "usr/local/sbin/libreecho-web",
@@ -479,7 +476,8 @@ def validate_no_connectivity_autostart(entries: dict[str, Entry]) -> None:
 
 def validate_ssh(entries: dict[str, Entry], manifest: dict[str, object],
                  expected_dropbear_sha256: str | None,
-                 expected_dropbearkey_sha256: str | None) -> bool:
+                 expected_dropbearkey_sha256: str | None,
+                 expected_scp_sha256: str | None) -> bool:
     raw_ssh = manifest.get("ssh")
     if raw_ssh is None:
         ssh: dict[str, object] = {"enabled": False}
@@ -488,17 +486,8 @@ def validate_ssh(entries: dict[str, Entry], manifest: dict[str, object],
     else:
         ssh = cast(dict[str, object], raw_ssh)
 
-    expected_enabled = (
-        expected_dropbear_sha256 is not None or
-        expected_dropbearkey_sha256 is not None
-    )
-    if bool(ssh.get("enabled")) != expected_enabled:
-        fail(
-            "SSH bundle expectation mismatch: "
-            f"expected={'enabled' if expected_enabled else 'disabled'} "
-            f"actual={'enabled' if ssh.get('enabled') else 'disabled'}"
-        )
-
+    if "etc/shadow" in entries:
+        fail("SSH image contains forbidden /etc/shadow credential material")
     forbidden_ssh_names = sorted(
         name for name in entries
         if name.endswith("/authorized_keys") or name == "authorized_keys"
@@ -507,21 +496,42 @@ def validate_ssh(entries: dict[str, Entry], manifest: dict[str, object],
     if forbidden_ssh_names:
         fail(f"SSH image contains forbidden key material: {forbidden_ssh_names}")
 
+    expected_enabled = (
+        expected_dropbear_sha256 is not None or
+        expected_dropbearkey_sha256 is not None or
+        expected_scp_sha256 is not None
+    )
+    if bool(ssh.get("enabled")) != expected_enabled:
+        fail(
+            "SSH bundle expectation mismatch: "
+            f"expected={'enabled' if expected_enabled else 'disabled'} "
+            f"actual={'enabled' if ssh.get('enabled') else 'disabled'}"
+        )
+
     if not expected_enabled:
         unexpected = sorted(name for name in SSH_MEMBER_NAMES if name in entries)
         if unexpected:
             fail(f"SSH bundle is disabled but members are present: {unexpected}")
+        if any(name.startswith("etc/dropbear/") for name in entries):
+            fail("SSH image contains persistent host-key material")
         return False
 
-    if expected_dropbear_sha256 is None or expected_dropbearkey_sha256 is None:
+    if (expected_dropbear_sha256 is None or
+            expected_dropbearkey_sha256 is None or
+            expected_scp_sha256 is None):
         fail("SSH binary identities are incomplete")
+    assert expected_dropbear_sha256 is not None
+    assert expected_dropbearkey_sha256 is not None
+    assert expected_scp_sha256 is not None
     expected_policy = {
         "enabled": True,
-        "activation": "manual-only",
-        "autostart": False,
-        "authentication": "password-only",
+        "activation": "deferred-after-webui-bootstrap",
+        "autostart": True,
+        "authentication": "webui-users-sha256",
+        "account_source": "/data/libreecho/config/users",
+        "privilege_policy": "non-root-ephemeral-users",
         "public_key_auth": False,
-        "root_login": True,
+        "root_login": False,
         "host_keys": "generated-ephemerally-under-/tmp/dropbear",
     }
     for key, value in expected_policy.items():
@@ -531,7 +541,7 @@ def validate_ssh(entries: dict[str, Entry], manifest: dict[str, object],
     if not isinstance(raw_files, dict):
         fail("SSH file manifest is missing")
     files = cast(dict[str, object], raw_files)
-    if set(files) != SSH_MEMBER_NAMES - {"root", "etc/dropbear"}:
+    if set(files) != SSH_MEMBER_NAMES:
         fail("SSH file manifest members changed")
 
     def static_binary_record(name: str, expected_hash: str) -> None:
@@ -566,10 +576,11 @@ def validate_ssh(entries: dict[str, Entry], manifest: dict[str, object],
 
     static_binary_record("sbin/dropbear", expected_dropbear_sha256)
     static_binary_record("sbin/dropbearkey", expected_dropbearkey_sha256)
+    static_binary_record("usr/bin/scp", expected_scp_sha256)
 
     expected_accounts = {
         "etc/passwd": b"root:x:0:0:root:/root:/bin/sh\n",
-        "etc/group": b"root:x:0:\n",
+        "etc/group": b"root:x:0:\nlibreecho-ssh:x:1000:\n",
         "etc/shells": b"/bin/sh\n",
     }
     for name, data in expected_accounts.items():
@@ -585,28 +596,29 @@ def validate_ssh(entries: dict[str, Entry], manifest: dict[str, object],
         if member.data != data:
             fail(f"SSH account content changed: {name}")
 
-    shadow = entries.get("etc/shadow")
-    if shadow is None or not stat.S_ISREG(shadow.mode) or stat.S_IMODE(shadow.mode) != 0o600:
-        fail("SSH /etc/shadow is missing or has unsafe permissions")
-    shadow_fields = shadow.data.rstrip(b"\n").split(b":")
-    if len(shadow_fields) != 9 or shadow_fields[0] != b"root":
-        fail("SSH /etc/shadow root record is malformed")
-    if not SSH_PASSWORD_HASH_RE.fullmatch(shadow_fields[1]):
-        fail("SSH /etc/shadow does not contain a supported salted root hash")
-    if shadow.data.count(b"\n") != 1 or shadow.data.endswith(b"\n\n"):
-        fail("SSH /etc/shadow must contain exactly one normalized record")
-    if files.get("etc/shadow") != {
-        "path": "/etc/shadow",
-        "size": len(shadow.data),
-        "mode": "0600",
-        "secret_content_not_recorded": True,
+    supervisor = entries.get("etc/init.d/libreecho-ssh.init")
+    raw_supervisor = files.get("etc/init.d/libreecho-ssh.init")
+    if (supervisor is None or not stat.S_ISREG(supervisor.mode) or
+            stat.S_IMODE(supervisor.mode) != 0o755 or
+            not isinstance(raw_supervisor, dict)):
+        fail("SSH supervisor is missing or has unsafe permissions")
+    assert supervisor is not None
+    assert isinstance(raw_supervisor, dict)
+    supervisor_record = cast(dict[str, object], raw_supervisor)
+    supervisor_path = supervisor_record.get("path")
+    if not isinstance(supervisor_path, str) or not Path(supervisor_path).is_absolute():
+        fail("SSH supervisor manifest path is not absolute")
+    if supervisor_record != {
+        "path": supervisor_path,
+        "sha256": sha256(supervisor.data),
+        "size": len(supervisor.data),
+        "mode": "0755",
     }:
-        fail("SSH shadow manifest record is unsafe or changed")
-
-    for name, mode in (("root", 0o755), ("etc/dropbear", 0o700)):
-        entry = entries.get(name)
-        if entry is None or not stat.S_ISDIR(entry.mode) or stat.S_IMODE(entry.mode) != mode:
-            fail(f"SSH runtime directory contract changed: {name}")
+        fail("SSH supervisor manifest record mismatch")
+    if (b"/etc/shadow" in supervisor.data or
+            b"ssh-root-password-hash" in supervisor.data or
+            b"authorized_keys" in supervisor.data):
+        fail("SSH supervisor contains forbidden credential or key material")
     if any(name.startswith("etc/dropbear/") for name in entries):
         fail("SSH image contains persistent host-key material")
     return True
@@ -983,6 +995,7 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                        expected_iwconfig_sha256: str | None,
                        expected_dropbear_sha256: str | None,
                        expected_dropbearkey_sha256: str | None,
+                       expected_scp_sha256: str | None,
                        expected_ui_manifest_sha256: str | None,
                        expected_ui_commit: str | None,
                        expected_ui_diff_sha256: str | None,
@@ -1780,7 +1793,8 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         info = elf_info(entry.data)
         if info is not None and info[:2] != (1, 40):
             fail(f"non-ARM32 ELF member {name}: {info[:2]}")
-    validate_ssh(entries, manifest, expected_dropbear_sha256, expected_dropbearkey_sha256)
+    validate_ssh(entries, manifest, expected_dropbear_sha256,
+                 expected_dropbearkey_sha256, expected_scp_sha256)
     return validate_connectivity(entries, manifest, schema_version)
 
 
@@ -1839,6 +1853,8 @@ def main() -> None:
                         help="require this static ARM32 Dropbear server in the initramfs")
     parser.add_argument("--expected-dropbearkey-sha256",
                         help="require this static ARM32 Dropbear host-key utility in the initramfs")
+    parser.add_argument("--expected-scp-sha256",
+                        help="require the static ARM32 scp server-side executable in the initramfs")
     parser.add_argument("--expected-ui-manifest-sha256",
                         help="require this pinned LibreEcho-UI file manifest")
     parser.add_argument("--expected-ui-commit",
@@ -1993,6 +2009,7 @@ def main() -> None:
         args.expected_tinymix_sha256,
         args.expected_iwconfig_sha256,
         args.expected_dropbear_sha256, args.expected_dropbearkey_sha256,
+        args.expected_scp_sha256,
         args.expected_ui_manifest_sha256, args.expected_ui_commit,
         args.expected_ui_diff_sha256,
         args.expected_airplay_payload_sha256, args.expected_airplay_payload_size,

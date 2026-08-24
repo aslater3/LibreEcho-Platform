@@ -1,0 +1,243 @@
+#!/bin/sh
+# Deferred SSH supervisor backed by the WebUI users file.
+
+BB=${BB:-/bin/busybox}
+USERS_FILE=${USERS_FILE:-/data/libreecho/config/users}
+PASSWD_FILE=/etc/passwd
+GROUP_FILE=/etc/group
+SHELLS_FILE=/etc/shells
+HOME_ROOT=/tmp/libreecho-ssh-home
+HOSTKEY_ROOT=/tmp/dropbear
+SUPERVISOR_PIDFILE=/run/libreecho-ssh-supervisor.pid
+DROPBEAR_PIDFILE=/run/libreecho-dropbear.pid
+STATUS_FILE=/run/libreecho/ssh.status
+DROPBEAR=${DROPBEAR:-/sbin/dropbear}
+DROPBEARKEY=${DROPBEARKEY:-/sbin/dropbearkey}
+
+log()
+{
+    printf 'libreecho-ssh:%s\n' "$*" > /dev/console 2>/dev/null || true
+}
+
+write_status()
+{
+    state=$1
+    tmp="$STATUS_FILE.tmp"
+    $BB mkdir -p "${STATUS_FILE%/*}" || return 1
+    {
+        printf 'schema=1\n'
+        printf 'enabled=1\n'
+        printf 'authentication=webui-users-sha256\n'
+        printf 'account_source=%s\n' "$USERS_FILE"
+        printf 'privilege_policy=non-root-ephemeral-users\n'
+        printf 'account_state=%s\n' "$state"
+        printf 'host_keys=ephemeral:%s\n' "$HOSTKEY_ROOT"
+    } > "$tmp" || return 1
+    $BB chmod 0644 "$tmp" || return 1
+    $BB mv -f "$tmp" "$STATUS_FILE"
+}
+
+users_file_ready()
+{
+    [ -f "$USERS_FILE" ] && [ ! -L "$USERS_FILE" ] || return 1
+    [ "$($BB stat -c %u "$USERS_FILE" 2>/dev/null)" = 0 ] || return 1
+    mode=$($BB stat -c %a "$USERS_FILE" 2>/dev/null) || return 1
+    case "$mode" in
+        600) ;;
+        *) return 1 ;;
+    esac
+    $BB awk -F: '
+        function ishex(value,    rest, removed) {
+            rest = value
+            removed = gsub(/[0-9A-Fa-f]/, "", rest)
+            return removed == length(value)
+        }
+        BEGIN { good = 1; count = 0 }
+        {
+            if (length($0) > 255) { good = 0; next }
+            if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/) next
+            if (NF != 4 || length($1) < 1 || length($1) > 31 ||
+                $1 !~ /^[A-Za-z0-9._-]+$/ || $2 != "sha256" ||
+                length($3) < 16 || length($3) > 64 || !ishex($3) ||
+                length($4) != 64 || !ishex($4)) {
+                good = 0
+                next
+            }
+            name = tolower($1)
+            if (name in seen) good = 0
+            seen[name] = 1
+            count++
+        }
+        END { exit (good && count > 0 && count <= 8) ? 0 : 1 }
+    ' "$USERS_FILE"
+}
+
+write_static_accounts()
+{
+    umask 077
+    {
+        printf 'root:x:0:\n'
+        printf 'libreecho-ssh:x:1000:\n'
+    } > "$GROUP_FILE.le.tmp" || return 1
+    printf '/bin/sh\n' > "$SHELLS_FILE.le.tmp" || return 1
+    $BB chmod 0644 "$GROUP_FILE.le.tmp" "$SHELLS_FILE.le.tmp" || return 1
+    $BB mv -f "$GROUP_FILE.le.tmp" "$GROUP_FILE" || return 1
+    $BB mv -f "$SHELLS_FILE.le.tmp" "$SHELLS_FILE" || return 1
+    printf 'root:x:0:0:root:/root:/bin/sh\n' > "$PASSWD_FILE.le.tmp" || return 1
+    $BB chmod 0644 "$PASSWD_FILE.le.tmp" || return 1
+    $BB mv -f "$PASSWD_FILE.le.tmp" "$PASSWD_FILE"
+}
+
+sync_accounts()
+{
+    users_file_ready || return 1
+    [ ! -L "$PASSWD_FILE" ] && [ ! -L "$GROUP_FILE" ] || return 1
+    umask 077
+    account_list=/tmp/libreecho-ssh-accounts
+    {
+        printf 'root:x:0:0:root:/root:/bin/sh\n'
+        $BB awk -F: -v home_root="$HOME_ROOT" -v list="$account_list.tmp" '
+            $0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/ { next }
+            { n++; printf "%s:x:%d:1000:LibreEcho SSH:%s/%s:/bin/sh\n", $1, 999 + n, home_root, $1; printf "%s:%d\n", $1, 999 + n > list }
+        ' "$USERS_FILE"
+    } > "$PASSWD_FILE.le.tmp" || return 1
+    {
+        printf 'root:x:0:\n'
+        printf 'libreecho-ssh:x:1000:\n'
+    } > "$GROUP_FILE.le.tmp" || return 1
+    $BB chmod 0644 "$PASSWD_FILE.le.tmp" "$GROUP_FILE.le.tmp" || return 1
+    $BB cmp -s "$PASSWD_FILE.le.tmp" "$PASSWD_FILE" 2>/dev/null ||
+        $BB mv -f "$PASSWD_FILE.le.tmp" "$PASSWD_FILE" || return 1
+    $BB cmp -s "$GROUP_FILE.le.tmp" "$GROUP_FILE" 2>/dev/null ||
+        $BB mv -f "$GROUP_FILE.le.tmp" "$GROUP_FILE" || return 1
+    $BB rm -rf "$HOME_ROOT" || return 1
+    $BB mkdir -p "$HOME_ROOT" || return 1
+    $BB chmod 0700 "$HOME_ROOT" || return 1
+    while IFS=: read -r username uid; do
+        home="$HOME_ROOT/$username"
+        $BB mkdir -p "$home" || return 1
+        $BB chmod 0700 "$home" || return 1
+        $BB chown "$uid:1000" "$home" || return 1
+    done < "$account_list.tmp"
+    $BB mv -f "$account_list.tmp" "$account_list" || return 1
+    $BB rm -f "$PASSWD_FILE.le.tmp" "$GROUP_FILE.le.tmp"
+}
+
+dropbear_running()
+{
+    [ -s "$DROPBEAR_PIDFILE" ] || return 1
+    pid=$($BB sed -n '1p' "$DROPBEAR_PIDFILE" 2>/dev/null)
+    case "$pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    $BB kill -0 "$pid" 2>/dev/null
+}
+
+stop_dropbear()
+{
+    if dropbear_running; then
+        pid=$($BB sed -n '1p' "$DROPBEAR_PIDFILE")
+        $BB kill "$pid" 2>/dev/null || true
+        i=0
+        while dropbear_running && [ "$i" -lt 10 ]; do
+            $BB sleep 1
+            i=$((i + 1))
+        done
+        dropbear_running && $BB kill -9 "$pid" 2>/dev/null || true
+    fi
+    $BB rm -f "$DROPBEAR_PIDFILE"
+}
+
+start_dropbear()
+{
+    [ -x "$DROPBEAR" ] && [ -x "$DROPBEARKEY" ] || return 1
+    $BB mkdir -p "$HOSTKEY_ROOT" || return 1
+    $BB chmod 0700 "$HOSTKEY_ROOT" || return 1
+    if [ ! -s "$HOSTKEY_ROOT/dropbear_ed25519_host_key" ]; then
+        $DROPBEARKEY -t ed25519 -f "$HOSTKEY_ROOT/dropbear_ed25519_host_key" \
+            >/tmp/libreecho-ssh-keygen.log 2>&1 || return 1
+        $BB chmod 0600 "$HOSTKEY_ROOT/dropbear_ed25519_host_key" || return 1
+    fi
+    $DROPBEAR -F -E -P "$DROPBEAR_PIDFILE" \
+        -r "$HOSTKEY_ROOT/dropbear_ed25519_host_key" -p 0.0.0.0:22 \
+        >/tmp/libreecho-dropbear.log 2>&1 &
+    $BB sleep 1
+    dropbear_running
+}
+
+clear_runtime_accounts()
+{
+    stop_dropbear
+    $BB rm -rf "$HOME_ROOT"
+    write_static_accounts || true
+}
+
+run_supervisor()
+{
+    while :; do
+        if users_file_ready && sync_accounts; then
+            if ! dropbear_running; then
+                if start_dropbear; then
+                    log started
+                else
+                    log start-failed
+                fi
+            fi
+            write_status ready || true
+        else
+            if dropbear_running; then
+                log users-invalid-stopping
+            fi
+            clear_runtime_accounts
+            write_status waiting-for-valid-webui-users || true
+        fi
+        $BB sleep 2
+    done
+}
+
+supervisor_running()
+{
+    [ -s "$SUPERVISOR_PIDFILE" ] || return 1
+    pid=$($BB sed -n '1p' "$SUPERVISOR_PIDFILE" 2>/dev/null)
+    case "$pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    $BB kill -0 "$pid" 2>/dev/null
+}
+
+start_service()
+{
+    supervisor_running && return 0
+    $BB mkdir -p "${SUPERVISOR_PIDFILE%/*}" "${DROPBEAR_PIDFILE%/*}" || return 1
+    write_static_accounts || return 1
+    run_supervisor &
+    printf '%s\n' "$!" > "$SUPERVISOR_PIDFILE"
+    $BB chmod 0600 "$SUPERVISOR_PIDFILE"
+}
+
+stop_service()
+{
+    if supervisor_running; then
+        pid=$($BB sed -n '1p' "$SUPERVISOR_PIDFILE")
+        $BB kill "$pid" 2>/dev/null || true
+    fi
+    $BB rm -f "$SUPERVISOR_PIDFILE"
+    clear_runtime_accounts
+    $BB rm -rf "$HOSTKEY_ROOT"
+    $BB rm -f "$STATUS_FILE"
+}
+
+case "${1:-}" in
+    start) start_service ;;
+    stop) stop_service ;;
+    restart) stop_service; start_service ;;
+    status)
+        supervisor_running || exit 1
+        [ -r "$STATUS_FILE" ] && $BB cat "$STATUS_FILE"
+        ;;
+    users-ready) users_file_ready ;;
+    *)
+        printf 'Usage: %s {start|stop|restart|status|users-ready}\n' "$0" >&2
+        exit 2
+        ;;
+esac

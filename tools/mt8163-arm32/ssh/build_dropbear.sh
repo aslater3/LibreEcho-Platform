@@ -66,6 +66,9 @@ dpkg-deb --extract "$LIBCRYPT_DEV_PACKAGE" "$LIBCRYPT_ROOT"
 dpkg-deb --extract "$LIBCRYPT_RUNTIME_PACKAGE" "$LIBCRYPT_ROOT"
 cp -- "$SSH_DIR/localoptions.h" "$SOURCE_DIR/localoptions.h"
 patch -d "$SOURCE_DIR" -p1 --forward < "$PATCH_DIR/0001-linux-pty-controlling-tty.patch"
+patch -d "$SOURCE_DIR" -p1 --forward < "$PATCH_DIR/0002-webui-users-password-auth.patch"
+patch -d "$SOURCE_DIR" -p1 --forward < "$PATCH_DIR/0003-webui-users-password-branch.patch"
+cp -- "$SSH_DIR/libreecho-auth.c" "$SOURCE_DIR/src/libreecho-auth.c"
 
 cd "$SOURCE_DIR"
 build_triplet="$($BUILD_CC -dumpmachine)"
@@ -93,12 +96,12 @@ export LIBS="${DROPBEAR_LIBS:--L$LIBCRYPT_ROOT/usr/lib/arm-linux-gnueabihf -lcry
   --disable-wtmpx \
   --disable-loginfunc \
   --disable-largefile
-make -j"$JOBS" PROGRAMS="dropbear dropbearkey"
+make -j"$JOBS" PROGRAMS="dropbear dropbearkey scp"
 
-"$STRIP" --strip-unneeded dropbear dropbearkey
-cp -- dropbear dropbearkey "$OUTPUT_DIR/"
+"$STRIP" --strip-unneeded dropbear dropbearkey scp
+cp -- dropbear dropbearkey scp "$OUTPUT_DIR/"
 
-for binary in dropbear dropbearkey; do
+for binary in dropbear dropbearkey scp; do
   path="$OUTPUT_DIR/$binary"
   file -L "$path" | grep -Eq 'ELF 32-bit.*ARM' || {
     echo "ERROR: unexpected ELF identity: $path" >&2
@@ -120,6 +123,7 @@ done
 
 dropbear_sha256="$(sha256sum "$OUTPUT_DIR/dropbear" | awk '{print $1}')"
 dropbearkey_sha256="$(sha256sum "$OUTPUT_DIR/dropbearkey" | awk '{print $1}')"
+scp_sha256="$(sha256sum "$OUTPUT_DIR/scp" | awk '{print $1}')"
 cat > "$OUTPUT_DIR/provenance.txt" <<EOF
 schema=1
 source_archive=$SOURCE_ARCHIVE
@@ -135,11 +139,13 @@ libcrypt_runtime_package=$LIBCRYPT_RUNTIME_PACKAGE
 libcrypt_runtime_sha256=$actual_libcrypt_runtime_sha256
 dropbear_sha256=$dropbear_sha256
 dropbearkey_sha256=$dropbearkey_sha256
-server_auth=password-only
+scp_sha256=$scp_sha256
+server_auth=webui-users-sha256
 server_public_key_auth=disabled
 pty_backend=linux-unix98-existing-slave
 static=1
 EOF
-printf 'dropbear=%s\ndropbearkey=%s\nprovenance=%s\n' \
-  "$OUTPUT_DIR/dropbear" "$OUTPUT_DIR/dropbearkey" "$OUTPUT_DIR/provenance.txt"
-printf 'dropbear_sha256=%s\ndropbearkey_sha256=%s\n' "$dropbear_sha256" "$dropbearkey_sha256"
+printf 'dropbear=%s\ndropbearkey=%s\nscp=%s\nprovenance=%s\n' \
+  "$OUTPUT_DIR/dropbear" "$OUTPUT_DIR/dropbearkey" "$OUTPUT_DIR/scp" "$OUTPUT_DIR/provenance.txt"
+printf 'dropbear_sha256=%s\ndropbearkey_sha256=%s\nscp_sha256=%s\n' \
+  "$dropbear_sha256" "$dropbearkey_sha256" "$scp_sha256"
