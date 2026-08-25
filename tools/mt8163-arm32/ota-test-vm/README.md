@@ -27,6 +27,40 @@ powers off:
 The BCB is reset to a fresh, current-slot-confirmed state before each mutating
 install so the phases run in one boot without tripping the A/B safety gate.
 
+## Seeding from a captured device (optional)
+
+With no arguments `mkdisk.sh` produces exactly the image it always did. Two
+optional arguments make the disk resemble a real device, or a broken one.
+
+```sh
+sh mkdisk.sh --profile device-profile.json
+sh mkdisk.sh --profile device-profile.json --scenario config-dir
+sh mkdisk.sh --scenario stray-data-file
+```
+
+`--profile` takes a captured device profile (produced by LibreEcho-UI's
+`tools/capture_device_profile.py`, which redacts identifying fields). Its
+`system_update` block decides which slot the BCB marks current and whether the
+other is bootable; its `config_export` block is written to
+`/data/libreecho/config` inside `userdata`, so the VM boots with a realistic
+configuration instead of an empty filesystem.
+
+`--scenario` seeds `/data` into a shape known to break a real device:
+
+| Scenario | Shape | Why it matters |
+|---|---|---|
+| `config-dir` | a **directory** where a config **file** belongs | halts every service on the next boot |
+| `stray-data-file` | an unallowlisted file directly under `/data` | has left **both** A/B slots unbootable |
+
+Both have bricked hardware. Rollback does not rescue either, because `/data` is
+shared between slots — which is exactly why reproducing them in QEMU is worth
+the trouble.
+
+Verify the script with `vmtest.sh`, in the same privileged container the header
+describes: it checks that the default image is unchanged, that the BCB follows
+the profile, that both scenarios land in `userdata`, and that an unknown
+scenario is refused.
+
 ## Prerequisites
 
 - Docker with `linux/amd64` (privileged) **and** `linux/arm/v7` emulation
