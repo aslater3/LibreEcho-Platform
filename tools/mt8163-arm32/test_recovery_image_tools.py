@@ -2558,6 +2558,43 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(channel.read_text(), "stable\\n")
             self.assertIn("DATA_CLEANUP_OK", result.stdout)
 
+    def _run_cleanup(self, data: Path):
+        return subprocess.run(
+            ["/bin/sh", str(TOOLS_DIR / "initramfs/libreecho-data-cleanup")],
+            env={
+                **os.environ,
+                "LIBREECHO_DATA_TEST_MODE": "1",
+                "DATA_ROOT": str(data),
+            },
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def test_userdata_cleanup_accepts_the_capture_mux_bypass_flag(self) -> None:
+        """micd's capture-mux bypass flag must not fail the data contract.
+
+        The instruction for using it is "create this file", and mkdir -p is an
+        easy thing to type by mistake. An unrecognised directory under config/
+        is not tolerated the way an unrecognised file is: it fails the
+        contract, which blocks every service on the next boot with no network
+        and no UI. Both shapes have to be accepted here.
+        """
+        for make in (lambda p: p.write_text(""), lambda p: p.mkdir()):
+            with tempfile.TemporaryDirectory() as temporary:
+                data = Path(temporary) / "data"
+                flag = data / "libreecho/config/bypass-capture-mux"
+                flag.parent.mkdir(parents=True)
+                make(flag)
+                result = self._run_cleanup(data)
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("DATA_CLEANUP_OK", result.stdout)
+                # Allowlisted, not merely tolerated -- a tolerated file is
+                # reported on every boot.
+                self.assertNotIn("DATA_CLEANUP_TOLERATED", result.stdout)
+                self.assertNotIn("DATA_CLEANUP_UNKNOWN", result.stdout)
+
     def test_schema2_disabled_record_is_exact(self) -> None:
         record = {
             "id": verifier.CONNECTIVITY_BUNDLE_ID,
