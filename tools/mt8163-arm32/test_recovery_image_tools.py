@@ -1421,7 +1421,7 @@ class SourceTests(unittest.TestCase):
         expected = {
             "sbin/wmt_configure": (
                 25744,
-                "2a57272037a34519e9f6f5dd64ab5a16ad304c81535c4aa7f15a8afae34aadb1",
+                "e0ff85f0ac2cb2b98718556470444cafd1fcd8865cdba27aa67e2c7d7a3303e0",
             ),
             "sbin/wmt_responder": (
                 21648,
@@ -1446,6 +1446,14 @@ class SourceTests(unittest.TestCase):
         }
         self.assertEqual(builder_pins, expected)
         self.assertEqual(verifier.CONNECTIVITY_HELPERS, expected)
+        self.assertEqual(
+            sum(int(item["size"]) for item in builder.CONNECTIVITY_ASSET_REQUIREMENTS.values()),
+            552507,
+        )
+        self.assertEqual(
+            sum(int(item["size"]) for item in verifier.CONNECTIVITY_ASSET_REQUIREMENTS.values()),
+            552507,
+        )
 
     def test_network_tools_are_pinned_and_manual_only(self) -> None:
         builder_script = TOOLS_DIR / "network-tools/build_wireless_tools.sh"

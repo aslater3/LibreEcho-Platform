@@ -55,7 +55,7 @@ SSH_PASSWORD_HASH_RE = re.compile(
     r"\$(?:1|5|6|2[abxy]?|y|gy)\$[^$:\r\n]{1,64}\$[^:\r\n]{1,512}\Z"
 )
 
-CONNECTIVITY_ASSET_REQUIREMENTS = {
+CONNECTIVITY_ASSET_REQUIREMENTS: dict[str, dict[str, str | int]] = {
     "ROMv2_lm_patch_1_0_hdr.bin": {
         "source": "etc/firmware/ROMv2_lm_patch_1_0_hdr.bin", "mode": 0o644,
         "size": 127596,
@@ -80,7 +80,7 @@ CONNECTIVITY_ASSET_REQUIREMENTS = {
 CONNECTIVITY_HELPERS = {
     "sbin/wmt_configure": (
         "wmt_config_helper", 25744,
-        "2a57272037a34519e9f6f5dd64ab5a16ad304c81535c4aa7f15a8afae34aadb1",
+        "e0ff85f0ac2cb2b98718556470444cafd1fcd8865cdba27aa67e2c7d7a3303e0",
     ),
     "sbin/wmt_responder": (
         "wmt_responder", 21648,
@@ -289,7 +289,7 @@ def add_connectivity_bundle(stage: Path, helpers: dict[str, Path],
     )
 
     expected_lines = []
-    requirement_records: dict[str, object] = {}
+    requirement_records: dict[str, dict[str, object]] = {}
     for target_name, specification in CONNECTIVITY_ASSET_REQUIREMENTS.items():
         expected_hash = str(specification["sha256"])
         expected_size = int(specification["size"])
@@ -344,7 +344,10 @@ def add_connectivity_bundle(stage: Path, helpers: dict[str, Path],
         "source_partition": "system_a-read-only",
         "embedded_vendor_file_count": 0,
         "required_vendor_file_count": len(requirement_records),
-        "required_vendor_bytes": 552827,
+        "required_vendor_bytes": sum(
+            int(specification["size"])
+            for specification in CONNECTIVITY_ASSET_REQUIREMENTS.values()
+        ),
         "helper_count": len(helper_records),
         "payload_bytes": sum(int(record["size"]) for record in helper_records.values()),
         "files": {},

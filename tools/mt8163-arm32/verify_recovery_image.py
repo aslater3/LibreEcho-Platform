@@ -129,7 +129,7 @@ AIRPLAY_BINARY_NAMES = {
     "usr/local/sbin/libreecho-audio-engine",
 }
 
-CONNECTIVITY_ASSET_REQUIREMENTS = {
+CONNECTIVITY_ASSET_REQUIREMENTS: dict[str, dict[str, str | int]] = {
     "ROMv2_lm_patch_1_0_hdr.bin": {
         "source": "etc/firmware/ROMv2_lm_patch_1_0_hdr.bin",
         "size": 127596,
@@ -154,7 +154,7 @@ CONNECTIVITY_ASSET_REQUIREMENTS = {
 
 CONNECTIVITY_HELPERS = {
     "sbin/wmt_configure": (
-        25744, "2a57272037a34519e9f6f5dd64ab5a16ad304c81535c4aa7f15a8afae34aadb1",
+        25744, "e0ff85f0ac2cb2b98718556470444cafd1fcd8865cdba27aa67e2c7d7a3303e0",
     ),
     "sbin/wmt_responder": (
         21648, "46170ddc1d1ddf21a85ec16df129aac47a258a439bc9e6ed061d1e5942aa48eb",
@@ -869,7 +869,10 @@ def validate_connectivity(entries: dict[str, Entry], manifest: dict[str, object]
         "source_partition": "system_a-read-only",
         "embedded_vendor_file_count": 0,
         "required_vendor_file_count": len(CONNECTIVITY_ASSET_REQUIREMENTS),
-        "required_vendor_bytes": 552827,
+        "required_vendor_bytes": sum(
+            int(record["size"])
+            for record in CONNECTIVITY_ASSET_REQUIREMENTS.values()
+        ),
         "helper_count": len(CONNECTIVITY_HELPERS),
         "payload_bytes": sum(size for size, _digest in CONNECTIVITY_HELPERS.values()),
         "files": {},
