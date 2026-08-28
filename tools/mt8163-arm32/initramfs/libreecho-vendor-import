@@ -12,13 +12,66 @@ SYSTEM_A_DEV=${LIBREECHO_VENDOR_SYSTEM_A_DEV:-/dev/mmcblk0p13}
 SYSTEM_A_SYSFS=${LIBREECHO_VENDOR_SYSTEM_A_SYSFS:-/sys/class/block/mmcblk0p13}
 SOURCE_ROOT=${LIBREECHO_VENDOR_SOURCE_ROOT:-}
 STAGE_PARENT=${LIBREECHO_VENDOR_STAGE_PARENT:-/tmp/libreecho-vendor-import}
+STATUS_PATH=${LIBREECHO_VENDOR_STATUS_PATH:-/run/libreecho/vendor-import.status}
+FORCE_MARKER=${LIBREECHO_VENDOR_FORCE_MARKER:-$DATA_ROOT/libreecho/config/vendor-import-force-next-boot}
 MOUNT_ROOT=/tmp/libreecho-stock-system-a
+SOURCE_LAYOUTS='etc/firmware vendor/firmware system/vendor/firmware system/etc/firmware'
 STAGE=
+ACTIVE_SPEC=$SPEC
 STAGE_PARENT_CREATED=0
 MOUNTED=0
+FORCE_REQUESTED=0
+VERIFICATION=none
+SELECTED_LAYOUT=none
+STATUS_STATE=starting
+STATUS_ERROR=none
+
+write_status()
+{
+    status_parent=${STATUS_PATH%/*}
+    status_temp=$STATUS_PATH.tmp.$$
+    [ "$status_parent" != "$STATUS_PATH" ] || return 0
+    [ -d "$status_parent" ] && [ ! -L "$status_parent" ] || return 0
+    {
+        printf 'state=%s\n' "$STATUS_STATE"
+        printf 'verification=%s\n' "$VERIFICATION"
+        printf 'source_partition=system_a\n'
+        printf 'source_layout=%s\n' "$SELECTED_LAYOUT"
+        printf 'force_requested=%s\n' "$FORCE_REQUESTED"
+        printf 'error=%s\n' "$STATUS_ERROR"
+    } > "$status_temp"
+    chmod 0600 "$status_temp"
+    mv "$status_temp" "$STATUS_PATH"
+}
+
+prepare_status_path()
+{
+    status_parent=${STATUS_PATH%/*}
+    status_base=${status_parent%/*}
+    [ "$status_parent" != "$STATUS_PATH" ] || return 1
+    [ -n "$status_parent" ] || return 1
+    [ "$status_base" != "$status_parent" ] || return 1
+    [ -n "$status_base" ] || status_base=/
+    if [ ! -e "$status_base" ]; then
+        mkdir "$status_base" || return 1
+        chmod 0755 "$status_base" || return 1
+    fi
+    [ -d "$status_base" ] && [ ! -L "$status_base" ] || return 1
+    if [ ! -e "$status_parent" ]; then
+        mkdir "$status_parent" || return 1
+        chmod 0755 "$status_parent" || return 1
+    fi
+    [ -d "$status_parent" ] && [ ! -L "$status_parent" ] || return 1
+    if [ -e "$STATUS_PATH" ]; then
+        [ -f "$STATUS_PATH" ] && [ ! -L "$STATUS_PATH" ] || return 1
+    fi
+}
 
 fail()
 {
+    STATUS_STATE=failed
+    STATUS_ERROR=$1
+    write_status
     printf '%s\n' "$1" >&2
     exit 2
 }
@@ -54,16 +107,117 @@ validate_spec()
             ''|*[!0-9]*) fail VENDOR_IMPORT_SPEC_SIZE_INVALID ;;
         esac
         case "$source_name" in
-            system/vendor/firmware/*) ;;
+            etc/firmware/*|vendor/firmware/*|system/vendor/firmware/*|system/etc/firmware/*) ;;
             *) fail VENDOR_IMPORT_SPEC_SOURCE_INVALID ;;
         esac
         case "$source_name" in *..*|*//*|*/./*) fail VENDOR_IMPORT_SPEC_SOURCE_INVALID ;; esac
         case "$target_name" in
             ''|*[!A-Za-z0-9._-]*|*..*) fail VENDOR_IMPORT_SPEC_TARGET_INVALID ;;
         esac
+        [ "${source_name##*/}" = "$target_name" ] || fail VENDOR_IMPORT_SPEC_SOURCE_TARGET_MISMATCH
         count=$((count + 1))
     done < "$SPEC"
     [ "$count" -eq 4 ] || fail VENDOR_IMPORT_SPEC_COUNT_INVALID
+}
+
+layout_is_safe()
+{
+    layout=$1
+    old_ifs=$IFS
+    IFS=/
+    current=$SOURCE_ROOT
+    for component in $layout; do
+        current=$current/$component
+        if [ -L "$current" ]; then
+            IFS=$old_ifs
+            return 2
+        fi
+        if [ ! -d "$current" ]; then
+            IFS=$old_ifs
+            return 1
+        fi
+    done
+    IFS=$old_ifs
+    return 0
+}
+
+forced_file_is_compatible()
+{
+    forced_source=$1
+    forced_target=$2
+    [ -f "$forced_source" ] && [ ! -L "$forced_source" ] || return 1
+    forced_size=$(stat -c %s "$forced_source")
+    case "$forced_target" in
+        ROMv2_lm_patch_1_0_hdr.bin)
+            [ "$forced_size" -ge 28 ] && [ "$forced_size" -le 16777216 ] || return 1
+            forced_meta=$(dd if="$forced_source" bs=1 skip=22 count=6 2>/dev/null | od -An -tx1 | tr -d ' \n')
+            [ "$forced_meta" = 8a0022000600 ] || return 1
+            ;;
+        ROMv2_lm_patch_1_1_hdr.bin)
+            [ "$forced_size" -ge 28 ] && [ "$forced_size" -le 16777216 ] || return 1
+            forced_meta=$(dd if="$forced_source" bs=1 skip=22 count=6 2>/dev/null | od -An -tx1 | tr -d ' \n')
+            [ "$forced_meta" = 8a0021000ef0 ] || return 1
+            ;;
+        WIFI_RAM_CODE_8163)
+            [ "$forced_size" -ge 1 ] && [ "$forced_size" -le 16777216 ] || return 1
+            ;;
+        WMT_SOC.cfg)
+            [ "$forced_size" -ge 1 ] && [ "$forced_size" -le 65536 ] || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+layout_matches()
+{
+    candidate_layout=$1
+    candidate_mode=$2
+    while IFS='|' read -r expected_hash expected_size source_name target_name; do
+        [ -n "$expected_hash" ] || continue
+        candidate=$SOURCE_ROOT/$candidate_layout/$target_name
+        [ -f "$candidate" ] && [ ! -L "$candidate" ] || return 1
+        if [ "$candidate_mode" = pinned ]; then
+            [ "$(stat -c %s "$candidate")" = "$expected_size" ] || return 1
+            [ "$(sha256sum "$candidate" | awk '{print $1}')" = "$expected_hash" ] || return 1
+        else
+            forced_file_is_compatible "$candidate" "$target_name" || return 1
+        fi
+    done < "$SPEC"
+    return 0
+}
+
+select_source_layout()
+{
+    saw_symlink=0
+    for candidate_layout in $SOURCE_LAYOUTS; do
+        if layout_is_safe "$candidate_layout"; then
+            if layout_matches "$candidate_layout" pinned; then
+                SELECTED_LAYOUT=$candidate_layout
+                VERIFICATION=hash-pinned
+                return 0
+            fi
+        else
+            layout_rc=$?
+            [ "$layout_rc" -eq 2 ] && saw_symlink=1
+        fi
+    done
+    if [ "$FORCE_REQUESTED" -eq 1 ]; then
+        for candidate_layout in $SOURCE_LAYOUTS; do
+            if layout_is_safe "$candidate_layout"; then
+                if layout_matches "$candidate_layout" forced; then
+                    SELECTED_LAYOUT=$candidate_layout
+                    VERIFICATION=forced-unverified
+                    return 0
+                fi
+            fi
+        done
+    fi
+    [ "$saw_symlink" -eq 0 ] || fail VENDOR_IMPORT_SOURCE_PATH_SYMLINK
+    if [ "$FORCE_REQUESTED" -eq 1 ]; then
+        fail VENDOR_IMPORT_FORCED_SET_INCOMPATIBLE
+    fi
+    fail VENDOR_IMPORT_NO_HASH_PINNED_SET
 }
 
 verify_assets()
@@ -73,7 +227,7 @@ verify_assets()
     [ "$(stat -c %a "$verify_root")" = 700 ] || return 1
     [ -f "$verify_root/ASSETS.tsv" ] && [ ! -L "$verify_root/ASSETS.tsv" ] || return 1
     [ "$(stat -c %a "$verify_root/ASSETS.tsv")" = 600 ] || return 1
-    cmp -s "$SPEC" "$verify_root/ASSETS.tsv" || return 1
+    cmp -s "$ACTIVE_SPEC" "$verify_root/ASSETS.tsv" || return 1
     count=0
     while IFS='|' read -r expected_hash expected_size source_name target_name; do
         [ -n "$expected_hash" ] || continue
@@ -84,14 +238,14 @@ verify_assets()
         actual_hash=$(sha256sum "$target" | awk '{print $1}')
         [ "$actual_hash" = "$expected_hash" ] || return 1
         count=$((count + 1))
-    done < "$SPEC"
+    done < "$ACTIVE_SPEC"
     [ "$count" -eq 4 ] || return 1
 
     for child in "$verify_root"/* "$verify_root"/.[!.]*; do
         [ -e "$child" ] || [ -L "$child" ] || continue
         name=${child##*/}
         [ "$name" = ASSETS.tsv ] && continue
-        grep -q "|$name$" "$SPEC" || return 1
+        grep -q "|$name$" "$ACTIVE_SPEC" || return 1
     done
     return 0
 }
@@ -119,11 +273,11 @@ install_runtime_files()
         [ "$(sha256sum "$temp" | awk '{print $1}')" = "$expected_hash" ] || \
             fail VENDOR_IMPORT_RUNTIME_HASH_MISMATCH
         mv "$temp" "$target"
-    done < "$SPEC"
+    done < "$ACTIVE_SPEC"
 
     wifi_source=$STAGE/WIFI_RAM_CODE_8163
-    wifi_hash=$(grep '|system/vendor/firmware/WIFI_RAM_CODE_8163|WIFI_RAM_CODE_8163$' "$SPEC" | cut -d '|' -f 1)
-    wifi_size=$(grep '|system/vendor/firmware/WIFI_RAM_CODE_8163|WIFI_RAM_CODE_8163$' "$SPEC" | cut -d '|' -f 2)
+    wifi_hash=$(grep '|WIFI_RAM_CODE_8163$' "$ACTIVE_SPEC" | cut -d '|' -f 1)
+    wifi_size=$(grep '|WIFI_RAM_CODE_8163$' "$ACTIVE_SPEC" | cut -d '|' -f 2)
     [ -n "$wifi_hash" ] && [ -n "$wifi_size" ] || fail VENDOR_IMPORT_WIFI_ALIAS_CONTRACT_INVALID
     alias=$FIRMWARE_ROOT/WIFI_RAM_CODE
     temp=$FIRMWARE_ROOT/.WIFI_RAM_CODE.import.$$
@@ -143,7 +297,9 @@ install_runtime_files()
     mv "$temp" "$alias"
 }
 
+prepare_status_path || fail VENDOR_IMPORT_STATUS_PATH_UNSAFE
 validate_spec
+write_status
 
 [ -d "$DATA_ROOT" ] && [ ! -L "$DATA_ROOT" ] || fail VENDOR_IMPORT_DATA_ROOT_INVALID
 if [ "$TEST_MODE" != 1 ]; then
@@ -156,7 +312,7 @@ if [ "$TEST_MODE" != 1 ]; then
     [ "$(cat "$SYSTEM_A_SYSFS/size")" = 1572864 ] || fail VENDOR_IMPORT_SYSTEM_A_SIZE_INVALID
     rm -rf "$MOUNT_ROOT"
     mkdir -p "$MOUNT_ROOT"
-    mount -t ext4 -o ro,nosuid,nodev,noexec "$SYSTEM_A_DEV" "$MOUNT_ROOT" || \
+    mount -t ext4 -o ro,noload,nosuid,nodev,noexec "$SYSTEM_A_DEV" "$MOUNT_ROOT" || \
         fail VENDOR_IMPORT_SYSTEM_A_MOUNT_FAILED
     MOUNTED=1
     SOURCE_ROOT=$MOUNT_ROOT
@@ -164,12 +320,17 @@ else
     [ -n "$SOURCE_ROOT" ] || fail VENDOR_IMPORT_TEST_SOURCE_MISSING
 fi
 
+if [ -e "$FORCE_MARKER" ] || [ -L "$FORCE_MARKER" ]; then
+    [ -f "$FORCE_MARKER" ] && [ ! -L "$FORCE_MARKER" ] || fail VENDOR_IMPORT_FORCE_MARKER_INVALID
+    [ "$(stat -c %a "$FORCE_MARKER")" = 600 ] || fail VENDOR_IMPORT_FORCE_MARKER_MODE_INVALID
+    [ "$(cat "$FORCE_MARKER")" = force-unverified-owner-local-import-v1 ] || \
+        fail VENDOR_IMPORT_FORCE_MARKER_CONTENT_INVALID
+    FORCE_REQUESTED=1
+    rm -f "$FORCE_MARKER"
+fi
+
 [ -d "$SOURCE_ROOT" ] && [ ! -L "$SOURCE_ROOT" ] || fail VENDOR_IMPORT_SOURCE_ROOT_INVALID
-for source_directory in system system/vendor system/vendor/firmware; do
-    [ -d "$SOURCE_ROOT/$source_directory" ] &&
-        [ ! -L "$SOURCE_ROOT/$source_directory" ] ||
-        fail VENDOR_IMPORT_SOURCE_PATH_SYMLINK
-done
+select_source_layout
 
 [ ! -L "$STAGE_PARENT" ] || fail VENDOR_IMPORT_STAGE_PATH_SYMLINK
 if [ -e "$STAGE_PARENT" ]; then
@@ -185,9 +346,23 @@ STAGE=$STAGE_PARENT/.$BUNDLE_ID.import.$$
 mkdir "$STAGE"
 chmod 0700 "$STAGE"
 
+if [ "$VERIFICATION" = forced-unverified ]; then
+    ACTIVE_SPEC=$STAGE/ASSETS.tsv
+    : > "$ACTIVE_SPEC"
+    chmod 0600 "$ACTIVE_SPEC"
+    while IFS='|' read -r expected_hash expected_size source_name target_name; do
+        [ -n "$expected_hash" ] || continue
+        source=$SOURCE_ROOT/$SELECTED_LAYOUT/$target_name
+        actual_hash=$(sha256sum "$source" | awk '{print $1}')
+        actual_size=$(stat -c %s "$source")
+        printf '%s|%s|%s/%s|%s\n' \
+            "$actual_hash" "$actual_size" "$SELECTED_LAYOUT" "$target_name" "$target_name" >> "$ACTIVE_SPEC"
+    done < "$SPEC"
+fi
+
 while IFS='|' read -r expected_hash expected_size source_name target_name; do
     [ -n "$expected_hash" ] || continue
-    source=$SOURCE_ROOT/$source_name
+    source=$SOURCE_ROOT/$SELECTED_LAYOUT/$target_name
     target=$STAGE/$target_name
     [ -f "$source" ] && [ ! -L "$source" ] || fail VENDOR_IMPORT_SOURCE_FILE_MISSING
     [ "$(stat -c %s "$source")" = "$expected_size" ] || fail VENDOR_IMPORT_SOURCE_SIZE_MISMATCH
@@ -197,10 +372,16 @@ while IFS='|' read -r expected_hash expected_size source_name target_name; do
     chmod 0600 "$target"
     [ "$(sha256sum "$target" | awk '{print $1}')" = "$expected_hash" ] || \
         fail VENDOR_IMPORT_COPY_HASH_MISMATCH
-done < "$SPEC"
-cp "$SPEC" "$STAGE/ASSETS.tsv"
+done < "$ACTIVE_SPEC"
+if [ "$ACTIVE_SPEC" != "$STAGE/ASSETS.tsv" ]; then
+    cp "$ACTIVE_SPEC" "$STAGE/ASSETS.tsv"
+fi
 chmod 0600 "$STAGE/ASSETS.tsv"
 verify_assets "$STAGE" || fail VENDOR_IMPORT_STAGE_INVALID
 install_runtime_files
 sync
-printf '%s\n' VENDOR_IMPORT_INSTALLED_RUNTIME_ONLY
+STATUS_STATE=ready
+STATUS_ERROR=none
+write_status
+printf 'VENDOR_IMPORT_INSTALLED_RUNTIME_ONLY verification=%s source_layout=%s\n' \
+    "$VERIFICATION" "$SELECTED_LAYOUT"

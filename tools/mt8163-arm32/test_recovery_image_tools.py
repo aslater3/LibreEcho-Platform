@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -211,6 +212,7 @@ class SourceTests(unittest.TestCase):
             "LIBREECHO_VENDOR_FIRMWARE_ROOT": str(firmware),
             "LIBREECHO_VENDOR_SPEC": str(specification),
             "LIBREECHO_VENDOR_STAGE_PARENT": str(root / "vendor-stage"),
+            "LIBREECHO_VENDOR_STATUS_PATH": str(root / "run/libreecho/vendor-import.status"),
         }
         return importer, data, source, firmware, environment, records
 
@@ -386,6 +388,7 @@ class SourceTests(unittest.TestCase):
                 "LIBREECHO_VENDOR_FIRMWARE_ROOT": str(firmware),
                 "LIBREECHO_VENDOR_SPEC": str(spec),
                 "LIBREECHO_VENDOR_STAGE_PARENT": str(root / "vendor-stage"),
+                "LIBREECHO_VENDOR_STATUS_PATH": str(root / "run/libreecho/vendor-import.status"),
             }
 
             first = subprocess.run(
@@ -425,6 +428,86 @@ class SourceTests(unittest.TestCase):
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             self.assertNotEqual(second.returncode, 0)
+            self.assertFalse((firmware / "WIFI_RAM_CODE").exists())
+
+    def test_vendor_import_probes_stock_system_root_layouts(self) -> None:
+        for layout in ("etc/firmware", "vendor/firmware", "system/etc/firmware"):
+            with self.subTest(layout=layout), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                importer, _data, source, firmware, environment, records = (
+                    self.vendor_import_fixture(root)
+                )
+                original = source / "system/vendor/firmware"
+                replacement = source / layout
+                replacement.parent.mkdir(parents=True, exist_ok=True)
+                original.rename(replacement)
+                result = subprocess.run(
+                    ["/bin/sh", str(importer)], env=environment,
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"source_layout={layout}", result.stdout)
+                for _source_name, target_name, payload in records:
+                    self.assertEqual((firmware / target_name).read_bytes(), payload)
+
+    def test_vendor_import_force_is_one_boot_structurally_gated_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            importer, data, source, firmware, environment, _records = (
+                self.vendor_import_fixture(root)
+            )
+            shutil.rmtree(source / "system")
+            payload_root = source / "etc/firmware"
+            payload_root.mkdir(parents=True)
+            patch_zero = bytearray(4096)
+            patch_zero[22:28] = bytes.fromhex("8a0022000600")
+            patch_one = bytearray(4096)
+            patch_one[22:28] = bytes.fromhex("8a0021000ef0")
+            forced = {
+                "ROMv2_lm_patch_1_0_hdr.bin": bytes(patch_zero),
+                "ROMv2_lm_patch_1_1_hdr.bin": bytes(patch_one),
+                "WIFI_RAM_CODE_8163": b"W" * 8192,
+                "WMT_SOC.cfg": b"coex_wmt_ant_mode=0\n",
+            }
+            for name, payload in forced.items():
+                (payload_root / name).write_bytes(payload)
+            force_marker = data / "libreecho/config/vendor-import-force-next-boot"
+            force_marker.parent.mkdir(parents=True)
+            force_marker.write_text("force-unverified-owner-local-import-v1\n")
+            force_marker.chmod(0o600)
+            environment["LIBREECHO_VENDOR_FORCE_MARKER"] = str(force_marker)
+            result = subprocess.run(
+                ["/bin/sh", str(importer)], env=environment,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("verification=forced-unverified", result.stdout)
+            self.assertFalse(force_marker.exists())
+            status = Path(environment["LIBREECHO_VENDOR_STATUS_PATH"]).read_text()
+            self.assertIn("state=ready\n", status)
+            self.assertIn("verification=forced-unverified\n", status)
+            for name, payload in forced.items():
+                self.assertEqual((firmware / name).read_bytes(), payload)
+
+    def test_vendor_import_force_rejects_incompatible_patch_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            importer, data, source, firmware, environment, _records = (
+                self.vendor_import_fixture(root)
+            )
+            for patch in (source / "system/vendor/firmware").glob("ROMv2_*.bin"):
+                patch.write_bytes(b"X" * 4096)
+            force_marker = data / "libreecho/config/vendor-import-force-next-boot"
+            force_marker.parent.mkdir(parents=True)
+            force_marker.write_text("force-unverified-owner-local-import-v1\n")
+            force_marker.chmod(0o600)
+            environment["LIBREECHO_VENDOR_FORCE_MARKER"] = str(force_marker)
+            result = subprocess.run(
+                ["/bin/sh", str(importer)], env=environment,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("VENDOR_IMPORT_FORCED_SET_INCOMPATIBLE", result.stderr)
             self.assertFalse((firmware / "WIFI_RAM_CODE").exists())
 
     def test_vendor_import_rejects_symlinked_transient_stage_parent(self) -> None:
@@ -1450,22 +1533,22 @@ class VendorAssetContractTests(unittest.TestCase):
     def test_local_asset_contract_is_shared_and_contains_no_payload(self) -> None:
         expected = {
             "ROMv2_lm_patch_1_0_hdr.bin": {
-                "source": "system/vendor/firmware/ROMv2_lm_patch_1_0_hdr.bin",
-                "mode": 0o644, "size": 128720,
-                "sha256": "b4460117f51a43f3284594ec08d8c8861ecc0e42b17820987da03ecabdebac1e",
+                "source": "etc/firmware/ROMv2_lm_patch_1_0_hdr.bin",
+                "mode": 0o644, "size": 127596,
+                "sha256": "36d7edc7095f4cdfdaaa9c67061cf079199a55be85ab76ce82c9e9bcb34824a2",
             },
             "ROMv2_lm_patch_1_1_hdr.bin": {
-                "source": "system/vendor/firmware/ROMv2_lm_patch_1_1_hdr.bin",
-                "mode": 0o644, "size": 50148,
-                "sha256": "10c4ed22a10b8a136bffd7ffce4d552300d76f8e593627d2a9841c3b11a5697e",
+                "source": "etc/firmware/ROMv2_lm_patch_1_1_hdr.bin",
+                "mode": 0o644, "size": 50952,
+                "sha256": "cabdb842d354dd123d2d3d939f06304c1cfb045f407b5880444be326ded16d8d",
             },
             "WIFI_RAM_CODE_8163": {
-                "source": "system/vendor/firmware/WIFI_RAM_CODE_8163",
+                "source": "etc/firmware/WIFI_RAM_CODE_8163",
                 "mode": 0o644, "size": 373840,
                 "sha256": "9669cc9b03cfdc5e8fd4fd6e14c4c4050e8c196738ca4707eea12f14a6a8e64c",
             },
             "WMT_SOC.cfg": {
-                "source": "system/vendor/firmware/WMT_SOC.cfg",
+                "source": "etc/firmware/WMT_SOC.cfg",
                 "mode": 0o644, "size": 119,
                 "sha256": "302bd4462de99c028c04092e561c1500d65582ce42a93c4c72ccae6e2c99013d",
             },

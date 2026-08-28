@@ -62,7 +62,6 @@ struct options {
 
 struct patch_descriptor {
 	const char *name;
-	off_t expected_size;
 	uint8_t expected_header[PATCH_HEADER_SIZE];
 	uint8_t expected_route[PATCH_ROUTE_SIZE];
 	uint8_t expected_download_seq;
@@ -72,7 +71,6 @@ struct patch_descriptor {
 static const struct patch_descriptor patch_descriptors[] = {
 	{
 		"ROMv2_lm_patch_1_0_hdr.bin",
-		128720,
 		{ 0x8a, 0x00 },
 		{ 0x22, 0x00, 0x06, 0x00 },
 		2,
@@ -80,7 +78,6 @@ static const struct patch_descriptor patch_descriptors[] = {
 	},
 	{
 		"ROMv2_lm_patch_1_1_hdr.bin",
-		50148,
 		{ 0x8a, 0x00 },
 		{ 0x21, 0x00, 0x0e, 0xf0 },
 		1,
@@ -220,12 +217,12 @@ static int load_patch_info(const struct options *options, size_t index,
 		close(fd);
 		return -1;
 	}
-	if (!S_ISREG(status.st_mode) || status.st_size != descriptor->expected_size) {
+	if (!S_ISREG(status.st_mode) || status.st_size < 28 ||
+	    status.st_size > 16777216) {
 		fprintf(stderr,
-			"unexpected patch file %s: regular=%s size=%lld expected=%lld\n",
+			"unexpected patch file %s: regular=%s size=%lld expected=28..16777216\n",
 			path, S_ISREG(status.st_mode) ? "yes" : "no",
-			(long long)status.st_size,
-			(long long)descriptor->expected_size);
+			(long long)status.st_size);
 		close(fd);
 		return -1;
 	}

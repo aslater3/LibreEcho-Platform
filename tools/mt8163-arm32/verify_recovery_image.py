@@ -38,7 +38,7 @@ ZIMAGE_MAGIC = 0x016F2818
 ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
 CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
-CONNECTIVITY_IMPORTER_SHA256 = "27f20efb39825333838df76eb843e4af537864f326a9648702739286a25e5d3a"
+CONNECTIVITY_IMPORTER_SHA256 = "7601145a15750abce6a4c21d20326ecbdc1e4dc36e5670c0ca3cc9d1bf1f1326"
 CONNECTIVITY_STOCK_SYSTEM_SHA256 = "56540b3a9ac4437901a5510d9fb5e09b1a8d0cc229548f0b08bb5c22d78684fe"
 CONNECTIVITY_EVIDENCE_MANIFEST_SHA256 = "d1eedd04efe0dbc78853f2b0f9357c092b4ca66242648908c0369956538441eb"
 WPA_SUPPLICANT_VERSION = "2.10"
@@ -131,22 +131,22 @@ AIRPLAY_BINARY_NAMES = {
 
 CONNECTIVITY_ASSET_REQUIREMENTS = {
     "ROMv2_lm_patch_1_0_hdr.bin": {
-        "source": "system/vendor/firmware/ROMv2_lm_patch_1_0_hdr.bin",
-        "size": 128720,
-        "sha256": "b4460117f51a43f3284594ec08d8c8861ecc0e42b17820987da03ecabdebac1e",
+        "source": "etc/firmware/ROMv2_lm_patch_1_0_hdr.bin",
+        "size": 127596,
+        "sha256": "36d7edc7095f4cdfdaaa9c67061cf079199a55be85ab76ce82c9e9bcb34824a2",
     },
     "ROMv2_lm_patch_1_1_hdr.bin": {
-        "source": "system/vendor/firmware/ROMv2_lm_patch_1_1_hdr.bin",
-        "size": 50148,
-        "sha256": "10c4ed22a10b8a136bffd7ffce4d552300d76f8e593627d2a9841c3b11a5697e",
+        "source": "etc/firmware/ROMv2_lm_patch_1_1_hdr.bin",
+        "size": 50952,
+        "sha256": "cabdb842d354dd123d2d3d939f06304c1cfb045f407b5880444be326ded16d8d",
     },
     "WIFI_RAM_CODE_8163": {
-        "source": "system/vendor/firmware/WIFI_RAM_CODE_8163",
+        "source": "etc/firmware/WIFI_RAM_CODE_8163",
         "size": 373840,
         "sha256": "9669cc9b03cfdc5e8fd4fd6e14c4c4050e8c196738ca4707eea12f14a6a8e64c",
     },
     "WMT_SOC.cfg": {
-        "source": "system/vendor/firmware/WMT_SOC.cfg",
+        "source": "etc/firmware/WMT_SOC.cfg",
         "size": 119,
         "sha256": "302bd4462de99c028c04092e561c1500d65582ce42a93c4c72ccae6e2c99013d",
     },
