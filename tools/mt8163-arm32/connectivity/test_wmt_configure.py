@@ -55,6 +55,30 @@ class PatchRoutingTests(unittest.TestCase):
             result.stdout,
         )
 
+    def test_owner_system_patch_sizes_keep_stock_routes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="wmt-owner-patch-test-") as temporary:
+            staged = self.staged_firmware(Path(temporary))
+            expected = {
+                PATCHES[0]: 127596,
+                PATCHES[1]: 50952,
+            }
+            for name, size in expected.items():
+                patch = staged / name
+                data = patch.read_bytes()
+                patch.write_bytes((data + bytes(size))[:size])
+            result = self.run_inspection(staged)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "seq=2 size=127596 header=8a:00 route=22:00:06:00 "
+                "address=00:00:06:00",
+                result.stdout,
+            )
+            self.assertIn(
+                "seq=1 size=50952 header=8a:00 route=21:00:0e:f0 "
+                "address=00:00:0e:f0",
+                result.stdout,
+            )
+
     def test_shifted_or_filename_order_metadata_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory(prefix="wmt-route-test-") as temporary:
             staged = self.staged_firmware(Path(temporary))
