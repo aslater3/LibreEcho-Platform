@@ -432,6 +432,27 @@ reboot_request_loop()
 reboot_request_loop &
 log reboot-supervisor-started
 
+# busybox's halt/poweroff/reboot applets do their work by signalling PID 1 --
+# they assume busybox init is there to catch it.  PID 1 here is this shell, so
+# without these traps the signal is discarded and `reboot` exits 0 having done
+# nothing at all, which reads as success.  Route each signal at the same forced
+# transition the recovery supervisor above already performs.
+signal_transition()
+{
+    log "reboot-signal-$1-accepted"
+    $BB sync
+    case "$1" in
+        halt)     $BB halt -f ;;
+        poweroff) $BB poweroff -f ;;
+        *)        $BB reboot -f ;;
+    esac
+}
+trap 'signal_transition reboot'   TERM
+trap 'signal_transition reboot'   INT
+trap 'signal_transition halt'     USR1
+trap 'signal_transition poweroff' USR2
+log reboot-signal-traps-installed
+
 # Stable MediaTek connectivity aliases.  btif is dynamically allocated and is
 # intentionally left to devtmpfs/ueventd.
 [ -c /dev/wmtWifi ] || $BB mknod /dev/wmtWifi c 153 0 2>/dev/null
@@ -1205,6 +1226,10 @@ fi
 
 # Android init remains PID 1.  Keep this service alive so the runme loop and
 # recovery diagnostics survive optional driver failures.
+# sleep in the background and wait for it: a trap only runs between commands,
+# so a foreground sleep would sit on a signal for up to an hour before the
+# handler fired.  wait is interruptible, so the transition is immediate.
 while true; do
-    $BB sleep 3600
+    $BB sleep 3600 &
+    wait $!
 done
