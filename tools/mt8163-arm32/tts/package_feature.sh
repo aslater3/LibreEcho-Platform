@@ -47,30 +47,28 @@ fi
   exit 1
 }
 
-if [[ "${TTS_PACKAGE_CONTRACT_TEST:-0}" != 1 ]]; then
-  northern_male_sha=$(sha256sum "$NORTHERN_MALE_MODEL" | awk '{print $1}')
-  female_sha=$(sha256sum "$FEMALE_MODEL" | awk '{print $1}')
-  tokens_sha=$(sha256sum "$TOKENS" | awk '{print $1}')
-  [[ "$northern_male_sha" == 786158f6507d49981889ece1803d8296adfcd34da847eb7e4ef69688ee148119 ]] || {
-    echo "ERROR: Northern English male model hash is not the reviewed metadata-only derivative" >&2
-    exit 1
-  }
-  [[ "$female_sha" == cf7f487689da2ec115cb5e9b5fb5ff4450f24e0c45565e0b72dd1eb4ed4caf65 ]] || {
-    echo "ERROR: Southern English female model hash is not the reviewed optimized model" >&2
-    exit 1
-  }
-  [[ "$tokens_sha" == 42d1a69ed2b91a51928a711aa228ed9f3dc021c6d359a3e9c4f37eb1d20f80bd ]] || {
-    echo "ERROR: VITS token table hash is not the reviewed English table" >&2
-    exit 1
-  }
-  file -b "$TTSD" | grep -Eq 'ELF 32-bit.*ARM.*statically linked' || {
-    echo "ERROR: TTS daemon is not a static ARM32 executable" >&2
-    exit 1
-  }
-  if readelf -l "$TTSD" | grep -q 'Requesting program interpreter'; then
-    echo "ERROR: TTS daemon has a dynamic interpreter" >&2
-    exit 1
-  fi
+northern_male_sha=$(sha256sum "$NORTHERN_MALE_MODEL" | awk '{print $1}')
+female_sha=$(sha256sum "$FEMALE_MODEL" | awk '{print $1}')
+tokens_sha=$(sha256sum "$TOKENS" | awk '{print $1}')
+[[ "$northern_male_sha" == 786158f6507d49981889ece1803d8296adfcd34da847eb7e4ef69688ee148119 ]] || {
+  echo "ERROR: Northern English male model hash is not the reviewed metadata-only derivative" >&2
+  exit 1
+}
+[[ "$female_sha" == cf7f487689da2ec115cb5e9b5fb5ff4450f24e0c45565e0b72dd1eb4ed4caf65 ]] || {
+  echo "ERROR: Southern English female model hash is not the reviewed optimized model" >&2
+  exit 1
+}
+[[ "$tokens_sha" == 42d1a69ed2b91a51928a711aa228ed9f3dc021c6d359a3e9c4f37eb1d20f80bd ]] || {
+  echo "ERROR: VITS token table hash is not the reviewed English table" >&2
+  exit 1
+}
+file -b "$TTSD" | grep -Eq 'ELF 32-bit.*ARM.*statically linked' || {
+  echo "ERROR: TTS daemon is not a static ARM32 executable" >&2
+  exit 1
+}
+if readelf -l "$TTSD" | grep -q 'Requesting program interpreter'; then
+  echo "ERROR: TTS daemon has a dynamic interpreter" >&2
+  exit 1
 fi
 
 root="$(mktemp -d /tmp/libreecho-tts-feature.XXXXXX)"
