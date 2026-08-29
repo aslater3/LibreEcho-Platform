@@ -117,13 +117,9 @@ libnl_libdir="$libnl_src/lib/.libs"
   exit 1
 }
 
-cflags=(
-  $common_cflags
-  "-idirafter" "$KERNEL_HEADERS"
-)
 make -C "$wpa_src/wpa_supplicant" -j"${LIBREECHO_BUILD_JOBS:-2}" \
   CC="$cc_wrapper" LIBNL_INC="$libnl_src/include" \
-  EXTRA_CFLAGS="${cflags[*]}" \
+  EXTRA_CFLAGS="$common_cflags -I$libnl_src/include -idirafter $KERNEL_HEADERS" \
   LDFLAGS="-static -no-pie -s -Wl,--build-id=none -L$libnl_libdir" \
   wpa_supplicant >/dev/null
 

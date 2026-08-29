@@ -860,7 +860,7 @@ class SourceTests(unittest.TestCase):
         ).read_text()
         self.assertIn("--kernel-headers DIR", builder)
         self.assertIn("KERNEL_HEADERS=", builder)
-        self.assertIn('"-idirafter" "$KERNEL_HEADERS"', builder)
+        self.assertIn("-idirafter $KERNEL_HEADERS", builder)
         self.assertIn("kernel_uapi_sha256", builder)
         self.assertNotIn("/usr/arm-linux-gnueabihf/include", builder)
         image_builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
@@ -885,6 +885,10 @@ class SourceTests(unittest.TestCase):
         self.assertIn("CONFIG_DRIVER_WEXT=y", config)
         self.assertIn("--libnl-archive FILE", builder)
         self.assertIn("libnl_source_sha256", builder)
+        self.assertIn('LIBNL_INC="$libnl_src/include"', builder)
+        self.assertIn(
+            'EXTRA_CFLAGS="$common_cflags -I$libnl_src/include', builder
+        )
         self.assertEqual(source_lock["drivers"], ["nl80211", "wext"])
         self.assertEqual(source_lock["libnl_version"], "3.11.0")
         self.assertEqual(
