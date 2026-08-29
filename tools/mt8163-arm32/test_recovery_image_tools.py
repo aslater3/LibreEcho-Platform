@@ -874,6 +874,18 @@ class SourceTests(unittest.TestCase):
         self.assertIn("$BB sleep 3600 &\n    wait $!", init)
         self.assertNotIn("\n    $BB sleep 3600\ndone", init)
 
+    def test_pid1_signal_delivery_harness(self) -> None:
+        harness = TOOLS_DIR / "test_pid1_signal_transitions.py"
+        result = subprocess.run(
+            [sys.executable, str(harness)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for signal_name in ("TERM", "INT", "USR1", "USR2"):
+            self.assertIn(f" {signal_name} ->", result.stdout)
+
     def test_health_confirm_restart_record_is_persistent(self) -> None:
         # Issue #41: the OTA health-confirm worker must leave persistent
         # evidence before forcing a reboot, so a worker restart is
