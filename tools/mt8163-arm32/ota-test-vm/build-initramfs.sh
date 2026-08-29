@@ -25,6 +25,7 @@ cp /work/stage/ota-public-key.hex $R/tools/ 2>/dev/null || true
 mkdir -p $R/usr/local/sbin $R/usr/local/libexec $R/etc/libreecho
 cp /work/stage/tools/libreecho-update $R/usr/local/sbin/ 2>/dev/null
 cp /work/stage/tools/libreecho-bootctl $R/usr/local/sbin/ 2>/dev/null
+cp /work/stage/tools/libreecho-data-cleanup $R/usr/local/sbin/ 2>/dev/null
 cp /work/stage/tools/libreecho-update-verify $R/usr/local/libexec/ 2>/dev/null
 cp /work/stage/ota-public-key.hex $R/etc/libreecho/ota-public-key.hex
 printf 'dev\n' > $R/etc/libreecho/update-channel
@@ -49,6 +50,7 @@ $B mount --bind /fakesys /sys/class/block
 $B mount -t ext4 /dev/mmcblk0p16 /data 2>/dev/null
 UPD=/usr/local/sbin/libreecho-update
 BC=/usr/local/sbin/libreecho-bootctl
+DC=/usr/local/sbin/libreecho-data-cleanup
 run_expect(){
   name=$1; expected_rc=$2; expected_text=$3; shift 3
   out=/tmp/ota-$name.log
@@ -74,6 +76,11 @@ assert_bcb(){
   echo "$status" | $B grep -q "^selected_slot=$selected$" || { echo "$status"; exit 1; }
   echo "$status" | $B grep -q "^slot_${selected}_success=$success$" || { echo "$status"; exit 1; }
 }
+assert_bcb_success(){
+  slot=$1; success=$2
+  status=$($BC status) || { echo "ASSERT:bcb-success:status"; exit 1; }
+  echo "$status" | $B grep -q "^slot_${slot}_success=$success$" || { echo "$status"; exit 1; }
+}
 reset_bcb(){
   $B printf '\000ABB\001\217\000' >/tmp/fresh-bcb
   $B dd if=/tmp/fresh-bcb of=/dev/mmcblk0p8 bs=1 seek=864 conv=notrunc 2>/dev/null || exit 1
@@ -83,6 +90,57 @@ echo "===PHASE0 capabilities (expect: allow-unsigned)==="
 run_expect phase0-capabilities 0 allow-unsigned $UPD capabilities
 run_expect phase0-unknown 2 Usage: $UPD bogus
 echo "===PHASE0_END==="
+# ---- PHASE_DATA_CONTRACT: run the production data-contract cleanup against the
+# seeded userdata and assert its verdict. mkdisk.sh's --scenario shapes have
+# each bricked real hardware; here the real validator must reject them, and a
+# clean userdata must pass. The expectation is derived independently from the
+# on-disk shape so the assertion cannot rubber-stamp the tool.
+echo "===PHASE_DATA_CONTRACT (real cleanup over seeded /data)==="
+expect_ok=1
+[ -d /data/libreecho/config/led.json ] && expect_ok=0
+for e in /data/* ; do
+  [ -e "$e" ] || continue
+  case "${e##*/}" in libreecho|lost+found) ;; *) expect_ok=0 ;; esac
+done
+set +e
+$DC >/tmp/data-contract.log 2>&1
+dc_rc=$?
+set -e
+$B cat /tmp/data-contract.log
+if [ "$expect_ok" = 1 ]; then
+  assert_rc data-contract "$dc_rc" 0 /tmp/data-contract.log
+  assert_output /tmp/data-contract.log DATA_CLEANUP_OK
+  echo "  clean userdata accepted"
+else
+  [ "$dc_rc" -ne 0 ] || { echo "ASSERT:data-contract:brick was accepted rc=$dc_rc"; exit 1; }
+  assert_output /tmp/data-contract.log DATA_CLEANUP_CONTRACT_FAILED
+  echo "  brick shape rejected by the real contract (rc=$dc_rc)"
+  echo "===PHASE_DATA_CONTRACT_END==="
+  echo "scenario image: brick reproduced and rejected; OTA phases skipped"
+  $B poweroff -f
+fi
+echo "===PHASE_DATA_CONTRACT_END==="
+# ---- PHASE_PROFILE: if mkdisk.sh seeded a captured profile (a non-default BCB
+# -- a current slot other than a, or a bootable inactive slot), exercise an
+# install against that real state BEFORE reset_bcb throws it away. This is the
+# only phase that covers an install from slot b or with a rollback available;
+# the reset-based phases below always start from the canonical slot-a fixture.
+seeded=$($BC status)
+seeded_slot=$(echo "$seeded" | $B sed -n 's/^selected_slot=//p')
+other_slot=b; [ "$seeded_slot" = b ] && other_slot=a
+other_succ=$(echo "$seeded" | $B sed -n "s/^slot_${other_slot}_success=//p")
+other_tries=$(echo "$seeded" | $B sed -n "s/^slot_${other_slot}_tries=//p")
+if [ "$seeded_slot" != a ] || [ "${other_succ:-0}" = 1 ] || [ "${other_tries:-0}" -gt 0 ]; then
+  echo "===PHASE_PROFILE install from captured slot=$seeded_slot (rollback slot=$other_slot)==="
+  run_expect phase-profile 0 UPDATE_READY $UPD install /tools/package.tar
+  # The install must target the inactive slot and leave the slot it came from as
+  # a confirmed-successful rollback (activate()'s priority-14 state).
+  assert_bcb "$other_slot" 0
+  assert_bcb_success "$seeded_slot" 1
+  echo "  installed into $other_slot; $seeded_slot preserved as bootable rollback"
+  echo "===PHASE_PROFILE_END==="
+  $B rm -rf /data/libreecho/update 2>/dev/null
+fi
 $B rm -rf /data/libreecho/update 2>/dev/null
 reset_bcb
 echo "===PHASE1 signed package.tar (expect ota_manifest_signature=PASS + UPDATE_READY)==="

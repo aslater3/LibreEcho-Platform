@@ -17,6 +17,17 @@ powers off:
 - **PHASE0 — `libreecho-update capabilities`** → prints `allow-unsigned`; an
   unknown subcommand exits non-zero (the fail-safe the web UI uses to gate the
   unsigned-upload checkbox).
+- **PHASE_DATA_CONTRACT** → runs the production `libreecho-data-cleanup` over the
+  seeded `/data` and asserts its verdict: a `--scenario` brick shape must be
+  rejected with `DATA_CLEANUP_CONTRACT_FAILED` (and the VM powers off — the
+  scenario's whole point is the rejection), a clean userdata must pass with
+  `DATA_CLEANUP_OK`. This is what makes the scenarios evidence rather than
+  inert files.
+- **PHASE_PROFILE** *(only when `--profile` seeded a non-default BCB)* → installs
+  from the captured slot before the reset below, asserting the install targets
+  the inactive slot and leaves the captured slot as a confirmed-successful
+  rollback. This is the only phase that covers an install from slot b or with a
+  rollback available.
 - **PHASE1 — signed `package.tar`** → `ota_manifest_signature=PASS` →
   `UPDATE_READY slot=b`, BCB flipped to the inactive slot.
 - **PHASE2 — unsigned `unsigned.tar`, no flag** → rejected with
@@ -41,9 +52,12 @@ sh mkdisk.sh --scenario stray-data-file
 `--profile` takes a captured device profile (produced by LibreEcho-UI's
 `tools/capture_device_profile.py`, which redacts identifying fields). Its
 `system_update` block decides which slot the BCB marks current and whether the
-other is bootable; its `config_export` block is written to
-`/data/libreecho/config` inside `userdata`, so the VM boots with a realistic
-configuration instead of an empty filesystem.
+other is a genuinely bootable rollback; its `config_export` block is written to
+`/data/libreecho/config/web-config.json` inside `userdata` -- the path
+`libreecho-init` and the web service actually read -- so the VM boots with a
+realistic configuration instead of an empty filesystem. A profile whose
+`config_export` is missing or malformed is rejected rather than silently
+seeding an empty configuration.
 
 `--scenario` seeds `/data` into a shape known to break a real device:
 
@@ -97,7 +111,7 @@ D            --platform linux/arm/v7  < build-initramfs.sh  # vmlinuz + initramf
 Then read the phase markers:
 
 ```sh
-sed -n '/===PHASE0/,/===PHASE3_END/p' boot-test.log
+sed -n '/===PHASE0/,/===PHASE3_END/p' boot-test.log   # includes DATA_CONTRACT + PROFILE
 ```
 
 ## Notes
