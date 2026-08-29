@@ -879,6 +879,7 @@ class SourceTests(unittest.TestCase):
             (TOOLS_DIR / "wpa-supplicant" / "SOURCE.lock").read_text()
         )
         wifi = (TOOLS_DIR / "initramfs/libreecho-wifi").read_text()
+        verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
         self.assertIn("CONFIG_DRIVER_NL80211=y", config)
         self.assertIn("CONFIG_LIBNL32=y", config)
         self.assertIn("CONFIG_DRIVER_WEXT=y", config)
@@ -891,6 +892,15 @@ class SourceTests(unittest.TestCase):
             "2a56e1edefa3e68a7c00879496736fdbf62fc94ed3232c0baba127ecfa76874d",
         )
         self.assertIn("-Dnl80211,wext", wifi)
+        self.assertIn("LIBNL_SOURCE_SHA256", verifier)
+        self.assertIn(
+            'source_record.get("libnl_source_sha256") != LIBNL_SOURCE_SHA256',
+            verifier,
+        )
+        self.assertIn(
+            'source_record.get("libnl_source_url") != LIBNL_SOURCE_URL',
+            verifier,
+        )
 
     def test_feature_policy_is_immutable_and_fail_closed(self) -> None:
         builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
