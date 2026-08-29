@@ -33,6 +33,8 @@ start() {
     stop
     /bin/ip link set "$IFACE" up || { log link-up-failed; return 5; }
     $BB rm -f "$LOG" "$DHCP_LOG"
+    # The comma list is a driver-initialization fallback. Once nl80211 starts,
+    # later association failures stay visible instead of restarting on WEXT.
     "$WPA" -B -Dnl80211,wext -i "$IFACE" -c "$CONF" -P "$PID" -f "$LOG" || {
         log supplicant-start-failed
         return 6

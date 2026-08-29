@@ -1007,7 +1007,8 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                        expected_nqptp_sha256: str | None,
                        expected_shairport_sync_sha256: str | None,
                        expected_avahi_daemon_sha256: str | None,
-                       expected_dbus_daemon_sha256: str | None) -> bool:
+                       expected_dbus_daemon_sha256: str | None,
+                       expected_wpa_supplicant_sha256: str | None = None) -> bool:
     if ramdisk[:4] != b"\x1f\x8b\x08\x00":
         fail("ramdisk gzip header is not deterministic")
     try:
@@ -1096,6 +1097,9 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
             fail("network asset hashes are malformed")
         wpa_hash: str = cast(str, wpa_hash_value)
         profile_hash: str = cast(str, profile_hash_value)
+        if (expected_wpa_supplicant_sha256 is not None and
+                wpa_hash != expected_wpa_supplicant_sha256):
+            fail("wpa_supplicant trusted identity mismatch")
         wpa = require_member(entries, "sbin/wpa_supplicant", wpa_hash, 0o755)
         if elf_info(wpa.data) != (1, 40, 0x05000400, None, (), False):
             fail("wpa_supplicant is not static ARM32 hard-float")
@@ -1838,6 +1842,8 @@ def main() -> None:
 
     parser.add_argument("--expected-iwconfig-sha256",
                         help="require this static ARM32 wireless-tools iwconfig utility")
+    parser.add_argument("--expected-wpa-supplicant-sha256",
+                        help="require this exact static ARM32 wpa_supplicant")
     parser.add_argument("--expected-image-profile", choices=("development", "ota"), required=True)
     parser.add_argument("--expected-service-profile", choices=("diagnostic", "production"),
                         required=True)
@@ -2022,6 +2028,7 @@ def main() -> None:
         args.expected_assistant_payload_size,
         args.expected_nqptp_sha256, args.expected_shairport_sync_sha256,
         args.expected_avahi_daemon_sha256, args.expected_dbus_daemon_sha256,
+        args.expected_wpa_supplicant_sha256,
     )
     expected_connectivity = args.expected_connectivity_bundle != "none"
     if connectivity_enabled != expected_connectivity:

@@ -900,7 +900,15 @@ class SourceTests(unittest.TestCase):
             "2a56e1edefa3e68a7c00879496736fdbf62fc94ed3232c0baba127ecfa76874d",
         )
         self.assertIn("-Dnl80211,wext", wifi)
+        image_builder = (
+            TOOLS_DIR / "build_recovery_image.py"
+        ).read_text()
+        self.assertIn("WPA_CONFIG_SHA256", image_builder)
+        self.assertIn('wpa_metadata["drivers"] != ["nl80211", "wext"]', image_builder)
+        self.assertIn('wpa_metadata["libnl_source_sha256"] != LIBNL_SOURCE_SHA256', image_builder)
         self.assertIn("LIBNL_SOURCE_SHA256", verifier)
+        self.assertIn("--expected-wpa-supplicant-sha256", verifier)
+        self.assertIn("expected_wpa_supplicant_sha256", verifier)
         self.assertIn(
             'source_record.get("libnl_source_sha256") != LIBNL_SOURCE_SHA256',
             verifier,
