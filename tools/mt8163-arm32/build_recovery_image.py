@@ -1558,6 +1558,7 @@ def add_network_bundle(stage: Path, wpa_supplicant: Path, wpa_metadata_path: Pat
     required_metadata = {
         "binary_sha256", "binary_size", "build_epoch", "compiler", "config_path",
         "config_sha256", "crypto", "drivers", "kernel_uapi_sha256", "license",
+        "libnl_license", "libnl_source_sha256", "libnl_source_url", "libnl_version",
         "source_sha256", "source_url", "static", "version",
     }
     if not isinstance(wpa_metadata, dict) or set(wpa_metadata) != required_metadata:

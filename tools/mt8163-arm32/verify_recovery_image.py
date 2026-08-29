@@ -1098,6 +1098,7 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         required_source = {
             "binary_sha256", "binary_size", "build_epoch", "compiler", "config_path",
             "config_sha256", "crypto", "drivers", "kernel_uapi_sha256", "license",
+            "libnl_license", "libnl_source_sha256", "libnl_source_url", "libnl_version",
             "source_sha256", "source_url", "static", "version",
         }
         if (not isinstance(source_record, dict) or set(source_record) != required_source or
@@ -1108,6 +1109,11 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                 source_record.get("license") != "BSD-3-Clause" or
                 source_record.get("version") != WPA_SUPPLICANT_VERSION or
                 source_record.get("static") is not True or
+                source_record.get("drivers") != ["nl80211", "wext"] or
+                source_record.get("libnl_version") != "3.11.0" or
+                source_record.get("libnl_license") != "LGPL-2.1-only" or
+                not re.fullmatch(r"[0-9a-f]{64}", str(source_record.get("libnl_source_sha256", ""))) or
+                not str(source_record.get("libnl_source_url", "")).startswith("https://") or
                 not re.fullmatch(r"[0-9a-f]{64}", str(source_record.get("config_sha256", ""))) or
                 not re.fullmatch(r"[0-9a-f]{64}", str(source_record.get("kernel_uapi_sha256", "")))):
             fail("wpa source provenance is missing or mismatched")

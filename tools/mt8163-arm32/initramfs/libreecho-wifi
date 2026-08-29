@@ -33,7 +33,7 @@ start() {
     stop
     /bin/ip link set "$IFACE" up || { log link-up-failed; return 5; }
     $BB rm -f "$LOG" "$DHCP_LOG"
-    "$WPA" -B -i "$IFACE" -c "$CONF" -P "$PID" -f "$LOG" || {
+    "$WPA" -B -Dnl80211,wext -i "$IFACE" -c "$CONF" -P "$PID" -f "$LOG" || {
         log supplicant-start-failed
         return 6
     }

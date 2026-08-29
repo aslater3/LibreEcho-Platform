@@ -707,7 +707,7 @@ class SourceTests(unittest.TestCase):
         core = TOOLS_DIR / "initramfs/usr/local/share/licenses/libreecho-core"
         components = json.loads((core / "COMPONENTS.json").read_text())
         component_ids = {component["id"] for component in components["components"]}
-        self.assertTrue({"busybox", "wpa-supplicant", "musl", "tinyalsa", "libsodium", "mt8163-audio-fpga"}.issubset(component_ids))
+        self.assertTrue({"busybox", "wpa-supplicant", "libnl", "musl", "tinyalsa", "libsodium", "mt8163-audio-fpga"}.issubset(component_ids))
         audio = next(component for component in components["components"] if component["id"] == "mt8163-audio-fpga")
         self.assertTrue(audio["included_in_public_artifact"])
         self.assertEqual(audio["redistribution_status"], "blocked")
@@ -851,7 +851,7 @@ class SourceTests(unittest.TestCase):
         builder = (
             TOOLS_DIR / "wpa-supplicant" / "build_wpa_supplicant.sh"
         ).read_text()
-        self.assertIn("LDFLAGS='-static -no-pie", builder)
+        self.assertRegex(builder, r'LDFLAGS=["\x27]-static -no-pie')
         self.assertIn("Type:[[:space:]]+EXEC", builder)
 
     def test_wpa_builder_requires_exported_linux_uapi_headers(self) -> None:
@@ -867,6 +867,30 @@ class SourceTests(unittest.TestCase):
         verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
         self.assertIn("--wpa-source-metadata", image_builder)
         self.assertIn("wpa source provenance is missing or mismatched", verifier)
+
+    def test_wpa_supplicant_prefers_nl80211_with_wext_fallback(self) -> None:
+        config = (
+            TOOLS_DIR / "wpa-supplicant" / "wpa_supplicant-2.10.config"
+        ).read_text()
+        builder = (
+            TOOLS_DIR / "wpa-supplicant" / "build_wpa_supplicant.sh"
+        ).read_text()
+        source_lock = json.loads(
+            (TOOLS_DIR / "wpa-supplicant" / "SOURCE.lock").read_text()
+        )
+        wifi = (TOOLS_DIR / "initramfs/libreecho-wifi").read_text()
+        self.assertIn("CONFIG_DRIVER_NL80211=y", config)
+        self.assertIn("CONFIG_LIBNL32=y", config)
+        self.assertIn("CONFIG_DRIVER_WEXT=y", config)
+        self.assertIn("--libnl-archive FILE", builder)
+        self.assertIn("libnl_source_sha256", builder)
+        self.assertEqual(source_lock["drivers"], ["nl80211", "wext"])
+        self.assertEqual(source_lock["libnl_version"], "3.11.0")
+        self.assertEqual(
+            source_lock["libnl_source_sha256"],
+            "2a56e1edefa3e68a7c00879496736fdbf62fc94ed3232c0baba127ecfa76874d",
+        )
+        self.assertIn("-Dnl80211,wext", wifi)
 
     def test_feature_policy_is_immutable_and_fail_closed(self) -> None:
         builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
