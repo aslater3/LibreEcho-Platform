@@ -44,7 +44,7 @@ BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
 CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
-CONNECTIVITY_IMPORTER_SHA256 = "27f20efb39825333838df76eb843e4af537864f326a9648702739286a25e5d3a"
+CONNECTIVITY_IMPORTER_SHA256 = "7601145a15750abce6a4c21d20326ecbdc1e4dc36e5670c0ca3cc9d1bf1f1326"
 WPA_SUPPLICANT_VERSION = "2.10"
 WPA_SOURCE_SHA256 = "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f"
 WPA_SOURCE_URL = "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz"
@@ -55,24 +55,24 @@ SSH_PASSWORD_HASH_RE = re.compile(
     r"\$(?:1|5|6|2[abxy]?|y|gy)\$[^$:\r\n]{1,64}\$[^:\r\n]{1,512}\Z"
 )
 
-CONNECTIVITY_ASSET_REQUIREMENTS = {
+CONNECTIVITY_ASSET_REQUIREMENTS: dict[str, dict[str, str | int]] = {
     "ROMv2_lm_patch_1_0_hdr.bin": {
-        "source": "system/vendor/firmware/ROMv2_lm_patch_1_0_hdr.bin", "mode": 0o644,
-        "size": 128720,
-        "sha256": "b4460117f51a43f3284594ec08d8c8861ecc0e42b17820987da03ecabdebac1e",
+        "source": "etc/firmware/ROMv2_lm_patch_1_0_hdr.bin", "mode": 0o644,
+        "size": 127596,
+        "sha256": "36d7edc7095f4cdfdaaa9c67061cf079199a55be85ab76ce82c9e9bcb34824a2",
     },
     "ROMv2_lm_patch_1_1_hdr.bin": {
-        "source": "system/vendor/firmware/ROMv2_lm_patch_1_1_hdr.bin", "mode": 0o644,
-        "size": 50148,
-        "sha256": "10c4ed22a10b8a136bffd7ffce4d552300d76f8e593627d2a9841c3b11a5697e",
+        "source": "etc/firmware/ROMv2_lm_patch_1_1_hdr.bin", "mode": 0o644,
+        "size": 50952,
+        "sha256": "cabdb842d354dd123d2d3d939f06304c1cfb045f407b5880444be326ded16d8d",
     },
     "WIFI_RAM_CODE_8163": {
-        "source": "system/vendor/firmware/WIFI_RAM_CODE_8163", "mode": 0o644,
+        "source": "etc/firmware/WIFI_RAM_CODE_8163", "mode": 0o644,
         "size": 373840,
         "sha256": "9669cc9b03cfdc5e8fd4fd6e14c4c4050e8c196738ca4707eea12f14a6a8e64c",
     },
     "WMT_SOC.cfg": {
-        "source": "system/vendor/firmware/WMT_SOC.cfg", "mode": 0o644, "size": 119,
+        "source": "etc/firmware/WMT_SOC.cfg", "mode": 0o644, "size": 119,
         "sha256": "302bd4462de99c028c04092e561c1500d65582ce42a93c4c72ccae6e2c99013d",
     },
 }
@@ -80,7 +80,7 @@ CONNECTIVITY_ASSET_REQUIREMENTS = {
 CONNECTIVITY_HELPERS = {
     "sbin/wmt_configure": (
         "wmt_config_helper", 25744,
-        "2a57272037a34519e9f6f5dd64ab5a16ad304c81535c4aa7f15a8afae34aadb1",
+        "e0ff85f0ac2cb2b98718556470444cafd1fcd8865cdba27aa67e2c7d7a3303e0",
     ),
     "sbin/wmt_responder": (
         "wmt_responder", 21648,
@@ -289,7 +289,7 @@ def add_connectivity_bundle(stage: Path, helpers: dict[str, Path],
     )
 
     expected_lines = []
-    requirement_records: dict[str, object] = {}
+    requirement_records: dict[str, dict[str, object]] = {}
     for target_name, specification in CONNECTIVITY_ASSET_REQUIREMENTS.items():
         expected_hash = str(specification["sha256"])
         expected_size = int(specification["size"])
@@ -344,7 +344,10 @@ def add_connectivity_bundle(stage: Path, helpers: dict[str, Path],
         "source_partition": "system_a-read-only",
         "embedded_vendor_file_count": 0,
         "required_vendor_file_count": len(requirement_records),
-        "required_vendor_bytes": 552827,
+        "required_vendor_bytes": sum(
+            int(specification["size"])
+            for specification in CONNECTIVITY_ASSET_REQUIREMENTS.values()
+        ),
         "helper_count": len(helper_records),
         "payload_bytes": sum(int(record["size"]) for record in helper_records.values()),
         "files": {},
