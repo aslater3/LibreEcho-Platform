@@ -225,6 +225,7 @@ TOLERATE_UNKNOWN_FILES=1
 check_children "$DATA_ROOT/libreecho/config" \
     web-config.json web-config.json.bak users wpa_supplicant.conf ntp.conf \
     agent.json agent.json.bak tts-voice vad-floor-rms \
+    bypass-capture-mux timers timers.tmp \
     led-state.json led-state.json.tmp
 TOLERATE_UNKNOWN_FILES=0
 check_children "$DATA_ROOT/libreecho/secrets" openai-codex.json

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -211,6 +212,7 @@ class SourceTests(unittest.TestCase):
             "LIBREECHO_VENDOR_FIRMWARE_ROOT": str(firmware),
             "LIBREECHO_VENDOR_SPEC": str(specification),
             "LIBREECHO_VENDOR_STAGE_PARENT": str(root / "vendor-stage"),
+            "LIBREECHO_VENDOR_STATUS_PATH": str(root / "run/libreecho/vendor-import.status"),
         }
         return importer, data, source, firmware, environment, records
 
@@ -386,6 +388,7 @@ class SourceTests(unittest.TestCase):
                 "LIBREECHO_VENDOR_FIRMWARE_ROOT": str(firmware),
                 "LIBREECHO_VENDOR_SPEC": str(spec),
                 "LIBREECHO_VENDOR_STAGE_PARENT": str(root / "vendor-stage"),
+                "LIBREECHO_VENDOR_STATUS_PATH": str(root / "run/libreecho/vendor-import.status"),
             }
 
             first = subprocess.run(
@@ -425,6 +428,86 @@ class SourceTests(unittest.TestCase):
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             self.assertNotEqual(second.returncode, 0)
+            self.assertFalse((firmware / "WIFI_RAM_CODE").exists())
+
+    def test_vendor_import_probes_stock_system_root_layouts(self) -> None:
+        for layout in ("etc/firmware", "vendor/firmware", "system/etc/firmware"):
+            with self.subTest(layout=layout), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                importer, _data, source, firmware, environment, records = (
+                    self.vendor_import_fixture(root)
+                )
+                original = source / "system/vendor/firmware"
+                replacement = source / layout
+                replacement.parent.mkdir(parents=True, exist_ok=True)
+                original.rename(replacement)
+                result = subprocess.run(
+                    ["/bin/sh", str(importer)], env=environment,
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"source_layout={layout}", result.stdout)
+                for _source_name, target_name, payload in records:
+                    self.assertEqual((firmware / target_name).read_bytes(), payload)
+
+    def test_vendor_import_force_is_one_boot_structurally_gated_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            importer, data, source, firmware, environment, _records = (
+                self.vendor_import_fixture(root)
+            )
+            shutil.rmtree(source / "system")
+            payload_root = source / "etc/firmware"
+            payload_root.mkdir(parents=True)
+            patch_zero = bytearray(4096)
+            patch_zero[22:28] = bytes.fromhex("8a0022000600")
+            patch_one = bytearray(4096)
+            patch_one[22:28] = bytes.fromhex("8a0021000ef0")
+            forced = {
+                "ROMv2_lm_patch_1_0_hdr.bin": bytes(patch_zero),
+                "ROMv2_lm_patch_1_1_hdr.bin": bytes(patch_one),
+                "WIFI_RAM_CODE_8163": b"W" * 8192,
+                "WMT_SOC.cfg": b"coex_wmt_ant_mode=0\n",
+            }
+            for name, payload in forced.items():
+                (payload_root / name).write_bytes(payload)
+            force_marker = data / "libreecho/config/vendor-import-force-next-boot"
+            force_marker.parent.mkdir(parents=True)
+            force_marker.write_text("force-unverified-owner-local-import-v1\n")
+            force_marker.chmod(0o600)
+            environment["LIBREECHO_VENDOR_FORCE_MARKER"] = str(force_marker)
+            result = subprocess.run(
+                ["/bin/sh", str(importer)], env=environment,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("verification=forced-unverified", result.stdout)
+            self.assertFalse(force_marker.exists())
+            status = Path(environment["LIBREECHO_VENDOR_STATUS_PATH"]).read_text()
+            self.assertIn("state=ready\n", status)
+            self.assertIn("verification=forced-unverified\n", status)
+            for name, payload in forced.items():
+                self.assertEqual((firmware / name).read_bytes(), payload)
+
+    def test_vendor_import_force_rejects_incompatible_patch_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            importer, data, source, firmware, environment, _records = (
+                self.vendor_import_fixture(root)
+            )
+            for patch in (source / "system/vendor/firmware").glob("ROMv2_*.bin"):
+                patch.write_bytes(b"X" * 4096)
+            force_marker = data / "libreecho/config/vendor-import-force-next-boot"
+            force_marker.parent.mkdir(parents=True)
+            force_marker.write_text("force-unverified-owner-local-import-v1\n")
+            force_marker.chmod(0o600)
+            environment["LIBREECHO_VENDOR_FORCE_MARKER"] = str(force_marker)
+            result = subprocess.run(
+                ["/bin/sh", str(importer)], env=environment,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("VENDOR_IMPORT_FORCED_SET_INCOMPATIBLE", result.stderr)
             self.assertFalse((firmware / "WIFI_RAM_CODE").exists())
 
     def test_vendor_import_rejects_symlinked_transient_stage_parent(self) -> None:
@@ -624,7 +707,7 @@ class SourceTests(unittest.TestCase):
         core = TOOLS_DIR / "initramfs/usr/local/share/licenses/libreecho-core"
         components = json.loads((core / "COMPONENTS.json").read_text())
         component_ids = {component["id"] for component in components["components"]}
-        self.assertTrue({"busybox", "wpa-supplicant", "musl", "tinyalsa", "libsodium", "mt8163-audio-fpga"}.issubset(component_ids))
+        self.assertTrue({"busybox", "wpa-supplicant", "libnl", "musl", "tinyalsa", "libsodium", "mt8163-audio-fpga"}.issubset(component_ids))
         audio = next(component for component in components["components"] if component["id"] == "mt8163-audio-fpga")
         self.assertTrue(audio["included_in_public_artifact"])
         self.assertEqual(audio["redistribution_status"], "blocked")
@@ -768,7 +851,7 @@ class SourceTests(unittest.TestCase):
         builder = (
             TOOLS_DIR / "wpa-supplicant" / "build_wpa_supplicant.sh"
         ).read_text()
-        self.assertIn("LDFLAGS='-static -no-pie", builder)
+        self.assertRegex(builder, r'LDFLAGS=["\x27]-static -no-pie')
         self.assertIn("Type:[[:space:]]+EXEC", builder)
 
     def test_wpa_builder_requires_exported_linux_uapi_headers(self) -> None:
@@ -777,13 +860,63 @@ class SourceTests(unittest.TestCase):
         ).read_text()
         self.assertIn("--kernel-headers DIR", builder)
         self.assertIn("KERNEL_HEADERS=", builder)
-        self.assertIn('"-idirafter" "$KERNEL_HEADERS"', builder)
+        self.assertIn("-idirafter $KERNEL_HEADERS", builder)
         self.assertIn("kernel_uapi_sha256", builder)
         self.assertNotIn("/usr/arm-linux-gnueabihf/include", builder)
         image_builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
         verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
         self.assertIn("--wpa-source-metadata", image_builder)
         self.assertIn("wpa source provenance is missing or mismatched", verifier)
+
+    def test_wpa_supplicant_prefers_nl80211_with_wext_fallback(self) -> None:
+        config = (
+            TOOLS_DIR / "wpa-supplicant" / "wpa_supplicant-2.10.config"
+        ).read_text()
+        builder = (
+            TOOLS_DIR / "wpa-supplicant" / "build_wpa_supplicant.sh"
+        ).read_text()
+        source_lock = json.loads(
+            (TOOLS_DIR / "wpa-supplicant" / "SOURCE.lock").read_text()
+        )
+        wifi = (TOOLS_DIR / "initramfs/libreecho-wifi").read_text()
+        verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        self.assertIn("CONFIG_DRIVER_NL80211=y", config)
+        self.assertIn("CONFIG_LIBNL32=y", config)
+        self.assertIn("CONFIG_DRIVER_WEXT=y", config)
+        self.assertIn("--libnl-archive FILE", builder)
+        self.assertIn("libnl_source_sha256", builder)
+        self.assertIn('LIBNL_INC="$libnl_src/include"', builder)
+        self.assertIn(
+            'EXTRA_CFLAGS="$common_cflags -I$libnl_src/include', builder
+        )
+        self.assertIn("for tool in ar ranlib strip; do", builder)
+        self.assertIn('AR="$wrappers/ar"', builder)
+        self.assertIn('RANLIB="$wrappers/ranlib"', builder)
+        self.assertIn('STRIP="$wrappers/strip"', builder)
+        self.assertEqual(source_lock["drivers"], ["nl80211", "wext"])
+        self.assertEqual(source_lock["libnl_version"], "3.11.0")
+        self.assertEqual(
+            source_lock["libnl_source_sha256"],
+            "2a56e1edefa3e68a7c00879496736fdbf62fc94ed3232c0baba127ecfa76874d",
+        )
+        self.assertIn("-Dnl80211,wext", wifi)
+        image_builder = (
+            TOOLS_DIR / "build_recovery_image.py"
+        ).read_text()
+        self.assertIn("WPA_CONFIG_SHA256", image_builder)
+        self.assertIn('wpa_metadata["drivers"] != ["nl80211", "wext"]', image_builder)
+        self.assertIn('wpa_metadata["libnl_source_sha256"] != LIBNL_SOURCE_SHA256', image_builder)
+        self.assertIn("LIBNL_SOURCE_SHA256", verifier)
+        self.assertIn("--expected-wpa-supplicant-sha256", verifier)
+        self.assertIn("expected_wpa_supplicant_sha256", verifier)
+        self.assertIn(
+            'source_record.get("libnl_source_sha256") != LIBNL_SOURCE_SHA256',
+            verifier,
+        )
+        self.assertIn(
+            'source_record.get("libnl_source_url") != LIBNL_SOURCE_URL',
+            verifier,
+        )
 
     def test_feature_policy_is_immutable_and_fail_closed(self) -> None:
         builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
@@ -1382,7 +1515,7 @@ class SourceTests(unittest.TestCase):
         expected = {
             "sbin/wmt_configure": (
                 25744,
-                "2a57272037a34519e9f6f5dd64ab5a16ad304c81535c4aa7f15a8afae34aadb1",
+                "e0ff85f0ac2cb2b98718556470444cafd1fcd8865cdba27aa67e2c7d7a3303e0",
             ),
             "sbin/wmt_responder": (
                 21648,
@@ -1407,6 +1540,14 @@ class SourceTests(unittest.TestCase):
         }
         self.assertEqual(builder_pins, expected)
         self.assertEqual(verifier.CONNECTIVITY_HELPERS, expected)
+        self.assertEqual(
+            sum(int(item["size"]) for item in builder.CONNECTIVITY_ASSET_REQUIREMENTS.values()),
+            552507,
+        )
+        self.assertEqual(
+            sum(int(item["size"]) for item in verifier.CONNECTIVITY_ASSET_REQUIREMENTS.values()),
+            552507,
+        )
 
     def test_network_tools_are_pinned_and_manual_only(self) -> None:
         builder_script = TOOLS_DIR / "network-tools/build_wireless_tools.sh"
@@ -1494,22 +1635,22 @@ class VendorAssetContractTests(unittest.TestCase):
     def test_local_asset_contract_is_shared_and_contains_no_payload(self) -> None:
         expected = {
             "ROMv2_lm_patch_1_0_hdr.bin": {
-                "source": "system/vendor/firmware/ROMv2_lm_patch_1_0_hdr.bin",
-                "mode": 0o644, "size": 128720,
-                "sha256": "b4460117f51a43f3284594ec08d8c8861ecc0e42b17820987da03ecabdebac1e",
+                "source": "etc/firmware/ROMv2_lm_patch_1_0_hdr.bin",
+                "mode": 0o644, "size": 127596,
+                "sha256": "36d7edc7095f4cdfdaaa9c67061cf079199a55be85ab76ce82c9e9bcb34824a2",
             },
             "ROMv2_lm_patch_1_1_hdr.bin": {
-                "source": "system/vendor/firmware/ROMv2_lm_patch_1_1_hdr.bin",
-                "mode": 0o644, "size": 50148,
-                "sha256": "10c4ed22a10b8a136bffd7ffce4d552300d76f8e593627d2a9841c3b11a5697e",
+                "source": "etc/firmware/ROMv2_lm_patch_1_1_hdr.bin",
+                "mode": 0o644, "size": 50952,
+                "sha256": "cabdb842d354dd123d2d3d939f06304c1cfb045f407b5880444be326ded16d8d",
             },
             "WIFI_RAM_CODE_8163": {
-                "source": "system/vendor/firmware/WIFI_RAM_CODE_8163",
+                "source": "etc/firmware/WIFI_RAM_CODE_8163",
                 "mode": 0o644, "size": 373840,
                 "sha256": "9669cc9b03cfdc5e8fd4fd6e14c4c4050e8c196738ca4707eea12f14a6a8e64c",
             },
             "WMT_SOC.cfg": {
-                "source": "system/vendor/firmware/WMT_SOC.cfg",
+                "source": "etc/firmware/WMT_SOC.cfg",
                 "mode": 0o644, "size": 119,
                 "sha256": "302bd4462de99c028c04092e561c1500d65582ce42a93c4c72ccae6e2c99013d",
             },
@@ -2601,6 +2742,67 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(channel.read_text(), "stable\\n")
             self.assertIn("DATA_CLEANUP_OK", result.stdout)
+
+    def _run_cleanup(self, data: Path):
+        return subprocess.run(
+            ["/bin/sh", str(TOOLS_DIR / "initramfs/libreecho-data-cleanup")],
+            env={
+                **os.environ,
+                "LIBREECHO_DATA_TEST_MODE": "1",
+                "DATA_ROOT": str(data),
+            },
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def test_userdata_cleanup_accepts_the_timer_schedule(self) -> None:
+        """timerd's saved schedule, and the temporary it renames over it.
+
+        The temporary is allowlisted too because a crash between write and
+        rename leaves it behind, and an unrecognised file that only appears
+        after a crash is the worst kind to discover on a device.
+        """
+        for name in ("timers", "timers.tmp"):
+            with tempfile.TemporaryDirectory() as temporary:
+                data = Path(temporary) / "data"
+                state = data / "libreecho/config" / name
+                state.parent.mkdir(parents=True)
+                state.write_text("countdown 1767225600 pasta\n")
+                result = self._run_cleanup(data)
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 0, output)
+                self.assertIn("DATA_CLEANUP_OK", output)
+                # Allowlisted, not merely tolerated. A tolerated file is
+                # reported on every boot, and these lines go to stderr, so
+                # checking stdout alone silently asserts nothing.
+                self.assertNotIn("DATA_CLEANUP_TOLERATED", output)
+                self.assertNotIn("DATA_CLEANUP_UNKNOWN", output)
+
+    def test_userdata_cleanup_accepts_the_capture_mux_bypass_flag(self) -> None:
+        """micd's capture-mux bypass flag must not fail the data contract.
+
+        The instruction for using it is "create this file", and mkdir -p is an
+        easy thing to type by mistake. An unrecognised directory under config/
+        is not tolerated the way an unrecognised file is: it fails the
+        contract, which blocks every service on the next boot with no network
+        and no UI. Both shapes have to be accepted here.
+        """
+        for make in (lambda p: p.write_text(""), lambda p: p.mkdir()):
+            with tempfile.TemporaryDirectory() as temporary:
+                data = Path(temporary) / "data"
+                flag = data / "libreecho/config/bypass-capture-mux"
+                flag.parent.mkdir(parents=True)
+                make(flag)
+                result = self._run_cleanup(data)
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 0, output)
+                self.assertIn("DATA_CLEANUP_OK", output)
+                # Allowlisted, not merely tolerated -- a tolerated file is
+                # reported on every boot, and those lines go to stderr, so
+                # checking stdout alone silently asserts nothing.
+                self.assertNotIn("DATA_CLEANUP_TOLERATED", output)
+                self.assertNotIn("DATA_CLEANUP_UNKNOWN", output)
 
     def test_schema2_disabled_record_is_exact(self) -> None:
         record = {
