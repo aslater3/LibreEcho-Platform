@@ -842,6 +842,50 @@ class SourceTests(unittest.TestCase):
             source = (TOOLS_DIR / name).read_text()
             self.assertIn(f'{constant} = "{init_hash}"', source)
 
+    def test_pid1_traps_the_signals_busybox_reboot_sends(self) -> None:
+        # Issue aslater3/LibreEcho#105: busybox halt/poweroff/reboot do their
+        # work by signalling PID 1, assuming busybox init is there to catch it.
+        # PID 1 here is this shell script, so without traps the signal is
+        # discarded and `reboot` exits 0 having done nothing -- which reads as
+        # success and made a documented recovery step a silent no-op.
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertIn("signal_transition()", init)
+        self.assertIn("trap 'signal_transition reboot'   TERM", init)
+        self.assertIn("trap 'signal_transition reboot'   INT", init)
+        self.assertIn("trap 'signal_transition halt'     USR1", init)
+        self.assertIn("trap 'signal_transition poweroff' USR2", init)
+        # Each signal maps to the matching forced transition.
+        self.assertIn("$BB halt -f", init)
+        self.assertIn("$BB poweroff -f", init)
+        # The traps must be installed in the main shell, after the recovery
+        # supervisor starts and before PID 1 parks in its idle loop.
+        supervisor = init.index("log reboot-supervisor-started")
+        installed = init.index("log reboot-signal-traps-installed")
+        idle_loop = init.index("$BB sleep 3600 &")
+        self.assertLess(supervisor, installed)
+        self.assertLess(installed, idle_loop)
+
+    def test_pid1_idle_loop_is_interruptible_by_a_trap(self) -> None:
+        # A trap only runs between commands, so a foreground `sleep 3600` would
+        # sit on the signal for up to an hour. Backgrounding the sleep and
+        # waiting on it makes the transition immediate, because wait is
+        # interruptible.
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertIn("$BB sleep 3600 &\n    wait $!", init)
+        self.assertNotIn("\n    $BB sleep 3600\ndone", init)
+
+    def test_pid1_signal_delivery_harness(self) -> None:
+        harness = TOOLS_DIR / "test_pid1_signal_transitions.py"
+        result = subprocess.run(
+            [sys.executable, str(harness)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for signal_name in ("TERM", "INT", "USR1", "USR2"):
+            self.assertIn(f" {signal_name} ->", result.stdout)
+
     def test_health_confirm_restart_record_is_persistent(self) -> None:
         # Issue #41: the OTA health-confirm worker must leave persistent
         # evidence before forcing a reboot, so a worker restart is
