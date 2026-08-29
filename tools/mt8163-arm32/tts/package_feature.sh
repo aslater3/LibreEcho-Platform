@@ -33,6 +33,14 @@ done
   echo "ERROR: eSpeak data is missing or is a symlink: $ESPEAK_DATA" >&2
   exit 1
 }
+if [[ -d "$ESPEAK_DATA/espeak-ng-data" &&
+      -f "$ESPEAK_DATA/espeak-ng-data/phontab" ]]; then
+  ESPEAK_DATA="$ESPEAK_DATA/espeak-ng-data"
+fi
+[[ -f "$ESPEAK_DATA/phontab" && -f "$ESPEAK_DATA/phonindex" ]] || {
+  echo "ERROR: eSpeak data root is missing phontab/phonindex: $ESPEAK_DATA" >&2
+  exit 1
+}
 [[ -x "$PACKAGER" ]] || {
   echo "ERROR: feature packager is missing: $PACKAGER" >&2
   exit 1
@@ -72,6 +80,11 @@ for voice in northern-male southern-female; do
   install -d "$model_dir"
   install -m 0644 "$TOKENS" "$model_dir/tokens.txt"
   cp -a "$ESPEAK_DATA" "$model_dir/espeak-ng-data"
+  [[ -f "$model_dir/espeak-ng-data/phontab" &&
+     -f "$model_dir/espeak-ng-data/phonindex" ]] || {
+    echo "ERROR: packaged eSpeak data is incomplete for $voice" >&2
+    exit 1
+  }
 done
 install -m 0644 "$NORTHERN_MALE_MODEL" \
   "$root/usr/local/share/libreecho/tts/models/northern-male/model.onnx"
