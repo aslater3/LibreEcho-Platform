@@ -58,4 +58,5 @@ jobs:
           while IFS= read -r -d '' script; do
             bash -n "$script"
           done < <(git ls-files -z 'tools/mt8163-arm32/*.sh' 'tools/mt8163-arm32/**/*.sh')
+          bash tools/mt8163-arm32/tts/test_package_feature_contract.sh
           git diff --check

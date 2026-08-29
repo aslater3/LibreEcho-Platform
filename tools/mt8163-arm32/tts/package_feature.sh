@@ -33,7 +33,8 @@ done
   echo "ERROR: eSpeak data is missing or is a symlink: $ESPEAK_DATA" >&2
   exit 1
 }
-if [[ -d "$ESPEAK_DATA/espeak-ng-data" &&
+if [[ ! -L "$ESPEAK_DATA/espeak-ng-data" &&
+      -d "$ESPEAK_DATA/espeak-ng-data" &&
       -f "$ESPEAK_DATA/espeak-ng-data/phontab" ]]; then
   ESPEAK_DATA="$ESPEAK_DATA/espeak-ng-data"
 fi
