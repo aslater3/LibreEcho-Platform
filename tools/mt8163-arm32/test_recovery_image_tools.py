@@ -889,6 +889,10 @@ class SourceTests(unittest.TestCase):
         self.assertIn(
             'EXTRA_CFLAGS="$common_cflags -I$libnl_src/include', builder
         )
+        self.assertIn("for tool in ar ranlib strip; do", builder)
+        self.assertIn('AR="$wrappers/ar"', builder)
+        self.assertIn('RANLIB="$wrappers/ranlib"', builder)
+        self.assertIn('STRIP="$wrappers/strip"', builder)
         self.assertEqual(source_lock["drivers"], ["nl80211", "wext"])
         self.assertEqual(source_lock["libnl_version"], "3.11.0")
         self.assertEqual(

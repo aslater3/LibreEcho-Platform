@@ -93,12 +93,33 @@ pathlib.Path(out).write_text(
 pathlib.Path(out).chmod(0o755)
 PY
 cross_prefix=${CC%gcc*}
-AR="${cross_prefix}ar"
-RANLIB="${cross_prefix}ranlib"
-STRIP="${cross_prefix}strip"
-for tool in "$AR" "$RANLIB" "$STRIP"; do
+real_ar="${cross_prefix}ar"
+real_ranlib="${cross_prefix}ranlib"
+real_strip="${cross_prefix}strip"
+for tool in "$real_ar" "$real_ranlib" "$real_strip"; do
   [[ -x "$tool" ]] || { printf 'ERROR: cross tool is unavailable: %s\n' "$tool" >&2; exit 1; }
 done
+wrappers="$work/tool-wrappers"
+mkdir -p "$wrappers"
+for tool in ar ranlib strip; do
+  case "$tool" in
+    ar) real=$real_ar ;;
+    ranlib) real=$real_ranlib ;;
+    strip) real=$real_strip ;;
+  esac
+  python3 - "$wrappers/$tool" "$real" "$host_library_path" <<'PY'
+import pathlib, shlex, sys
+out, real, library_path = sys.argv[1:]
+pathlib.Path(out).write_text(
+    "#!/bin/sh\nexport LD_LIBRARY_PATH=" + shlex.quote(library_path) +
+    "${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\nexec " + shlex.quote(real) + " \"$@\"\n"
+)
+pathlib.Path(out).chmod(0o755)
+PY
+done
+AR="$wrappers/ar"
+RANLIB="$wrappers/ranlib"
+STRIP="$wrappers/strip"
 
 export SOURCE_DATE_EPOCH=0
 canonical=/usr/src/wpa_supplicant-2.10
