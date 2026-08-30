@@ -868,13 +868,12 @@ start_ui_services()
         script="/etc/init.d/libreecho-$service.init"
         if [ -x "$script" ]; then
             if [ "$service" = web ] && [ "$SERVICE_PROFILE" = production ]; then
-                web_listen=127.0.0.1:8080
-                if [ -r /data/libreecho/config/users ]; then
-                    web_listen=0.0.0.0:8080
-                    log ui-web-production-authenticated-lan
-                else
-                    log ui-web-production-loopback-fallback
-                fi
+                # The control plane is intentionally reachable on the LAN in
+                # every production state, including first-run setup.  Binding
+                # conditionally on the users file left the already-running
+                # daemon on loopback after setup created the first account.
+                web_listen=0.0.0.0:8080
+                log ui-web-production-lan
                 ARGS="--backend linux --config /data/libreecho/config/web-config.json --web-root /usr/local/share/libreecho/web --listen $web_listen" \
                     "$script" start >/tmp/libreecho-"$service".init.log 2>&1
             else
