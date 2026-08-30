@@ -815,13 +815,31 @@ def main() -> None:
                 f"linking AFE speaker pinctrl-{index}",
             )
         # Keep the stock EVT amp-high, amp-low, camera-MCLK, and DAC-mux groups
-        # as the final named states.  The camera-MCLK group is the existing
-        # stock group (phandle 0x2c, named camdefault in this legacy blob) that
-        # carries CMMCLK.  The DAC-mux groups are the stock GPIO124 controls.
+        # as the final named states.  Resolve the stock phandles after all
+        # fdtput operations: extending a legacy blob can renumber pre-existing
+        # phandles, so fixed values here can silently point AFE pinctrl states
+        # at unrelated nodes.
+        def stock_phandle(node: str) -> int:
+            for property_name in ("phandle", "linux,phandle"):
+                try:
+                    values = fdt_hex_cells(
+                        fdtget, candidate_path, f"{PINCTRL_NODE}/{node}", property_name,
+                    )
+                except SystemExit:
+                    continue
+                if len(values) == 1:
+                    return values[0]
+            fail(f"transformed pinctrl group has no phandle: {node}")
+
+        stock_audio_phandles = {
+            "pinctrl-4": stock_phandle("audexamphigh"),
+            "pinctrl-5": stock_phandle("audexamplow"),
+            "pinctrl-6": stock_phandle("camdefault"),
+        }
         for property_name, phandle, label in (
-            ("pinctrl-4", 0x2A, "external-amp high"),
-            ("pinctrl-5", 0x2B, "external-amp low"),
-            ("pinctrl-6", 0x2C, "codec CMMCLK"),
+            ("pinctrl-4", stock_audio_phandles["pinctrl-4"], "external-amp high"),
+            ("pinctrl-5", stock_audio_phandles["pinctrl-5"], "external-amp low"),
+            ("pinctrl-6", stock_audio_phandles["pinctrl-6"], "codec CMMCLK"),
             ("pinctrl-7", RADAR_DACMUX_HIGH_PHANDLE, "DAC-mux high"),
             ("pinctrl-8", RADAR_DACMUX_LOW_PHANDLE, "DAC-mux low"),
         ):
