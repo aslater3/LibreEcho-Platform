@@ -2092,8 +2092,10 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("ui-connectivity-services-disabled-for-diagnostic-profile", source)
         self.assertNotIn("USB_DIAGNOSTIC_MODE=1", source)
         self.assertNotIn("--allow-insecure-lan", source)
-        self.assertIn("ui-web-production-loopback-fallback", source)
-        self.assertIn("ui-web-production-authenticated-lan", source)
+        self.assertNotIn("ui-web-production-loopback-fallback", source)
+        self.assertIn("ui-web-production-lan", source)
+        self.assertIn("web_listen=0.0.0.0:8080", source)
+        self.assertNotIn("if [ -r /data/libreecho/config/users ]; then", source)
         self.assertNotIn("libreecho-update-fetch watch", source)
         self.assertIn(
             'if [ "$IMAGE_PROFILE" = ota ] && [ "$SERVICE_PROFILE" = production ]; then',
