@@ -37,6 +37,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y device-tree-compiler
           python -m pip install --disable-pip-version-check PyNaCl==1.5.0
 
       - name: Run maintained Platform suites
