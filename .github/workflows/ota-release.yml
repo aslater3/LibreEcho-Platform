@@ -44,6 +44,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m unittest -q \
+            tools/mt8163-arm32/test_build_wifi_dtb.py \
             tools/mt8163-arm32/test_recovery_image_tools.py \
             tools/mt8163-arm32/test_source_offer_tools.py
 

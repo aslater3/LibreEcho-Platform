@@ -318,6 +318,18 @@ def require_present(fdtget: str, dtb: Path, node: str, property_name: str) -> No
         fail(f"{node}/{property_name} is missing: {detail}")
 
 
+def fdt_phandle(fdtget: str, dtb: Path, node: str) -> int:
+    """Return the final phandle exposed by a named provider node."""
+    for property_name in ("phandle", "linux,phandle"):
+        try:
+            values = fdt_hex_cells(fdtget, dtb, node, property_name)
+        except SystemExit:
+            continue
+        if len(values) == 1:
+            return values[0]
+    fail(f"pinctrl provider has no usable phandle: {node}")
+
+
 def power_domain_provider_phandle(fdtget: str, dtb: Path) -> int:
     """Resolve and validate the transformed MT8163 SCPSYS provider."""
     phandle = fdt_hex_cells(fdtget, dtb, SCPSYS_NODE, "phandle")
@@ -531,14 +543,16 @@ def verify_wifi(fdtget: str, dtb: Path, data: bytes) -> int:
         "i2s1clk-gpio", "i2s1dat-gpio", "i2s1mclk-gpio", "i2s1ws-gpio",
     ):
         require_absent(fdtget, dtb, AFE_NODE, property_name)
-    if fdt_hex_cells(fdtget, dtb, AFE_NODE, "pinctrl-7") != (
-        RADAR_DACMUX_HIGH_PHANDLE,
+    for property_name, node, label in (
+        ("pinctrl-4", f"{PINCTRL_NODE}/audexamphigh", "external-amp high"),
+        ("pinctrl-5", f"{PINCTRL_NODE}/audexamplow", "external-amp low"),
+        ("pinctrl-6", f"{PINCTRL_NODE}/camdefault", "codec CMMCLK"),
+        ("pinctrl-7", f"{PINCTRL_NODE}/audexampdacmuxhigh", "DAC-mux high"),
+        ("pinctrl-8", f"{PINCTRL_NODE}/audexampdacmuxlow", "DAC-mux low"),
     ):
-        fail("Wi-Fi EVT DTB does not connect AFE to DAC-mux high")
-    if fdt_hex_cells(fdtget, dtb, AFE_NODE, "pinctrl-8") != (
-        RADAR_DACMUX_LOW_PHANDLE,
-    ):
-        fail("Wi-Fi EVT DTB does not connect AFE to DAC-mux low")
+        expected = fdt_phandle(fdtget, dtb, node)
+        if fdt_hex_cells(fdtget, dtb, AFE_NODE, property_name) != (expected,):
+            fail(f"Wi-Fi EVT DTB does not connect AFE to {label}")
     scpsys_phandle = power_domain_provider_phandle(fdtget, dtb)
     if fdt_hex_cells(fdtget, dtb, AFE_NODE, "power-domains") != (
         scpsys_phandle, AFE_POWER_DOMAIN_ID,
@@ -814,24 +828,11 @@ def main() -> None:
                 ],
                 f"linking AFE speaker pinctrl-{index}",
             )
-        # Keep the stock EVT amp-high, amp-low, camera-MCLK, and DAC-mux groups
-        # as the final named states.  The camera-MCLK group is the existing
-        # stock group (phandle 0x2c, named camdefault in this legacy blob) that
-        # carries CMMCLK.  The DAC-mux groups are the stock GPIO124 controls.
-        for property_name, phandle, label in (
-            ("pinctrl-4", 0x2A, "external-amp high"),
-            ("pinctrl-5", 0x2B, "external-amp low"),
-            ("pinctrl-6", 0x2C, "codec CMMCLK"),
-            ("pinctrl-7", RADAR_DACMUX_HIGH_PHANDLE, "DAC-mux high"),
-            ("pinctrl-8", RADAR_DACMUX_LOW_PHANDLE, "DAC-mux low"),
-        ):
-            run(
-                [
-                    fdtput, "-t", "x", str(candidate_path), AFE_NODE,
-                    property_name, f"0x{phandle:x}",
-                ],
-                f"linking AFE {label} {property_name}",
-            )
+        # The AFE's final stock amp-high, amp-low, CMMCLK, and generated
+        # DAC-mux references are linked after every structural fdtput below.
+        # fdtput may renumber legacy phandles while extending the blob, so
+        # consumer references must be resolved from the final named provider
+        # nodes rather than copied from legacy numeric values.
 
         for property_name, value in (
             ("compatible", "fixed-clock"),
@@ -1018,6 +1019,27 @@ def main() -> None:
             ],
             "restoring the stock AFE power-domain provider",
         )
+        final_pinctrl_refs = (
+            ("pinctrl-4", f"{PINCTRL_NODE}/audexamphigh", "external-amp high"),
+            ("pinctrl-5", f"{PINCTRL_NODE}/audexamplow", "external-amp low"),
+            ("pinctrl-6", f"{PINCTRL_NODE}/camdefault", "codec CMMCLK"),
+            ("pinctrl-7", f"{PINCTRL_NODE}/audexampdacmuxhigh", "DAC-mux high"),
+            ("pinctrl-8", f"{PINCTRL_NODE}/audexampdacmuxlow", "DAC-mux low"),
+        )
+        for property_name, node, label in final_pinctrl_refs:
+            phandle = fdt_phandle(fdtget, candidate_path, node)
+            run(
+                [
+                    fdtput, "-t", "x", str(candidate_path), AFE_NODE,
+                    property_name, f"0x{phandle:x}",
+                ],
+                f"linking final AFE {label} {property_name}",
+            )
+        for property_name, node, label in final_pinctrl_refs:
+            expected = fdt_phandle(fdtget, candidate_path, node)
+            actual = fdt_hex_cells(fdtget, candidate_path, AFE_NODE, property_name)
+            if actual != (expected,):
+                fail(f"final AFE {property_name} does not reference {label}")
         candidate = candidate_path.read_bytes()
         total = verify_wifi(fdtget, candidate_path, candidate)
 
