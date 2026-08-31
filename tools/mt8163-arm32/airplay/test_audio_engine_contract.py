@@ -23,6 +23,8 @@ def main() -> None:
         "output=S16_LE/48000/duplicated-stereo",
         "static int prepare_initial_period",
         "ready_activity_mask(sources)",
+        "power_output_controls(card)",
+        "unmute_output_controls(card)",
     )
     missing = [fragment for fragment in required if fragment not in text]
     if missing:

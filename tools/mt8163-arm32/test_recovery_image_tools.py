@@ -1329,8 +1329,10 @@ class SourceTests(unittest.TestCase):
         first_write = source.index(
             "write_period(pcm, output, &reference, first_activity)"
         )
-        amp_enable = source.index("enable_output_controls(card)")
-        self.assertLess(first_write, amp_enable)
+        power_amp = source.index("power_output_controls(card)")
+        unmute = source.index("unmute_output_controls(card)")
+        self.assertLess(power_amp, first_write)
+        self.assertLess(first_write, unmute)
         self.assertIn(
             "ready = prepare_initial_period(sources, root, output, &dynamics,",
             source,

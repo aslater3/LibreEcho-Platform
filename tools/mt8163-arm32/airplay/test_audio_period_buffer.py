@@ -155,6 +155,24 @@ int main(void)
         sources[i].idle_periods = 0;
         sources[i].received = 0;
     }
+    if (write(pipes[0][1], half, sizeof(half)) != (ssize_t)sizeof(half) ||
+        write(pipes[0][1], half, sizeof(half)) != (ssize_t)sizeof(half))
+        return fail("media prebuffer write failed");
+    if (read_sources(sources, "/tmp") < 0 ||
+        sources[0].received != period_bytes)
+        return fail("media period was not prebuffered");
+    if (write(pipes[3][1], half, sizeof(half)) != (ssize_t)sizeof(half) ||
+        write(pipes[3][1], half, sizeof(half)) != (ssize_t)sizeof(half))
+        return fail("priority arrival write failed");
+    if (wait_for_period(sources, "/tmp") != 1 ||
+        sources[3].received != period_bytes)
+        return fail("newly arrived priority period was not drained");
+    consume_period(sources);
+
+    for (i = 0; i < SOURCE_COUNT; ++i) {
+        sources[i].idle_periods = 0;
+        sources[i].received = 0;
+    }
     if (write(pipes[2][1], half, sizeof(half)) != (ssize_t)sizeof(half) ||
         write(pipes[2][1], half, sizeof(half)) != (ssize_t)sizeof(half))
         return fail("one-period startup write failed");

@@ -173,10 +173,10 @@ static int arm_output_controls(unsigned int card, int volume,
     return result;
 }
 
-/* Enable the physical amplifier only while muted, let its power rail settle,
- * then release the codec mute.  The old order (codec unmute, then amp on)
- * was the source of the audible cyclic scratch/pop on the tweeter path. */
-static int enable_output_controls(unsigned int card)
+/* Enable the physical amplifier while keeping the codec muted, then let its
+ * power rail settle.  The first PCM period is queued only after this delay so
+ * a short clip is still present when the codec is unmuted. */
+static int power_output_controls(unsigned int card)
 {
     struct mixer *mixer;
     int result = 0;
@@ -192,15 +192,26 @@ static int enable_output_controls(unsigned int card)
         result = -1;
     mixer_close(mixer);
     usleep(AMP_SETTLE_US);
+    if (result < 0)
+        fprintf(stderr, "audio-engine: output power controls unavailable\n");
+    return result;
+}
+
+static int unmute_output_controls(unsigned int card)
+{
+    struct mixer *mixer;
+    int result = 0;
 
     mixer = mixer_open(card);
-    if (!mixer)
+    if (!mixer) {
+        fprintf(stderr, "audio-engine: mixer %u unavailable\n", card);
         return -1;
+    }
     if (set_enum_control(mixer, "MFP Gpio Mute", "Off") < 0)
         result = -1;
     mixer_close(mixer);
     if (result < 0)
-        fprintf(stderr, "audio-engine: output enable controls unavailable\n");
+        fprintf(stderr, "audio-engine: output unmute control unavailable\n");
     return result;
 }
 
@@ -699,6 +710,8 @@ static int period_ready(const struct source_bus *sources)
 
 static int wait_for_period(struct source_bus *sources, const char *root)
 {
+	if (read_sources(sources, root) < 0)
+		return -1;
 	while (!stopping && !period_ready(sources)) {
 		if (!sources_active(sources))
 			return 0;
@@ -968,13 +981,19 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				if (set_pcm_volume(card, startup_volume) < 0)
 					playback_start_failed = 1;
 			}
+			if (!playback_start_failed &&
+			    power_output_controls(card) < 0)
+				playback_start_failed = 1;
 			if (!playback_start_failed) {
 				/* Mark ownership immediately after a successful sender write so
 				 * any later start failure can restore exactly what we changed. */
 				if (airplay_volume >= 0 && airplay_media_playing)
 					airplay_volume_applied = 1;
+				/* Queue the first period only after amp settle.  The PCM starts
+				 * with mute still asserted, and unmute follows this write so a
+				 * one-period clip is not consumed during the settle delay. */
 				if (write_period(pcm, output, &reference, first_activity) < 0 ||
-				    enable_output_controls(card) < 0)
+				    unmute_output_controls(card) < 0)
 					playback_start_failed = 1;
 			}
 		}
