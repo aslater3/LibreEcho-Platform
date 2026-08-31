@@ -739,8 +739,15 @@ def validate_ui_startup_contract(bundle: Path) -> None:
             "etc/init.d/libreecho-web.init",
             (
                 "STARTUP_READY_TIMEOUT_TICKS=${STARTUP_READY_TIMEOUT_TICKS:-600}",
+                "BT_READY_PATH=${BT_READY_PATH:-/run/libreecho/bluetooth-ready}",
+                "bluetooth_integration_state()",
+                "bluetooth_ready()",
                 "startup_services_ready()",
-                "for socket in network audio mic led bluetooth airplay; do",
+                "for socket in network audio mic led airplay; do",
+                "case \"$(bluetooth_integration_state)\" in",
+                "disabled) ;;",
+                "enabled)",
+                '[ -f "$BT_READY_PATH" ]',
                 "mark_startup_ready()",
                 "count=0",
                 "while :; do",
@@ -751,9 +758,22 @@ def validate_ui_startup_contract(bundle: Path) -> None:
                 "sleep 0.1",
                 "count=$((count + 1))",
                 '[ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0',
-                "for socket in network audio mic led bluetooth airplay; do",
                 '[ -S "/run/libreecho/$socket.sock" ] || return 1',
                 "start_service\n        mark_startup_ready >/dev/null 2>&1 &",
+            ),
+        ),
+        (
+            "etc/init.d/libreecho-agentd.init",
+            (
+                "AGENT_DEPENDENCY_TIMEOUT_SECONDS=${AGENT_DEPENDENCY_TIMEOUT_SECONDS:-90}",
+                "AGENT_DEPENDENCY_POLL_SECONDS=${AGENT_DEPENDENCY_POLL_SECONDS:-1}",
+                "dependency_sockets_ready()",
+                "missing_dependency_sockets()",
+                "wait_for_dependency_sockets()",
+                "remaining=$((AGENT_DEPENDENCY_TIMEOUT_SECONDS - elapsed))",
+                "poll_seconds=$AGENT_DEPENDENCY_POLL_SECONDS",
+                'sleep "$poll_seconds"',
+                "wait_for_dependency_sockets || {",
             ),
         ),
     )
@@ -780,7 +800,23 @@ def validate_ui_startup_contract(bundle: Path) -> None:
                     f"ERROR: UI startup contract missing {marker!r} in {relative}"
                 )
         if relative.endswith("libreecho-web.init"):
+            if "for socket in network audio mic led bluetooth airplay; do" in text:
+                raise SystemExit(
+                    "ERROR: UI startup Bluetooth readiness must be conditional"
+                )
             readiness_start = text.index("mark_startup_ready()")
+            startup_start = text.index("startup_services_ready()")
+            startup_body = text[startup_start:readiness_start]
+            for marker in (
+                'case "$(bluetooth_integration_state)" in',
+                "disabled) ;;",
+                "enabled)",
+                'bluetooth_ready || return 1',
+            ):
+                if marker not in startup_body:
+                    raise SystemExit(
+                        f"ERROR: UI startup Bluetooth contract missing {marker!r}"
+                    )
             dispatch_start = text.index('case "${1:-}" in')
             readiness_body = text[readiness_start:dispatch_start]
             ordered = (
@@ -810,6 +846,14 @@ def validate_ui_startup_contract(bundle: Path) -> None:
                 raise SystemExit("ERROR: UI startup start case does not run readiness")
             if "&" not in start_body:
                 raise SystemExit("ERROR: UI startup readiness polling must run in background")
+        if relative.endswith("libreecho-agentd.init"):
+            start_service_start = text.index("start_service()")
+            dispatch_start = text.index('case "${1:-}" in')
+            start_body = text[start_service_start:dispatch_start]
+            if "wait_for_dependency_sockets || {" not in start_body:
+                raise SystemExit(
+                    "ERROR: agentd start case does not wait for dependencies"
+                )
 
     led_text = contract_paths["etc/init.d/libreecho-ledd.init"]
     web_text = contract_paths["etc/init.d/libreecho-web.init"]
