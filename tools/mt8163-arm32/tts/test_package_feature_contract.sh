@@ -63,12 +63,12 @@ def entry(key, value):
     return varint((14 << 3) | 2) + varint(len(data)) + data
 
 props = (
-    ("model_author", "OpenSLR SLR83 contributors and Piper contributors"),
-    ("model_language", "en-GB"),
-    ("model_license", "CC-BY-SA-4.0"),
-    ("model_name", "northern_english_male"),
-    ("model_url", "https://huggingface.co/rhasspy/piper-voices/tree/ea046e8458f6acd997706d6e6066a022b42f6fb1/en/en_GB/northern_english_male/medium"),
-    ("piper_version", "1.0"),
+    ("model_type", "vits"),
+    ("comment", "piper"),
+    ("language", "English"),
+    ("voice", "en-gb-x-rp"),
+    ("has_espeak", "1"),
+    ("n_speakers", "1"),
     ("sample_rate", "22050"),
 )
 Path(sys.argv[2]).write_bytes(
@@ -76,7 +76,7 @@ Path(sys.argv[2]).write_bytes(
 )
 PY
 printf '%s  %s\n' \
-  bf4de4bc3da0ef15cd1745b4fb08ee67b9ca6bf02311ce4d2eede04a6f057411 \
+  d23e7891af7062eb188283dba94866e25ffd5b01a0d9fb9a23c71a39b75b2308 \
   "$northern" | sha256sum -c -
 mkdir -p "$root/pipeline"
 cat >"$root/pipeline/package_feature_payload.sh" <<'EOF'
