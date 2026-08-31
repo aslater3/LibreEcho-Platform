@@ -368,9 +368,11 @@ static int send_music_visualizer_frame(struct music_visualizer *visualizer)
 
 static int higher_priority_active(const struct source_bus *sources)
 {
-	return sources[SOURCE_SYSTEM].idle_periods > 0 ||
-		sources[SOURCE_ANNOUNCEMENT].idle_periods > 0 ||
-		sources[SOURCE_ALARM].idle_periods > 0;
+	const size_t period_bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
+
+	return sources[SOURCE_SYSTEM].received >= period_bytes ||
+		sources[SOURCE_ANNOUNCEMENT].received >= period_bytes ||
+		sources[SOURCE_ALARM].received >= period_bytes;
 }
 
 static void process_music_visualizer(struct music_visualizer *visualizer,
@@ -1045,12 +1047,12 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 					}
 				}
 			}
-			ready = wait_for_period(sources, root);
-			if (ready < 0) {
+			if (poll_sources(sources, 20) < 0 ||
+			    read_sources(sources, root) < 0) {
 				stopping = 1;
 				break;
 			}
-			if (ready == 0)
+			if (!period_ready(sources))
 				break;
 			sync_announcement_led(sources, &announcement_led_active);
 			sync_playback_status(sources, &status);
