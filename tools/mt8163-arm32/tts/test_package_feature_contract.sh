@@ -17,7 +17,8 @@ unsquashfs -quiet -d "$root/tree" "$payload"
 
 input="$root/input"
 ttsd="$root/tree/usr/local/sbin/libreecho-ttsd"
-northern="$root/tree/usr/local/share/libreecho/tts/models/northern-male/model.onnx"
+northern_old="$root/tree/usr/local/share/libreecho/tts/models/northern-male/model.onnx"
+northern="$root/northern-male.derived.onnx"
 female="$root/tree/usr/local/share/libreecho/tts/models/southern-female/model.onnx"
 tokens="$root/tree/usr/local/share/libreecho/tts/models/northern-male/tokens.txt"
 mkdir -p "$input"
@@ -25,10 +26,58 @@ cp -a /usr/lib/x86_64-linux-gnu/espeak-ng-data "$input/espeak-ng-data"
 test -f "$input/espeak-ng-data/phontab"
 test -f "$input/espeak-ng-data/phonindex"
 test -x "$ttsd"
-test -f "$northern"
+test -f "$northern_old"
 test -f "$female"
 test -f "$tokens"
 
+upstream="$root/piper-en_GB-northern_english_male-medium.onnx"
+upstream_url="https://huggingface.co/rhasspy/piper-voices/resolve/ea046e8458f6acd997706d6e6066a022b42f6fb1/en/en_GB/northern_english_male/medium/en_GB-northern_english_male-medium.onnx?download=true"
+curl -fsSL --retry 3 -o "$upstream" "$upstream_url"
+printf '%s  %s\n' \
+  57a219ae8e638873db7d18893304be5069c42868f392bb95c3ff17f0690d0689 \
+  "$upstream" | sha256sum -c -
+python3 - "$upstream" "$northern" <<'PY'
+from pathlib import Path
+import sys
+
+
+def varint(value):
+    result = bytearray()
+    while True:
+        byte = value & 0x7f
+        value >>= 7
+        if value:
+            result.append(byte | 0x80)
+        else:
+            result.append(byte)
+            return bytes(result)
+
+
+def field(number, value):
+    data = value.encode()
+    return varint((number << 3) | 2) + varint(len(data)) + data
+
+
+def entry(key, value):
+    data = field(1, key) + field(2, value)
+    return varint((14 << 3) | 2) + varint(len(data)) + data
+
+props = (
+    ("model_author", "OpenSLR SLR83 contributors and Piper contributors"),
+    ("model_language", "en-GB"),
+    ("model_license", "CC-BY-SA-4.0"),
+    ("model_name", "northern_english_male"),
+    ("model_url", "https://huggingface.co/rhasspy/piper-voices/tree/ea046e8458f6acd997706d6e6066a022b42f6fb1/en/en_GB/northern_english_male/medium"),
+    ("piper_version", "1.0"),
+    ("sample_rate", "22050"),
+)
+Path(sys.argv[2]).write_bytes(
+    Path(sys.argv[1]).read_bytes() + b"".join(entry(k, v) for k, v in props)
+)
+PY
+printf '%s  %s\n' \
+  bf4de4bc3da0ef15cd1745b4fb08ee67b9ca6bf02311ce4d2eede04a6f057411 \
+  "$northern" | sha256sum -c -
 mkdir -p "$root/pipeline"
 cat >"$root/pipeline/package_feature_payload.sh" <<'EOF'
 #!/usr/bin/env bash
