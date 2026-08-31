@@ -173,6 +173,22 @@ int main(void)
         sources[i].idle_periods = 0;
         sources[i].received = 0;
     }
+    for (i = 0; i < LE_AUDIO_PERIOD_BUFFER_PERIODS * 2; ++i) {
+        if (write(pipes[0][1], half, sizeof(half)) != (ssize_t)sizeof(half))
+            return fail("full-buffer write failed");
+    }
+    if (read_sources(sources, "/tmp") < 0 ||
+        sources[0].received != period_bytes * LE_AUDIO_PERIOD_BUFFER_PERIODS)
+        return fail("full media buffer was not retained");
+    if (read_or_retain_sources(sources, "/tmp") != 1 ||
+        sources[0].received != period_bytes * LE_AUDIO_PERIOD_BUFFER_PERIODS)
+        return fail("retained media was not actionable without a new read");
+    consume_period(sources);
+
+    for (i = 0; i < SOURCE_COUNT; ++i) {
+        sources[i].idle_periods = 0;
+        sources[i].received = 0;
+    }
     if (write(pipes[2][1], half, sizeof(half)) != (ssize_t)sizeof(half) ||
         write(pipes[2][1], half, sizeof(half)) != (ssize_t)sizeof(half))
         return fail("one-period startup write failed");
@@ -302,6 +318,7 @@ def main() -> None:
         "le_audio_period_buffer_append",
         "le_audio_period_buffer_consume",
         "wait_for_period",
+        "read_or_retain_sources",
     )
     missing = [fragment for fragment in required if fragment not in engine]
     if missing:
@@ -315,6 +332,12 @@ def main() -> None:
         raise SystemExit("audio engine must retain queued source bytes across reads")
     if "memset(cursor, 0, bytes);" in read_sources:
         raise SystemExit("audio engine must not zero-fill a short source period")
+    run_start = engine.index("static int run_engine")
+    run_engine = engine[run_start:]
+    if "int poll_timeout = period_ready(sources) ? 20 : -1;" not in run_engine:
+        raise SystemExit("retained periods need a timed state recheck")
+    if "if (read_or_retain_sources(sources, root) <= 0)" not in run_engine:
+        raise SystemExit("retained periods must advance without a new FIFO read")
     print("audio_period_buffer: short-read accumulation and engine continuity PASS")
 
 

@@ -23,6 +23,8 @@ def main() -> None:
         "output=S16_LE/48000/duplicated-stereo",
         "static int prepare_initial_period",
         "ready_activity_mask(sources)",
+        "read_or_retain_sources",
+        "int poll_timeout = period_ready(sources) ? 20 : -1;",
         "power_output_controls(card)",
         "unmute_output_controls(card)",
     )

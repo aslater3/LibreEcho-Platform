@@ -708,6 +708,16 @@ static int period_ready(const struct source_bus *sources)
 	return 0;
 }
 
+static int read_or_retain_sources(struct source_bus *sources,
+				       const char *root)
+{
+	int received = read_sources(sources, root);
+
+	if (received < 0)
+		return -1;
+	return received > 0 || period_ready(sources) ? 1 : 0;
+}
+
 static int wait_for_period(struct source_bus *sources, const char *root)
 {
 	if (read_sources(sources, root) < 0)
@@ -885,12 +895,13 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		struct pcm *pcm = NULL;
 		unsigned int first_activity;
 		int ready;
+		int poll_timeout = period_ready(sources) ? 20 : -1;
 
-		if (poll_sources(sources, -1) < 0)
+		if (poll_sources(sources, poll_timeout) < 0)
 			break;
 		if (stopping)
 			break;
-		if (read_sources(sources, root) <= 0)
+		if (read_or_retain_sources(sources, root) <= 0)
 			continue;
 		ready = prepare_initial_period(sources, root, output, &dynamics,
 					      &first_activity);
