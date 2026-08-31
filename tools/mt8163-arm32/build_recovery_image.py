@@ -1273,7 +1273,7 @@ def add_tts_external_payload(payload: Path, payload_manifest: Path,
         "default_voice": "southern-female",
         "threads": 4,
         "streaming": True,
-        "in_process": True,
+        "in_process": False,
         "cpu_boost_during_synthesis": True,
         "external_payload": True,
         "payload": {

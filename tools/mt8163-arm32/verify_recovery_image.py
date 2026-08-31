@@ -1155,7 +1155,7 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                 tts.get("voices") != ["southern-female", "northern-male"] or
                 tts.get("default_voice") != "southern-female" or
                 tts.get("threads") != 4 or tts.get("streaming") is not True or
-                tts.get("in_process") is not True or
+                tts.get("in_process") is not False or
                 tts.get("cpu_boost_during_synthesis") is not True or
                 not isinstance(payload, dict) or payload.get("format") != "squashfs-lz4" or
                 payload.get("filename") != "tts.squashfs" or

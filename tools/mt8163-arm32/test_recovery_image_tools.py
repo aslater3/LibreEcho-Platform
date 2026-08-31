@@ -85,6 +85,14 @@ def newc_archive(*members: bytes, tail: bytes = b"") -> bytes:
     return b"".join(members) + newc_member(b"TRAILER!!!", 0) + tail
 
 
+class TtsProcessModeTests(unittest.TestCase):
+    def test_external_tts_manifest_matches_cancellable_production_default(self) -> None:
+        builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        self.assertIn('"in_process": False', builder)
+        self.assertIn('tts.get("in_process") is not False', verifier_source)
+
+
 class NewcTests(unittest.TestCase):
     def test_canonical_member_and_zero_padding(self) -> None:
         entries = verifier.parse_newc(
