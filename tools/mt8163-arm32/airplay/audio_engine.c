@@ -686,7 +686,8 @@ static int sources_active(const struct source_bus *sources)
 	unsigned int i;
 
 	for (i = 0; i < SOURCE_COUNT; ++i)
-		if (sources[i].idle_periods > 0)
+		if (sources[i].idle_periods > 0 ||
+		    sources[i].received >= PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t))
 			return 1;
 	return 0;
 }

@@ -183,7 +183,13 @@ int main(void)
     if (read_or_retain_sources(sources, "/tmp") != 1 ||
         sources[0].received != period_bytes * LE_AUDIO_PERIOD_BUFFER_PERIODS)
         return fail("retained media was not actionable without a new read");
+    sources[0].idle_periods = 0;
     consume_period(sources);
+    if (!sources_active(sources) || !period_ready(sources))
+        return fail("retained second period was not kept active");
+    consume_period(sources);
+    if (sources_active(sources) || period_ready(sources))
+        return fail("retained periods did not drain cleanly");
 
     for (i = 0; i < SOURCE_COUNT; ++i) {
         sources[i].idle_periods = 0;
