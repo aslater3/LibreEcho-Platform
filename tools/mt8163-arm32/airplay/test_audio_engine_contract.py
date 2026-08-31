@@ -21,6 +21,8 @@ def main() -> None:
         "output[frame * OUTPUT_CHANNELS + 1] = rendered;",
         "OUTPUT_CHANNELS, activity_mask",
         "output=S16_LE/48000/duplicated-stereo",
+        "static int prepare_initial_period",
+        "ready_activity_mask(sources)",
     )
     missing = [fragment for fragment in required if fragment not in text]
     if missing:

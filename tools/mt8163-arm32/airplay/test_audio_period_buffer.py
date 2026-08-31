@@ -101,6 +101,7 @@ int main(void)
     int pipes[SOURCE_COUNT][2];
     int16_t half[PERIOD_SIZE * INPUT_CHANNELS / 2];
     int16_t output[PERIOD_SIZE * OUTPUT_CHANNELS];
+    unsigned int activity_mask = 0;
     size_t period_bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
     size_t i;
 
@@ -138,28 +139,37 @@ int main(void)
         return fail("concurrent partial write failed");
     if (read_sources(sources, "/tmp") < 0 ||
         sources[0].received != period_bytes ||
-        sources[1].received != sizeof(half) || period_ready(sources))
-        return fail("partial active source was reported ready");
-
-    for (i = 0; i < sizeof(half) / sizeof(half[0]); ++i)
-        half[i] = 4000;
-    if (write(pipes[1][1], half, sizeof(half)) != (ssize_t)sizeof(half))
-        return fail("final short write failed");
-    if (read_sources(sources, "/tmp") < 0 ||
-        sources[0].received != period_bytes ||
-        sources[1].received != period_bytes || !period_ready(sources))
-        return fail("short reads did not form complete active periods");
+        sources[1].received != sizeof(half) || !period_ready(sources))
+        return fail("ready source was blocked by partial source");
 
     puffin_dynamics_init(&dynamics);
     render_period(sources, output, &dynamics);
     for (i = 0; i < PERIOD_SIZE; ++i) {
         if (output[i * OUTPUT_CHANNELS] == 0 ||
             output[i * OUTPUT_CHANNELS] != output[i * OUTPUT_CHANNELS + 1])
-            return fail("rendered period contains a gap or channel mismatch");
+            return fail("ready source did not render while another was partial");
     }
     consume_period(sources);
-    if (sources[0].received != 0)
-        return fail("period consumption left stale bytes");
+
+    for (i = 0; i < SOURCE_COUNT; ++i) {
+        sources[i].idle_periods = 0;
+        sources[i].received = 0;
+    }
+    if (write(pipes[2][1], half, sizeof(half)) != (ssize_t)sizeof(half) ||
+        write(pipes[2][1], half, sizeof(half)) != (ssize_t)sizeof(half))
+        return fail("one-period startup write failed");
+    if (read_sources(sources, "/tmp") < 0 ||
+        prepare_initial_period(sources, "/tmp", output, &dynamics,
+                               &activity_mask) != 1 ||
+        activity_mask == 0)
+        return fail("one complete period was not accepted at startup");
+    for (i = 0; i < PERIOD_SIZE; ++i) {
+        if (output[i * OUTPUT_CHANNELS] == 0 ||
+            output[i * OUTPUT_CHANNELS] != output[i * OUTPUT_CHANNELS + 1])
+            return fail("one-period startup render contains a gap");
+    }
+
+    consume_period(sources);
 
     for (i = 0; i < SOURCE_COUNT; ++i) {
         close(pipes[i][0]);

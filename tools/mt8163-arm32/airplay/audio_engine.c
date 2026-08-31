@@ -690,16 +690,11 @@ static int source_period_ready(const struct source_bus *source)
 static int period_ready(const struct source_bus *sources)
 {
 	unsigned int i;
-	int active = 0;
 
-	for (i = 0; i < SOURCE_COUNT; ++i) {
-		if (sources[i].idle_periods == 0)
-			continue;
-		active = 1;
-		if (!source_period_ready(&sources[i]))
-			return 0;
-	}
-	return active;
+	for (i = 0; i < SOURCE_COUNT; ++i)
+		if (source_period_ready(&sources[i]))
+			return 1;
+	return 0;
 }
 
 static int wait_for_period(struct source_bus *sources, const char *root)
@@ -724,6 +719,21 @@ static void consume_period(struct source_bus *sources)
 		le_audio_period_buffer_consume(
 			(unsigned char *)sources[i].samples, &sources[i].received,
 			period_bytes);
+}
+
+static unsigned int ready_activity_mask(const struct source_bus *sources)
+{
+	unsigned int mask = 0;
+
+	if (source_period_ready(&sources[SOURCE_MEDIA]))
+		mask |= PLAYBACK_BUS_MEDIA;
+	if (source_period_ready(&sources[SOURCE_SYSTEM]))
+		mask |= PLAYBACK_BUS_SYSTEM;
+	if (source_period_ready(&sources[SOURCE_ANNOUNCEMENT]))
+		mask |= PLAYBACK_BUS_ANNOUNCEMENT;
+	if (source_period_ready(&sources[SOURCE_ALARM]))
+		mask |= PLAYBACK_BUS_ALARM;
+	return mask;
 }
 
 static void render_period(struct source_bus *sources, int16_t *output,
@@ -765,6 +775,22 @@ static void render_period(struct source_bus *sources, int16_t *output,
 	}
 }
 
+static int prepare_initial_period(struct source_bus *sources, const char *root,
+				  int16_t *output,
+				  struct puffin_dynamics *dynamics,
+				  unsigned int *activity_mask)
+{
+	int ready = wait_for_period(sources, root);
+
+	if (ready <= 0)
+		return ready;
+	puffin_dynamics_init(dynamics);
+	render_period(sources, output, dynamics);
+	if (activity_mask)
+		*activity_mask = ready_activity_mask(sources);
+	return 1;
+}
+
 static int write_period(struct pcm *pcm, const int16_t *samples,
 			struct le_aec_reference_sender *reference,
 			unsigned int activity_mask)
@@ -801,7 +827,6 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	struct playback_status status;
 	struct le_aec_reference_sender reference;
 	int16_t *output = NULL;
-	int16_t *second = NULL;
 	int result = -1;
 	int announcement_led_active = 0;
 	int saved_volume = -1;
@@ -835,10 +860,9 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			"audio-engine: AEC reference tap unavailable: %s\n",
 			strerror(errno));
 	sync_playback_status(sources, &status);
-	output = malloc(bytes * 2);
+	output = malloc(bytes);
 	if (!output)
 		goto out;
-	second = output + PERIOD_SIZE * OUTPUT_CHANNELS;
 	fprintf(stderr,
 		"audio-engine: ready (root=%s, input=S16_LE/48000/stereo, "
 		"output=S16_LE/48000/duplicated-stereo, PCM %u,%u)\n",
@@ -847,7 +871,6 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	while (!stopping) {
 		struct pcm *pcm = NULL;
 		unsigned int first_activity;
-		unsigned int second_activity;
 		int ready;
 
 		if (poll_sources(sources, -1) < 0)
@@ -856,7 +879,8 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			break;
 		if (read_sources(sources, root) <= 0)
 			continue;
-		ready = wait_for_period(sources, root);
+		ready = prepare_initial_period(sources, root, output, &dynamics,
+					      &first_activity);
 		if (ready <= 0) {
 			if (ready < 0 || stopping)
 				break;
@@ -864,22 +888,6 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		}
 		sync_announcement_led(sources, &announcement_led_active);
 		sync_playback_status(sources, &status);
-		puffin_dynamics_init(&dynamics);
-		render_period(sources, output, &dynamics);
-		first_activity = source_activity_mask(sources);
-		consume_period(sources);
-		ready = wait_for_period(sources, root);
-		if (ready <= 0) {
-			if (ready < 0 || stopping)
-				break;
-			clear_source_activity(sources, &announcement_led_active,
-					      &visualizer, &status);
-			continue;
-		}
-		sync_announcement_led(sources, &announcement_led_active);
-		sync_playback_status(sources, &status);
-		render_period(sources, second, &dynamics);
-		second_activity = source_activity_mask(sources);
 
 		saved_volume = -1;
 		airplay_volume_applied = 0;
@@ -944,7 +952,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		 * already at, which is what audiod and the physical buttons set.
 		 */
 		int airplay_media_playing =
-			(second_activity & PLAYBACK_BUS_MEDIA) != 0;
+			(first_activity & PLAYBACK_BUS_MEDIA) != 0;
 		int startup_volume = saved_volume;
 		int playback_start_failed = 0;
 		int airplay_volume_attempted = 0;
@@ -966,7 +974,6 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				if (airplay_volume >= 0 && airplay_media_playing)
 					airplay_volume_applied = 1;
 				if (write_period(pcm, output, &reference, first_activity) < 0 ||
-				    write_period(pcm, second, &reference, second_activity) < 0 ||
 				    enable_output_controls(card) < 0)
 					playback_start_failed = 1;
 			}
@@ -983,13 +990,13 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 					      &visualizer, &status);
 			continue;
 		}
-		process_music_visualizer(&visualizer, sources, second);
+		process_music_visualizer(&visualizer, sources, output);
 		consume_period(sources);
 
 		while (!stopping && sources_active(sources)) {
 			/* Same scoping for live volume changes from the sender. */
 			if (airplay_session && airplay_is_active(root) &&
-			    (source_activity_mask(sources) & PLAYBACK_BUS_MEDIA)) {
+			    (ready_activity_mask(sources) & PLAYBACK_BUS_MEDIA)) {
 				int requested = airplay_volume_to_mixer(root);
 
 				if (requested >= 0 &&
@@ -1018,7 +1025,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			sync_playback_status(sources, &status);
 			render_period(sources, output, &dynamics);
 			if (write_period(pcm, output, &reference,
-					 source_activity_mask(sources)) < 0) {
+					 ready_activity_mask(sources)) < 0) {
 				fprintf(stderr,
 					"audio-engine: PCM write failed: %s\n",
 					pcm_get_error(pcm));
