@@ -45,10 +45,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cd tools/mt8163-arm32
           python -m unittest -q \
-            tools/mt8163-arm32/test_build_wifi_dtb.py \
-            tools/mt8163-arm32/test_recovery_image_tools.py \
-            tools/mt8163-arm32/test_source_offer_tools.py
+            test_build_wifi_dtb.py \
+            test_verify_radar_puffin_dtb.py \
+            test_recovery_image_tools.py \
+            test_source_offer_tools.py
 
       - name: Validate tracked Python and shell source
         shell: bash
