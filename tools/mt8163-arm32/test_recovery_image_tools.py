@@ -1329,15 +1329,19 @@ class SourceTests(unittest.TestCase):
         first_write = source.index(
             "write_period(pcm, output, &reference, first_activity)"
         )
-        second_write = source.index(
-            "write_period(pcm, second, &reference, second_activity)"
-        )
-        amp_enable = source.index("enable_output_controls(card)")
-        self.assertLess(first_write, amp_enable)
-        self.assertLess(second_write, amp_enable)
+        power_amp = source.index("power_output_controls(card)")
+        unmute = source.index("unmute_output_controls(card)")
+        self.assertLess(power_amp, first_write)
+        self.assertLess(first_write, unmute)
         self.assertIn(
-            "pcm_writei(pcm, samples, PERIOD_SIZE)", source
+            "ready = prepare_initial_period(sources, root, output, &dynamics,",
+            source,
         )
+        self.assertIn(
+            "const size_t bytes = PERIOD_SIZE * OUTPUT_CHANNELS * sizeof(int16_t);",
+            source,
+        )
+        self.assertIn("pcm_writei(pcm, samples, PERIOD_SIZE)", source)
         self.assertIn(
             "le_aec_reference_publish(reference, samples, PERIOD_SIZE",
             source,

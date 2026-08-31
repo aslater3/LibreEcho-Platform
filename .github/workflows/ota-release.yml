@@ -45,6 +45,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python tools/mt8163-arm32/airplay/test_audio_period_buffer.py
           cd tools/mt8163-arm32
           python -m unittest -q \
             test_build_wifi_dtb.py \
