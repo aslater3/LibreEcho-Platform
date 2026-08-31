@@ -50,7 +50,7 @@ fi
 northern_male_sha=$(sha256sum "$NORTHERN_MALE_MODEL" | awk '{print $1}')
 female_sha=$(sha256sum "$FEMALE_MODEL" | awk '{print $1}')
 tokens_sha=$(sha256sum "$TOKENS" | awk '{print $1}')
-[[ "$northern_male_sha" == bf4de4bc3da0ef15cd1745b4fb08ee67b9ca6bf02311ce4d2eede04a6f057411 ]] || {
+[[ "$northern_male_sha" == d23e7891af7062eb188283dba94866e25ffd5b01a0d9fb9a23c71a39b75b2308 ]] || {
   echo "ERROR: Northern English male model hash is not the reviewed metadata-only derivative" >&2
   exit 1
 }
