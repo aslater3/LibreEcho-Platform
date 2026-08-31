@@ -28,6 +28,7 @@
 #include <tinyalsa/pcm.h>
 
 #include "aec_reference.h"
+#include "audio_period_buffer.h"
 #include "audio_visualizer.h"
 #include "playback_status.h"
 #include "puffin_downmix.h"
@@ -66,6 +67,7 @@ struct source_bus {
 	unsigned int idle_periods;
 	int32_t gain_q15;
 	int16_t *samples;
+	size_t capacity;
 	size_t received;
 };
 
@@ -438,8 +440,10 @@ static void clear_source_activity(struct source_bus *sources,
 {
 	unsigned int i;
 
-	for (i = 0; i < SOURCE_COUNT; ++i)
+	for (i = 0; i < SOURCE_COUNT; ++i) {
 		sources[i].idle_periods = 0;
+		sources[i].received = 0;
+	}
 	sync_announcement_led(sources, announcement_led_active);
 	stop_music_visualizer(visualizer);
 	sync_playback_status(sources, status);
@@ -552,7 +556,8 @@ static int setup_sources(struct source_bus *sources, const char *root)
 		"media", "system", "announcement", "alarm"
 	};
 	unsigned int i;
-	const size_t bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
+	const size_t period_bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
+	const size_t bytes = period_bytes * LE_AUDIO_PERIOD_BUFFER_PERIODS;
 
 	if (mkdir(root, 0770) < 0 && errno != EEXIST)
 		return -1;
@@ -573,6 +578,7 @@ static int setup_sources(struct source_bus *sources, const char *root)
 		sources[i].samples = calloc(1, bytes);
 		if (!sources[i].samples)
 			return -1;
+		sources[i].capacity = bytes;
 	}
 	return 0;
 }
@@ -609,22 +615,31 @@ static int poll_sources(struct source_bus *sources, int timeout_ms)
 
 static int read_sources(struct source_bus *sources, const char *root)
 {
-	const size_t bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
+	const size_t period_bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
 	unsigned int i;
 	int received_any = 0;
 
 	for (i = 0; i < SOURCE_COUNT; ++i) {
 		unsigned char *cursor = (unsigned char *)sources[i].samples;
+		size_t new_bytes = 0;
 
-		sources[i].received = 0;
-		memset(cursor, 0, bytes);
-		while (sources[i].received < bytes) {
-			ssize_t n = read(sources[i].fd,
-					 cursor + sources[i].received,
-					 bytes - sources[i].received);
+		while (sources[i].received < sources[i].capacity) {
+			size_t read_bytes = sources[i].capacity - sources[i].received;
+			unsigned char input[4096];
+			ssize_t n;
+			size_t appended;
+
+			if (read_bytes > sizeof(input))
+				read_bytes = sizeof(input);
+			n = read(sources[i].fd, input, read_bytes);
 
 			if (n > 0) {
-				sources[i].received += (size_t)n;
+				appended = le_audio_period_buffer_append(
+					cursor, &sources[i].received, sources[i].capacity,
+					input, (size_t)n);
+				if (appended != (size_t)n)
+					return -1;
+				new_bytes += appended;
 				received_any = 1;
 				continue;
 			}
@@ -636,10 +651,16 @@ static int read_sources(struct source_bus *sources, const char *root)
 				break;
 			return -1;
 		}
-		if (sources[i].received > 0)
+		if (new_bytes > 0)
 			sources[i].idle_periods = SOURCE_IDLE_PERIODS;
 		else if (sources[i].idle_periods > 0)
 			--sources[i].idle_periods;
+
+		/* A producer that stopped below one complete period cannot leave a
+		 * stale partial frame prefix to be joined to the next stream. */
+		if (sources[i].idle_periods == 0 &&
+		    sources[i].received < period_bytes)
+			sources[i].received = 0;
 	}
 	/* During an AirPlay session the codec volume is the authoritative phone
 	 * volume.  Do not attenuate the media bus a second time. */
@@ -659,30 +680,76 @@ static int sources_active(const struct source_bus *sources)
 	return 0;
 }
 
+static int source_period_ready(const struct source_bus *source)
+{
+	const size_t period_bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
+
+	return le_audio_period_buffer_ready(source->received, period_bytes);
+}
+
+static int period_ready(const struct source_bus *sources)
+{
+	unsigned int i;
+	int active = 0;
+
+	for (i = 0; i < SOURCE_COUNT; ++i) {
+		if (sources[i].idle_periods == 0)
+			continue;
+		active = 1;
+		if (!source_period_ready(&sources[i]))
+			return 0;
+	}
+	return active;
+}
+
+static int wait_for_period(struct source_bus *sources, const char *root)
+{
+	while (!stopping && !period_ready(sources)) {
+		if (!sources_active(sources))
+			return 0;
+		if (poll_sources(sources, 20) < 0)
+			return -1;
+		if (read_sources(sources, root) < 0)
+			return -1;
+	}
+	return period_ready(sources) ? 1 : 0;
+}
+
+static void consume_period(struct source_bus *sources)
+{
+	const size_t period_bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
+	unsigned int i;
+
+	for (i = 0; i < SOURCE_COUNT; ++i)
+		le_audio_period_buffer_consume(
+			(unsigned char *)sources[i].samples, &sources[i].received,
+			period_bytes);
+}
+
 static void render_period(struct source_bus *sources, int16_t *output,
 			  struct puffin_dynamics *dynamics)
 {
 	size_t frame;
 	int higher_priority =
-		sources[SOURCE_SYSTEM].received > 0 ||
-		sources[SOURCE_ANNOUNCEMENT].received > 0 ||
-		sources[SOURCE_ALARM].received > 0;
-	int alarm_active = sources[SOURCE_ALARM].received > 0;
+		source_period_ready(&sources[SOURCE_SYSTEM]) ||
+		source_period_ready(&sources[SOURCE_ANNOUNCEMENT]) ||
+		source_period_ready(&sources[SOURCE_ALARM]);
+	int alarm_active = source_period_ready(&sources[SOURCE_ALARM]);
 
 	for (frame = 0; frame < PERIOD_SIZE; ++frame) {
 		int32_t mixed = 0;
 		unsigned int source;
 
 		for (source = 0; source < SOURCE_COUNT; ++source) {
-			size_t available_frames = sources[source].received /
-				(INPUT_CHANNELS * sizeof(int16_t));
 			int32_t mono;
 			int32_t gain;
 
-			if (frame >= available_frames)
+			if (!source_period_ready(&sources[source]))
 				continue;
-			mono = (int32_t)sources[source].samples[frame * 2] +
-			       (int32_t)sources[source].samples[frame * 2 + 1];
+			mono = (int32_t)sources[source].samples[
+				frame * INPUT_CHANNELS] +
+			       (int32_t)sources[source].samples[
+					frame * INPUT_CHANNELS + 1];
 			mono /= 2;
 			gain = sources[source].gain_q15;
 			if (source == SOURCE_MEDIA && alarm_active)
@@ -781,6 +848,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		struct pcm *pcm = NULL;
 		unsigned int first_activity;
 		unsigned int second_activity;
+		int ready;
 
 		if (poll_sources(sources, -1) < 0)
 			break;
@@ -788,14 +856,26 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			break;
 		if (read_sources(sources, root) <= 0)
 			continue;
+		ready = wait_for_period(sources, root);
+		if (ready <= 0) {
+			if (ready < 0 || stopping)
+				break;
+			continue;
+		}
 		sync_announcement_led(sources, &announcement_led_active);
 		sync_playback_status(sources, &status);
 		puffin_dynamics_init(&dynamics);
 		render_period(sources, output, &dynamics);
 		first_activity = source_activity_mask(sources);
-		(void)poll_sources(sources, 20);
-		if (read_sources(sources, root) < 0)
-			break;
+		consume_period(sources);
+		ready = wait_for_period(sources, root);
+		if (ready <= 0) {
+			if (ready < 0 || stopping)
+				break;
+			clear_source_activity(sources, &announcement_led_active,
+					      &visualizer, &status);
+			continue;
+		}
 		sync_announcement_led(sources, &announcement_led_active);
 		sync_playback_status(sources, &status);
 		render_period(sources, second, &dynamics);
@@ -904,6 +984,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			continue;
 		}
 		process_music_visualizer(&visualizer, sources, second);
+		consume_period(sources);
 
 		while (!stopping && sources_active(sources)) {
 			/* Same scoping for live volume changes from the sender. */
@@ -926,11 +1007,13 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 					}
 				}
 			}
-			(void)poll_sources(sources, 20);
-			if (read_sources(sources, root) < 0) {
+			ready = wait_for_period(sources, root);
+			if (ready < 0) {
 				stopping = 1;
 				break;
 			}
+			if (ready == 0)
+				break;
 			sync_announcement_led(sources, &announcement_led_active);
 			sync_playback_status(sources, &status);
 			render_period(sources, output, &dynamics);
@@ -942,6 +1025,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				break;
 			}
 			process_music_visualizer(&visualizer, sources, output);
+			consume_period(sources);
 		}
 		clear_source_activity(sources, &announcement_led_active,
 				      &visualizer, &status);
