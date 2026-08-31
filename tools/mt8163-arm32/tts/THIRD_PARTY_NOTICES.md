@@ -32,7 +32,7 @@ offer.
 - Upstream model SHA-256:
   `57a219ae8e638873db7d18893304be5069c42868f392bb95c3ff17f0690d0689`
 - LibreEcho metadata-only model SHA-256:
-  `786158f6507d49981889ece1803d8296adfcd34da847eb7e4ef69688ee148119`
+  `bf4de4bc3da0ef15cd1745b4fb08ee67b9ca6bf02311ce4d2eede04a6f057411`
 - Dataset: OpenSLR SLR83, Northern English male
 - License: Creative Commons Attribution-ShareAlike 4.0 International
   (`CC-BY-SA-4.0`)
