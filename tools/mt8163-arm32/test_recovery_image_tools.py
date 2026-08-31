@@ -1801,11 +1801,30 @@ class PolicyTests(unittest.TestCase):
         valid_web = "\n".join((
             "STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}",
             "STARTUP_READY_TIMEOUT_TICKS=${STARTUP_READY_TIMEOUT_TICKS:-600}",
+            "BT_READY_PATH=${BT_READY_PATH:-/run/libreecho/bluetooth-ready}",
+            "bluetooth_integration_state() {",
+            "    printf 'disabled\\n'",
+            "}",
+            "bluetooth_ready() {",
+            "    case \"$(bluetooth_integration_state)\" in",
+            "        disabled) return 0 ;;",
+            "        enabled) [ -f \"$BT_READY_PATH\" ] ;;",
+            "        *) return 1 ;;",
+            "    esac",
+            "}",
             "startup_services_ready() {",
-            "    for socket in network audio mic led bluetooth airplay; do",
+            "    for socket in network audio mic led airplay; do",
             '        [ -S "/run/libreecho/$socket.sock" ] || return 1',
-            "        : \"$socket\"",
             "    done",
+            "    case \"$(bluetooth_integration_state)\" in",
+            "        disabled) ;;",
+            "        enabled)",
+            "            [ -s /var/run/libreecho-btd.pid ] || return 1",
+            "            [ -S /run/libreecho/bluetooth.sock ] || return 1",
+            "            bluetooth_ready || return 1",
+            "            ;;",
+            "        *) return 1 ;;",
+            "    esac",
             "}",
             "mark_startup_ready() {",
             "    count=0",
@@ -1826,13 +1845,54 @@ class PolicyTests(unittest.TestCase):
             "    start) start_service\n        mark_startup_ready >/dev/null 2>&1 & ;;",
             "esac",
         )) + "\n"
+        valid_agentd = "\n".join((
+            "AGENT_DEPENDENCY_TIMEOUT_SECONDS=${AGENT_DEPENDENCY_TIMEOUT_SECONDS:-90}",
+            "AGENT_DEPENDENCY_POLL_SECONDS=${AGENT_DEPENDENCY_POLL_SECONDS:-1}",
+            "dependency_sockets_ready() {",
+            "    [ -S \"$WAKE_SOCKET\" ] &&",
+            "        [ -S \"$STT_SOCKET\" ] &&",
+            "        [ -S \"$AUDIO_SOCKET\" ] &&",
+            "        [ -S \"$TTS_SOCKET\" ]",
+            "}",
+            "missing_dependency_sockets() {",
+            "    printf 'wakeword,stt,audio,tts\\n'",
+            "}",
+            "wait_for_dependency_sockets() {",
+            "    elapsed=0",
+            "    while ! dependency_sockets_ready; do",
+            '        if [ "$elapsed" -ge "$AGENT_DEPENDENCY_TIMEOUT_SECONDS" ]; then',
+            '            echo "dependencies not ready after ${AGENT_DEPENDENCY_TIMEOUT_SECONDS}s: $(missing_dependency_sockets)" >&2',
+            "            return 1",
+            "        fi",
+            "        remaining=$((AGENT_DEPENDENCY_TIMEOUT_SECONDS - elapsed))",
+            "        poll_seconds=$AGENT_DEPENDENCY_POLL_SECONDS",
+            '        if [ "$poll_seconds" -gt "$remaining" ]; then',
+            "            poll_seconds=$remaining",
+            "        fi",
+            '        sleep "$poll_seconds"',
+            "        elapsed=$((elapsed + poll_seconds))",
+            "    done",
+            "}",
+            "start_service() {",
+            "    wait_for_dependency_sockets || {",
+            "        unmount_runtime",
+            "        return 1",
+            "    }",
+            "}",
+            "case \"${1:-}\" in",
+            "    start) start_service ;;",
+            "esac",
+        )) + "\n"
+
         with tempfile.TemporaryDirectory() as temporary:
             bundle = Path(temporary)
             led = bundle / "etc/init.d/libreecho-ledd.init"
             web = bundle / "etc/init.d/libreecho-web.init"
+            agentd = bundle / "etc/init.d/libreecho-agentd.init"
             led.parent.mkdir(parents=True)
             led.write_text(valid_led)
             web.write_text(valid_web)
+            agentd.write_text(valid_agentd)
 
             builder.validate_ui_startup_contract(bundle)
 
@@ -1878,7 +1938,7 @@ class PolicyTests(unittest.TestCase):
 
             web.write_text(valid_web.replace(
                 '        [ -S "/run/libreecho/$socket.sock" ] || return 1\n',
-                "",
+                '        : "$socket"\n',
             ))
             with self.assertRaisesRegex(SystemExit, "startup contract missing"):
                 builder.validate_ui_startup_contract(bundle)
