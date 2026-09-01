@@ -173,6 +173,14 @@ class RadarPuffinDtbTests(unittest.TestCase):
             source = source.replace(old, new)
         verifier.verify_dtb(self.compile_dts(source))
 
+    def test_rejects_conflicting_external_amp_pinctrl_states(self) -> None:
+        dtb = self.compile_dts(VALID_DTS.replace(
+            "pinctrl-4 = <&audexamphigh>;",
+            "pinctrl-4 = <&audexamphigh &audexamplow>;",
+        ))
+        with self.assertRaisesRegex(verifier.ContractError, "contradictory audexamplow"):
+            verifier.verify_dtb(dtb)
+
     def test_rejects_topckgen_without_syscon(self) -> None:
         dtb = self.compile_dts(
             VALID_DTS.replace(

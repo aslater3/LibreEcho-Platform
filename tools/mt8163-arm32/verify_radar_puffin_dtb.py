@@ -233,16 +233,20 @@ def verify_dtb(dtb: Path) -> None:
     _require_absent(dtb, AFE, "dacmux-gpios")
 
     pin_groups = (
-        (4, "audexamphigh"),
-        (5, "audexamplow"),
-        (7, "audexampdacmuxhigh"),
-        (8, "audexampdacmuxlow"),
+        (4, "audexamphigh", "audexamplow"),
+        (5, "audexamplow", "audexamphigh"),
+        (7, "audexampdacmuxhigh", "audexampdacmuxlow"),
+        (8, "audexampdacmuxlow", "audexampdacmuxhigh"),
     )
-    for index, group in pin_groups:
+    for index, group, opposite in pin_groups:
         expected = _phandle(dtb, f"{PINCTRL}/{group}")
         references = _cells(dtb, AFE, f"pinctrl-{index}")
         if expected not in references:
             raise ContractError(f"AFE pinctrl-{index} does not reference {group}")
+        if _phandle(dtb, f"{PINCTRL}/{opposite}") in references:
+            raise ContractError(
+                f"AFE pinctrl-{index} references contradictory {opposite} alongside {group}"
+            )
 
     _check_gpio_state(dtb, "audexamphigh", 0x7A00, "output-high", "external amp on")
     _check_gpio_state(dtb, "audexamplow", 0x7A00, "output-low", "external amp off")
