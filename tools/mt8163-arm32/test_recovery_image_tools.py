@@ -2036,6 +2036,51 @@ class PolicyTests(unittest.TestCase):
         ):
             self.assertIn(marker, stager)
 
+    def test_post_staging_reboot_starts_persisted_feature_services(self) -> None:
+        init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertIn("start_persisted_feature_services()", init_script)
+        start = init_script.index("start_persisted_feature_services()")
+        body = init_script[start:init_script.index("\n}\n", start) + 3]
+        for feature, service in (
+            ("airplay2", "airplayd"),
+            ("wakeword", "waked"),
+            ("stt", "sttd"),
+            ("tts", "ttsd"),
+            ("assistant", "agentd"),
+        ):
+            with self.subTest(feature=feature):
+                self.assertIn(feature, body)
+                self.assertIn(f'{feature}) service={service}', body)
+        self.assertIn(
+            'payload=/data/libreecho/features/$feature/payload.squashfs', body
+        )
+        self.assertIn('[ -f "$payload" ] || continue', body)
+        self.assertIn('"$script" start', body)
+        call_start = init_script.index(
+            "    start_persisted_feature_services", start + len(body)
+        )
+        self.assertLess(
+            init_script.index("    done", start),
+            call_start,
+        )
+
+    def test_disabled_airplay_staging_skips_liveness_but_enabled_requires_it(self) -> None:
+        stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()
+        self.assertIn("airplay_explicitly_disabled()", stager)
+        start = stager.index("airplay_explicitly_disabled()")
+        body = stager[start:stager.index("\n}\n", start) + 3]
+        self.assertIn('"integrations"', body)
+        self.assertIn("integrations & 16", body)
+        self.assertIn('[ $((integrations & 16)) -eq 0 ]', body)
+        decision = stager[stager.index("start_feature_service_if_enabled()"):]
+        self.assertIn('FEATURE_ID" = airplay2', decision)
+        self.assertIn("airplay_explicitly_disabled", decision)
+        self.assertIn("start_feature_service", decision)
+        self.assertLess(
+            decision.index("airplay_explicitly_disabled"),
+            decision.index("start_feature_service", decision.index("airplay_explicitly_disabled")),
+        )
+
     def test_first_install_confirmation_requires_startup_ready_and_led_handoff(self) -> None:
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
         self.assertIn(

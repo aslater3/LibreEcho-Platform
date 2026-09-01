@@ -64,6 +64,28 @@ feature_service_ready()
     return 0
 }
 
+airplay_explicitly_disabled()
+{
+    config=/data/libreecho/config/web-config.json
+    [ -r "$config" ] || return 1
+    integrations=$($BB sed -n \
+        's/.*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "$config" 2>/dev/null | $BB sed -n '1p')
+    case "$integrations" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ $((integrations & 16)) -eq 0 ]
+}
+
+start_feature_service_if_enabled()
+{
+    if [ "$FEATURE_ID" = airplay2 ] && airplay_explicitly_disabled; then
+        echo FEATURE_STAGE_AIRPLAY_DISABLED
+        return 0
+    fi
+    start_feature_service
+}
+
 start_feature_service()
 {
     "$FEATURE_SERVICE_SCRIPT" start \
@@ -154,7 +176,7 @@ $BB mv "$DEST/staging/payload.squashfs.new" "$DEST/payload.squashfs"
 $BB cp "$MANIFEST_FILE" "$DEST/manifest.json"
 $BB sync
 
-start_feature_service
+start_feature_service_if_enabled
 if [ "$RESTART_AGENT" = 1 ] &&
         [ -x /etc/init.d/libreecho-agentd.init ]; then
     FEATURE_SERVICE=agentd
