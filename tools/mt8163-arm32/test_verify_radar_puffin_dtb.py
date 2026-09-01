@@ -173,6 +173,16 @@ class RadarPuffinDtbTests(unittest.TestCase):
             source = source.replace(old, new)
         verifier.verify_dtb(self.compile_dts(source))
 
+    def test_accepts_other_pinctrl_state_in_audio_composite(self) -> None:
+        source = VALID_DTS.replace(
+            "            mclk: mclk {};",
+            "            mclk: mclk {};\n            camdefault: camdefault {};",
+        ).replace(
+            "pinctrl-4 = <&audexamphigh>;",
+            "pinctrl-4 = <&audexamphigh &camdefault>;",
+        )
+        verifier.verify_dtb(self.compile_dts(source))
+
     def test_rejects_conflicting_external_amp_pinctrl_states(self) -> None:
         dtb = self.compile_dts(VALID_DTS.replace(
             "pinctrl-4 = <&audexamphigh>;",
