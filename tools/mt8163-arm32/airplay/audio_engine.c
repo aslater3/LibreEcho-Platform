@@ -28,6 +28,7 @@
 #include <tinyalsa/pcm.h>
 
 #include "aec_reference.h"
+#include "audio_period_buffer.h"
 #include "audio_visualizer.h"
 #include "playback_status.h"
 #include "puffin_downmix.h"
@@ -66,6 +67,7 @@ struct source_bus {
 	unsigned int idle_periods;
 	int32_t gain_q15;
 	int16_t *samples;
+	size_t capacity;
 	size_t received;
 };
 
@@ -171,10 +173,10 @@ static int arm_output_controls(unsigned int card, int volume,
     return result;
 }
 
-/* Enable the physical amplifier only while muted, let its power rail settle,
- * then release the codec mute.  The old order (codec unmute, then amp on)
- * was the source of the audible cyclic scratch/pop on the tweeter path. */
-static int enable_output_controls(unsigned int card)
+/* Enable the physical amplifier while keeping the codec muted, then let its
+ * power rail settle.  The first PCM period is queued only after this delay so
+ * a short clip is still present when the codec is unmuted. */
+static int power_output_controls(unsigned int card)
 {
     struct mixer *mixer;
     int result = 0;
@@ -190,15 +192,26 @@ static int enable_output_controls(unsigned int card)
         result = -1;
     mixer_close(mixer);
     usleep(AMP_SETTLE_US);
+    if (result < 0)
+        fprintf(stderr, "audio-engine: output power controls unavailable\n");
+    return result;
+}
+
+static int unmute_output_controls(unsigned int card)
+{
+    struct mixer *mixer;
+    int result = 0;
 
     mixer = mixer_open(card);
-    if (!mixer)
+    if (!mixer) {
+        fprintf(stderr, "audio-engine: mixer %u unavailable\n", card);
         return -1;
+    }
     if (set_enum_control(mixer, "MFP Gpio Mute", "Off") < 0)
         result = -1;
     mixer_close(mixer);
     if (result < 0)
-        fprintf(stderr, "audio-engine: output enable controls unavailable\n");
+        fprintf(stderr, "audio-engine: output unmute control unavailable\n");
     return result;
 }
 
@@ -355,9 +368,11 @@ static int send_music_visualizer_frame(struct music_visualizer *visualizer)
 
 static int higher_priority_active(const struct source_bus *sources)
 {
-	return sources[SOURCE_SYSTEM].idle_periods > 0 ||
-		sources[SOURCE_ANNOUNCEMENT].idle_periods > 0 ||
-		sources[SOURCE_ALARM].idle_periods > 0;
+	const size_t period_bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
+
+	return sources[SOURCE_SYSTEM].received >= period_bytes ||
+		sources[SOURCE_ANNOUNCEMENT].received >= period_bytes ||
+		sources[SOURCE_ALARM].received >= period_bytes;
 }
 
 static void process_music_visualizer(struct music_visualizer *visualizer,
@@ -397,10 +412,16 @@ static void process_music_visualizer(struct music_visualizer *visualizer,
 		visualizer->active = 1;
 }
 
+static int source_has_activity(const struct source_bus *source)
+{
+	return source->idle_periods > 0 ||
+		source->received >= PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
+}
+
 static void sync_announcement_led(const struct source_bus *sources,
 				  int *active)
 {
-	int wanted = sources[SOURCE_ANNOUNCEMENT].idle_periods > 0;
+	int wanted = source_has_activity(&sources[SOURCE_ANNOUNCEMENT]);
 
 	if (wanted == *active)
 		return;
@@ -412,13 +433,13 @@ static unsigned int source_activity_mask(const struct source_bus *sources)
 {
 	unsigned int mask = 0;
 
-	if (sources[SOURCE_MEDIA].idle_periods > 0)
+	if (source_has_activity(&sources[SOURCE_MEDIA]))
 		mask |= PLAYBACK_BUS_MEDIA;
-	if (sources[SOURCE_SYSTEM].idle_periods > 0)
+	if (source_has_activity(&sources[SOURCE_SYSTEM]))
 		mask |= PLAYBACK_BUS_SYSTEM;
-	if (sources[SOURCE_ANNOUNCEMENT].idle_periods > 0)
+	if (source_has_activity(&sources[SOURCE_ANNOUNCEMENT]))
 		mask |= PLAYBACK_BUS_ANNOUNCEMENT;
-	if (sources[SOURCE_ALARM].idle_periods > 0)
+	if (source_has_activity(&sources[SOURCE_ALARM]))
 		mask |= PLAYBACK_BUS_ALARM;
 	return mask;
 }
@@ -438,8 +459,10 @@ static void clear_source_activity(struct source_bus *sources,
 {
 	unsigned int i;
 
-	for (i = 0; i < SOURCE_COUNT; ++i)
+	for (i = 0; i < SOURCE_COUNT; ++i) {
 		sources[i].idle_periods = 0;
+		sources[i].received = 0;
+	}
 	sync_announcement_led(sources, announcement_led_active);
 	stop_music_visualizer(visualizer);
 	sync_playback_status(sources, status);
@@ -552,7 +575,8 @@ static int setup_sources(struct source_bus *sources, const char *root)
 		"media", "system", "announcement", "alarm"
 	};
 	unsigned int i;
-	const size_t bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
+	const size_t period_bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
+	const size_t bytes = period_bytes * LE_AUDIO_PERIOD_BUFFER_PERIODS;
 
 	if (mkdir(root, 0770) < 0 && errno != EEXIST)
 		return -1;
@@ -573,6 +597,7 @@ static int setup_sources(struct source_bus *sources, const char *root)
 		sources[i].samples = calloc(1, bytes);
 		if (!sources[i].samples)
 			return -1;
+		sources[i].capacity = bytes;
 	}
 	return 0;
 }
@@ -609,22 +634,31 @@ static int poll_sources(struct source_bus *sources, int timeout_ms)
 
 static int read_sources(struct source_bus *sources, const char *root)
 {
-	const size_t bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
+	const size_t period_bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
 	unsigned int i;
 	int received_any = 0;
 
 	for (i = 0; i < SOURCE_COUNT; ++i) {
 		unsigned char *cursor = (unsigned char *)sources[i].samples;
+		size_t new_bytes = 0;
 
-		sources[i].received = 0;
-		memset(cursor, 0, bytes);
-		while (sources[i].received < bytes) {
-			ssize_t n = read(sources[i].fd,
-					 cursor + sources[i].received,
-					 bytes - sources[i].received);
+		while (sources[i].received < sources[i].capacity) {
+			size_t read_bytes = sources[i].capacity - sources[i].received;
+			unsigned char input[4096];
+			ssize_t n;
+			size_t appended;
+
+			if (read_bytes > sizeof(input))
+				read_bytes = sizeof(input);
+			n = read(sources[i].fd, input, read_bytes);
 
 			if (n > 0) {
-				sources[i].received += (size_t)n;
+				appended = le_audio_period_buffer_append(
+					cursor, &sources[i].received, sources[i].capacity,
+					input, (size_t)n);
+				if (appended != (size_t)n)
+					return -1;
+				new_bytes += appended;
 				received_any = 1;
 				continue;
 			}
@@ -636,10 +670,21 @@ static int read_sources(struct source_bus *sources, const char *root)
 				break;
 			return -1;
 		}
-		if (sources[i].received > 0)
+		if (new_bytes > 0)
 			sources[i].idle_periods = SOURCE_IDLE_PERIODS;
 		else if (sources[i].idle_periods > 0)
 			--sources[i].idle_periods;
+
+		/* A producer that ends below one complete period still needs its
+		 * audible tail. Pad it once after the inactivity grace, then let the
+		 * normal render/consume path drain that final period. */
+		if (sources[i].idle_periods == 0 &&
+		    sources[i].received > 0 &&
+		    sources[i].received < period_bytes) {
+			memset(cursor + sources[i].received, 0,
+			       period_bytes - sources[i].received);
+			sources[i].received = period_bytes;
+		}
 	}
 	/* During an AirPlay session the codec volume is the authoritative phone
 	 * volume.  Do not attenuate the media bus a second time. */
@@ -654,9 +699,77 @@ static int sources_active(const struct source_bus *sources)
 	unsigned int i;
 
 	for (i = 0; i < SOURCE_COUNT; ++i)
-		if (sources[i].idle_periods > 0)
+		if (source_has_activity(&sources[i]))
 			return 1;
 	return 0;
+}
+
+static int source_period_ready(const struct source_bus *source)
+{
+	const size_t period_bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
+
+	return le_audio_period_buffer_ready(source->received, period_bytes);
+}
+
+static int period_ready(const struct source_bus *sources)
+{
+	unsigned int i;
+
+	for (i = 0; i < SOURCE_COUNT; ++i)
+		if (source_period_ready(&sources[i]))
+			return 1;
+	return 0;
+}
+
+static int read_or_retain_sources(struct source_bus *sources,
+				       const char *root)
+{
+	int received = read_sources(sources, root);
+
+	if (received < 0)
+		return -1;
+	return received > 0 || period_ready(sources) ? 1 : 0;
+}
+
+static int wait_for_period(struct source_bus *sources, const char *root)
+{
+	if (read_sources(sources, root) < 0)
+		return -1;
+	while (!stopping && !period_ready(sources)) {
+		if (!sources_active(sources))
+			return 0;
+		if (poll_sources(sources, 20) < 0)
+			return -1;
+		if (read_sources(sources, root) < 0)
+			return -1;
+	}
+	return period_ready(sources) ? 1 : 0;
+}
+
+static void consume_period(struct source_bus *sources)
+{
+	const size_t period_bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
+	unsigned int i;
+
+	for (i = 0; i < SOURCE_COUNT; ++i)
+		le_audio_period_buffer_consume(
+			(unsigned char *)sources[i].samples, &sources[i].received,
+			period_bytes);
+}
+
+static unsigned int ready_activity_mask(const struct source_bus *sources)
+{
+	unsigned int mask = 0;
+
+	if (source_period_ready(&sources[SOURCE_MEDIA]))
+		mask |= PLAYBACK_BUS_MEDIA;
+	if (source_period_ready(&sources[SOURCE_SYSTEM]))
+		mask |= PLAYBACK_BUS_SYSTEM;
+	if (source_period_ready(&sources[SOURCE_ANNOUNCEMENT]))
+		mask |= PLAYBACK_BUS_ANNOUNCEMENT;
+	if (source_period_ready(&sources[SOURCE_ALARM]))
+		mask |= PLAYBACK_BUS_ALARM;
+	return mask;
 }
 
 static void render_period(struct source_bus *sources, int16_t *output,
@@ -664,25 +777,25 @@ static void render_period(struct source_bus *sources, int16_t *output,
 {
 	size_t frame;
 	int higher_priority =
-		sources[SOURCE_SYSTEM].received > 0 ||
-		sources[SOURCE_ANNOUNCEMENT].received > 0 ||
-		sources[SOURCE_ALARM].received > 0;
-	int alarm_active = sources[SOURCE_ALARM].received > 0;
+		source_period_ready(&sources[SOURCE_SYSTEM]) ||
+		source_period_ready(&sources[SOURCE_ANNOUNCEMENT]) ||
+		source_period_ready(&sources[SOURCE_ALARM]);
+	int alarm_active = source_period_ready(&sources[SOURCE_ALARM]);
 
 	for (frame = 0; frame < PERIOD_SIZE; ++frame) {
 		int32_t mixed = 0;
 		unsigned int source;
 
 		for (source = 0; source < SOURCE_COUNT; ++source) {
-			size_t available_frames = sources[source].received /
-				(INPUT_CHANNELS * sizeof(int16_t));
 			int32_t mono;
 			int32_t gain;
 
-			if (frame >= available_frames)
+			if (!source_period_ready(&sources[source]))
 				continue;
-			mono = (int32_t)sources[source].samples[frame * 2] +
-			       (int32_t)sources[source].samples[frame * 2 + 1];
+			mono = (int32_t)sources[source].samples[
+				frame * INPUT_CHANNELS] +
+			       (int32_t)sources[source].samples[
+					frame * INPUT_CHANNELS + 1];
 			mono /= 2;
 			gain = sources[source].gain_q15;
 			if (source == SOURCE_MEDIA && alarm_active)
@@ -696,6 +809,22 @@ static void render_period(struct source_bus *sources, int16_t *output,
 		output[frame * OUTPUT_CHANNELS] = rendered;
 		output[frame * OUTPUT_CHANNELS + 1] = rendered;
 	}
+}
+
+static int prepare_initial_period(struct source_bus *sources, const char *root,
+				  int16_t *output,
+				  struct puffin_dynamics *dynamics,
+				  unsigned int *activity_mask)
+{
+	int ready = wait_for_period(sources, root);
+
+	if (ready <= 0)
+		return ready;
+	puffin_dynamics_init(dynamics);
+	render_period(sources, output, dynamics);
+	if (activity_mask)
+		*activity_mask = ready_activity_mask(sources);
+	return 1;
 }
 
 static int write_period(struct pcm *pcm, const int16_t *samples,
@@ -734,7 +863,6 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	struct playback_status status;
 	struct le_aec_reference_sender reference;
 	int16_t *output = NULL;
-	int16_t *second = NULL;
 	int result = -1;
 	int announcement_led_active = 0;
 	int saved_volume = -1;
@@ -768,10 +896,9 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			"audio-engine: AEC reference tap unavailable: %s\n",
 			strerror(errno));
 	sync_playback_status(sources, &status);
-	output = malloc(bytes * 2);
+	output = malloc(bytes);
 	if (!output)
 		goto out;
-	second = output + PERIOD_SIZE * OUTPUT_CHANNELS;
 	fprintf(stderr,
 		"audio-engine: ready (root=%s, input=S16_LE/48000/stereo, "
 		"output=S16_LE/48000/duplicated-stereo, PCM %u,%u)\n",
@@ -780,26 +907,24 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	while (!stopping) {
 		struct pcm *pcm = NULL;
 		unsigned int first_activity;
-		unsigned int second_activity;
+		int ready;
+		int poll_timeout = period_ready(sources) ? 20 : -1;
 
-		if (poll_sources(sources, -1) < 0)
+		if (poll_sources(sources, poll_timeout) < 0)
 			break;
 		if (stopping)
 			break;
-		if (read_sources(sources, root) <= 0)
+		if (read_or_retain_sources(sources, root) <= 0)
 			continue;
+		ready = prepare_initial_period(sources, root, output, &dynamics,
+					      &first_activity);
+		if (ready <= 0) {
+			if (ready < 0 || stopping)
+				break;
+			continue;
+		}
 		sync_announcement_led(sources, &announcement_led_active);
 		sync_playback_status(sources, &status);
-		puffin_dynamics_init(&dynamics);
-		render_period(sources, output, &dynamics);
-		first_activity = source_activity_mask(sources);
-		(void)poll_sources(sources, 20);
-		if (read_sources(sources, root) < 0)
-			break;
-		sync_announcement_led(sources, &announcement_led_active);
-		sync_playback_status(sources, &status);
-		render_period(sources, second, &dynamics);
-		second_activity = source_activity_mask(sources);
 
 		saved_volume = -1;
 		airplay_volume_applied = 0;
@@ -864,7 +989,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		 * already at, which is what audiod and the physical buttons set.
 		 */
 		int airplay_media_playing =
-			(second_activity & PLAYBACK_BUS_MEDIA) != 0;
+			(first_activity & PLAYBACK_BUS_MEDIA) != 0;
 		int startup_volume = saved_volume;
 		int playback_start_failed = 0;
 		int airplay_volume_attempted = 0;
@@ -880,14 +1005,19 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				if (set_pcm_volume(card, startup_volume) < 0)
 					playback_start_failed = 1;
 			}
+			if (!playback_start_failed &&
+			    power_output_controls(card) < 0)
+				playback_start_failed = 1;
 			if (!playback_start_failed) {
 				/* Mark ownership immediately after a successful sender write so
 				 * any later start failure can restore exactly what we changed. */
 				if (airplay_volume >= 0 && airplay_media_playing)
 					airplay_volume_applied = 1;
+				/* Queue the first period only after amp settle.  The PCM starts
+				 * with mute still asserted, and unmute follows this write so a
+				 * one-period clip is not consumed during the settle delay. */
 				if (write_period(pcm, output, &reference, first_activity) < 0 ||
-				    write_period(pcm, second, &reference, second_activity) < 0 ||
-				    enable_output_controls(card) < 0)
+				    unmute_output_controls(card) < 0)
 					playback_start_failed = 1;
 			}
 		}
@@ -903,12 +1033,13 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 					      &visualizer, &status);
 			continue;
 		}
-		process_music_visualizer(&visualizer, sources, second);
+		process_music_visualizer(&visualizer, sources, output);
+		consume_period(sources);
 
 		while (!stopping && sources_active(sources)) {
 			/* Same scoping for live volume changes from the sender. */
 			if (airplay_session && airplay_is_active(root) &&
-			    (source_activity_mask(sources) & PLAYBACK_BUS_MEDIA)) {
+			    (ready_activity_mask(sources) & PLAYBACK_BUS_MEDIA)) {
 				int requested = airplay_volume_to_mixer(root);
 
 				if (requested >= 0 &&
@@ -926,22 +1057,33 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 					}
 				}
 			}
-			(void)poll_sources(sources, 20);
-			if (read_sources(sources, root) < 0) {
+			if (poll_sources(sources, 20) < 0 ||
+			    read_sources(sources, root) < 0) {
 				stopping = 1;
 				break;
 			}
 			sync_announcement_led(sources, &announcement_led_active);
+			if (!period_ready(sources)) {
+				memset(output, 0, PERIOD_SIZE * OUTPUT_CHANNELS * sizeof(*output));
+				if (write_period(pcm, output, &reference, 0) < 0) {
+					fprintf(stderr,
+						"audio-engine: PCM silence write failed: %s\n",
+						pcm_get_error(pcm));
+					break;
+				}
+				continue;
+			}
 			sync_playback_status(sources, &status);
 			render_period(sources, output, &dynamics);
 			if (write_period(pcm, output, &reference,
-					 source_activity_mask(sources)) < 0) {
+					 ready_activity_mask(sources)) < 0) {
 				fprintf(stderr,
 					"audio-engine: PCM write failed: %s\n",
 					pcm_get_error(pcm));
 				break;
 			}
 			process_music_visualizer(&visualizer, sources, output);
+			consume_period(sources);
 		}
 		clear_source_activity(sources, &announcement_led_active,
 				      &visualizer, &status);

@@ -4,7 +4,9 @@
 This checks the hardware semantics that made the accepted Linux 6.1 image
 usable.  It intentionally does not pin phandle numbers, which are build-order
 artifacts, but it does pin the providers, clock IDs, GPIO pinmux values, and
-accepted amp/DAC-mux control path.
+accepted amp/DAC-mux control path.  A pinctrl consumer may reference several
+provider states at once; validation therefore requires each named hardware
+state to be present rather than requiring a singleton phandle.
 """
 
 from __future__ import annotations
@@ -231,15 +233,31 @@ def verify_dtb(dtb: Path) -> None:
     _require_absent(dtb, AFE, "dacmux-gpios")
 
     pin_groups = (
-        (4, "audexamphigh"),
-        (5, "audexamplow"),
-        (7, "audexampdacmuxhigh"),
-        (8, "audexampdacmuxlow"),
+        (4, "audexamphigh", "audexamplow"),
+        (5, "audexamplow", "audexamphigh"),
+        (7, "audexampdacmuxhigh", "audexampdacmuxlow"),
+        (8, "audexampdacmuxlow", "audexampdacmuxhigh"),
     )
-    for index, group in pin_groups:
+    for index, group, opposite in pin_groups:
         expected = _phandle(dtb, f"{PINCTRL}/{group}")
-        if _cells(dtb, AFE, f"pinctrl-{index}") != (expected,):
+        references = _cells(dtb, AFE, f"pinctrl-{index}")
+        if expected not in references:
             raise ContractError(f"AFE pinctrl-{index} does not reference {group}")
+        allowed_nodes = {
+            f"{PINCTRL}/audexamphigh", f"{PINCTRL}/audexamplow",
+            f"{PINCTRL}/audexampdacmuxhigh", f"{PINCTRL}/audexampdacmuxlow",
+            f"{PINCTRL}/mclk",
+        }
+        for phandle in references:
+            node = _node_for_phandle(dtb, phandle)
+            if node not in allowed_nodes:
+                raise ContractError(
+                    f"AFE pinctrl-{index} reference {node} is not a pinctrl state"
+                )
+        if _phandle(dtb, f"{PINCTRL}/{opposite}") in references:
+            raise ContractError(
+                f"AFE pinctrl-{index} references contradictory {opposite} alongside {group}"
+            )
 
     _check_gpio_state(dtb, "audexamphigh", 0x7A00, "output-high", "external amp on")
     _check_gpio_state(dtb, "audexamplow", 0x7A00, "output-low", "external amp off")

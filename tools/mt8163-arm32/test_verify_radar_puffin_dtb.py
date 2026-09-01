@@ -158,6 +158,37 @@ class RadarPuffinDtbTests(unittest.TestCase):
     def test_accepts_complete_audio_and_hardware_contract(self) -> None:
         verifier.verify_dtb(self.compile_dts(VALID_DTS))
 
+    def test_accepts_composite_audio_pinctrl_states(self) -> None:
+        source = VALID_DTS
+        for old, new in (
+            ("pinctrl-0 = <&pmic_idle>;", "pinctrl-0 = <&pmic_idle &mclk>;"),
+            ("pinctrl-1 = <&pmic_active>;", "pinctrl-1 = <&pmic_active &mclk>;"),
+            ("pinctrl-2 = <&i2s_idle>;", "pinctrl-2 = <&i2s_idle &mclk>;"),
+            ("pinctrl-3 = <&i2s_active>;", "pinctrl-3 = <&i2s_active &mclk>;"),
+            ("pinctrl-4 = <&audexamphigh>;", "pinctrl-4 = <&audexamphigh &mclk>;"),
+            ("pinctrl-5 = <&audexamplow>;", "pinctrl-5 = <&audexamplow &mclk>;"),
+            ("pinctrl-7 = <&audexampdacmuxhigh>;", "pinctrl-7 = <&audexampdacmuxhigh &mclk>;"),
+            ("pinctrl-8 = <&audexampdacmuxlow>;", "pinctrl-8 = <&audexampdacmuxlow &mclk>;"),
+        ):
+            source = source.replace(old, new)
+        verifier.verify_dtb(self.compile_dts(source))
+
+    def test_rejects_conflicting_external_amp_pinctrl_states(self) -> None:
+        dtb = self.compile_dts(VALID_DTS.replace(
+            "pinctrl-4 = <&audexamphigh>;",
+            "pinctrl-4 = <&audexamphigh &audexamplow>;",
+        ))
+        with self.assertRaisesRegex(verifier.ContractError, "contradictory audexamplow"):
+            verifier.verify_dtb(dtb)
+
+    def test_rejects_non_pinctrl_composite_reference(self) -> None:
+        dtb = self.compile_dts(VALID_DTS.replace(
+            "pinctrl-4 = <&audexamphigh>;",
+            "pinctrl-4 = <&audexamphigh &codec_mclk>;",
+        ))
+        with self.assertRaisesRegex(verifier.ContractError, "not a pinctrl state"):
+            verifier.verify_dtb(dtb)
+
     def test_rejects_topckgen_without_syscon(self) -> None:
         dtb = self.compile_dts(
             VALID_DTS.replace(
