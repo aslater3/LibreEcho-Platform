@@ -37,6 +37,9 @@ def main() -> None:
         raise SystemExit("one-channel MonoRight PCM regresses the left DAC to noise")
     if "output=S16_LE/48000/mono MonoRight" in text:
         raise SystemExit("MonoRight output banner must not remain")
+    playback_loop = text[text.index("while (!stopping && sources_active(sources))"):text.index("clear_source_activity(sources", text.index("while (!stopping && sources_active(sources))"))]
+    if "int ready = wait_for_period(sources, root);" not in playback_loop:
+        raise SystemExit("active playback must retain partial source periods through wait_for_period")
     print("audio_engine_contract: mono programme duplicated into stereo PCM 23 PASS")
 
 

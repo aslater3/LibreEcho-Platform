@@ -1047,12 +1047,13 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 					}
 				}
 			}
-			if (poll_sources(sources, 20) < 0 ||
-			    read_sources(sources, root) < 0) {
+			int ready = wait_for_period(sources, root);
+
+			if (ready < 0) {
 				stopping = 1;
 				break;
 			}
-			if (!period_ready(sources))
+			if (ready == 0)
 				break;
 			sync_announcement_led(sources, &announcement_led_active);
 			sync_playback_status(sources, &status);
