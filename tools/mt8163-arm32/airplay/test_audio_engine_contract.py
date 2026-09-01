@@ -38,10 +38,12 @@ def main() -> None:
     if "output=S16_LE/48000/mono MonoRight" in text:
         raise SystemExit("MonoRight output banner must not remain")
     playback_loop = text[text.index("while (!stopping && sources_active(sources))"):text.index("clear_source_activity(sources", text.index("while (!stopping && sources_active(sources))"))]
-    if "if (poll_sources(sources, 20) < 0 ||" not in playback_loop:
-        raise SystemExit("active playback must continue polling while a partial period is retained")
-    if "read_sources(sources, root) < 0" not in playback_loop:
-        raise SystemExit("active playback must keep appending retained source periods")
+    if "sources[i].received > 0 &&" not in text or "period_bytes - sources[i].received" not in text:
+        raise SystemExit("final partial source period must be zero-padded before inactivity cleanup")
+    if "sources[i].received = period_bytes;" not in text:
+        raise SystemExit("final partial source period must become renderable")
+    if "sync_announcement_led(sources, &announcement_led_active);" not in playback_loop:
+        raise SystemExit("active playback must synchronize announcement LED changes")
     if "memset(output, 0, PERIOD_SIZE * OUTPUT_CHANNELS * sizeof(*output));" not in playback_loop:
         raise SystemExit("active playback must feed silence while a partial period is retained")
     if "write_period(pcm, output, &reference, 0)" not in playback_loop:

@@ -669,11 +669,16 @@ static int read_sources(struct source_bus *sources, const char *root)
 		else if (sources[i].idle_periods > 0)
 			--sources[i].idle_periods;
 
-		/* A producer that stopped below one complete period cannot leave a
-		 * stale partial frame prefix to be joined to the next stream. */
+		/* A producer that ends below one complete period still needs its
+		 * audible tail. Pad it once after the inactivity grace, then let the
+		 * normal render/consume path drain that final period. */
 		if (sources[i].idle_periods == 0 &&
-		    sources[i].received < period_bytes)
-			sources[i].received = 0;
+		    sources[i].received > 0 &&
+		    sources[i].received < period_bytes) {
+			memset(cursor + sources[i].received, 0,
+			       period_bytes - sources[i].received);
+			sources[i].received = period_bytes;
+		}
 	}
 	/* During an AirPlay session the codec volume is the authoritative phone
 	 * volume.  Do not attenuate the media bus a second time. */
@@ -1052,6 +1057,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				stopping = 1;
 				break;
 			}
+			sync_announcement_led(sources, &announcement_led_active);
 			if (!period_ready(sources)) {
 				memset(output, 0, PERIOD_SIZE * OUTPUT_CHANNELS * sizeof(*output));
 				if (write_period(pcm, output, &reference, 0) < 0) {
