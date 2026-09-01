@@ -174,6 +174,7 @@ if [ -f "$DEST/payload.squashfs" ]; then
 fi
 $BB mv "$DEST/staging/payload.squashfs.new" "$DEST/payload.squashfs"
 $BB cp "$MANIFEST_FILE" "$DEST/manifest.json"
+rmdir "$DEST/staging" || { echo FEATURE_STAGE_STAGING_CLEANUP_FAILED; exit 1; }
 $BB sync
 
 start_feature_service_if_enabled

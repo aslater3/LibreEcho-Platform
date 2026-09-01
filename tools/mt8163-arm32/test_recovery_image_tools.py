@@ -2036,6 +2036,15 @@ class PolicyTests(unittest.TestCase):
         ):
             self.assertIn(marker, stager)
 
+    def test_feature_staging_removes_completed_staging_marker(self) -> None:
+        stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()
+        move = stager.index('$BB mv "$DEST/staging/payload.squashfs.new" "$DEST/payload.squashfs"')
+        manifest = stager.index('$BB cp "$MANIFEST_FILE" "$DEST/manifest.json"', move)
+        cleanup = stager.index('rmdir "$DEST/staging"', manifest)
+        self.assertLess(move, manifest)
+        self.assertLess(manifest, cleanup)
+        self.assertIn('|| { echo FEATURE_STAGE_STAGING_CLEANUP_FAILED; exit 1; }', stager[cleanup:cleanup + 100])
+
     def test_post_staging_reboot_starts_persisted_feature_services(self) -> None:
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
         self.assertIn("start_persisted_feature_services()", init_script)
