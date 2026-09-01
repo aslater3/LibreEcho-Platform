@@ -181,6 +181,14 @@ class RadarPuffinDtbTests(unittest.TestCase):
         with self.assertRaisesRegex(verifier.ContractError, "contradictory audexamplow"):
             verifier.verify_dtb(dtb)
 
+    def test_rejects_non_pinctrl_composite_reference(self) -> None:
+        dtb = self.compile_dts(VALID_DTS.replace(
+            "pinctrl-4 = <&audexamphigh>;",
+            "pinctrl-4 = <&audexamphigh &codec_mclk>;",
+        ))
+        with self.assertRaisesRegex(verifier.ContractError, "not a pinctrl state"):
+            verifier.verify_dtb(dtb)
+
     def test_rejects_topckgen_without_syscon(self) -> None:
         dtb = self.compile_dts(
             VALID_DTS.replace(

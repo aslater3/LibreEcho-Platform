@@ -1047,15 +1047,21 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 					}
 				}
 			}
-			int ready = wait_for_period(sources, root);
-
-			if (ready < 0) {
+			if (poll_sources(sources, 20) < 0 ||
+			    read_sources(sources, root) < 0) {
 				stopping = 1;
 				break;
 			}
-			if (ready == 0)
-				break;
-			sync_announcement_led(sources, &announcement_led_active);
+			if (!period_ready(sources)) {
+				memset(output, 0, PERIOD_SIZE * OUTPUT_CHANNELS * sizeof(*output));
+				if (write_period(pcm, output, &reference, 0) < 0) {
+					fprintf(stderr,
+						"audio-engine: PCM silence write failed: %s\n",
+						pcm_get_error(pcm));
+					break;
+				}
+				continue;
+			}
 			sync_playback_status(sources, &status);
 			render_period(sources, output, &dynamics);
 			if (write_period(pcm, output, &reference,

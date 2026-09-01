@@ -243,6 +243,17 @@ def verify_dtb(dtb: Path) -> None:
         references = _cells(dtb, AFE, f"pinctrl-{index}")
         if expected not in references:
             raise ContractError(f"AFE pinctrl-{index} does not reference {group}")
+        allowed_nodes = {
+            f"{PINCTRL}/audexamphigh", f"{PINCTRL}/audexamplow",
+            f"{PINCTRL}/audexampdacmuxhigh", f"{PINCTRL}/audexampdacmuxlow",
+            f"{PINCTRL}/mclk",
+        }
+        for phandle in references:
+            node = _node_for_phandle(dtb, phandle)
+            if node not in allowed_nodes:
+                raise ContractError(
+                    f"AFE pinctrl-{index} reference {node} is not a pinctrl state"
+                )
         if _phandle(dtb, f"{PINCTRL}/{opposite}") in references:
             raise ContractError(
                 f"AFE pinctrl-{index} references contradictory {opposite} alongside {group}"
