@@ -412,10 +412,16 @@ static void process_music_visualizer(struct music_visualizer *visualizer,
 		visualizer->active = 1;
 }
 
+static int source_has_activity(const struct source_bus *source)
+{
+	return source->idle_periods > 0 ||
+		source->received >= PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
+}
+
 static void sync_announcement_led(const struct source_bus *sources,
 				  int *active)
 {
-	int wanted = sources[SOURCE_ANNOUNCEMENT].idle_periods > 0;
+	int wanted = source_has_activity(&sources[SOURCE_ANNOUNCEMENT]);
 
 	if (wanted == *active)
 		return;
@@ -427,13 +433,13 @@ static unsigned int source_activity_mask(const struct source_bus *sources)
 {
 	unsigned int mask = 0;
 
-	if (sources[SOURCE_MEDIA].idle_periods > 0)
+	if (source_has_activity(&sources[SOURCE_MEDIA]))
 		mask |= PLAYBACK_BUS_MEDIA;
-	if (sources[SOURCE_SYSTEM].idle_periods > 0)
+	if (source_has_activity(&sources[SOURCE_SYSTEM]))
 		mask |= PLAYBACK_BUS_SYSTEM;
-	if (sources[SOURCE_ANNOUNCEMENT].idle_periods > 0)
+	if (source_has_activity(&sources[SOURCE_ANNOUNCEMENT]))
 		mask |= PLAYBACK_BUS_ANNOUNCEMENT;
-	if (sources[SOURCE_ALARM].idle_periods > 0)
+	if (source_has_activity(&sources[SOURCE_ALARM]))
 		mask |= PLAYBACK_BUS_ALARM;
 	return mask;
 }
@@ -693,8 +699,7 @@ static int sources_active(const struct source_bus *sources)
 	unsigned int i;
 
 	for (i = 0; i < SOURCE_COUNT; ++i)
-		if (sources[i].idle_periods > 0 ||
-		    sources[i].received >= PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t))
+		if (source_has_activity(&sources[i]))
 			return 1;
 	return 0;
 }

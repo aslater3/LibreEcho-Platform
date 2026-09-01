@@ -211,6 +211,27 @@ int main(void)
 
     consume_period(sources);
 
+    /* A final short announcement is padded after its grace window.  It must
+       still count as announcing until the padded period has been consumed. */
+    for (i = 0; i < SOURCE_COUNT; ++i) {
+        sources[i].idle_periods = 0;
+        sources[i].received = 0;
+    }
+    if (write(pipes[SOURCE_ANNOUNCEMENT][1], half, sizeof(half)) !=
+        (ssize_t)sizeof(half))
+        return fail("short announcement write failed");
+    if (read_sources(sources, "/tmp") < 0)
+        return fail("short announcement read failed");
+    for (i = 0; i < SOURCE_IDLE_PERIODS; ++i)
+        if (read_sources(sources, "/tmp") < 0)
+            return fail("short announcement inactivity read failed");
+    if (!source_period_ready(&sources[SOURCE_ANNOUNCEMENT]) ||
+        !(source_activity_mask(sources) & PLAYBACK_BUS_ANNOUNCEMENT))
+        return fail("padded announcement tail did not remain active");
+    consume_period(sources);
+    if (source_activity_mask(sources) & PLAYBACK_BUS_ANNOUNCEMENT)
+        return fail("consumed announcement tail remained active");
+
     for (i = 0; i < SOURCE_COUNT; ++i) {
         close(pipes[i][0]);
         close(pipes[i][1]);
