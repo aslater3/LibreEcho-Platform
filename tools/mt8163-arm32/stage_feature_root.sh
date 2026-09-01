@@ -33,6 +33,78 @@ esac
 [ -f "$PAYLOAD_FILE" ] || { echo FEATURE_STAGE_PAYLOAD_MISSING; exit 1; }
 [ -f "$MANIFEST_FILE" ] || { echo FEATURE_STAGE_MANIFEST_MISSING; exit 1; }
 
+FEATURE_SERVICE=
+FEATURE_SOCKET=
+case "$FEATURE_ID" in
+    airplay2) FEATURE_SERVICE=airplayd; FEATURE_SOCKET=/run/libreecho/airplay.sock ;;
+    stt) FEATURE_SERVICE=sttd; FEATURE_SOCKET=/run/libreecho/stt.sock ;;
+    tts) FEATURE_SERVICE=ttsd; FEATURE_SOCKET=/run/libreecho/tts.sock ;;
+    assistant) FEATURE_SERVICE=agentd; FEATURE_SOCKET=/run/libreecho/agent.sock ;;
+    wakeword) FEATURE_SERVICE=waked; FEATURE_SOCKET=/run/libreecho/wakeword.sock ;;
+    *) echo FEATURE_STAGE_SERVICE_UNKNOWN; exit 1 ;;
+esac
+FEATURE_SERVICE_SCRIPT=/etc/init.d/libreecho-$FEATURE_SERVICE.init
+FEATURE_SERVICE_PIDFILE=/var/run/libreecho-$FEATURE_SERVICE.pid
+FEATURE_SERVICE_READY_TIMEOUT_SECONDS=${FEATURE_SERVICE_READY_TIMEOUT_SECONDS:-30}
+
+feature_service_ready()
+{
+    [ -x "$FEATURE_SERVICE_SCRIPT" ] || return 1
+    "$FEATURE_SERVICE_SCRIPT" status >/dev/null 2>&1 || return 1
+    [ -s "$FEATURE_SERVICE_PIDFILE" ] || return 1
+    service_pid=$($BB sed -n '1p' "$FEATURE_SERVICE_PIDFILE" 2>/dev/null)
+    case "$service_pid" in ''|*[!0-9]*) return 1 ;; esac
+    $BB kill -0 "$service_pid" 2>/dev/null || return 1
+    [ -S "$FEATURE_SOCKET" ] || return 1
+    # The listening entry is a non-invasive, bounded liveness probe.  Do not
+    # send a feature command: each daemon owns a different wire protocol.
+    $BB awk -v socket="$FEATURE_SOCKET" \
+        '$NF == socket { found=1 } END { exit found ? 0 : 1 }' \
+        /proc/net/unix >/dev/null 2>&1 || return 1
+    return 0
+}
+
+airplay_explicitly_disabled()
+{
+    config=/data/libreecho/config/web-config.json
+    [ -r "$config" ] || return 1
+    integrations=$($BB sed -n \
+        's/.*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "$config" 2>/dev/null | $BB sed -n '1p')
+    case "$integrations" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ $((integrations & 16)) -eq 0 ]
+}
+
+start_feature_service_if_enabled()
+{
+    if [ "$FEATURE_ID" = airplay2 ] && airplay_explicitly_disabled; then
+        echo FEATURE_STAGE_AIRPLAY_DISABLED
+        return 0
+    fi
+    start_feature_service
+}
+
+start_feature_service()
+{
+    "$FEATURE_SERVICE_SCRIPT" start \
+        >/tmp/$FEATURE_SERVICE-feature-start.log 2>&1 || {
+        echo FEATURE_STAGE_SERVICE_START_FAILED
+        exit 1
+    }
+    ready_count=0
+    while [ "$ready_count" -lt "$FEATURE_SERVICE_READY_TIMEOUT_SECONDS" ]; do
+        feature_service_ready && return 0
+        $BB sleep 1
+        ready_count=$((ready_count + 1))
+    done
+    feature_service_ready || {
+        echo FEATURE_STAGE_SERVICE_NOT_READY
+        exit 1
+    }
+}
+
 # The initramfs normally mounts /data. Keep this fallback for first-install
 # staging and remount an existing read-only Android mount read-write; never
 # format or repair the partition here.
@@ -104,25 +176,14 @@ $BB mv "$DEST/staging/payload.squashfs.new" "$DEST/payload.squashfs"
 $BB cp "$MANIFEST_FILE" "$DEST/manifest.json"
 $BB sync
 
-if [ "$FEATURE_ID" = airplay2 ] && [ -x /etc/init.d/libreecho-airplayd.init ]; then
-    /etc/init.d/libreecho-airplayd.init start >/tmp/airplay-feature-start.log 2>&1 || true
-fi
-if [ "$FEATURE_ID" = tts ] && [ -x /etc/init.d/libreecho-ttsd.init ]; then
-    /etc/init.d/libreecho-ttsd.init start >/tmp/tts-feature-start.log 2>&1 || true
-fi
-if [ "$FEATURE_ID" = wakeword ] && [ -x /etc/init.d/libreecho-waked.init ]; then
-    /etc/init.d/libreecho-waked.init start >/tmp/wakeword-feature-start.log 2>&1 || true
-fi
-if [ "$FEATURE_ID" = stt ] && [ -x /etc/init.d/libreecho-sttd.init ]; then
-    /etc/init.d/libreecho-sttd.init start >/tmp/stt-feature-start.log 2>&1 || true
-fi
-if [ "$FEATURE_ID" = assistant ] && [ -x /etc/init.d/libreecho-agentd.init ]; then
-    /etc/init.d/libreecho-agentd.init start >/tmp/assistant-feature-start.log 2>&1 || true
-fi
+start_feature_service_if_enabled
 if [ "$RESTART_AGENT" = 1 ] &&
         [ -x /etc/init.d/libreecho-agentd.init ]; then
-    /etc/init.d/libreecho-agentd.init start \
-        >/tmp/assistant-feature-start.log 2>&1 || true
+    FEATURE_SERVICE=agentd
+    FEATURE_SOCKET=/run/libreecho/agent.sock
+    FEATURE_SERVICE_SCRIPT=/etc/init.d/libreecho-agentd.init
+    FEATURE_SERVICE_PIDFILE=/var/run/libreecho-agentd.pid
+    start_feature_service
 fi
 $BB rm -f "$CONFIG" "$PAYLOAD_FILE" "$MANIFEST_FILE"
 echo "FEATURE_STAGE_OK:$FEATURE_ID"
