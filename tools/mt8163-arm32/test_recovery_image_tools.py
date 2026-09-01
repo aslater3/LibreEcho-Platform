@@ -1852,6 +1852,12 @@ class PolicyTests(unittest.TestCase):
         valid_agentd = "\n".join((
             "AGENT_DEPENDENCY_TIMEOUT_SECONDS=${AGENT_DEPENDENCY_TIMEOUT_SECONDS:-90}",
             "AGENT_DEPENDENCY_POLL_SECONDS=${AGENT_DEPENDENCY_POLL_SECONDS:-1}",
+            "PAYLOAD=/data/libreecho/features/assistant/payload.squashfs",
+            "RUNTIME_ROOT=/run/libreecho/features/assistant/root",
+            "mount_runtime() {",
+            "    mount -t squashfs -o loop,ro,none \"$PAYLOAD\" \"$RUNTIME_ROOT\"",
+            "}",
+            "unmount_runtime() { :; }",
             "dependency_sockets_ready() {",
             "    [ -S \"$WAKE_SOCKET\" ] &&",
             "        [ -S \"$STT_SOCKET\" ] &&",
@@ -1878,6 +1884,7 @@ class PolicyTests(unittest.TestCase):
             "    done",
             "}",
             "start_service() {",
+            "    mount_runtime || return 1",
             "    wait_for_dependency_sockets || {",
             "        unmount_runtime",
             "        return 1",
@@ -1897,6 +1904,34 @@ class PolicyTests(unittest.TestCase):
             led.write_text(valid_led)
             web.write_text(valid_web)
             agentd.write_text(valid_agentd)
+            feature_script = "\n".join((
+                "PAYLOAD=/data/libreecho/features/feature/payload.squashfs",
+                "RUNTIME_ROOT=/run/libreecho/features/feature/root",
+                "mount_runtime() {",
+                "    mount -t squashfs -o loop,ro,none \"$PAYLOAD\" \"$RUNTIME_ROOT\"",
+                "}",
+                "unmount_runtime() { :; }",
+                "start_service() {",
+                "    mount_runtime || return 1",
+                "}",
+                "case \"${1:-}\" in",
+                "    start) start_service ;;",
+                "esac",
+            )) + "\n"
+            for name in (
+                "libreecho-airplayd.init",
+                "libreecho-sttd.init",
+                "libreecho-ttsd.init",
+                "libreecho-waked.init",
+            ):
+                path = bundle / "etc/init.d" / name
+                path.write_text(feature_script)
+            (bundle / "etc/init.d/libreecho-airplayd.init").write_text(
+                feature_script
+                + "airplay_enabled_at_boot=1\\n"
+                + "integrations=$((integrations & 16))\\n"
+                + "# persistent AirPlay disable is read from the user config\\n"
+            )
 
             builder.validate_ui_startup_contract(bundle)
 
@@ -1970,18 +2005,78 @@ class PolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "startup-animation"):
                 builder.validate_ui_startup_contract(bundle)
 
-    def test_streaming_voice_services_start_warm_in_dependency_order(self) -> None:
+    def test_production_boot_defers_payload_backed_services(self) -> None:
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
-        service_line = (
-            'services="logd networkd timed audiod micd waked sttd ledd buttond btd '
-            'airplayd ttsd agentd web"'
+        self.assertIn(
+            'services="logd networkd timed audiod micd ledd buttond btd web"',
+            init_script,
         )
+        self.assertIn(
+            'services="logd networkd timed audiod micd ledd buttond btd wyomingd web"',
+            init_script,
+        )
+        self.assertIn("feature-services-deferred-until-staged", init_script)
+        for service in ("airplayd", "sttd", "ttsd", "agentd"):
+            self.assertNotIn(f"services=\"logd networkd timed audiod micd waked {service}", init_script)
+
+    def test_feature_staging_requires_verified_service_liveness(self) -> None:
+        stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()
+        for marker in (
+            "feature_service_ready()",
+            'FEATURE_SOCKET=/run/libreecho/airplay.sock',
+            'FEATURE_SOCKET=/run/libreecho/stt.sock',
+            'FEATURE_SOCKET=/run/libreecho/tts.sock',
+            'FEATURE_SOCKET=/run/libreecho/agent.sock',
+            'FEATURE_SERVICE_READY_TIMEOUT_SECONDS=${FEATURE_SERVICE_READY_TIMEOUT_SECONDS:-30}',
+            '"$FEATURE_SERVICE_SCRIPT" status >/dev/null 2>&1',
+            '[ -S "$FEATURE_SOCKET" ]',
+            '$BB awk -v socket="$FEATURE_SOCKET"',
+            "/proc/net/unix >/dev/null 2>&1 || return 1",
+            "feature_service_ready || {",
+        ):
+            self.assertIn(marker, stager)
+
+    def test_first_install_confirmation_requires_startup_ready_and_led_handoff(self) -> None:
+        init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertIn(
+            'STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}',
+            init_script,
+        )
+        self.assertIn("startup_ready_marker_valid()", init_script)
+        self.assertIn("startup-ready-marker-missing", init_script)
+        self.assertIn("led-handoff-not-ready", init_script)
+        self.assertIn("startup_ready_marker_valid || {", init_script)
+        self.assertLess(
+            init_script.index("startup_ready_marker_valid || {"),
+            init_script.index("libreecho-bootctl confirm \"$selected_slot\""),
+        )
+
+    def test_ui_startup_contract_covers_payload_services_and_airplay_default(self) -> None:
+        builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        for script in (
+            "libreecho-airplayd.init",
+            "libreecho-sttd.init",
+            "libreecho-ttsd.init",
+            "libreecho-agentd.init",
+        ):
+            self.assertIn(f'"etc/init.d/{script}"', builder_source)
+        self.assertIn("mount_runtime || return 1", builder_source)
+        self.assertIn("airplay_enabled_at_boot=1", builder_source)
+        self.assertIn("integrations & 16", builder_source)
+        self.assertIn("persistent AirPlay disable", builder_source)
+
+    def test_streaming_voice_services_defer_until_feature_staging(self) -> None:
+        init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        service_line = 'services="logd networkd timed audiod micd ledd buttond btd web"'
         self.assertIn(service_line, init_script)
         self.assertLess(service_line.index("audiod"), service_line.index("buttond"))
         self.assertLess(service_line.index("ledd"), service_line.index("buttond"))
-        self.assertLess(service_line.index("waked"), service_line.index("sttd"))
-        self.assertLess(service_line.index("sttd"), service_line.index("agentd"))
-        self.assertLess(service_line.index("ttsd"), service_line.index("agentd"))
+        self.assertIn("feature-services-deferred-until-staged", init_script)
+        for service in ("airplayd", "sttd", "ttsd", "agentd"):
+            self.assertNotIn(
+                f'services="logd networkd timed audiod micd {service}',
+                init_script,
+            )
 
     def test_hostname_is_derived_from_audited_idme_serial(self) -> None:
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()

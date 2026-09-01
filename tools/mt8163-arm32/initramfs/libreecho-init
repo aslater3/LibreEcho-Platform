@@ -30,6 +30,7 @@ esac
 FEATURE_POLICY_VALUE=$($BB cat /etc/libreecho/feature-policy 2>/dev/null)
 FEATURE_POLICY=exclude
 FIRST_INSTALL_MARKER=/etc/libreecho/first-install-confirm
+STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}
 case "$FEATURE_POLICY_VALUE" in
     preserve|redistributable|community-noncommercial|exclude)
         FEATURE_POLICY=$FEATURE_POLICY_VALUE
@@ -869,22 +870,23 @@ start_ui_services()
             [ "$FEATURE_POLICY" = community-noncommercial ]; then
         if [ "$ha_enabled" -eq 1 ]; then
             log ui-home-assistant-mode-enabled
-            services="logd networkd timed audiod micd waked ledd buttond btd airplayd wyomingd web"
+            services="logd networkd timed audiod micd ledd buttond btd wyomingd web"
         else
-            services="logd networkd timed audiod micd waked sttd ledd buttond btd airplayd ttsd agentd web"
+            services="logd networkd timed audiod micd ledd buttond btd web"
         fi
         if [ "$FEATURE_POLICY" = community-noncommercial ]; then
             log ui-services-community-noncommercial-with-wakeword
         fi
     else
         if [ "$ha_enabled" -eq 1 ]; then
-            services="logd networkd timed audiod micd ledd buttond btd airplayd wyomingd web"
+            services="logd networkd timed audiod micd ledd buttond btd wyomingd web"
         else
-            services="logd networkd timed audiod micd sttd ledd buttond btd airplayd ttsd agentd web"
+            services="logd networkd timed audiod micd ledd buttond btd web"
         fi
         log ui-services-redistributable-without-wakeword
     fi
     fi
+    log feature-services-deferred-until-staged
     for service in $services; do
         script="/etc/init.d/libreecho-$service.init"
         if [ -x "$script" ]; then
@@ -1065,27 +1067,83 @@ ota_health_confirm_worker()
         return 0
     }
 
+    startup_ready_marker_valid()
+    {
+        [ -r "$STARTUP_READY" ] || return 1
+        [ "$($BB sed -n 's/^schema=//p' "$STARTUP_READY" 2>/dev/null)" = 1 ] || return 1
+        return 0
+    }
+
+    service_process_ready()
+    {
+        service=$1
+        socket=$2
+        script="/etc/init.d/libreecho-$service.init"
+        pidfile="/var/run/libreecho-$service.pid"
+        [ -x "$script" ] || return 1
+        "$script" status >/dev/null 2>&1 || return 1
+        [ -s "$pidfile" ] || return 1
+        pid=$($BB sed -n '1p' "$pidfile" 2>/dev/null)
+        case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+        $BB kill -0 "$pid" 2>/dev/null || return 1
+        [ -S "$socket" ] || return 1
+        $BB awk -v socket="$socket" \
+            '$NF == socket { found=1 } END { exit found ? 0 : 1 }' \
+            /proc/net/unix >/dev/null 2>&1 || return 1
+        return 0
+    }
+
+    led_handoff_ready()
+    {
+        service_process_ready ledd /run/libreecho/led.sock || {
+            log led-handoff-not-ready
+            return 1
+        }
+        return 0
+    }
+
     ota_health_services_ready()
     {
         [ "$SERVICE_PROFILE" = production ] || return 0
-        for required_socket in \
-            /run/libreecho/network.sock \
-            /run/libreecho/audio.sock \
-            /run/libreecho/mic.sock \
-            /run/libreecho/led.sock \
-            /run/libreecho/bluetooth.sock \
-            /run/libreecho/airplay.sock; do
-            [ -S "$required_socket" ] || {
-                log "ota-health-services-not-ready:$required_socket"
+        startup_ready_marker_valid || {
+            log startup-ready-marker-missing
+            return 1
+        }
+        for required_service in \
+            "networkd /run/libreecho/network.sock" \
+            "audiod /run/libreecho/audio.sock" \
+            "micd /run/libreecho/mic.sock" \
+            "btd /run/libreecho/bluetooth.sock" \
+            "airplayd /run/libreecho/airplay.sock"; do
+            service_name=${required_service%% *}
+            service_socket=${required_service#* }
+            service_process_ready "$service_name" "$service_socket" || {
+                log "ota-health-services-not-ready:$service_name"
                 return 1
             }
         done
+        led_handoff_ready || return 1
         if [ -S /run/libreecho/stt.sock ] &&
            [ -S /run/libreecho/tts.sock ] &&
            [ -S /run/libreecho/agent.sock ]; then
+            for required_service in \
+                "sttd /run/libreecho/stt.sock" \
+                "ttsd /run/libreecho/tts.sock" \
+                "agentd /run/libreecho/agent.sock"; do
+                service_name=${required_service%% *}
+                service_socket=${required_service#* }
+                service_process_ready "$service_name" "$service_socket" || {
+                    log "ota-health-services-not-ready:$service_name"
+                    return 1
+                }
+            done
             return 0
         fi
         if [ -S /run/libreecho/wyoming.sock ]; then
+            service_process_ready wyomingd /run/libreecho/wyoming.sock || {
+                log ota-health-services-not-ready:wyomingd
+                return 1
+            }
             return 0
         fi
         # A device whose voice pipeline is served by remote Wyoming endpoints

@@ -39,7 +39,7 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "b4c0b91c24979701d27bfc9a775cf6bee1907477393ab7d350c642a83f566d30"
+RECOVERY_INIT_SHA256 = "f9f7d8c070a34c00dd5f9829cacd41ddbb8c0ac42a020f9c2f932a1a9d80e741"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
@@ -767,6 +767,12 @@ def validate_ui_startup_contract(bundle: Path) -> None:
             (
                 "AGENT_DEPENDENCY_TIMEOUT_SECONDS=${AGENT_DEPENDENCY_TIMEOUT_SECONDS:-90}",
                 "AGENT_DEPENDENCY_POLL_SECONDS=${AGENT_DEPENDENCY_POLL_SECONDS:-1}",
+                "PAYLOAD=",
+                "RUNTIME_ROOT=",
+                "mount_runtime()",
+                "mount -t squashfs",
+                "unmount_runtime()",
+                "mount_runtime || return 1",
                 "dependency_sockets_ready()",
                 "missing_dependency_sockets()",
                 "wait_for_dependency_sockets()",
@@ -777,6 +783,50 @@ def validate_ui_startup_contract(bundle: Path) -> None:
             ),
         ),
     )
+    payload_contracts = {
+        "etc/init.d/libreecho-airplayd.init": (
+            "PAYLOAD=",
+            "RUNTIME_ROOT=",
+            "mount_runtime()",
+            "mount -t squashfs",
+            "unmount_runtime()",
+            "mount_runtime || return 1",
+            "start) start_service",
+            # AirPlay is enabled by default; the persisted integration bit is
+            # the explicit, user-controlled disable (not a boot-time default).
+            "airplay_enabled_at_boot=1",
+            "integrations & 16",
+            "persistent AirPlay disable",
+        ),
+        "etc/init.d/libreecho-sttd.init": (
+            "PAYLOAD=",
+            "RUNTIME_ROOT=",
+            "mount_runtime()",
+            "mount -t squashfs",
+            "unmount_runtime()",
+            "mount_runtime || return 1",
+            "start) start_service",
+        ),
+        "etc/init.d/libreecho-ttsd.init": (
+            "PAYLOAD=",
+            "RUNTIME_ROOT=",
+            "mount_runtime()",
+            "mount -t squashfs",
+            "unmount_runtime()",
+            "mount_runtime || return 1",
+            "start) start_service",
+        ),
+        "etc/init.d/libreecho-waked.init": (
+            "PAYLOAD=",
+            "RUNTIME_ROOT=",
+            "mount_runtime()",
+            "mount -t squashfs",
+            "unmount_runtime()",
+            "mount_runtime || return 1",
+            "start) start_service",
+        ),
+    }
+    contracts += tuple(payload_contracts.items())
     contract_paths = {}
     for relative, required in contracts:
         source = pinned_source(bundle, relative, f"UI startup contract {relative}")
@@ -850,9 +900,21 @@ def validate_ui_startup_contract(bundle: Path) -> None:
             start_service_start = text.index("start_service()")
             dispatch_start = text.index('case "${1:-}" in')
             start_body = text[start_service_start:dispatch_start]
+            if "mount_runtime || return 1" not in start_body:
+                raise SystemExit(
+                    "ERROR: assistant start case does not fail closed before mounting"
+                )
             if "wait_for_dependency_sockets || {" not in start_body:
                 raise SystemExit(
                     "ERROR: agentd start case does not wait for dependencies"
+                )
+        if relative in payload_contracts:
+            start_service_start = text.index("start_service()")
+            dispatch_start = text.index('case "${1:-}" in')
+            start_body = text[start_service_start:dispatch_start]
+            if "mount_runtime || return 1" not in start_body:
+                raise SystemExit(
+                    f"ERROR: payload service does not fail closed before starting: {relative}"
                 )
 
     led_text = contract_paths["etc/init.d/libreecho-ledd.init"]
