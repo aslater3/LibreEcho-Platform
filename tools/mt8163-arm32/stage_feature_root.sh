@@ -174,7 +174,9 @@ if [ -f "$DEST/payload.squashfs" ]; then
 fi
 $BB mv "$DEST/staging/payload.squashfs.new" "$DEST/payload.squashfs"
 $BB cp "$MANIFEST_FILE" "$DEST/manifest.json"
-$BB sync
+$BB sync || { echo FEATURE_STAGE_COMMIT_SYNC_FAILED; exit 1; }
+rmdir "$DEST/staging" || { echo FEATURE_STAGE_STAGING_CLEANUP_FAILED; exit 1; }
+$BB sync || { echo FEATURE_STAGE_MARKER_SYNC_FAILED; exit 1; }
 
 start_feature_service_if_enabled
 if [ "$RESTART_AGENT" = 1 ] &&
