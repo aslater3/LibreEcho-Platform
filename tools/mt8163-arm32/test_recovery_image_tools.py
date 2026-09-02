@@ -2041,8 +2041,12 @@ class PolicyTests(unittest.TestCase):
         move = stager.index('$BB mv "$DEST/staging/payload.squashfs.new" "$DEST/payload.squashfs"')
         manifest = stager.index('$BB cp "$MANIFEST_FILE" "$DEST/manifest.json"', move)
         cleanup = stager.index('rmdir "$DEST/staging"', manifest)
+        first_sync = stager.index('$BB sync', manifest)
+        second_sync = stager.index('$BB sync', cleanup)
         self.assertLess(move, manifest)
-        self.assertLess(manifest, cleanup)
+        self.assertLess(manifest, first_sync)
+        self.assertLess(first_sync, cleanup)
+        self.assertLess(cleanup, second_sync)
         self.assertIn('|| { echo FEATURE_STAGE_STAGING_CLEANUP_FAILED; exit 1; }', stager[cleanup:cleanup + 100])
 
     def test_post_staging_reboot_starts_persisted_feature_services(self) -> None:
