@@ -1742,11 +1742,12 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         fail("runtime /init overlay manifest mismatch")
     reconcile = verified_overlay["libreecho-reconcile-features"]
     for marker in (
-        b"/etc/libreecho/service-profile",
-        b"/etc/libreecho/feature-policy",
+        b"FEATURE_RECONCILE_ETC_ROOT:-/etc",
+        b"$ETC_ROOT/libreecho/service-profile",
+        b"$ETC_ROOT/libreecho/feature-policy",
         b"integrations & 1",
         b"integrations & 16",
-        b"/data/libreecho/features/$feature/payload.squashfs",
+        b"$DATA_ROOT/libreecho/features/$feature/payload.squashfs",
         b"\"$script\" start",
         b"feature-services-reconcile-failed",
     ):

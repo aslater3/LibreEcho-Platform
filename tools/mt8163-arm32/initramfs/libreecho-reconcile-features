@@ -4,17 +4,26 @@
 # applying setup settings and Wi-Fi.  Each feature init script mounts its
 # squashfs runtime before starting its daemon.
 
-BB=/bin/busybox
-LOCK=/run/libreecho/reconcile-features.lock
+BB=${BB:-/bin/busybox}
+ETC_ROOT=${FEATURE_RECONCILE_ETC_ROOT:-/etc}
+DATA_ROOT=${FEATURE_RECONCILE_DATA_ROOT:-/data}
+RUN_ROOT=${FEATURE_RECONCILE_RUN_ROOT:-/run}
+VAR_RUN_ROOT=${FEATURE_RECONCILE_VAR_RUN_ROOT:-/var/run}
+INIT_ROOT=${FEATURE_RECONCILE_INIT_ROOT:-/etc/init.d}
+PROC_NET_UNIX=${FEATURE_RECONCILE_PROC_NET_UNIX:-/proc/net/unix}
+LOG_FILE=${FEATURE_RECONCILE_LOG_FILE:-/tmp/init.log}
+KMSG=${FEATURE_RECONCILE_KMSG:-/dev/kmsg}
+CONSOLE=${FEATURE_RECONCILE_CONSOLE:-/dev/console}
+LOCK=$RUN_ROOT/libreecho/reconcile-features.lock
 LOCK_TIMEOUT_SECONDS=${FEATURE_RECONCILE_LOCK_TIMEOUT_SECONDS:-120}
 READY_TIMEOUT_SECONDS=${FEATURE_RECONCILE_READY_TIMEOUT_SECONDS:-30}
 
 log()
 {
     msg="libreecho-feature-reconcile: $*"
-    printf '%s\n' "$*" >> /tmp/init.log
-    printf '<6>%s\n' "$msg" > /dev/kmsg 2>/dev/null
-    printf '%s\n' "$msg" > /dev/console 2>/dev/null
+    printf '%s\n' "$*" >> "$LOG_FILE"
+    printf '<6>%s\n' "$msg" > "$KMSG" 2>/dev/null
+    printf '%s\n' "$msg" > "$CONSOLE" 2>/dev/null
 }
 
 acquire_lock()
@@ -67,13 +76,13 @@ release_lock()
 
 read_policy()
 {
-    SERVICE_PROFILE_VALUE=$($BB cat /etc/libreecho/service-profile 2>/dev/null)
+    SERVICE_PROFILE_VALUE=$($BB cat "$ETC_ROOT/libreecho/service-profile" 2>/dev/null)
     SERVICE_PROFILE=diagnostic
     case "$SERVICE_PROFILE_VALUE" in
         production) SERVICE_PROFILE=production ;;
     esac
 
-    FEATURE_POLICY_VALUE=$($BB cat /etc/libreecho/feature-policy 2>/dev/null)
+    FEATURE_POLICY_VALUE=$($BB cat "$ETC_ROOT/libreecho/feature-policy" 2>/dev/null)
     FEATURE_POLICY=exclude
     case "$FEATURE_POLICY_VALUE" in
         preserve|redistributable|community-noncommercial|exclude)
@@ -85,7 +94,7 @@ read_policy()
 select_topology()
 {
     ha_enabled=0
-    config=/data/libreecho/config/web-config.json
+    config=$DATA_ROOT/libreecho/config/web-config.json
     if [ -r "$config" ]; then
         integrations=$($BB sed -n \
             's/^[[:space:]]*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*$/\1/p' \
@@ -121,8 +130,8 @@ feature_service_ready()
 {
     service=$1
     socket=$2
-    script=/etc/init.d/libreecho-$service.init
-    pidfile=/var/run/libreecho-$service.pid
+    script=$INIT_ROOT/libreecho-$service.init
+    pidfile=$VAR_RUN_ROOT/libreecho-$service.pid
     [ -x "$script" ] || return 1
     "$script" status >/dev/null 2>&1 || return 1
     [ -s "$pidfile" ] || return 1
@@ -132,13 +141,13 @@ feature_service_ready()
     [ -S "$socket" ] || return 1
     $BB awk -v socket="$socket" \
         '$NF == socket { found=1 } END { exit found ? 0 : 1 }' \
-        /proc/net/unix >/dev/null 2>&1 || return 1
+        "$PROC_NET_UNIX" >/dev/null 2>&1 || return 1
     return 0
 }
 
 airplay_explicitly_disabled()
 {
-    config=/data/libreecho/config/web-config.json
+    config=$DATA_ROOT/libreecho/config/web-config.json
     [ -r "$config" ] || return 1
     integrations=$($BB sed -n \
         's/.*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
@@ -149,23 +158,46 @@ airplay_explicitly_disabled()
     [ $((integrations & 16)) -eq 0 ]
 }
 
+stop_disabled_airplay()
+{
+    service=airplayd
+    script=$INIT_ROOT/libreecho-$service.init
+    pidfile=$VAR_RUN_ROOT/libreecho-$service.pid
+    socket=$RUN_ROOT/libreecho/airplay.sock
+    [ -x "$script" ] || {
+        log feature-reconcile-service-missing:airplayd
+        return 1
+    }
+    "$script" stop >/tmp/libreecho-airplayd.reconcile.log 2>&1 || {
+        log feature-reconcile-service-stop-failed:airplayd
+        return 1
+    }
+    if "$script" status >/dev/null 2>&1 || [ -e "$pidfile" ] || [ -S "$socket" ]; then
+        log feature-reconcile-service-still-running:airplayd
+        return 1
+    fi
+    log feature-reconcile-service-disabled:airplayd
+    return 0
+}
+
 start_feature()
 {
     feature=$1
     case "$feature" in
-        airplay2) service=airplayd; socket=/run/libreecho/airplay.sock ;;
-        stt) service=sttd; socket=/run/libreecho/stt.sock ;;
-        tts) service=ttsd; socket=/run/libreecho/tts.sock ;;
-        assistant) service=agentd; socket=/run/libreecho/agent.sock ;;
-        wakeword) service=waked; socket=/run/libreecho/wakeword.sock ;;
+        airplay2) service=airplayd; socket=$RUN_ROOT/libreecho/airplay.sock ;;
+        stt) service=sttd; socket=$RUN_ROOT/libreecho/stt.sock ;;
+        tts) service=ttsd; socket=$RUN_ROOT/libreecho/tts.sock ;;
+        assistant) service=agentd; socket=$RUN_ROOT/libreecho/agent.sock ;;
+        wakeword) service=waked; socket=$RUN_ROOT/libreecho/wakeword.sock ;;
         *) log "feature-reconcile-unknown-feature:$feature"; return 1 ;;
     esac
     if [ "$feature" = airplay2 ] && airplay_explicitly_disabled; then
         log feature-reconcile-airplay-disabled
-        return 0
+        stop_disabled_airplay
+        return $?
     fi
 
-    payload=/data/libreecho/features/$feature/payload.squashfs
+    payload=$DATA_ROOT/libreecho/features/$feature/payload.squashfs
     if [ ! -f "$payload" ]; then
         log "feature-reconcile-payload-missing:$feature"
         return 1
@@ -176,7 +208,7 @@ start_feature()
         return 1
     fi
 
-    script=/etc/init.d/libreecho-$service.init
+    script=$INIT_ROOT/libreecho-$service.init
     if [ ! -x "$script" ]; then
         log "feature-reconcile-service-missing:$service"
         return 1
@@ -225,7 +257,7 @@ reconcile()
     return 0
 }
 
-$BB mkdir -p /run/libreecho
+$BB mkdir -p "$RUN_ROOT/libreecho"
 acquire_lock || exit 1
 reconcile
 rc=$?

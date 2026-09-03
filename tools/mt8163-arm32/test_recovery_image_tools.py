@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -2028,12 +2029,13 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(helper.is_file())
         self.assertTrue(helper.stat().st_mode & stat.S_IXUSR)
         source = helper.read_text()
-        self.assertIn("/etc/libreecho/service-profile", source)
-        self.assertIn("/etc/libreecho/feature-policy", source)
+        self.assertIn("FEATURE_RECONCILE_ETC_ROOT:-/etc", source)
+        self.assertIn("$ETC_ROOT/libreecho/service-profile", source)
+        self.assertIn("$ETC_ROOT/libreecho/feature-policy", source)
         self.assertIn('"integrations"', source)
         self.assertIn("integrations & 1", source)
         self.assertIn("integrations & 16", source)
-        self.assertIn("/data/libreecho/features/$feature/payload.squashfs", source)
+        self.assertIn("$DATA_ROOT/libreecho/features/$feature/payload.squashfs", source)
         self.assertIn("/staging", source)
         self.assertIn('"$script" start', source)
         self.assertIn("feature-services-reconcile-failed", source)
@@ -2061,6 +2063,106 @@ class PolicyTests(unittest.TestCase):
             'if init_script != read(stage / "init"):',
             builder_source,
         )
+
+    def test_post_staging_reconcile_executes_topology_and_failures(self) -> None:
+        helper = TOOLS_DIR / "initramfs/libreecho-reconcile-features"
+        busybox = shutil.which("busybox")
+        if busybox is None:
+            self.skipTest("busybox is required for the reconciliation fixture")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            etc = root / "etc"
+            data = root / "data"
+            run = root / "run"
+            var_run = root / "var-run"
+            init = root / "init.d"
+            states = root / "states"
+            actions = root / "actions"
+            sockets: list[socket.socket] = []
+            for path in (etc / "libreecho", data / "libreecho/config", run / "libreecho", var_run, init, states):
+                path.mkdir(parents=True, exist_ok=True)
+            (etc / "libreecho/service-profile").write_text("production\n")
+            (etc / "libreecho/feature-policy").write_text("community-noncommercial\n")
+            (data / "libreecho/config/web-config.json").write_text('{"integrations":20}\n')
+
+            services = {
+                "waked": "wakeword",
+                "sttd": "stt",
+                "airplayd": "airplay2",
+                "ttsd": "tts",
+                "agentd": "assistant",
+            }
+            proc_lines = []
+            for service, feature in services.items():
+                feature_dir = data / "libreecho/features" / feature
+                feature_dir.mkdir(parents=True)
+                (feature_dir / "payload.squashfs").write_bytes(b"verified-fixture")
+                socket_path = run / "libreecho" / ({
+                    "waked": "wakeword.sock", "sttd": "stt.sock",
+                    "airplayd": "airplay.sock", "ttsd": "tts.sock",
+                    "agentd": "agent.sock",
+                }[service])
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                listener.bind(str(socket_path))
+                listener.listen(1)
+                sockets.append(listener)
+                proc_lines.append(f"00000000: 00000002 00000000 00010000 0001 01 1 {socket_path}\n")
+                (var_run / f"libreecho-{service}.pid").write_text(f"{os.getpid()}\n")
+                script = init / f"libreecho-{service}.init"
+                script.write_text(
+                    "#!/bin/sh\nset -eu\n"
+                    f"state='{states / service}'\nactions='{actions}'\n"
+                    'case "${1:-}" in\n'
+                    '  start) printf "%s:start\\n" "${0##*/}" >>"$actions"; : >"$state" ;;\n'
+                    '  stop) printf "%s:stop\\n" "${0##*/}" >>"$actions"; rm -f "$state" '
+                    f"'{var_run / f'libreecho-{service}.pid'}' '{socket_path}' ;;\n"
+                    '  status) test -f "$state" ;;\n'
+                    '  *) exit 2 ;;\nesac\n'
+                )
+                script.chmod(0o755)
+            proc_unix = root / "proc-net-unix"
+            proc_unix.write_text("".join(proc_lines))
+            env = {
+                **os.environ,
+                "BB": busybox,
+                "FEATURE_RECONCILE_ETC_ROOT": str(etc),
+                "FEATURE_RECONCILE_DATA_ROOT": str(data),
+                "FEATURE_RECONCILE_RUN_ROOT": str(run),
+                "FEATURE_RECONCILE_VAR_RUN_ROOT": str(var_run),
+                "FEATURE_RECONCILE_INIT_ROOT": str(init),
+                "FEATURE_RECONCILE_PROC_NET_UNIX": str(proc_unix),
+                "FEATURE_RECONCILE_LOG_FILE": str(root / "reconcile.log"),
+                "FEATURE_RECONCILE_KMSG": "/dev/null",
+                "FEATURE_RECONCILE_CONSOLE": "/dev/null",
+                "FEATURE_RECONCILE_READY_TIMEOUT_SECONDS": "1",
+            }
+
+            subprocess.run(["sh", str(helper)], env=env, check=True)
+            self.assertEqual(
+                actions.read_text().splitlines(),
+                [
+                    "libreecho-waked.init:start", "libreecho-sttd.init:start",
+                    "libreecho-airplayd.init:start", "libreecho-ttsd.init:start",
+                    "libreecho-agentd.init:start",
+                ],
+            )
+
+            actions.write_text("")
+            (data / "libreecho/config/web-config.json").write_text('{"integrations":4}\n')
+            subprocess.run(["sh", str(helper)], env=env, check=True)
+            disabled_actions = actions.read_text().splitlines()
+            self.assertIn("libreecho-airplayd.init:stop", disabled_actions)
+            self.assertNotIn("libreecho-airplayd.init:start", disabled_actions)
+
+            (data / "libreecho/features/assistant/payload.squashfs").unlink()
+            failed = subprocess.run(["sh", str(helper)], env=env, check=False)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn(
+                "feature-reconcile-payload-missing:assistant",
+                (root / "reconcile.log").read_text(),
+            )
+            for listener in sockets:
+                listener.close()
 
     def test_feature_staging_requires_verified_service_liveness(self) -> None:
         stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()
