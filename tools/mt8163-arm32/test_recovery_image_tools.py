@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -2019,6 +2020,184 @@ class PolicyTests(unittest.TestCase):
         for service in ("airplayd", "sttd", "ttsd", "agentd"):
             self.assertNotIn(f"services=\"logd networkd timed audiod micd waked {service}", init_script)
 
+    def test_post_staging_reconcile_is_shared_boot_and_final_setup_contract(self) -> None:
+        helper = TOOLS_DIR / "initramfs/libreecho-reconcile-features"
+        init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+
+        self.assertTrue(helper.is_file())
+        self.assertTrue(helper.stat().st_mode & stat.S_IXUSR)
+        source = helper.read_text()
+        self.assertIn("FEATURE_RECONCILE_ETC_ROOT:-/etc", source)
+        self.assertIn("$ETC_ROOT/libreecho/service-profile", source)
+        self.assertIn("$ETC_ROOT/libreecho/feature-policy", source)
+        self.assertIn('"integrations"', source)
+        self.assertIn("integrations & 1", source)
+        self.assertIn("integrations & 16", source)
+        self.assertIn("$DATA_ROOT/libreecho/features/$feature/payload.squashfs", source)
+        self.assertIn("/staging", source)
+        self.assertIn('"$script" start', source)
+        self.assertIn("feature-services-reconcile-failed", source)
+        self.assertIn('return "$failed"', source)
+
+        order = (
+            'persisted_features="wakeword airplay2"',
+            'persisted_features=airplay2',
+            'persisted_features="wakeword stt airplay2 tts assistant"',
+            'persisted_features="stt airplay2 tts assistant"',
+        )
+        positions = [source.index(marker) for marker in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn(
+            "/usr/local/sbin/libreecho-reconcile-features",
+            init_script,
+        )
+        self.assertIn("libreecho-reconcile-features", builder_source)
+        self.assertIn("libreecho-reconcile-features", verifier_source)
+        self.assertIn(
+            'if init_script != read(stage / "libreecho-init"):',
+            builder_source,
+        )
+        self.assertNotIn(
+            'if init_script != read(stage / "init"):',
+            builder_source,
+        )
+
+    def test_post_staging_reconcile_executes_topology_and_failures(self) -> None:
+        helper = TOOLS_DIR / "initramfs/libreecho-reconcile-features"
+        busybox = shutil.which("busybox")
+        if busybox is None:
+            self.skipTest("busybox is required for the reconciliation fixture")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            etc = root / "etc"
+            data = root / "data"
+            run = root / "run"
+            var_run = root / "var-run"
+            init = root / "init.d"
+            states = root / "states"
+            actions = root / "actions"
+            sockets: list[socket.socket] = []
+            for path in (etc / "libreecho", data / "libreecho/config", run / "libreecho", var_run, init, states):
+                path.mkdir(parents=True, exist_ok=True)
+            (etc / "libreecho/service-profile").write_text("production\n")
+            (etc / "libreecho/feature-policy").write_text("community-noncommercial\n")
+            (data / "libreecho/config/web-config.json").write_text('{"integrations":20}\n')
+
+            services = {
+                "waked": ("wakeword", "wakeword.sock"),
+                "sttd": ("stt", "stt.sock"),
+                "airplayd": ("airplay2", "airplay.sock"),
+                "ttsd": ("tts", "tts.sock"),
+                "agentd": ("assistant", "agent.sock"),
+                "wyomingd": (None, None),
+            }
+            proc_lines = []
+            socket_paths = {}
+            for service, (feature, socket_name) in services.items():
+                if feature is not None:
+                    feature_dir = data / "libreecho/features" / feature
+                    feature_dir.mkdir(parents=True)
+                    (feature_dir / "payload.squashfs").write_bytes(b"verified-fixture")
+                socket_path = run / "libreecho" / socket_name if socket_name else None
+                socket_paths[service] = socket_path
+                if socket_path is not None:
+                    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    listener.bind(str(socket_path))
+                    listener.listen(1)
+                    sockets.append(listener)
+                    proc_lines.append(f"00000000: 00000002 00000000 00010000 0001 01 1 {socket_path}\n")
+                pidfile = var_run / f"libreecho-{service}.pid"
+                pidfile.write_text(f"{os.getpid()}\n")
+                stop_targets = f"'{pidfile}'"
+                if socket_path is not None:
+                    stop_targets += f" '{socket_path}'"
+                script = init / f"libreecho-{service}.init"
+                script.write_text(
+                    "#!/bin/sh\nset -eu\n"
+                    f"state='{states / service}'\nactions='{actions}'\n"
+                    'case "${1:-}" in\n'
+                    '  start) printf "%s:start\\n" "${0##*/}" >>"$actions"; : >"$state"; '
+                    f"printf '%s\\n' '{os.getpid()}' >'{pidfile}' ;;\n"
+                    '  stop) printf "%s:stop\\n" "${0##*/}" >>"$actions"; rm -f "$state" '
+                    f"{stop_targets} ;;\n"
+                    '  status) test -f "$state" ;;\n'
+                    '  *) exit 2 ;;\nesac\n'
+                )
+                script.chmod(0o755)
+            proc_unix = root / "proc-net-unix"
+            proc_unix.write_text("".join(proc_lines))
+            env = {
+                **os.environ,
+                "BB": busybox,
+                "FEATURE_RECONCILE_ETC_ROOT": str(etc),
+                "FEATURE_RECONCILE_DATA_ROOT": str(data),
+                "FEATURE_RECONCILE_RUN_ROOT": str(run),
+                "FEATURE_RECONCILE_VAR_RUN_ROOT": str(var_run),
+                "FEATURE_RECONCILE_INIT_ROOT": str(init),
+                "FEATURE_RECONCILE_PROC_NET_UNIX": str(proc_unix),
+                "FEATURE_RECONCILE_LOG_FILE": str(root / "reconcile.log"),
+                "FEATURE_RECONCILE_KMSG": "/dev/null",
+                "FEATURE_RECONCILE_CONSOLE": "/dev/null",
+                "FEATURE_RECONCILE_READY_TIMEOUT_SECONDS": "1",
+            }
+
+            subprocess.run(["sh", str(helper)], env=env, check=True)
+            self.assertEqual(
+                actions.read_text().splitlines(),
+                [
+                    "libreecho-wyomingd.init:stop",
+                    "libreecho-waked.init:start", "libreecho-sttd.init:start",
+                    "libreecho-airplayd.init:start", "libreecho-ttsd.init:start",
+                    "libreecho-agentd.init:start",
+                ],
+            )
+
+            actions.write_text("")
+            (data / "libreecho/config/web-config.json").write_text('{"integrations":4}\n')
+            subprocess.run(["sh", str(helper)], env=env, check=True)
+            disabled_actions = actions.read_text().splitlines()
+            self.assertIn("libreecho-airplayd.init:stop", disabled_actions)
+            self.assertNotIn("libreecho-airplayd.init:start", disabled_actions)
+
+            (data / "libreecho/features/assistant/payload.squashfs").unlink()
+            failed = subprocess.run(["sh", str(helper)], env=env, check=False)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn(
+                "feature-reconcile-payload-missing:assistant",
+                (root / "reconcile.log").read_text(),
+            )
+
+            (data / "libreecho/features/assistant/payload.squashfs").write_bytes(
+                b"verified-fixture"
+            )
+            airplay_socket = socket_paths["airplayd"]
+            self.assertIsNotNone(airplay_socket)
+            airplay_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            airplay_listener.bind(str(airplay_socket))
+            airplay_listener.listen(1)
+            sockets.append(airplay_listener)
+            (var_run / "libreecho-airplayd.pid").write_text(f"{os.getpid()}\n")
+            actions.write_text("")
+            (data / "libreecho/config/web-config.json").write_text(
+                '{\n  "integrations": 21\n}\n'
+            )
+            subprocess.run(["sh", str(helper)], env=env, check=True)
+            self.assertEqual(
+                actions.read_text().splitlines(),
+                [
+                    "libreecho-agentd.init:stop",
+                    "libreecho-sttd.init:stop",
+                    "libreecho-ttsd.init:stop",
+                    "libreecho-wyomingd.init:start",
+                    "libreecho-waked.init:start",
+                    "libreecho-airplayd.init:start",
+                ],
+            )
+            for listener in sockets:
+                listener.close()
+
     def test_feature_staging_requires_verified_service_liveness(self) -> None:
         stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()
         for marker in (
@@ -2054,27 +2233,13 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("start_persisted_feature_services()", init_script)
         start = init_script.index("start_persisted_feature_services()")
         body = init_script[start:init_script.index("\n}\n", start) + 3]
-        for feature, service in (
-            ("airplay2", "airplayd"),
-            ("wakeword", "waked"),
-            ("stt", "sttd"),
-            ("tts", "ttsd"),
-            ("assistant", "agentd"),
-        ):
-            with self.subTest(feature=feature):
-                self.assertIn(feature, body)
-                self.assertIn(f'{feature}) service={service}', body)
         self.assertIn(
-            'payload=/data/libreecho/features/$feature/payload.squashfs', body
+            "script=/usr/local/sbin/libreecho-reconcile-features", body
         )
-        self.assertIn('[ -f "$payload" ] || continue', body)
-        self.assertIn('"$script" start', body)
-        call_start = init_script.index(
-            "    start_persisted_feature_services", start + len(body)
-        )
-        self.assertLess(
-            init_script.index("    done", start),
-            call_start,
+        self.assertIn('"$script"', body)
+        self.assertIn('return "$rc"', body)
+        self.assertIn(
+            "    start_persisted_feature_services", init_script[init_script.index("start_ui_services()"):]
         )
 
     def test_disabled_airplay_staging_skips_liveness_but_enabled_requires_it(self) -> None:
