@@ -2310,6 +2310,30 @@ ota_health_services_ready
             malformed = subprocess.run(["sh", "-c", airplay_harness])
             self.assertNotEqual(malformed.returncode, 0)
 
+    def test_updater_identity_uses_compact_selected_topology(self) -> None:
+        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
+        start = updater.index("feature_daemon_required()\n")
+        end = updater.index("\n}\n", start) + 3
+        function = updater[start:end]
+        busybox = shutil.which("busybox") or "busybox"
+        with tempfile.TemporaryDirectory() as td:
+            config = Path(td) / "web-config.json"
+            function = function.replace(
+                "/data/libreecho/config/web-config.json", str(config)
+            )
+            harness = f"""
+BB={busybox}
+CURRENT_SERVICE_PROFILE=production
+{function}
+feature_daemon_required tts
+"""
+            config.write_text('{"integrations":1}\n')
+            home_assistant = subprocess.run(["sh", "-c", harness])
+            self.assertNotEqual(home_assistant.returncode, 0)
+            config.write_text('{"integrations":0}\n')
+            local = subprocess.run(["sh", "-c", harness])
+            self.assertEqual(local.returncode, 0)
+
     def test_feature_staging_requires_verified_service_liveness(self) -> None:
         stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()
         for marker in (
