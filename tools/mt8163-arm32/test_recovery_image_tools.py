@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -2181,7 +2182,7 @@ class PolicyTests(unittest.TestCase):
             (var_run / "libreecho-airplayd.pid").write_text(f"{os.getpid()}\n")
             actions.write_text("")
             (data / "libreecho/config/web-config.json").write_text(
-                '{\n  "integrations": 21\n}\n'
+                '{"integrations":21}\n'
             )
             subprocess.run(["sh", str(helper)], env=env, check=True)
             self.assertEqual(
@@ -2195,8 +2196,171 @@ class PolicyTests(unittest.TestCase):
                     "libreecho-airplayd.init:start",
                 ],
             )
+            (etc / "libreecho/feature-policy").write_text("redistributable\n")
+            unsupported_ha = subprocess.run(["sh", str(helper)], env=env)
+            self.assertNotEqual(unsupported_ha.returncode, 0)
+            self.assertIn(
+                "feature-reconcile-home-assistant-requires-wakeword",
+                (root / "reconcile.log").read_text(),
+            )
+
+            invalid_env = env.copy()
+            invalid_env["FEATURE_RECONCILE_READY_TIMEOUT_SECONDS"] = "0"
+            invalid = subprocess.run(["sh", str(helper)], env=invalid_env)
+            self.assertNotEqual(invalid.returncode, 0)
+
+            ownerless_lock = run / "libreecho/reconcile-features.lock"
+            ownerless_lock.mkdir(parents=True, exist_ok=True)
+            lock_env = env.copy()
+            lock_env["FEATURE_RECONCILE_LOCK_TIMEOUT_SECONDS"] = "1"
+            started = time.monotonic()
+            blocked = subprocess.run(["sh", str(helper)], env=lock_env)
+            self.assertNotEqual(blocked.returncode, 0)
+            self.assertLess(time.monotonic() - started, 3)
+            self.assertTrue(ownerless_lock.is_dir())
+
             for listener in sockets:
                 listener.close()
+
+    def test_health_and_reconcile_bounds_follow_persisted_topology(self) -> None:
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        helper = (TOOLS_DIR / "initramfs/libreecho-reconcile-features").read_text()
+        self.assertIn("health_airplay_enabled=0", init)
+        self.assertIn(
+            "[ $((health_integrations & 16)) -ne 0 ] && health_airplay_enabled=1",
+            init,
+        )
+        self.assertNotIn("wyomingd /run/libreecho/wyoming.sock", init)
+        self.assertIn("$BB awk -v port=29CC", init)
+        self.assertIn("LOCK_TIMEOUT_MAX_SECONDS=300", helper)
+        self.assertIn("READY_TIMEOUT_MAX_SECONDS=120", helper)
+        self.assertIn("feature-reconcile-invalid-timeout", helper)
+        self.assertIn("feature-reconcile-lock-ownership-lost", helper)
+        self.assertIn("feature-reconcile-lock-owner-missing\n                    return 1", helper)
+        self.assertIn("release_lock || rc=1", helper)
+
+        busybox = shutil.which("busybox")
+        if busybox:
+            with tempfile.TemporaryDirectory() as td:
+                lock = Path(td) / "reconcile.lock"
+                lock.mkdir()
+                (lock / "pid").write_text("999999\n")
+                start = helper.index("release_lock()\n")
+                end = helper.index("\n}\n", start) + 3
+                function = helper[start:end]
+                ownership_lost = subprocess.run(
+                    [
+                        "sh",
+                        "-c",
+                        f"""BB={busybox}
+LOCK={lock}
+LOCK_OWNER_PID=$$
+log() {{ :; }}
+{function}
+release_lock
+""",
+                    ]
+                )
+                self.assertNotEqual(ownership_lost.returncode, 0)
+                self.assertTrue(lock.is_dir())
+
+    def test_ota_health_requires_selected_wyoming_listener(self) -> None:
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertIn("home_assistant_integration_enabled()", init)
+
+        def shell_function(name: str) -> str:
+            start = init.index(f"{name}()\n")
+            end = init.index("\n    }\n", start) + 7
+            return init[start:end]
+
+        with tempfile.TemporaryDirectory() as td:
+            config = Path(td) / "web-config.json"
+            pidfile = Path(td) / "wyomingd.pid"
+            proc_tcp = Path(td) / "tcp"
+            config.write_text('{"integrations":1}\n')
+            pidfile.write_text(f"{os.getpid()}\n")
+            proc_tcp.write_text("")
+            functions = "\n".join(
+                shell_function(name)
+                for name in (
+                    "home_assistant_integration_enabled",
+                    "ota_health_services_ready",
+                )
+            )
+            functions = functions.replace(
+                "/data/libreecho/config/web-config.json", str(config)
+            ).replace(
+                "/var/run/libreecho-wyomingd.pid", str(pidfile)
+            ).replace("/proc/net/tcp", str(proc_tcp))
+            busybox = shutil.which("busybox")
+            if busybox is None:
+                self.skipTest("busybox is required for the OTA health fixture")
+            harness = f"""
+BB={busybox}
+SERVICE_PROFILE=production
+{functions}
+log() {{ :; }}
+startup_ready_marker_valid() {{ return 0; }}
+service_process_ready() {{ return 0; }}
+led_handoff_ready() {{ return 0; }}
+voice_stack_absent() {{ return 0; }}
+ota_health_services_ready
+"""
+            missing = subprocess.run(["sh", "-c", harness])
+            self.assertNotEqual(missing.returncode, 0)
+            proc_tcp.write_text(
+                "  0: 00000000:29CC 00000000:0000 0A 00000000:00000000 "
+                "00:00000000 00000000 0 0 0 1 0000000000000000 100 0 0 10 0\n"
+            )
+            ready = subprocess.run(["sh", "-c", harness])
+            self.assertEqual(ready.returncode, 0)
+
+            airplay_harness = f"""
+BB={busybox}
+SERVICE_PROFILE=production
+{functions}
+log() {{ :; }}
+startup_ready_marker_valid() {{ return 0; }}
+service_process_ready() {{ [ "$1" != airplayd ]; }}
+led_handoff_ready() {{ return 0; }}
+voice_stack_absent() {{ return 0; }}
+ota_health_services_ready
+"""
+            config.write_text('{"integrations":4}\n')
+            disabled = subprocess.run(["sh", "-c", airplay_harness])
+            self.assertEqual(disabled.returncode, 0)
+            config.write_text('{"integrations":20}\n')
+            enabled = subprocess.run(["sh", "-c", airplay_harness])
+            self.assertNotEqual(enabled.returncode, 0)
+            config.write_text('{"integrations":"invalid"}\n')
+            malformed = subprocess.run(["sh", "-c", airplay_harness])
+            self.assertNotEqual(malformed.returncode, 0)
+
+    def test_updater_identity_uses_compact_selected_topology(self) -> None:
+        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
+        start = updater.index("feature_daemon_required()\n")
+        end = updater.index("\n}\n", start) + 3
+        function = updater[start:end]
+        busybox = shutil.which("busybox")
+        if not busybox:
+            self.skipTest("busybox is required for updater shell behavior")
+        with tempfile.TemporaryDirectory() as td:
+            config = Path(td) / "web-config.json"
+            function = function.replace(
+                "/data/libreecho/config/web-config.json", str(config)
+            )
+            harness = f"""
+BB={busybox}
+CURRENT_SERVICE_PROFILE=production
+{function}
+feature_daemon_required tts
+"""
+            config.write_text('{"integrations":1}\n')
+            home_assistant = subprocess.run(["sh", "-c", harness])
+            self.assertNotEqual(home_assistant.returncode, 0)
+            config.write_text('{"integrations":0}\n')
+            local = subprocess.run(["sh", "-c", harness])
+            self.assertEqual(local.returncode, 0)
 
     def test_feature_staging_requires_verified_service_liveness(self) -> None:
         stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()

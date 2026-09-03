@@ -17,6 +17,8 @@ CONSOLE=${FEATURE_RECONCILE_CONSOLE:-/dev/console}
 LOCK=$RUN_ROOT/libreecho/reconcile-features.lock
 LOCK_TIMEOUT_SECONDS=${FEATURE_RECONCILE_LOCK_TIMEOUT_SECONDS:-120}
 READY_TIMEOUT_SECONDS=${FEATURE_RECONCILE_READY_TIMEOUT_SECONDS:-30}
+LOCK_TIMEOUT_MAX_SECONDS=300
+READY_TIMEOUT_MAX_SECONDS=120
 
 log()
 {
@@ -37,7 +39,7 @@ acquire_lock()
                 # afterwards.  Do not remove a lock during that small window.
                 if [ "$elapsed" -ge "$LOCK_TIMEOUT_SECONDS" ]; then
                     log feature-reconcile-lock-owner-missing
-                    $BB rm -rf "$LOCK" 2>/dev/null || return 1
+                    return 1
                 else
                     $BB sleep 1
                     elapsed=$((elapsed + 1))
@@ -71,7 +73,20 @@ acquire_lock()
 
 release_lock()
 {
+    owner=$($BB cat "$LOCK/pid" 2>/dev/null)
+    [ "$owner" = "$$" ] || {
+        log feature-reconcile-lock-ownership-lost
+        return 1
+    }
     $BB rm -rf "$LOCK" 2>/dev/null
+}
+
+validate_timeouts()
+{
+    case "$LOCK_TIMEOUT_SECONDS" in ''|*[!0-9]*|0) return 1 ;; esac
+    case "$READY_TIMEOUT_SECONDS" in ''|*[!0-9]*|0) return 1 ;; esac
+    [ "$LOCK_TIMEOUT_SECONDS" -le "$LOCK_TIMEOUT_MAX_SECONDS" ] || return 1
+    [ "$READY_TIMEOUT_SECONDS" -le "$READY_TIMEOUT_MAX_SECONDS" ] || return 1
 }
 
 read_policy()
@@ -97,7 +112,7 @@ select_topology()
     config=$DATA_ROOT/libreecho/config/web-config.json
     if [ -r "$config" ]; then
         integrations=$($BB sed -n \
-            's/^[[:space:]]*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*$/\1/p' \
+            's/.*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
             "$config" 2>/dev/null | $BB head -n 1)
         case "$integrations" in
             ''|*[!0-9]*) ;;
@@ -109,6 +124,10 @@ select_topology()
         case "$FEATURE_POLICY" in
             preserve|community-noncommercial)
                 persisted_features="wakeword airplay2"
+                ;;
+            redistributable)
+                log feature-reconcile-home-assistant-requires-wakeword
+                return 1
                 ;;
             *)
                 persisted_features=airplay2
@@ -301,7 +320,7 @@ reconcile()
         log "feature-reconcile-skipped:$SERVICE_PROFILE:$FEATURE_POLICY"
         return 0
     fi
-    select_topology
+    select_topology || return 1
     reconcile_topology || {
         log feature-service-topology-reconcile-failed
         return 1
@@ -319,8 +338,12 @@ reconcile()
 }
 
 $BB mkdir -p "$RUN_ROOT/libreecho"
+validate_timeouts || {
+    log feature-reconcile-invalid-timeout
+    exit 1
+}
 acquire_lock || exit 1
 reconcile
 rc=$?
-release_lock
+release_lock || rc=1
 exit "$rc"
