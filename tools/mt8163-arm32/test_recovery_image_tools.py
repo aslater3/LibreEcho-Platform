@@ -2237,6 +2237,32 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("feature-reconcile-invalid-timeout", helper)
         self.assertIn("feature-reconcile-lock-ownership-lost", helper)
         self.assertIn("feature-reconcile-lock-owner-missing\n                    return 1", helper)
+        self.assertIn("release_lock || rc=1", helper)
+
+        busybox = shutil.which("busybox")
+        if busybox:
+            with tempfile.TemporaryDirectory() as td:
+                lock = Path(td) / "reconcile.lock"
+                lock.mkdir()
+                (lock / "pid").write_text("999999\n")
+                start = helper.index("release_lock()\n")
+                end = helper.index("\n}\n", start) + 3
+                function = helper[start:end]
+                ownership_lost = subprocess.run(
+                    [
+                        "sh",
+                        "-c",
+                        f"""BB={busybox}
+LOCK={lock}
+LOCK_OWNER_PID=$$
+log() {{ :; }}
+{function}
+release_lock
+""",
+                    ]
+                )
+                self.assertNotEqual(ownership_lost.returncode, 0)
+                self.assertTrue(lock.is_dir())
 
     def test_ota_health_requires_selected_wyoming_listener(self) -> None:
         init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
@@ -2315,7 +2341,9 @@ ota_health_services_ready
         start = updater.index("feature_daemon_required()\n")
         end = updater.index("\n}\n", start) + 3
         function = updater[start:end]
-        busybox = shutil.which("busybox") or "busybox"
+        busybox = shutil.which("busybox")
+        if not busybox:
+            self.skipTest("busybox is required for updater shell behavior")
         with tempfile.TemporaryDirectory() as td:
             config = Path(td) / "web-config.json"
             function = function.replace(

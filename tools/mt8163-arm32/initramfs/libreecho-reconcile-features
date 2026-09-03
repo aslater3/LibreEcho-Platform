@@ -345,5 +345,5 @@ validate_timeouts || {
 acquire_lock || exit 1
 reconcile
 rc=$?
-release_lock
+release_lock || rc=1
 exit "$rc"
