@@ -2019,6 +2019,41 @@ class PolicyTests(unittest.TestCase):
         for service in ("airplayd", "sttd", "ttsd", "agentd"):
             self.assertNotIn(f"services=\"logd networkd timed audiod micd waked {service}", init_script)
 
+    def test_post_staging_reconcile_is_shared_boot_and_final_setup_contract(self) -> None:
+        helper = TOOLS_DIR / "initramfs/libreecho-reconcile-features"
+        init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+
+        self.assertTrue(helper.is_file())
+        self.assertTrue(helper.stat().st_mode & stat.S_IXUSR)
+        source = helper.read_text()
+        self.assertIn("/etc/libreecho/service-profile", source)
+        self.assertIn("/etc/libreecho/feature-policy", source)
+        self.assertIn('"integrations"', source)
+        self.assertIn("integrations & 1", source)
+        self.assertIn("integrations & 16", source)
+        self.assertIn("/data/libreecho/features/$feature/payload.squashfs", source)
+        self.assertIn("/staging", source)
+        self.assertIn('"$script" start', source)
+        self.assertIn("feature-services-reconcile-failed", source)
+        self.assertIn('return "$failed"', source)
+
+        order = (
+            'persisted_features="wakeword airplay2"',
+            'persisted_features=airplay2',
+            'persisted_features="wakeword stt airplay2 tts assistant"',
+            'persisted_features="stt airplay2 tts assistant"',
+        )
+        positions = [source.index(marker) for marker in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn(
+            "/usr/local/sbin/libreecho-reconcile-features",
+            init_script,
+        )
+        self.assertIn("libreecho-reconcile-features", builder_source)
+        self.assertIn("libreecho-reconcile-features", verifier_source)
+
     def test_feature_staging_requires_verified_service_liveness(self) -> None:
         stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()
         for marker in (
@@ -2054,27 +2089,13 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("start_persisted_feature_services()", init_script)
         start = init_script.index("start_persisted_feature_services()")
         body = init_script[start:init_script.index("\n}\n", start) + 3]
-        for feature, service in (
-            ("airplay2", "airplayd"),
-            ("wakeword", "waked"),
-            ("stt", "sttd"),
-            ("tts", "ttsd"),
-            ("assistant", "agentd"),
-        ):
-            with self.subTest(feature=feature):
-                self.assertIn(feature, body)
-                self.assertIn(f'{feature}) service={service}', body)
         self.assertIn(
-            'payload=/data/libreecho/features/$feature/payload.squashfs', body
+            "script=/usr/local/sbin/libreecho-reconcile-features", body
         )
-        self.assertIn('[ -f "$payload" ] || continue', body)
-        self.assertIn('"$script" start', body)
-        call_start = init_script.index(
-            "    start_persisted_feature_services", start + len(body)
-        )
-        self.assertLess(
-            init_script.index("    done", start),
-            call_start,
+        self.assertIn('"$script"', body)
+        self.assertIn('return "$rc"', body)
+        self.assertIn(
+            "    start_persisted_feature_services", init_script[init_script.index("start_ui_services()"):]
         )
 
     def test_disabled_airplay_staging_skips_liveness_but_enabled_requires_it(self) -> None:

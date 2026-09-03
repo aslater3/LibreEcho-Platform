@@ -837,55 +837,15 @@ apply_timezone()
 
 start_persisted_feature_services()
 {
-    [ "$SERVICE_PROFILE" = production ] || return 0
-    case "$FEATURE_POLICY" in
-        preserve|redistributable|community-noncommercial) ;;
-        *) return 0 ;;
-    esac
-    if [ "${ha_enabled:-0}" -eq 1 ]; then
-        case "$FEATURE_POLICY" in
-            preserve|community-noncommercial)
-                persisted_features="wakeword airplay2"
-                ;;
-            *)
-                persisted_features=airplay2
-                ;;
-        esac
-    else
-        case "$FEATURE_POLICY" in
-            preserve|community-noncommercial)
-                persisted_features="wakeword stt airplay2 tts assistant"
-                ;;
-            *)
-                persisted_features="stt airplay2 tts assistant"
-                ;;
-        esac
+    script=/usr/local/sbin/libreecho-reconcile-features
+    if [ ! -x "$script" ]; then
+        log feature-reconcile-helper-missing
+        return 1
     fi
-    for feature in $persisted_features; do
-        case "$feature" in
-            airplay2) service=airplayd ;;
-            wakeword) service=waked ;;
-            stt) service=sttd ;;
-            tts) service=ttsd ;;
-            assistant) service=agentd ;;
-            *) continue ;;
-        esac
-        payload=/data/libreecho/features/$feature/payload.squashfs
-        [ -f "$payload" ] || continue
-        feature_root=${payload%/payload.squashfs}
-        [ ! -d "$feature_root/staging" ] || {
-            log "persisted-feature-deferred-while-staging:$feature"
-            continue
-        }
-        script="/etc/init.d/libreecho-$service.init"
-        if [ -x "$script" ]; then
-            "$script" start >/tmp/libreecho-"$service".persisted.log 2>&1
-            rc=$?
-            log "persisted-feature-service-start:$service:$rc"
-        else
-            log "persisted-feature-service-missing:$service"
-        fi
-    done
+    "$script"
+    rc=$?
+    log "persisted-feature-reconcile:$rc"
+    return "$rc"
 }
 
 start_ui_services()

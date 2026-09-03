@@ -53,7 +53,7 @@ WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-INIT_SHA256 = "36be53a00d647eee4ff3c4a3979b985f6b16a4217bc22d9814f698ce10458e81"
+INIT_SHA256 = "f6190448896b585ea4499a7afca668a2c19a482272f19a531ecd508d8d91db3c"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -61,6 +61,7 @@ OVERLAY_FILES = {
     "init.rc": 0o644,
     "init.recovery.mt8163.rc": 0o644,
     "libreecho-init": 0o755,
+    "libreecho-reconcile-features": 0o755,
     "libreecho-data-cleanup": 0o755,
     "libreecho-vendor-import": 0o755,
     "vendor-assets/mt8163-v181-stock-v1.tsv": 0o644,
@@ -72,6 +73,7 @@ OVERLAY_FILES = {
 }
 OVERLAY_TARGETS = {
     "profile": "etc/profile",
+    "libreecho-reconcile-features": "usr/local/sbin/libreecho-reconcile-features",
     "libreecho-data-cleanup": "usr/local/sbin/libreecho-data-cleanup",
     "libreecho-vendor-import": "usr/local/sbin/libreecho-vendor-import",
     "vendor-assets/mt8163-v181-stock-v1.tsv": (
@@ -1738,6 +1740,18 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         "source": "libreecho-init",
     }:
         fail("runtime /init overlay manifest mismatch")
+    reconcile = verified_overlay["libreecho-reconcile-features"]
+    for marker in (
+        b"/etc/libreecho/service-profile",
+        b"/etc/libreecho/feature-policy",
+        b"integrations & 1",
+        b"integrations & 16",
+        b"/data/libreecho/features/$feature/payload.squashfs",
+        b"\"$script\" start",
+        b"feature-services-reconcile-failed",
+    ):
+        if marker not in reconcile.data:
+            fail(f"feature reconciliation helper lacks {marker!r}")
     for marker in (
         b"FASTBOOT_PLEASE", b"/tmp/runme", b"functionfs", b"/dev/stpwmt", b"/dev/stpbt",
         b"PARTNAME=expdb", b"/sys/class/block/mmcblk0p7", b"20480", b"bs=15 count=1",
