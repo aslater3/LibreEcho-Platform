@@ -125,6 +125,10 @@ select_topology()
             preserve|community-noncommercial)
                 persisted_features="wakeword airplay2"
                 ;;
+            redistributable)
+                log feature-reconcile-home-assistant-requires-wakeword
+                return 1
+                ;;
             *)
                 persisted_features=airplay2
                 ;;
@@ -316,7 +320,7 @@ reconcile()
         log "feature-reconcile-skipped:$SERVICE_PROFILE:$FEATURE_POLICY"
         return 0
     fi
-    select_topology
+    select_topology || return 1
     reconcile_topology || {
         log feature-service-topology-reconcile-failed
         return 1

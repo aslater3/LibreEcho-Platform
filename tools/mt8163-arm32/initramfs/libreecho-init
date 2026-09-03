@@ -1116,6 +1116,21 @@ ota_health_confirm_worker()
         return 0
     }
 
+    home_assistant_integration_enabled()
+    {
+        config=/data/libreecho/config/web-config.json
+        integrations=
+        if [ -r "$config" ]; then
+            integrations=$($BB sed -n \
+                's/.*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+                "$config" 2>/dev/null | $BB head -n 1)
+        fi
+        case "$integrations" in
+            ''|*[!0-9]*) return 1 ;;
+            *) [ $((integrations & 1)) -ne 0 ] ;;
+        esac
+    }
+
     ota_health_services_ready()
     {
         [ "$SERVICE_PROFILE" = production ] || return 0
@@ -1156,6 +1171,26 @@ ota_health_confirm_worker()
             }
         fi
         led_handoff_ready || return 1
+        if home_assistant_integration_enabled; then
+            wyoming_pidfile=/var/run/libreecho-wyomingd.pid
+            [ -s "$wyoming_pidfile" ] || {
+                log ota-health-services-not-ready:wyomingd
+                return 1
+            }
+            wyoming_pid=$($BB sed -n '1p' "$wyoming_pidfile" 2>/dev/null)
+            case "$wyoming_pid" in ''|*[!0-9]*) return 1 ;; esac
+            $BB kill -0 "$wyoming_pid" 2>/dev/null || {
+                log ota-health-services-not-ready:wyomingd
+                return 1
+            }
+            $BB awk -v port=29CC \
+                '$4 == "0A" && $2 ~ (":" port "$") { found=1 } END { exit found ? 0 : 1 }' \
+                /proc/net/tcp 2>/dev/null || {
+                    log ota-health-services-not-ready:wyomingd
+                    return 1
+                }
+            return 0
+        fi
         if [ -S /run/libreecho/stt.sock ] &&
            [ -S /run/libreecho/tts.sock ] &&
            [ -S /run/libreecho/agent.sock ]; then
@@ -1172,26 +1207,10 @@ ota_health_confirm_worker()
             done
             return 0
         fi
-        wyoming_pidfile=/var/run/libreecho-wyomingd.pid
-        if [ -s "$wyoming_pidfile" ] &&
-           $BB awk -v port=29CC \
-               '$4 == "0A" && $2 ~ (":" port "$") { found=1 } END { exit found ? 0 : 1 }' \
-               /proc/net/tcp 2>/dev/null; then
-            wyoming_pid=$($BB sed -n '1p' "$wyoming_pidfile" 2>/dev/null)
-            case "$wyoming_pid" in ''|*[!0-9]*) return 1 ;; esac
-            $BB kill -0 "$wyoming_pid" 2>/dev/null || {
-                log ota-health-services-not-ready:wyomingd
-                return 1
-            }
-            return 0
-        fi
-        # A device whose voice pipeline is served by remote Wyoming endpoints
-        # never mounts the local stt/tts/assistant features, so none of the
-        # sockets above can exist and neither branch can ever pass.  Requiring
-        # them would make every OTA on such a device fail confirmation and roll
-        # back, even when the image is completely healthy.  Voice is not what
-        # makes a slot recoverable -- /data, networking and the web/API plane
-        # are, and those are already checked.
+
+        # A payload-free diagnostic/preserve state can intentionally have no
+        # selected local voice graph. The Home Assistant branch has already
+        # returned above and therefore can never use this fallback.
         if voice_stack_absent; then
             return 0
         fi

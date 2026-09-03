@@ -2196,6 +2196,14 @@ class PolicyTests(unittest.TestCase):
                     "libreecho-airplayd.init:start",
                 ],
             )
+            (etc / "libreecho/feature-policy").write_text("redistributable\n")
+            unsupported_ha = subprocess.run(["sh", str(helper)], env=env)
+            self.assertNotEqual(unsupported_ha.returncode, 0)
+            self.assertIn(
+                "feature-reconcile-home-assistant-requires-wakeword",
+                (root / "reconcile.log").read_text(),
+            )
+
             invalid_env = env.copy()
             invalid_env["FEATURE_RECONCILE_READY_TIMEOUT_SECONDS"] = "0"
             invalid = subprocess.run(["sh", str(helper)], env=invalid_env)
@@ -2229,6 +2237,57 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("feature-reconcile-invalid-timeout", helper)
         self.assertIn("feature-reconcile-lock-ownership-lost", helper)
         self.assertIn("feature-reconcile-lock-owner-missing\n                    return 1", helper)
+
+    def test_ota_health_requires_selected_wyoming_listener(self) -> None:
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertIn("home_assistant_integration_enabled()", init)
+
+        def shell_function(name: str) -> str:
+            start = init.index(f"{name}()\n")
+            end = init.index("\n    }\n", start) + 7
+            return init[start:end]
+
+        with tempfile.TemporaryDirectory() as td:
+            config = Path(td) / "web-config.json"
+            pidfile = Path(td) / "wyomingd.pid"
+            proc_tcp = Path(td) / "tcp"
+            config.write_text('{"integrations":1}\n')
+            pidfile.write_text(f"{os.getpid()}\n")
+            proc_tcp.write_text("")
+            functions = "\n".join(
+                shell_function(name)
+                for name in (
+                    "home_assistant_integration_enabled",
+                    "ota_health_services_ready",
+                )
+            )
+            functions = functions.replace(
+                "/data/libreecho/config/web-config.json", str(config)
+            ).replace(
+                "/var/run/libreecho-wyomingd.pid", str(pidfile)
+            ).replace("/proc/net/tcp", str(proc_tcp))
+            busybox = shutil.which("busybox")
+            if busybox is None:
+                self.skipTest("busybox is required for the OTA health fixture")
+            harness = f"""
+BB={busybox}
+SERVICE_PROFILE=production
+{functions}
+log() {{ :; }}
+startup_ready_marker_valid() {{ return 0; }}
+service_process_ready() {{ return 0; }}
+led_handoff_ready() {{ return 0; }}
+voice_stack_absent() {{ return 0; }}
+ota_health_services_ready
+"""
+            missing = subprocess.run(["sh", "-c", harness])
+            self.assertNotEqual(missing.returncode, 0)
+            proc_tcp.write_text(
+                "  0: 00000000:29CC 00000000:0000 0A 00000000:00000000 "
+                "00:00000000 00000000 0 0 0 1 0000000000000000 100 0 0 10 0\n"
+            )
+            ready = subprocess.run(["sh", "-c", harness])
+            self.assertEqual(ready.returncode, 0)
 
     def test_feature_staging_requires_verified_service_liveness(self) -> None:
         stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()
