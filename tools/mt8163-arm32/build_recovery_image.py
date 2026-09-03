@@ -1799,7 +1799,7 @@ def validate_stage(stage: Path) -> None:
             raise SystemExit(
                 f"ERROR: recovery control script has invalid shell syntax: {relative}"
             )
-    if init_script != read(stage / "init"):
+    if init_script != read(stage / "libreecho-init"):
         raise SystemExit("ERROR: runtime /init differs from audited libreecho-init")
     if not init_script.startswith(b"#!/bin/busybox sh\n"):
         raise SystemExit("ERROR: runtime /init is not the audited BusyBox shell script")

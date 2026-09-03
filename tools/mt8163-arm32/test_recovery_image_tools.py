@@ -2053,6 +2053,14 @@ class PolicyTests(unittest.TestCase):
         )
         self.assertIn("libreecho-reconcile-features", builder_source)
         self.assertIn("libreecho-reconcile-features", verifier_source)
+        self.assertIn(
+            'if init_script != read(stage / "libreecho-init"):',
+            builder_source,
+        )
+        self.assertNotIn(
+            'if init_script != read(stage / "init"):',
+            builder_source,
+        )
 
     def test_feature_staging_requires_verified_service_liveness(self) -> None:
         stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()
