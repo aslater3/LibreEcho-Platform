@@ -745,8 +745,12 @@ def validate_ui_startup_contract(bundle: Path) -> None:
                 "BT_READY_PATH=${BT_READY_PATH:-/run/libreecho/bluetooth-ready}",
                 "bluetooth_integration_state()",
                 "bluetooth_ready()",
+                "airplay_integration_state()",
                 "startup_services_ready()",
-                "for socket in network audio mic led airplay; do",
+                "for socket in network audio mic led; do",
+                "case \"$(airplay_integration_state)\" in",
+                "pidfile=/var/run/libreecho-airplayd.pid",
+                "[ -S /run/libreecho/airplay.sock ] || return 1",
                 "case \"$(bluetooth_integration_state)\" in",
                 "disabled) ;;",
                 "enabled)",
@@ -853,9 +857,12 @@ def validate_ui_startup_contract(bundle: Path) -> None:
                     f"ERROR: UI startup contract missing {marker!r} in {relative}"
                 )
         if relative.endswith("libreecho-web.init"):
-            if "for socket in network audio mic led bluetooth airplay; do" in text:
+            if (
+                "for socket in network audio mic led airplay; do" in text
+                or "for socket in network audio mic led bluetooth airplay; do" in text
+            ):
                 raise SystemExit(
-                    "ERROR: UI startup Bluetooth readiness must be conditional"
+                    "ERROR: UI startup optional-integration readiness must be conditional"
                 )
             readiness_start = text.index("mark_startup_ready()")
             startup_start = text.index("startup_services_ready()")
