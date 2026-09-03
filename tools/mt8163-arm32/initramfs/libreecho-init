@@ -1127,8 +1127,7 @@ ota_health_confirm_worker()
             "networkd /run/libreecho/network.sock" \
             "audiod /run/libreecho/audio.sock" \
             "micd /run/libreecho/mic.sock" \
-            "btd /run/libreecho/bluetooth.sock" \
-            "airplayd /run/libreecho/airplay.sock"; do
+            "btd /run/libreecho/bluetooth.sock"; do
             service_name=${required_service%% *}
             service_socket=${required_service#* }
             service_process_ready "$service_name" "$service_socket" || {
@@ -1136,6 +1135,26 @@ ota_health_confirm_worker()
                 return 1
             }
         done
+        health_config=/data/libreecho/config/web-config.json
+        health_integrations=
+        if [ -r "$health_config" ]; then
+            health_integrations=$($BB sed -n \
+                's/.*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+                "$health_config" 2>/dev/null | $BB head -n 1)
+        fi
+        case "$health_integrations" in
+            ''|*[!0-9]*) health_airplay_enabled=1 ;;
+            *)
+                health_airplay_enabled=0
+                [ $((health_integrations & 16)) -ne 0 ] && health_airplay_enabled=1
+                ;;
+        esac
+        if [ "$health_airplay_enabled" -eq 1 ]; then
+            service_process_ready airplayd /run/libreecho/airplay.sock || {
+                log ota-health-services-not-ready:airplayd
+                return 1
+            }
+        fi
         led_handoff_ready || return 1
         if [ -S /run/libreecho/stt.sock ] &&
            [ -S /run/libreecho/tts.sock ] &&
@@ -1153,8 +1172,14 @@ ota_health_confirm_worker()
             done
             return 0
         fi
-        if [ -S /run/libreecho/wyoming.sock ]; then
-            service_process_ready wyomingd /run/libreecho/wyoming.sock || {
+        wyoming_pidfile=/var/run/libreecho-wyomingd.pid
+        if [ -s "$wyoming_pidfile" ] &&
+           $BB awk -v port=29CC \
+               '$4 == "0A" && $2 ~ (":" port "$") { found=1 } END { exit found ? 0 : 1 }' \
+               /proc/net/tcp 2>/dev/null; then
+            wyoming_pid=$($BB sed -n '1p' "$wyoming_pidfile" 2>/dev/null)
+            case "$wyoming_pid" in ''|*[!0-9]*) return 1 ;; esac
+            $BB kill -0 "$wyoming_pid" 2>/dev/null || {
                 log ota-health-services-not-ready:wyomingd
                 return 1
             }

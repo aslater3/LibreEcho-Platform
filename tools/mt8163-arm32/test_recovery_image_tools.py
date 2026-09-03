@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -2195,8 +2196,39 @@ class PolicyTests(unittest.TestCase):
                     "libreecho-airplayd.init:start",
                 ],
             )
+            invalid_env = env.copy()
+            invalid_env["FEATURE_RECONCILE_READY_TIMEOUT_SECONDS"] = "0"
+            invalid = subprocess.run(["sh", str(helper)], env=invalid_env)
+            self.assertNotEqual(invalid.returncode, 0)
+
+            ownerless_lock = run / "libreecho/reconcile-features.lock"
+            ownerless_lock.mkdir(parents=True, exist_ok=True)
+            lock_env = env.copy()
+            lock_env["FEATURE_RECONCILE_LOCK_TIMEOUT_SECONDS"] = "1"
+            started = time.monotonic()
+            blocked = subprocess.run(["sh", str(helper)], env=lock_env)
+            self.assertNotEqual(blocked.returncode, 0)
+            self.assertLess(time.monotonic() - started, 3)
+            self.assertTrue(ownerless_lock.is_dir())
+
             for listener in sockets:
                 listener.close()
+
+    def test_health_and_reconcile_bounds_follow_persisted_topology(self) -> None:
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        helper = (TOOLS_DIR / "initramfs/libreecho-reconcile-features").read_text()
+        self.assertIn("health_airplay_enabled=0", init)
+        self.assertIn(
+            "[ $((health_integrations & 16)) -ne 0 ] && health_airplay_enabled=1",
+            init,
+        )
+        self.assertNotIn("wyomingd /run/libreecho/wyoming.sock", init)
+        self.assertIn("$BB awk -v port=29CC", init)
+        self.assertIn("LOCK_TIMEOUT_MAX_SECONDS=300", helper)
+        self.assertIn("READY_TIMEOUT_MAX_SECONDS=120", helper)
+        self.assertIn("feature-reconcile-invalid-timeout", helper)
+        self.assertIn("feature-reconcile-lock-ownership-lost", helper)
+        self.assertIn("feature-reconcile-lock-owner-missing\n                    return 1", helper)
 
     def test_feature_staging_requires_verified_service_liveness(self) -> None:
         stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()
