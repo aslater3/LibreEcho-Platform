@@ -2182,7 +2182,7 @@ class PolicyTests(unittest.TestCase):
             (var_run / "libreecho-airplayd.pid").write_text(f"{os.getpid()}\n")
             actions.write_text("")
             (data / "libreecho/config/web-config.json").write_text(
-                '{\n  "integrations": 21\n}\n'
+                '{"integrations":21}\n'
             )
             subprocess.run(["sh", str(helper)], env=env, check=True)
             self.assertEqual(
@@ -2288,6 +2288,27 @@ ota_health_services_ready
             )
             ready = subprocess.run(["sh", "-c", harness])
             self.assertEqual(ready.returncode, 0)
+
+            airplay_harness = f"""
+BB={busybox}
+SERVICE_PROFILE=production
+{functions}
+log() {{ :; }}
+startup_ready_marker_valid() {{ return 0; }}
+service_process_ready() {{ [ "$1" != airplayd ]; }}
+led_handoff_ready() {{ return 0; }}
+voice_stack_absent() {{ return 0; }}
+ota_health_services_ready
+"""
+            config.write_text('{"integrations":4}\n')
+            disabled = subprocess.run(["sh", "-c", airplay_harness])
+            self.assertEqual(disabled.returncode, 0)
+            config.write_text('{"integrations":20}\n')
+            enabled = subprocess.run(["sh", "-c", airplay_harness])
+            self.assertNotEqual(enabled.returncode, 0)
+            config.write_text('{"integrations":"invalid"}\n')
+            malformed = subprocess.run(["sh", "-c", airplay_harness])
+            self.assertNotEqual(malformed.returncode, 0)
 
     def test_feature_staging_requires_verified_service_liveness(self) -> None:
         stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()
