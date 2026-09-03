@@ -2086,36 +2086,42 @@ class PolicyTests(unittest.TestCase):
             (data / "libreecho/config/web-config.json").write_text('{"integrations":20}\n')
 
             services = {
-                "waked": "wakeword",
-                "sttd": "stt",
-                "airplayd": "airplay2",
-                "ttsd": "tts",
-                "agentd": "assistant",
+                "waked": ("wakeword", "wakeword.sock"),
+                "sttd": ("stt", "stt.sock"),
+                "airplayd": ("airplay2", "airplay.sock"),
+                "ttsd": ("tts", "tts.sock"),
+                "agentd": ("assistant", "agent.sock"),
+                "wyomingd": (None, None),
             }
             proc_lines = []
-            for service, feature in services.items():
-                feature_dir = data / "libreecho/features" / feature
-                feature_dir.mkdir(parents=True)
-                (feature_dir / "payload.squashfs").write_bytes(b"verified-fixture")
-                socket_path = run / "libreecho" / ({
-                    "waked": "wakeword.sock", "sttd": "stt.sock",
-                    "airplayd": "airplay.sock", "ttsd": "tts.sock",
-                    "agentd": "agent.sock",
-                }[service])
-                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                listener.bind(str(socket_path))
-                listener.listen(1)
-                sockets.append(listener)
-                proc_lines.append(f"00000000: 00000002 00000000 00010000 0001 01 1 {socket_path}\n")
-                (var_run / f"libreecho-{service}.pid").write_text(f"{os.getpid()}\n")
+            socket_paths = {}
+            for service, (feature, socket_name) in services.items():
+                if feature is not None:
+                    feature_dir = data / "libreecho/features" / feature
+                    feature_dir.mkdir(parents=True)
+                    (feature_dir / "payload.squashfs").write_bytes(b"verified-fixture")
+                socket_path = run / "libreecho" / socket_name if socket_name else None
+                socket_paths[service] = socket_path
+                if socket_path is not None:
+                    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    listener.bind(str(socket_path))
+                    listener.listen(1)
+                    sockets.append(listener)
+                    proc_lines.append(f"00000000: 00000002 00000000 00010000 0001 01 1 {socket_path}\n")
+                pidfile = var_run / f"libreecho-{service}.pid"
+                pidfile.write_text(f"{os.getpid()}\n")
+                stop_targets = f"'{pidfile}'"
+                if socket_path is not None:
+                    stop_targets += f" '{socket_path}'"
                 script = init / f"libreecho-{service}.init"
                 script.write_text(
                     "#!/bin/sh\nset -eu\n"
                     f"state='{states / service}'\nactions='{actions}'\n"
                     'case "${1:-}" in\n'
-                    '  start) printf "%s:start\\n" "${0##*/}" >>"$actions"; : >"$state" ;;\n'
+                    '  start) printf "%s:start\\n" "${0##*/}" >>"$actions"; : >"$state"; '
+                    f"printf '%s\\n' '{os.getpid()}' >'{pidfile}' ;;\n"
                     '  stop) printf "%s:stop\\n" "${0##*/}" >>"$actions"; rm -f "$state" '
-                    f"'{var_run / f'libreecho-{service}.pid'}' '{socket_path}' ;;\n"
+                    f"{stop_targets} ;;\n"
                     '  status) test -f "$state" ;;\n'
                     '  *) exit 2 ;;\nesac\n'
                 )
@@ -2141,6 +2147,7 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(
                 actions.read_text().splitlines(),
                 [
+                    "libreecho-wyomingd.init:stop",
                     "libreecho-waked.init:start", "libreecho-sttd.init:start",
                     "libreecho-airplayd.init:start", "libreecho-ttsd.init:start",
                     "libreecho-agentd.init:start",
@@ -2160,6 +2167,33 @@ class PolicyTests(unittest.TestCase):
             self.assertIn(
                 "feature-reconcile-payload-missing:assistant",
                 (root / "reconcile.log").read_text(),
+            )
+
+            (data / "libreecho/features/assistant/payload.squashfs").write_bytes(
+                b"verified-fixture"
+            )
+            airplay_socket = socket_paths["airplayd"]
+            self.assertIsNotNone(airplay_socket)
+            airplay_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            airplay_listener.bind(str(airplay_socket))
+            airplay_listener.listen(1)
+            sockets.append(airplay_listener)
+            (var_run / "libreecho-airplayd.pid").write_text(f"{os.getpid()}\n")
+            actions.write_text("")
+            (data / "libreecho/config/web-config.json").write_text(
+                '{\n  "integrations": 21\n}\n'
+            )
+            subprocess.run(["sh", str(helper)], env=env, check=True)
+            self.assertEqual(
+                actions.read_text().splitlines(),
+                [
+                    "libreecho-agentd.init:stop",
+                    "libreecho-sttd.init:stop",
+                    "libreecho-ttsd.init:stop",
+                    "libreecho-wyomingd.init:start",
+                    "libreecho-waked.init:start",
+                    "libreecho-airplayd.init:start",
+                ],
             )
             for listener in sockets:
                 listener.close()
