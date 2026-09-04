@@ -1,0 +1,32 @@
+name: Button backport checks
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/button-backport.yml'
+      - 'tools/mt8163-arm32/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  button-image-contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install device-tree test tools
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y device-tree-compiler
+      - name: Check bundle shell syntax
+        run: bash -n tools/mt8163-arm32/ui/build_ui_bundle.sh
+      - name: Check Python syntax
+        run: >-
+          python3 -m py_compile
+          tools/mt8163-arm32/build_recovery_image.py
+          tools/mt8163-arm32/verify_recovery_image.py
+          tools/mt8163-arm32/build_wifi_dtb.py
+          tools/mt8163-arm32/verify_radar_puffin_dtb.py
+      - name: Run recovery packaging and real-DTB fixture contracts
+        working-directory: tools/mt8163-arm32
+        run: python3 -m unittest -v test_recovery_image_tools test_build_wifi_dtb test_verify_radar_puffin_dtb

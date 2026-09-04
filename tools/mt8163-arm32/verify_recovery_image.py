@@ -100,6 +100,7 @@ UI_BINARY_NAMES = {
     "usr/local/sbin/libreecho-audiod",
     "usr/local/sbin/libreecho-micd",
     "usr/local/sbin/libreecho-ledd",
+    "usr/local/sbin/libreecho-buttond",
     "usr/local/sbin/libreecho-btd",
     "usr/local/sbin/libreecho-airplayd",
     "usr/local/sbin/libreecho-wyomingd",
@@ -114,6 +115,7 @@ UI_INIT_NAMES = {
     "etc/init.d/libreecho-audiod.init",
     "etc/init.d/libreecho-micd.init",
     "etc/init.d/libreecho-ledd.init",
+    "etc/init.d/libreecho-buttond.init",
     "etc/init.d/libreecho-btd.init",
     "etc/init.d/libreecho-airplayd.init",
     "etc/init.d/libreecho-ttsd.init",
@@ -127,6 +129,9 @@ UI_FIXED_NAMES = UI_BINARY_NAMES | UI_INIT_NAMES | {
     "etc/libreecho/airplay2.conf",
     "etc/libreecho/ntp.conf",
     "usr/local/share/libreecho/ui-manifest.txt",
+    "usr/local/share/libreecho/sounds/action-1.raw",
+    "usr/local/share/libreecho/sounds/action-2.raw",
+    "usr/local/share/libreecho/sounds/action-3.raw",
 }
 UI_OPTIONAL_NAMES = {"etc/libreecho/users"}
 AIRPLAY_BINARY_NAMES = {
@@ -792,6 +797,8 @@ def validate_ui(entries: dict[str, Entry], manifest: dict[str, object],
             fail(f"UI file size changed: {name}")
         if name == "etc/libreecho/users" and not member.data.strip():
             fail("UI users file is empty")
+        if name.startswith("usr/local/share/libreecho/sounds/") and not member.data:
+            fail(f"UI action sound is empty: {name}")
         if name in UI_BINARY_NAMES:
             if name in {
                     "usr/local/sbin/libreecho-sttd-wyoming",

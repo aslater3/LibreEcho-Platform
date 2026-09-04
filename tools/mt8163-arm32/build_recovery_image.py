@@ -739,6 +739,14 @@ def validate_ui_startup_contract(bundle: Path) -> None:
             ),
         ),
         (
+            "etc/init.d/libreecho-buttond.init",
+            (
+                "DAEMON=${DAEMON:-/usr/local/sbin/libreecho-buttond}",
+                'start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- $ARGS',
+                "start) start_service",
+            ),
+        ),
+        (
             "etc/init.d/libreecho-web.init",
             (
                 "STARTUP_READY_TIMEOUT_TICKS=${STARTUP_READY_TIMEOUT_TICKS:-600}",
@@ -1023,7 +1031,7 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
     for binary in (
         "libreecho-web", "libreecho-logd", "libreecho-networkd",
         "libreecho-timed", "libreecho-audiod", "libreecho-micd",
-        "libreecho-ledd", "libreecho-btd",
+        "libreecho-ledd", "libreecho-buttond", "libreecho-btd",
         "libreecho-airplayd", "libreecho-wyomingd",
         "libreecho-sttd-wyoming", "libreecho-ttsd-wyoming",
     ):
@@ -1031,7 +1039,8 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
     for script in (
         "libreecho-web.init", "libreecho-logd.init", "libreecho-networkd.init",
         "libreecho-timed.init", "libreecho-audiod.init",
-        "libreecho-micd.init", "libreecho-ledd.init", "libreecho-btd.init",
+        "libreecho-micd.init", "libreecho-ledd.init", "libreecho-buttond.init",
+        "libreecho-btd.init",
         "libreecho-airplayd.init", "libreecho-ttsd.init", "libreecho-waked.init",
         "libreecho-sttd.init", "libreecho-agentd.init", "libreecho-wyomingd.init",
     ):
@@ -1045,7 +1054,8 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
             raise SystemExit("ERROR: UI users file must be private and non-empty")
         copy_file("etc/libreecho/users", "etc/libreecho/users", 0o600)
     for relative in sorted(bundled_files):
-        if not relative.startswith("share/libreecho/web/"):
+        if not relative.startswith("share/libreecho/web/") and not relative.startswith(
+                "share/libreecho/sounds/"):
             continue
         target_name = "usr/local/" + relative
         copy_file(relative, target_name, 0o644)
