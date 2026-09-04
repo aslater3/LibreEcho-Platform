@@ -2128,6 +2128,7 @@ class PolicyTests(unittest.TestCase):
                 script = init / f"libreecho-{service}.init"
                 script.write_text(
                     "#!/bin/sh\nset -eu\n"
+                    '[ -z "${ARGS+x}" ] || exit 9\n'
                     f"state='{states / service}'\nactions='{actions}'\n"
                     'case "${1:-}" in\n'
                     '  start) printf "%s:start\\n" "${0##*/}" >>"$actions"; : >"$state"; '
@@ -2153,6 +2154,7 @@ class PolicyTests(unittest.TestCase):
                 "FEATURE_RECONCILE_KMSG": "/dev/null",
                 "FEATURE_RECONCILE_CONSOLE": "/dev/null",
                 "FEATURE_RECONCILE_READY_TIMEOUT_SECONDS": "1",
+                "ARGS": "--foreground --document-root /usr/local/share/libreecho/web",
             }
 
             subprocess.run(["sh", str(helper)], env=env, check=True)

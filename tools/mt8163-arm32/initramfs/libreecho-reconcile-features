@@ -4,6 +4,11 @@
 # applying setup settings and Wi-Fi.  Each feature init script mounts its
 # squashfs runtime before starting its daemon.
 
+# Init scripts use ARGS as an optional per-service override.  The WebUI also
+# exports ARGS for its own daemon, so do not pass that unrelated value through
+# setup reconciliation into wake/STT/TTS/assistant service launches.
+unset ARGS
+
 BB=${BB:-/bin/busybox}
 ETC_ROOT=${FEATURE_RECONCILE_ETC_ROOT:-/etc}
 DATA_ROOT=${FEATURE_RECONCILE_DATA_ROOT:-/data}
