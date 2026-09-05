@@ -16,8 +16,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Install device-tree test tools
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y device-tree-compiler
+      - name: Install device-tree and Python test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y device-tree-compiler
+          python3 -m pip install --disable-pip-version-check PyNaCl==1.5.0
       - name: Check bundle shell syntax
         run: bash -n tools/mt8163-arm32/ui/build_ui_bundle.sh
       - name: Check Python syntax
