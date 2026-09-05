@@ -736,6 +736,14 @@ def validate_ui_startup_contract(bundle: Path) -> None:
             ),
         ),
         (
+            "etc/init.d/libreecho-buttond.init",
+            (
+                "DAEMON=${DAEMON:-/usr/local/sbin/libreecho-buttond}",
+                'start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- $ARGS',
+                "start) start_service",
+            ),
+        ),
+        (
             "etc/init.d/libreecho-web.init",
             (
                 "STARTUP_READY_TIMEOUT_TICKS=${STARTUP_READY_TIMEOUT_TICKS:-600}",
@@ -1044,7 +1052,8 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
             raise SystemExit("ERROR: UI users file must be private and non-empty")
         copy_file("etc/libreecho/users", "etc/libreecho/users", 0o600)
     for relative in sorted(bundled_files):
-        if not relative.startswith("share/libreecho/web/"):
+        if not relative.startswith("share/libreecho/web/") and not relative.startswith(
+                "share/libreecho/sounds/"):
             continue
         target_name = "usr/local/" + relative
         copy_file(relative, target_name, 0o644)

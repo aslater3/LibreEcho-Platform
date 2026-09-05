@@ -139,7 +139,7 @@ do
 done
 
 mkdir -p "$OUTPUT/sbin" "$OUTPUT/share/libreecho/web" \
-    "$OUTPUT/etc/init.d" "$OUTPUT/etc/libreecho"
+    "$OUTPUT/share/libreecho/sounds" "$OUTPUT/etc/init.d" "$OUTPUT/etc/libreecho"
 
 for binary in \
     libreecho-web libreecho-logd libreecho-networkd libreecho-timed \
@@ -170,6 +170,14 @@ install -m 0644 "$UI_SOURCE/config/airplay2.conf" \
     "$OUTPUT/etc/libreecho/airplay2.conf"
 install -m 0644 "$UI_SOURCE/config/ntp.conf" \
     "$OUTPUT/etc/libreecho/ntp.conf"
+for sound in action-1.raw action-2.raw action-3.raw; do
+    path="$UI_SOURCE/sounds/$sound"
+    [[ -f "$path" && ! -L "$path" && -s "$path" ]] || {
+        echo "ERROR: missing or empty UI action sound: $path" >&2
+        exit 1
+    }
+    install -m 0644 "$path" "$OUTPUT/share/libreecho/sounds/$sound"
+done
 if [[ -n "$USERS_SOURCE" ]]; then
     install -m 0600 "$USERS_SOURCE" "$OUTPUT/etc/libreecho/users"
 fi

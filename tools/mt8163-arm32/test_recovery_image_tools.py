@@ -1883,12 +1883,57 @@ class PolicyTests(unittest.TestCase):
         self.assertNotIn("--startup-audio", init_script)
         self.assertIn("log audio-startup-disabled", init_script)
 
+    def test_ui_bundle_ships_buttond_and_action_sounds(self) -> None:
+        bundle = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        image_builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        image_verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        self.assertIn("libreecho-buttond", bundle)
+        self.assertIn("libreecho-buttond.init", bundle)
+        self.assertIn('"share/libreecho/sounds/"', image_builder)
+        self.assertIn("libreecho-buttond", image_builder)
+        self.assertIn("libreecho-buttond", image_verifier)
+        for sound in ("action-1.raw", "action-2.raw", "action-3.raw"):
+            self.assertIn(sound, bundle)
+            self.assertIn(f"usr/local/share/libreecho/sounds/{sound}", image_verifier)
+
+    def test_ui_verifier_rejects_missing_button_members(self) -> None:
+        required = (
+            "usr/local/sbin/libreecho-buttond",
+            "etc/init.d/libreecho-buttond.init",
+            "usr/local/share/libreecho/sounds/action-1.raw",
+            "usr/local/share/libreecho/sounds/action-2.raw",
+            "usr/local/share/libreecho/sounds/action-3.raw",
+        )
+        for missing in required:
+            with self.subTest(missing=missing):
+                names = (verifier.UI_FIXED_NAMES | {"usr/local/share/libreecho/web/index.html"}) - {missing}
+                entries = {name: verifier.Entry(name, stat.S_IFREG | 0o644, 0, 0, 0, b"fixture") for name in names}
+                ui = {
+                    "enabled": True, "activation": "automatic-after-loopback",
+                    "autostart": True, "hardware_ownership": "existing-control-plane",
+                    "commit": "a" * 40, "diff_sha256": "b" * 64,
+                    "manifest_sha256": "c" * 64, "files": {name: {} for name in names},
+                }
+                with self.assertRaisesRegex(SystemExit, "UI file set changed"):
+                    verifier.validate_ui(entries, {"ui": ui}, "c" * 64, "a" * 40, "b" * 64)
+
     def test_ui_bundle_startup_contract_is_fail_closed(self) -> None:
         valid_led = "\n".join((
             "DAEMON=/usr/local/sbin/libreecho-ledd",
             "PIDFILE=/var/run/libreecho-ledd.pid",
             "STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}",
             "ARGS=${ARGS:---foreground --socket $SOCKET --startup-animation --startup-ready $STARTUP_READY}",
+            "start_service() {",
+            '    start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- $ARGS',
+            "}",
+            "case \"${1:-}\" in",
+            "    start) start_service ;;",
+            "esac",
+        )) + "\n"
+        valid_buttond = "\n".join((
+            "DAEMON=${DAEMON:-/usr/local/sbin/libreecho-buttond}",
+            "PIDFILE=${PIDFILE:-/var/run/libreecho-buttond.pid}",
+            "ARGS=${ARGS:---foreground}",
             "start_service() {",
             '    start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- $ARGS',
             "}",
@@ -2003,10 +2048,12 @@ class PolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             bundle = Path(temporary)
             led = bundle / "etc/init.d/libreecho-ledd.init"
+            buttond = bundle / "etc/init.d/libreecho-buttond.init"
             web = bundle / "etc/init.d/libreecho-web.init"
             agentd = bundle / "etc/init.d/libreecho-agentd.init"
             led.parent.mkdir(parents=True)
             led.write_text(valid_led)
+            buttond.write_text(valid_buttond)
             web.write_text(valid_web)
             agentd.write_text(valid_agentd)
             feature_script = "\n".join((
