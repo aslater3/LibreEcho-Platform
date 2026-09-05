@@ -37,20 +37,28 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y device-tree-compiler
           python -m pip install --disable-pip-version-check PyNaCl==1.5.0
 
       - name: Run maintained Platform suites
         shell: bash
         run: |
           set -euo pipefail
+          python tools/mt8163-arm32/airplay/test_audio_period_buffer.py
+          cd tools/mt8163-arm32
           python -m unittest -q \
-            tools/mt8163-arm32/test_recovery_image_tools.py \
-            tools/mt8163-arm32/test_source_offer_tools.py
+            test_build_wifi_dtb.py \
+            test_verify_radar_puffin_dtb.py \
+            test_recovery_image_tools.py \
+            test_source_offer_tools.py
 
       - name: Validate tracked Python and shell source
         shell: bash
         run: |
           set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y espeak-ng-data squashfs-tools
           python -m py_compile \
             tools/mt8163-arm32/build_recovery_image.py \
             tools/mt8163-arm32/verify_recovery_image.py \
@@ -58,4 +66,5 @@ jobs:
           while IFS= read -r -d '' script; do
             bash -n "$script"
           done < <(git ls-files -z 'tools/mt8163-arm32/*.sh' 'tools/mt8163-arm32/**/*.sh')
+          bash tools/mt8163-arm32/tts/test_package_feature_contract.sh
           git diff --check

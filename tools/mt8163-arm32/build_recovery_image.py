@@ -39,37 +39,44 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "aaf587b382c83af4883b7585fc92ff88441f0539b88d56e5e56c1ec1f53c2b90"
+RECOVERY_INIT_SHA256 = "805110e30c4a1cd505c6ff59822753eef475671a979bfe79aaba9d4cdb4a84eb"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
 CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
-CONNECTIVITY_IMPORTER_SHA256 = "27f20efb39825333838df76eb843e4af537864f326a9648702739286a25e5d3a"
+CONNECTIVITY_IMPORTER_SHA256 = "7601145a15750abce6a4c21d20326ecbdc1e4dc36e5670c0ca3cc9d1bf1f1326"
 WPA_SUPPLICANT_VERSION = "2.10"
 WPA_SOURCE_SHA256 = "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f"
 WPA_SOURCE_URL = "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz"
+WPA_CONFIG_PATH = "tools/mt8163-arm32/wpa-supplicant/wpa_supplicant-2.10.config"
+WPA_CONFIG_SHA256 = "6125cc857687fcd464531dcce09194f4b10add0eceec489ae58b6d35c8885f2c"
+LIBNL_SOURCE_SHA256 = "2a56e1edefa3e68a7c00879496736fdbf62fc94ed3232c0baba127ecfa76874d"
+LIBNL_SOURCE_URL = (
+    "https://github.com/thom311/libnl/releases/download/"
+    "libnl3_11_0/libnl-3.11.0.tar.gz"
+)
 WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-CONNECTIVITY_ASSET_REQUIREMENTS = {
+CONNECTIVITY_ASSET_REQUIREMENTS: dict[str, dict[str, str | int]] = {
     "ROMv2_lm_patch_1_0_hdr.bin": {
-        "source": "system/vendor/firmware/ROMv2_lm_patch_1_0_hdr.bin", "mode": 0o644,
-        "size": 128720,
-        "sha256": "b4460117f51a43f3284594ec08d8c8861ecc0e42b17820987da03ecabdebac1e",
+        "source": "etc/firmware/ROMv2_lm_patch_1_0_hdr.bin", "mode": 0o644,
+        "size": 127596,
+        "sha256": "36d7edc7095f4cdfdaaa9c67061cf079199a55be85ab76ce82c9e9bcb34824a2",
     },
     "ROMv2_lm_patch_1_1_hdr.bin": {
-        "source": "system/vendor/firmware/ROMv2_lm_patch_1_1_hdr.bin", "mode": 0o644,
-        "size": 50148,
-        "sha256": "10c4ed22a10b8a136bffd7ffce4d552300d76f8e593627d2a9841c3b11a5697e",
+        "source": "etc/firmware/ROMv2_lm_patch_1_1_hdr.bin", "mode": 0o644,
+        "size": 50952,
+        "sha256": "cabdb842d354dd123d2d3d939f06304c1cfb045f407b5880444be326ded16d8d",
     },
     "WIFI_RAM_CODE_8163": {
-        "source": "system/vendor/firmware/WIFI_RAM_CODE_8163", "mode": 0o644,
+        "source": "etc/firmware/WIFI_RAM_CODE_8163", "mode": 0o644,
         "size": 373840,
         "sha256": "9669cc9b03cfdc5e8fd4fd6e14c4c4050e8c196738ca4707eea12f14a6a8e64c",
     },
     "WMT_SOC.cfg": {
-        "source": "system/vendor/firmware/WMT_SOC.cfg", "mode": 0o644, "size": 119,
+        "source": "etc/firmware/WMT_SOC.cfg", "mode": 0o644, "size": 119,
         "sha256": "302bd4462de99c028c04092e561c1500d65582ce42a93c4c72ccae6e2c99013d",
     },
 }
@@ -77,7 +84,7 @@ CONNECTIVITY_ASSET_REQUIREMENTS = {
 CONNECTIVITY_HELPERS = {
     "sbin/wmt_configure": (
         "wmt_config_helper", 25744,
-        "2a57272037a34519e9f6f5dd64ab5a16ad304c81535c4aa7f15a8afae34aadb1",
+        "e0ff85f0ac2cb2b98718556470444cafd1fcd8865cdba27aa67e2c7d7a3303e0",
     ),
     "sbin/wmt_responder": (
         "wmt_responder", 21648,
@@ -286,7 +293,7 @@ def add_connectivity_bundle(stage: Path, helpers: dict[str, Path],
     )
 
     expected_lines = []
-    requirement_records: dict[str, object] = {}
+    requirement_records: dict[str, dict[str, object]] = {}
     for target_name, specification in CONNECTIVITY_ASSET_REQUIREMENTS.items():
         expected_hash = str(specification["sha256"])
         expected_size = int(specification["size"])
@@ -341,7 +348,10 @@ def add_connectivity_bundle(stage: Path, helpers: dict[str, Path],
         "source_partition": "system_a-read-only",
         "embedded_vendor_file_count": 0,
         "required_vendor_file_count": len(requirement_records),
-        "required_vendor_bytes": 552827,
+        "required_vendor_bytes": sum(
+            int(specification["size"])
+            for specification in CONNECTIVITY_ASSET_REQUIREMENTS.values()
+        ),
         "helper_count": len(helper_records),
         "payload_bytes": sum(int(record["size"]) for record in helper_records.values()),
         "files": {},
@@ -382,6 +392,9 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         "init.rc": ("init.rc", 0o644),
         "init.recovery.mt8163.rc": ("init.recovery.mt8163.rc", 0o644),
         "libreecho-init": ("libreecho-init", 0o755),
+        "libreecho-reconcile-features": (
+            "usr/local/sbin/libreecho-reconcile-features", 0o755,
+        ),
         "libreecho-data-cleanup": (
             "usr/local/sbin/libreecho-data-cleanup", 0o755,
         ),
@@ -726,8 +739,19 @@ def validate_ui_startup_contract(bundle: Path) -> None:
             "etc/init.d/libreecho-web.init",
             (
                 "STARTUP_READY_TIMEOUT_TICKS=${STARTUP_READY_TIMEOUT_TICKS:-600}",
+                "BT_READY_PATH=${BT_READY_PATH:-/run/libreecho/bluetooth-ready}",
+                "bluetooth_integration_state()",
+                "bluetooth_ready()",
+                "airplay_integration_state()",
                 "startup_services_ready()",
-                "for socket in network audio mic led bluetooth airplay; do",
+                "for socket in network audio mic led; do",
+                "case \"$(airplay_integration_state)\" in",
+                "pidfile=/var/run/libreecho-airplayd.pid",
+                "[ -S /run/libreecho/airplay.sock ] || return 1",
+                "case \"$(bluetooth_integration_state)\" in",
+                "disabled) ;;",
+                "enabled)",
+                '[ -f "$BT_READY_PATH" ]',
                 "mark_startup_ready()",
                 "count=0",
                 "while :; do",
@@ -738,12 +762,75 @@ def validate_ui_startup_contract(bundle: Path) -> None:
                 "sleep 0.1",
                 "count=$((count + 1))",
                 '[ "$count" -lt "$STARTUP_READY_TIMEOUT_TICKS" ] || count=0',
-                "for socket in network audio mic led bluetooth airplay; do",
                 '[ -S "/run/libreecho/$socket.sock" ] || return 1',
                 "start_service\n        mark_startup_ready >/dev/null 2>&1 &",
             ),
         ),
+        (
+            "etc/init.d/libreecho-agentd.init",
+            (
+                "AGENT_DEPENDENCY_TIMEOUT_SECONDS=${AGENT_DEPENDENCY_TIMEOUT_SECONDS:-90}",
+                "AGENT_DEPENDENCY_POLL_SECONDS=${AGENT_DEPENDENCY_POLL_SECONDS:-1}",
+                "PAYLOAD=",
+                "RUNTIME_ROOT=",
+                "mount_runtime()",
+                "mount -t squashfs",
+                "unmount_runtime()",
+                "mount_runtime || return 1",
+                "dependency_sockets_ready()",
+                "missing_dependency_sockets()",
+                "wait_for_dependency_sockets()",
+                "remaining=$((AGENT_DEPENDENCY_TIMEOUT_SECONDS - elapsed))",
+                "poll_seconds=$AGENT_DEPENDENCY_POLL_SECONDS",
+                'sleep "$poll_seconds"',
+                "wait_for_dependency_sockets || {",
+            ),
+        ),
     )
+    payload_contracts = {
+        "etc/init.d/libreecho-airplayd.init": (
+            "PAYLOAD=",
+            "RUNTIME_ROOT=",
+            "mount_runtime()",
+            "mount -t squashfs",
+            "unmount_runtime()",
+            "mount_runtime || return 1",
+            "start) start_service",
+            # AirPlay is enabled by default; the persisted integration bit is
+            # the explicit, user-controlled disable (not a boot-time default).
+            "airplay_enabled_at_boot=1",
+            "integrations & 16",
+            "persistent AirPlay disable",
+        ),
+        "etc/init.d/libreecho-sttd.init": (
+            "PAYLOAD=",
+            "RUNTIME_ROOT=",
+            "mount_runtime()",
+            "mount -t squashfs",
+            "unmount_runtime()",
+            "mount_runtime || return 1",
+            "start) start_service",
+        ),
+        "etc/init.d/libreecho-ttsd.init": (
+            "PAYLOAD=",
+            "RUNTIME_ROOT=",
+            "mount_runtime()",
+            "mount -t squashfs",
+            "unmount_runtime()",
+            "mount_runtime || return 1",
+            "start) start_service",
+        ),
+        "etc/init.d/libreecho-waked.init": (
+            "PAYLOAD=",
+            "RUNTIME_ROOT=",
+            "mount_runtime()",
+            "mount -t squashfs",
+            "unmount_runtime()",
+            "mount_runtime || return 1",
+            "start) start_service",
+        ),
+    }
+    contracts += tuple(payload_contracts.items())
     contract_paths = {}
     for relative, required in contracts:
         source = pinned_source(bundle, relative, f"UI startup contract {relative}")
@@ -767,7 +854,26 @@ def validate_ui_startup_contract(bundle: Path) -> None:
                     f"ERROR: UI startup contract missing {marker!r} in {relative}"
                 )
         if relative.endswith("libreecho-web.init"):
+            if (
+                "for socket in network audio mic led airplay; do" in text
+                or "for socket in network audio mic led bluetooth airplay; do" in text
+            ):
+                raise SystemExit(
+                    "ERROR: UI startup optional-integration readiness must be conditional"
+                )
             readiness_start = text.index("mark_startup_ready()")
+            startup_start = text.index("startup_services_ready()")
+            startup_body = text[startup_start:readiness_start]
+            for marker in (
+                'case "$(bluetooth_integration_state)" in',
+                "disabled) ;;",
+                "enabled)",
+                'bluetooth_ready || return 1',
+            ):
+                if marker not in startup_body:
+                    raise SystemExit(
+                        f"ERROR: UI startup Bluetooth contract missing {marker!r}"
+                    )
             dispatch_start = text.index('case "${1:-}" in')
             readiness_body = text[readiness_start:dispatch_start]
             ordered = (
@@ -797,6 +903,26 @@ def validate_ui_startup_contract(bundle: Path) -> None:
                 raise SystemExit("ERROR: UI startup start case does not run readiness")
             if "&" not in start_body:
                 raise SystemExit("ERROR: UI startup readiness polling must run in background")
+        if relative.endswith("libreecho-agentd.init"):
+            start_service_start = text.index("start_service()")
+            dispatch_start = text.index('case "${1:-}" in')
+            start_body = text[start_service_start:dispatch_start]
+            if "mount_runtime || return 1" not in start_body:
+                raise SystemExit(
+                    "ERROR: assistant start case does not fail closed before mounting"
+                )
+            if "wait_for_dependency_sockets || {" not in start_body:
+                raise SystemExit(
+                    "ERROR: agentd start case does not wait for dependencies"
+                )
+        if relative in payload_contracts:
+            start_service_start = text.index("start_service()")
+            dispatch_start = text.index('case "${1:-}" in')
+            start_body = text[start_service_start:dispatch_start]
+            if "mount_runtime || return 1" not in start_body:
+                raise SystemExit(
+                    f"ERROR: payload service does not fail closed before starting: {relative}"
+                )
 
     led_text = contract_paths["etc/init.d/libreecho-ledd.init"]
     web_text = contract_paths["etc/init.d/libreecho-web.init"]
@@ -1534,6 +1660,7 @@ def add_network_bundle(stage: Path, wpa_supplicant: Path, wpa_metadata_path: Pat
     required_metadata = {
         "binary_sha256", "binary_size", "build_epoch", "compiler", "config_path",
         "config_sha256", "crypto", "drivers", "kernel_uapi_sha256", "license",
+        "libnl_license", "libnl_source_sha256", "libnl_source_url", "libnl_version",
         "source_sha256", "source_url", "static", "version",
     }
     if not isinstance(wpa_metadata, dict) or set(wpa_metadata) != required_metadata:
@@ -1545,6 +1672,14 @@ def add_network_bundle(stage: Path, wpa_supplicant: Path, wpa_metadata_path: Pat
             wpa_metadata["source_url"] != WPA_SOURCE_URL or
             wpa_metadata["license"] != "BSD-3-Clause" or
             wpa_metadata["version"] != WPA_SUPPLICANT_VERSION or
+            wpa_metadata["config_path"] != WPA_CONFIG_PATH or
+            wpa_metadata["config_sha256"] != WPA_CONFIG_SHA256 or
+            wpa_metadata["crypto"] != "internal" or
+            wpa_metadata["drivers"] != ["nl80211", "wext"] or
+            wpa_metadata["libnl_version"] != "3.11.0" or
+            wpa_metadata["libnl_license"] != "LGPL-2.1-only" or
+            wpa_metadata["libnl_source_sha256"] != LIBNL_SOURCE_SHA256 or
+            wpa_metadata["libnl_source_url"] != LIBNL_SOURCE_URL or
             wpa_metadata["static"] is not True or
             not isinstance(wpa_metadata["kernel_uapi_sha256"], str) or
             not re.fullmatch(r"[0-9a-f]{64}", wpa_metadata["kernel_uapi_sha256"])):
@@ -1641,6 +1776,15 @@ def validate_stage(stage: Path) -> None:
     if "Requesting program interpreter" in output:
         raise SystemExit("ERROR: sbin/adbd is not static")
     init_script = read(stage / "init")
+    for relative in ("libreecho-init", "usr/local/sbin/libreecho-reconcile-features"):
+        syntax = subprocess.run(
+            ["sh", "-n", str(stage / relative)],
+            capture_output=True, text=True,
+        )
+        if syntax.returncode != 0:
+            raise SystemExit(
+                f"ERROR: recovery control script has invalid shell syntax: {relative}"
+            )
     if init_script != read(stage / "libreecho-init"):
         raise SystemExit("ERROR: runtime /init differs from audited libreecho-init")
     if not init_script.startswith(b"#!/bin/busybox sh\n"):

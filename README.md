@@ -92,6 +92,24 @@ release-relative pipeline checkout. Do not substitute a private path in source,
 documentation, or a UI-controlled value. Shell syntax checks can be run with
 `bash -n` over the tracked `tools/mt8163-arm32` scripts.
 
+### Final setup feature reconciliation
+
+After the final setup process has atomically committed setup settings and Wi-Fi
+configuration, it must invoke the installed Platform helper synchronously:
+
+```sh
+/usr/local/sbin/libreecho-reconcile-features
+```
+
+The helper rereads the immutable image `service-profile` and `feature-policy`,
+selects the topology from the persisted integration settings, starts each
+selected payload-backed service in dependency-safe order, and returns non-zero
+when a payload is still staged or a service cannot become ready. The setup
+process should keep setup incomplete and retry/report the failure in that case.
+A successful helper run does not create `startup-ready` itself; the already
+running WebUI readiness worker observes the healthy service graph and creates
+`/run/libreecho/startup-ready`.
+
 A host check is not hardware acceptance. A complete image still requires the
 paired current kernel, UI bundle, private build orchestration, independent image
 verification, and separately recorded runtime/hardware evidence.

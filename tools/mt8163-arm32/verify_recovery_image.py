@@ -38,17 +38,22 @@ ZIMAGE_MAGIC = 0x016F2818
 ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
 CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
-CONNECTIVITY_IMPORTER_SHA256 = "27f20efb39825333838df76eb843e4af537864f326a9648702739286a25e5d3a"
+CONNECTIVITY_IMPORTER_SHA256 = "7601145a15750abce6a4c21d20326ecbdc1e4dc36e5670c0ca3cc9d1bf1f1326"
 CONNECTIVITY_STOCK_SYSTEM_SHA256 = "56540b3a9ac4437901a5510d9fb5e09b1a8d0cc229548f0b08bb5c22d78684fe"
 CONNECTIVITY_EVIDENCE_MANIFEST_SHA256 = "d1eedd04efe0dbc78853f2b0f9357c092b4ca66242648908c0369956538441eb"
 WPA_SUPPLICANT_VERSION = "2.10"
 WPA_SOURCE_SHA256 = "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f"
 WPA_SOURCE_URL = "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz"
+LIBNL_SOURCE_SHA256 = "2a56e1edefa3e68a7c00879496736fdbf62fc94ed3232c0baba127ecfa76874d"
+LIBNL_SOURCE_URL = (
+    "https://github.com/thom311/libnl/releases/download/"
+    "libnl3_11_0/libnl-3.11.0.tar.gz"
+)
 WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-INIT_SHA256 = "aaf587b382c83af4883b7585fc92ff88441f0539b88d56e5e56c1ec1f53c2b90"
+INIT_SHA256 = "805110e30c4a1cd505c6ff59822753eef475671a979bfe79aaba9d4cdb4a84eb"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -56,6 +61,7 @@ OVERLAY_FILES = {
     "init.rc": 0o644,
     "init.recovery.mt8163.rc": 0o644,
     "libreecho-init": 0o755,
+    "libreecho-reconcile-features": 0o755,
     "libreecho-data-cleanup": 0o755,
     "libreecho-vendor-import": 0o755,
     "vendor-assets/mt8163-v181-stock-v1.tsv": 0o644,
@@ -67,6 +73,7 @@ OVERLAY_FILES = {
 }
 OVERLAY_TARGETS = {
     "profile": "etc/profile",
+    "libreecho-reconcile-features": "usr/local/sbin/libreecho-reconcile-features",
     "libreecho-data-cleanup": "usr/local/sbin/libreecho-data-cleanup",
     "libreecho-vendor-import": "usr/local/sbin/libreecho-vendor-import",
     "vendor-assets/mt8163-v181-stock-v1.tsv": (
@@ -130,24 +137,24 @@ AIRPLAY_BINARY_NAMES = {
     "usr/local/sbin/libreecho-audio-engine",
 }
 
-CONNECTIVITY_ASSET_REQUIREMENTS = {
+CONNECTIVITY_ASSET_REQUIREMENTS: dict[str, dict[str, str | int]] = {
     "ROMv2_lm_patch_1_0_hdr.bin": {
-        "source": "system/vendor/firmware/ROMv2_lm_patch_1_0_hdr.bin",
-        "size": 128720,
-        "sha256": "b4460117f51a43f3284594ec08d8c8861ecc0e42b17820987da03ecabdebac1e",
+        "source": "etc/firmware/ROMv2_lm_patch_1_0_hdr.bin",
+        "size": 127596,
+        "sha256": "36d7edc7095f4cdfdaaa9c67061cf079199a55be85ab76ce82c9e9bcb34824a2",
     },
     "ROMv2_lm_patch_1_1_hdr.bin": {
-        "source": "system/vendor/firmware/ROMv2_lm_patch_1_1_hdr.bin",
-        "size": 50148,
-        "sha256": "10c4ed22a10b8a136bffd7ffce4d552300d76f8e593627d2a9841c3b11a5697e",
+        "source": "etc/firmware/ROMv2_lm_patch_1_1_hdr.bin",
+        "size": 50952,
+        "sha256": "cabdb842d354dd123d2d3d939f06304c1cfb045f407b5880444be326ded16d8d",
     },
     "WIFI_RAM_CODE_8163": {
-        "source": "system/vendor/firmware/WIFI_RAM_CODE_8163",
+        "source": "etc/firmware/WIFI_RAM_CODE_8163",
         "size": 373840,
         "sha256": "9669cc9b03cfdc5e8fd4fd6e14c4c4050e8c196738ca4707eea12f14a6a8e64c",
     },
     "WMT_SOC.cfg": {
-        "source": "system/vendor/firmware/WMT_SOC.cfg",
+        "source": "etc/firmware/WMT_SOC.cfg",
         "size": 119,
         "sha256": "302bd4462de99c028c04092e561c1500d65582ce42a93c4c72ccae6e2c99013d",
     },
@@ -155,7 +162,7 @@ CONNECTIVITY_ASSET_REQUIREMENTS = {
 
 CONNECTIVITY_HELPERS = {
     "sbin/wmt_configure": (
-        25744, "2a57272037a34519e9f6f5dd64ab5a16ad304c81535c4aa7f15a8afae34aadb1",
+        25744, "e0ff85f0ac2cb2b98718556470444cafd1fcd8865cdba27aa67e2c7d7a3303e0",
     ),
     "sbin/wmt_responder": (
         21648, "46170ddc1d1ddf21a85ec16df129aac47a258a439bc9e6ed061d1e5942aa48eb",
@@ -885,7 +892,10 @@ def validate_connectivity(entries: dict[str, Entry], manifest: dict[str, object]
         "source_partition": "system_a-read-only",
         "embedded_vendor_file_count": 0,
         "required_vendor_file_count": len(CONNECTIVITY_ASSET_REQUIREMENTS),
-        "required_vendor_bytes": 552827,
+        "required_vendor_bytes": sum(
+            int(record["size"])
+            for record in CONNECTIVITY_ASSET_REQUIREMENTS.values()
+        ),
         "helper_count": len(CONNECTIVITY_HELPERS),
         "payload_bytes": sum(size for size, _digest in CONNECTIVITY_HELPERS.values()),
         "files": {},
@@ -1016,7 +1026,8 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                        expected_nqptp_sha256: str | None,
                        expected_shairport_sync_sha256: str | None,
                        expected_avahi_daemon_sha256: str | None,
-                       expected_dbus_daemon_sha256: str | None) -> bool:
+                       expected_dbus_daemon_sha256: str | None,
+                       expected_wpa_supplicant_sha256: str | None = None) -> bool:
     if ramdisk[:4] != b"\x1f\x8b\x08\x00":
         fail("ramdisk gzip header is not deterministic")
     try:
@@ -1105,6 +1116,9 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
             fail("network asset hashes are malformed")
         wpa_hash: str = cast(str, wpa_hash_value)
         profile_hash: str = cast(str, profile_hash_value)
+        if (expected_wpa_supplicant_sha256 is not None and
+                wpa_hash != expected_wpa_supplicant_sha256):
+            fail("wpa_supplicant trusted identity mismatch")
         wpa = require_member(entries, "sbin/wpa_supplicant", wpa_hash, 0o755)
         if elf_info(wpa.data) != (1, 40, 0x05000400, None, (), False):
             fail("wpa_supplicant is not static ARM32 hard-float")
@@ -1112,6 +1126,7 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         required_source = {
             "binary_sha256", "binary_size", "build_epoch", "compiler", "config_path",
             "config_sha256", "crypto", "drivers", "kernel_uapi_sha256", "license",
+            "libnl_license", "libnl_source_sha256", "libnl_source_url", "libnl_version",
             "source_sha256", "source_url", "static", "version",
         }
         if (not isinstance(source_record, dict) or set(source_record) != required_source or
@@ -1122,6 +1137,11 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                 source_record.get("license") != "BSD-3-Clause" or
                 source_record.get("version") != WPA_SUPPLICANT_VERSION or
                 source_record.get("static") is not True or
+                source_record.get("drivers") != ["nl80211", "wext"] or
+                source_record.get("libnl_version") != "3.11.0" or
+                source_record.get("libnl_license") != "LGPL-2.1-only" or
+                source_record.get("libnl_source_sha256") != LIBNL_SOURCE_SHA256 or
+                source_record.get("libnl_source_url") != LIBNL_SOURCE_URL or
                 not re.fullmatch(r"[0-9a-f]{64}", str(source_record.get("config_sha256", ""))) or
                 not re.fullmatch(r"[0-9a-f]{64}", str(source_record.get("kernel_uapi_sha256", "")))):
             fail("wpa source provenance is missing or mismatched")
@@ -1737,6 +1757,19 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         "source": "libreecho-init",
     }:
         fail("runtime /init overlay manifest mismatch")
+    reconcile = verified_overlay["libreecho-reconcile-features"]
+    for marker in (
+        b"FEATURE_RECONCILE_ETC_ROOT:-/etc",
+        b"$ETC_ROOT/libreecho/service-profile",
+        b"$ETC_ROOT/libreecho/feature-policy",
+        b"integrations & 1",
+        b"integrations & 16",
+        b"$DATA_ROOT/libreecho/features/$feature/payload.squashfs",
+        b"\"$script\" start",
+        b"feature-services-reconcile-failed",
+    ):
+        if marker not in reconcile.data:
+            fail(f"feature reconciliation helper lacks {marker!r}")
     for marker in (
         b"FASTBOOT_PLEASE", b"/tmp/runme", b"functionfs", b"/dev/stpwmt", b"/dev/stpbt",
         b"PARTNAME=expdb", b"/sys/class/block/mmcblk0p7", b"20480", b"bs=15 count=1",
@@ -1842,6 +1875,8 @@ def main() -> None:
 
     parser.add_argument("--expected-iwconfig-sha256",
                         help="require this static ARM32 wireless-tools iwconfig utility")
+    parser.add_argument("--expected-wpa-supplicant-sha256",
+                        help="require this exact static ARM32 wpa_supplicant")
     parser.add_argument("--expected-image-profile", choices=("development", "ota"), required=True)
     parser.add_argument("--expected-service-profile", choices=("diagnostic", "production"),
                         required=True)
@@ -2029,6 +2064,7 @@ def main() -> None:
         args.expected_assistant_payload_size,
         args.expected_nqptp_sha256, args.expected_shairport_sync_sha256,
         args.expected_avahi_daemon_sha256, args.expected_dbus_daemon_sha256,
+        args.expected_wpa_supplicant_sha256,
     )
     expected_connectivity = args.expected_connectivity_bundle != "none"
     if connectivity_enabled != expected_connectivity:

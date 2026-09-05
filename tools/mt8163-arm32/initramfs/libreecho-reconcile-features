@@ -1,0 +1,354 @@
+#!/bin/busybox sh
+# Reconcile persisted feature payloads after installation has finished staging.
+# PID1 invokes this during boot; the final setup process invokes it again after
+# applying setup settings and Wi-Fi.  Each feature init script mounts its
+# squashfs runtime before starting its daemon.
+
+# Init scripts use ARGS as an optional per-service override.  The WebUI also
+# exports ARGS for its own daemon, so do not pass that unrelated value through
+# setup reconciliation into wake/STT/TTS/assistant service launches.
+unset ARGS
+
+BB=${BB:-/bin/busybox}
+ETC_ROOT=${FEATURE_RECONCILE_ETC_ROOT:-/etc}
+DATA_ROOT=${FEATURE_RECONCILE_DATA_ROOT:-/data}
+RUN_ROOT=${FEATURE_RECONCILE_RUN_ROOT:-/run}
+VAR_RUN_ROOT=${FEATURE_RECONCILE_VAR_RUN_ROOT:-/var/run}
+INIT_ROOT=${FEATURE_RECONCILE_INIT_ROOT:-/etc/init.d}
+PROC_NET_UNIX=${FEATURE_RECONCILE_PROC_NET_UNIX:-/proc/net/unix}
+LOG_FILE=${FEATURE_RECONCILE_LOG_FILE:-/tmp/init.log}
+KMSG=${FEATURE_RECONCILE_KMSG:-/dev/kmsg}
+CONSOLE=${FEATURE_RECONCILE_CONSOLE:-/dev/console}
+LOCK=$RUN_ROOT/libreecho/reconcile-features.lock
+LOCK_TIMEOUT_SECONDS=${FEATURE_RECONCILE_LOCK_TIMEOUT_SECONDS:-120}
+READY_TIMEOUT_SECONDS=${FEATURE_RECONCILE_READY_TIMEOUT_SECONDS:-30}
+LOCK_TIMEOUT_MAX_SECONDS=300
+READY_TIMEOUT_MAX_SECONDS=120
+
+log()
+{
+    msg="libreecho-feature-reconcile: $*"
+    printf '%s\n' "$*" >> "$LOG_FILE"
+    printf '<6>%s\n' "$msg" > "$KMSG" 2>/dev/null
+    printf '%s\n' "$msg" > "$CONSOLE" 2>/dev/null
+}
+
+acquire_lock()
+{
+    elapsed=0
+    while ! $BB mkdir "$LOCK" 2>/dev/null; do
+        owner=$($BB cat "$LOCK/pid" 2>/dev/null)
+        case "$owner" in
+            ''|*[!0-9]*)
+                # mkdir is atomic, but the owner file is written immediately
+                # afterwards.  Do not remove a lock during that small window.
+                if [ "$elapsed" -ge "$LOCK_TIMEOUT_SECONDS" ]; then
+                    log feature-reconcile-lock-owner-missing
+                    return 1
+                else
+                    $BB sleep 1
+                    elapsed=$((elapsed + 1))
+                fi
+                continue
+                ;;
+            *)
+                if $BB kill -0 "$owner" 2>/dev/null; then
+                    if [ "$elapsed" -ge "$LOCK_TIMEOUT_SECONDS" ]; then
+                        log "feature-reconcile-lock-timeout:$owner"
+                        return 1
+                    fi
+                    $BB sleep 1
+                    elapsed=$((elapsed + 1))
+                    continue
+                fi
+                ;;
+        esac
+        $BB rm -rf "$LOCK" 2>/dev/null || {
+            log feature-reconcile-lock-remove-failed
+            return 1
+        }
+    done
+    printf '%s\n' "$$" > "$LOCK/pid" || {
+        $BB rm -rf "$LOCK"
+        log feature-reconcile-lock-owner-write-failed
+        return 1
+    }
+    return 0
+}
+
+release_lock()
+{
+    owner=$($BB cat "$LOCK/pid" 2>/dev/null)
+    [ "$owner" = "$$" ] || {
+        log feature-reconcile-lock-ownership-lost
+        return 1
+    }
+    $BB rm -rf "$LOCK" 2>/dev/null
+}
+
+validate_timeouts()
+{
+    case "$LOCK_TIMEOUT_SECONDS" in ''|*[!0-9]*|0) return 1 ;; esac
+    case "$READY_TIMEOUT_SECONDS" in ''|*[!0-9]*|0) return 1 ;; esac
+    [ "$LOCK_TIMEOUT_SECONDS" -le "$LOCK_TIMEOUT_MAX_SECONDS" ] || return 1
+    [ "$READY_TIMEOUT_SECONDS" -le "$READY_TIMEOUT_MAX_SECONDS" ] || return 1
+}
+
+read_policy()
+{
+    SERVICE_PROFILE_VALUE=$($BB cat "$ETC_ROOT/libreecho/service-profile" 2>/dev/null)
+    SERVICE_PROFILE=diagnostic
+    case "$SERVICE_PROFILE_VALUE" in
+        production) SERVICE_PROFILE=production ;;
+    esac
+
+    FEATURE_POLICY_VALUE=$($BB cat "$ETC_ROOT/libreecho/feature-policy" 2>/dev/null)
+    FEATURE_POLICY=exclude
+    case "$FEATURE_POLICY_VALUE" in
+        preserve|redistributable|community-noncommercial|exclude)
+            FEATURE_POLICY=$FEATURE_POLICY_VALUE
+            ;;
+    esac
+}
+
+select_topology()
+{
+    ha_enabled=0
+    config=$DATA_ROOT/libreecho/config/web-config.json
+    if [ -r "$config" ]; then
+        integrations=$($BB sed -n \
+            's/.*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+            "$config" 2>/dev/null | $BB head -n 1)
+        case "$integrations" in
+            ''|*[!0-9]*) ;;
+            *) [ $((integrations & 1)) -ne 0 ] && ha_enabled=1 ;;
+        esac
+    fi
+
+    if [ "$ha_enabled" -eq 1 ]; then
+        case "$FEATURE_POLICY" in
+            preserve|community-noncommercial)
+                persisted_features="wakeword airplay2"
+                ;;
+            redistributable)
+                log feature-reconcile-home-assistant-requires-wakeword
+                return 1
+                ;;
+            *)
+                persisted_features=airplay2
+                ;;
+        esac
+    else
+        case "$FEATURE_POLICY" in
+            preserve|community-noncommercial)
+                persisted_features="wakeword stt airplay2 tts assistant"
+                ;;
+            *)
+                persisted_features="stt airplay2 tts assistant"
+                ;;
+        esac
+    fi
+}
+
+daemon_service_ready()
+{
+    service=$1
+    script=$INIT_ROOT/libreecho-$service.init
+    pidfile=$VAR_RUN_ROOT/libreecho-$service.pid
+    [ -x "$script" ] || return 1
+    "$script" status >/dev/null 2>&1 || return 1
+    [ -s "$pidfile" ] || return 1
+    pid=$($BB sed -n '1p' "$pidfile" 2>/dev/null)
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    $BB kill -0 "$pid" 2>/dev/null || return 1
+    return 0
+}
+
+feature_service_ready()
+{
+    service=$1
+    socket=$2
+    daemon_service_ready "$service" || return 1
+    [ -S "$socket" ] || return 1
+    $BB awk -v socket="$socket" \
+        '$NF == socket { found=1 } END { exit found ? 0 : 1 }' \
+        "$PROC_NET_UNIX" >/dev/null 2>&1 || return 1
+    return 0
+}
+
+stop_service()
+{
+    service=$1
+    socket=${2:-}
+    script=$INIT_ROOT/libreecho-$service.init
+    pidfile=$VAR_RUN_ROOT/libreecho-$service.pid
+    [ -x "$script" ] || {
+        log "feature-reconcile-service-missing:$service"
+        return 1
+    }
+    "$script" stop >"/tmp/libreecho-$service.reconcile.log" 2>&1 || {
+        log "feature-reconcile-service-stop-failed:$service"
+        return 1
+    }
+    if "$script" status >/dev/null 2>&1 || [ -e "$pidfile" ]; then
+        log "feature-reconcile-service-still-running:$service"
+        return 1
+    fi
+    if [ -n "$socket" ] && [ -S "$socket" ]; then
+        log "feature-reconcile-service-socket-still-present:$service"
+        return 1
+    fi
+    log "feature-reconcile-service-stopped:$service"
+    return 0
+}
+
+start_daemon_service()
+{
+    service=$1
+    script=$INIT_ROOT/libreecho-$service.init
+    [ -x "$script" ] || {
+        log "feature-reconcile-service-missing:$service"
+        return 1
+    }
+    "$script" start >"/tmp/libreecho-$service.reconcile.log" 2>&1 || {
+        log "feature-reconcile-service-start-failed:$service"
+        return 1
+    }
+    ready_count=0
+    while [ "$ready_count" -lt "$READY_TIMEOUT_SECONDS" ]; do
+        daemon_service_ready "$service" && {
+            log "feature-reconcile-service-ready:$service"
+            return 0
+        }
+        $BB sleep 1
+        ready_count=$((ready_count + 1))
+    done
+    daemon_service_ready "$service" && return 0
+    log "feature-reconcile-service-not-ready:$service"
+    return 1
+}
+
+airplay_explicitly_disabled()
+{
+    config=$DATA_ROOT/libreecho/config/web-config.json
+    [ -r "$config" ] || return 1
+    integrations=$($BB sed -n \
+        's/.*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "$config" 2>/dev/null | $BB sed -n '1p')
+    case "$integrations" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ $((integrations & 16)) -eq 0 ]
+}
+
+stop_disabled_airplay()
+{
+    stop_service airplayd "$RUN_ROOT/libreecho/airplay.sock" || return 1
+    log feature-reconcile-service-disabled:airplayd
+    return 0
+}
+
+reconcile_topology()
+{
+    if [ "$ha_enabled" -eq 1 ]; then
+        stop_service agentd "$RUN_ROOT/libreecho/agent.sock" || return 1
+        stop_service sttd "$RUN_ROOT/libreecho/stt.sock" || return 1
+        stop_service ttsd "$RUN_ROOT/libreecho/tts.sock" || return 1
+        start_daemon_service wyomingd || return 1
+    else
+        stop_service wyomingd || return 1
+    fi
+    return 0
+}
+
+start_feature()
+{
+    feature=$1
+    case "$feature" in
+        airplay2) service=airplayd; socket=$RUN_ROOT/libreecho/airplay.sock ;;
+        stt) service=sttd; socket=$RUN_ROOT/libreecho/stt.sock ;;
+        tts) service=ttsd; socket=$RUN_ROOT/libreecho/tts.sock ;;
+        assistant) service=agentd; socket=$RUN_ROOT/libreecho/agent.sock ;;
+        wakeword) service=waked; socket=$RUN_ROOT/libreecho/wakeword.sock ;;
+        *) log "feature-reconcile-unknown-feature:$feature"; return 1 ;;
+    esac
+    if [ "$feature" = airplay2 ] && airplay_explicitly_disabled; then
+        log feature-reconcile-airplay-disabled
+        stop_disabled_airplay
+        return $?
+    fi
+
+    payload=$DATA_ROOT/libreecho/features/$feature/payload.squashfs
+    if [ ! -f "$payload" ]; then
+        log "feature-reconcile-payload-missing:$feature"
+        return 1
+    fi
+    feature_root=${payload%/payload.squashfs}
+    if [ -d "$feature_root/staging" ]; then
+        log "feature-reconcile-staging-present:$feature"
+        return 1
+    fi
+
+    script=$INIT_ROOT/libreecho-$service.init
+    if [ ! -x "$script" ]; then
+        log "feature-reconcile-service-missing:$service"
+        return 1
+    fi
+    "$script" start >/tmp/libreecho-"$service".reconcile.log 2>&1
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "feature-reconcile-service-start-failed:$service:$rc"
+        return 1
+    fi
+
+    ready_count=0
+    while [ "$ready_count" -lt "$READY_TIMEOUT_SECONDS" ]; do
+        feature_service_ready "$service" "$socket" && {
+            log "feature-reconcile-service-ready:$service"
+            return 0
+        }
+        $BB sleep 1
+        ready_count=$((ready_count + 1))
+    done
+    if feature_service_ready "$service" "$socket"; then
+        log "feature-reconcile-service-ready:$service"
+        return 0
+    fi
+    log "feature-reconcile-service-not-ready:$service"
+    return 1
+}
+
+reconcile()
+{
+    read_policy
+    if [ "$SERVICE_PROFILE" != production ] || [ "$FEATURE_POLICY" = exclude ]; then
+        log "feature-reconcile-skipped:$SERVICE_PROFILE:$FEATURE_POLICY"
+        return 0
+    fi
+    select_topology || return 1
+    reconcile_topology || {
+        log feature-service-topology-reconcile-failed
+        return 1
+    }
+    failed=0
+    for feature in $persisted_features; do
+        start_feature "$feature" || failed=1
+    done
+    if [ "$failed" -ne 0 ]; then
+        log feature-services-reconcile-failed
+        return "$failed"
+    fi
+    log feature-services-reconciled
+    return 0
+}
+
+$BB mkdir -p "$RUN_ROOT/libreecho"
+validate_timeouts || {
+    log feature-reconcile-invalid-timeout
+    exit 1
+}
+acquire_lock || exit 1
+reconcile
+rc=$?
+release_lock || rc=1
+exit "$rc"

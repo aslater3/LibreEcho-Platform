@@ -4,7 +4,9 @@
 This checks the hardware semantics that made the accepted Linux 6.1 image
 usable.  It intentionally does not pin phandle numbers, which are build-order
 artifacts, but it does pin the providers, clock IDs, GPIO pinmux values, and
-accepted amp/DAC-mux control path.
+accepted amp/DAC-mux control path.  A pinctrl consumer may reference several
+provider states at once; validation therefore requires each named hardware
+state to be present rather than requiring a singleton phandle.
 """
 
 from __future__ import annotations
@@ -238,7 +240,8 @@ def verify_dtb(dtb: Path) -> None:
     )
     for index, group in pin_groups:
         expected = _phandle(dtb, f"{PINCTRL}/{group}")
-        if _cells(dtb, AFE, f"pinctrl-{index}") != (expected,):
+        references = _cells(dtb, AFE, f"pinctrl-{index}")
+        if expected not in references:
             raise ContractError(f"AFE pinctrl-{index} does not reference {group}")
 
     _check_gpio_state(dtb, "audexamphigh", 0x7A00, "output-high", "external amp on")
