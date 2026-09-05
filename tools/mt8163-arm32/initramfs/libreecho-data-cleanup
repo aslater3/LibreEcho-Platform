@@ -242,7 +242,7 @@ check_children "$DATA_ROOT/libreecho/config" \
     agent.json agent.json.bak tts-voice vad-floor-rms \
     led-state.json led-state.json.tmp \
     users.sessions radio-stations.json radio-stations.json.bak \
-    https-cert.pem https-key.pem
+    https-cert.pem https-key.pem bypass-capture-mux timers timers.tmp
 TOLERATE_UNKNOWN_FILES=0
 check_children "$DATA_ROOT/libreecho/secrets" openai-codex.json
 

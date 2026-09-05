@@ -8,11 +8,14 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import socket
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -211,6 +214,7 @@ class SourceTests(unittest.TestCase):
             "LIBREECHO_VENDOR_FIRMWARE_ROOT": str(firmware),
             "LIBREECHO_VENDOR_SPEC": str(specification),
             "LIBREECHO_VENDOR_STAGE_PARENT": str(root / "vendor-stage"),
+            "LIBREECHO_VENDOR_STATUS_PATH": str(root / "run/libreecho/vendor-import.status"),
         }
         return importer, data, source, firmware, environment, records
 
@@ -386,6 +390,7 @@ class SourceTests(unittest.TestCase):
                 "LIBREECHO_VENDOR_FIRMWARE_ROOT": str(firmware),
                 "LIBREECHO_VENDOR_SPEC": str(spec),
                 "LIBREECHO_VENDOR_STAGE_PARENT": str(root / "vendor-stage"),
+                "LIBREECHO_VENDOR_STATUS_PATH": str(root / "run/libreecho/vendor-import.status"),
             }
 
             first = subprocess.run(
@@ -425,6 +430,86 @@ class SourceTests(unittest.TestCase):
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             self.assertNotEqual(second.returncode, 0)
+            self.assertFalse((firmware / "WIFI_RAM_CODE").exists())
+
+    def test_vendor_import_probes_stock_system_root_layouts(self) -> None:
+        for layout in ("etc/firmware", "vendor/firmware", "system/etc/firmware"):
+            with self.subTest(layout=layout), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                importer, _data, source, firmware, environment, records = (
+                    self.vendor_import_fixture(root)
+                )
+                original = source / "system/vendor/firmware"
+                replacement = source / layout
+                replacement.parent.mkdir(parents=True, exist_ok=True)
+                original.rename(replacement)
+                result = subprocess.run(
+                    ["/bin/sh", str(importer)], env=environment,
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"source_layout={layout}", result.stdout)
+                for _source_name, target_name, payload in records:
+                    self.assertEqual((firmware / target_name).read_bytes(), payload)
+
+    def test_vendor_import_force_is_one_boot_structurally_gated_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            importer, data, source, firmware, environment, _records = (
+                self.vendor_import_fixture(root)
+            )
+            shutil.rmtree(source / "system")
+            payload_root = source / "etc/firmware"
+            payload_root.mkdir(parents=True)
+            patch_zero = bytearray(4096)
+            patch_zero[22:28] = bytes.fromhex("8a0022000600")
+            patch_one = bytearray(4096)
+            patch_one[22:28] = bytes.fromhex("8a0021000ef0")
+            forced = {
+                "ROMv2_lm_patch_1_0_hdr.bin": bytes(patch_zero),
+                "ROMv2_lm_patch_1_1_hdr.bin": bytes(patch_one),
+                "WIFI_RAM_CODE_8163": b"W" * 8192,
+                "WMT_SOC.cfg": b"coex_wmt_ant_mode=0\n",
+            }
+            for name, payload in forced.items():
+                (payload_root / name).write_bytes(payload)
+            force_marker = data / "libreecho/config/vendor-import-force-next-boot"
+            force_marker.parent.mkdir(parents=True)
+            force_marker.write_text("force-unverified-owner-local-import-v1\n")
+            force_marker.chmod(0o600)
+            environment["LIBREECHO_VENDOR_FORCE_MARKER"] = str(force_marker)
+            result = subprocess.run(
+                ["/bin/sh", str(importer)], env=environment,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("verification=forced-unverified", result.stdout)
+            self.assertFalse(force_marker.exists())
+            status = Path(environment["LIBREECHO_VENDOR_STATUS_PATH"]).read_text()
+            self.assertIn("state=ready\n", status)
+            self.assertIn("verification=forced-unverified\n", status)
+            for name, payload in forced.items():
+                self.assertEqual((firmware / name).read_bytes(), payload)
+
+    def test_vendor_import_force_rejects_incompatible_patch_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            importer, data, source, firmware, environment, _records = (
+                self.vendor_import_fixture(root)
+            )
+            for patch in (source / "system/vendor/firmware").glob("ROMv2_*.bin"):
+                patch.write_bytes(b"X" * 4096)
+            force_marker = data / "libreecho/config/vendor-import-force-next-boot"
+            force_marker.parent.mkdir(parents=True)
+            force_marker.write_text("force-unverified-owner-local-import-v1\n")
+            force_marker.chmod(0o600)
+            environment["LIBREECHO_VENDOR_FORCE_MARKER"] = str(force_marker)
+            result = subprocess.run(
+                ["/bin/sh", str(importer)], env=environment,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("VENDOR_IMPORT_FORCED_SET_INCOMPATIBLE", result.stderr)
             self.assertFalse((firmware / "WIFI_RAM_CODE").exists())
 
     def test_vendor_import_rejects_symlinked_transient_stage_parent(self) -> None:
@@ -624,7 +709,7 @@ class SourceTests(unittest.TestCase):
         core = TOOLS_DIR / "initramfs/usr/local/share/licenses/libreecho-core"
         components = json.loads((core / "COMPONENTS.json").read_text())
         component_ids = {component["id"] for component in components["components"]}
-        self.assertTrue({"busybox", "wpa-supplicant", "musl", "tinyalsa", "libsodium", "mt8163-audio-fpga"}.issubset(component_ids))
+        self.assertTrue({"busybox", "wpa-supplicant", "libnl", "musl", "tinyalsa", "libsodium", "mt8163-audio-fpga"}.issubset(component_ids))
         audio = next(component for component in components["components"] if component["id"] == "mt8163-audio-fpga")
         self.assertTrue(audio["included_in_public_artifact"])
         self.assertEqual(audio["redistribution_status"], "blocked")
@@ -768,7 +853,7 @@ class SourceTests(unittest.TestCase):
         builder = (
             TOOLS_DIR / "wpa-supplicant" / "build_wpa_supplicant.sh"
         ).read_text()
-        self.assertIn("LDFLAGS='-static -no-pie", builder)
+        self.assertRegex(builder, r'LDFLAGS=["\x27]-static -no-pie')
         self.assertIn("Type:[[:space:]]+EXEC", builder)
 
     def test_wpa_builder_requires_exported_linux_uapi_headers(self) -> None:
@@ -777,13 +862,63 @@ class SourceTests(unittest.TestCase):
         ).read_text()
         self.assertIn("--kernel-headers DIR", builder)
         self.assertIn("KERNEL_HEADERS=", builder)
-        self.assertIn('"-idirafter" "$KERNEL_HEADERS"', builder)
+        self.assertIn("-idirafter $KERNEL_HEADERS", builder)
         self.assertIn("kernel_uapi_sha256", builder)
         self.assertNotIn("/usr/arm-linux-gnueabihf/include", builder)
         image_builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
         verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
         self.assertIn("--wpa-source-metadata", image_builder)
         self.assertIn("wpa source provenance is missing or mismatched", verifier)
+
+    def test_wpa_supplicant_prefers_nl80211_with_wext_fallback(self) -> None:
+        config = (
+            TOOLS_DIR / "wpa-supplicant" / "wpa_supplicant-2.10.config"
+        ).read_text()
+        builder = (
+            TOOLS_DIR / "wpa-supplicant" / "build_wpa_supplicant.sh"
+        ).read_text()
+        source_lock = json.loads(
+            (TOOLS_DIR / "wpa-supplicant" / "SOURCE.lock").read_text()
+        )
+        wifi = (TOOLS_DIR / "initramfs/libreecho-wifi").read_text()
+        verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        self.assertIn("CONFIG_DRIVER_NL80211=y", config)
+        self.assertIn("CONFIG_LIBNL32=y", config)
+        self.assertIn("CONFIG_DRIVER_WEXT=y", config)
+        self.assertIn("--libnl-archive FILE", builder)
+        self.assertIn("libnl_source_sha256", builder)
+        self.assertIn('LIBNL_INC="$libnl_src/include"', builder)
+        self.assertIn(
+            'EXTRA_CFLAGS="$common_cflags -I$libnl_src/include', builder
+        )
+        self.assertIn("for tool in ar ranlib strip; do", builder)
+        self.assertIn('AR="$wrappers/ar"', builder)
+        self.assertIn('RANLIB="$wrappers/ranlib"', builder)
+        self.assertIn('STRIP="$wrappers/strip"', builder)
+        self.assertEqual(source_lock["drivers"], ["nl80211", "wext"])
+        self.assertEqual(source_lock["libnl_version"], "3.11.0")
+        self.assertEqual(
+            source_lock["libnl_source_sha256"],
+            "2a56e1edefa3e68a7c00879496736fdbf62fc94ed3232c0baba127ecfa76874d",
+        )
+        self.assertIn("-Dnl80211,wext", wifi)
+        image_builder = (
+            TOOLS_DIR / "build_recovery_image.py"
+        ).read_text()
+        self.assertIn("WPA_CONFIG_SHA256", image_builder)
+        self.assertIn('wpa_metadata["drivers"] != ["nl80211", "wext"]', image_builder)
+        self.assertIn('wpa_metadata["libnl_source_sha256"] != LIBNL_SOURCE_SHA256', image_builder)
+        self.assertIn("LIBNL_SOURCE_SHA256", verifier)
+        self.assertIn("--expected-wpa-supplicant-sha256", verifier)
+        self.assertIn("expected_wpa_supplicant_sha256", verifier)
+        self.assertIn(
+            'source_record.get("libnl_source_sha256") != LIBNL_SOURCE_SHA256',
+            verifier,
+        )
+        self.assertIn(
+            'source_record.get("libnl_source_url") != LIBNL_SOURCE_URL',
+            verifier,
+        )
 
     def test_feature_policy_is_immutable_and_fail_closed(self) -> None:
         builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
@@ -841,6 +976,50 @@ class SourceTests(unittest.TestCase):
         for name, constant in pins.items():
             source = (TOOLS_DIR / name).read_text()
             self.assertIn(f'{constant} = "{init_hash}"', source)
+
+    def test_pid1_traps_the_signals_busybox_reboot_sends(self) -> None:
+        # Issue aslater3/LibreEcho#105: busybox halt/poweroff/reboot do their
+        # work by signalling PID 1, assuming busybox init is there to catch it.
+        # PID 1 here is this shell script, so without traps the signal is
+        # discarded and `reboot` exits 0 having done nothing -- which reads as
+        # success and made a documented recovery step a silent no-op.
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertIn("signal_transition()", init)
+        self.assertIn("trap 'signal_transition reboot'   TERM", init)
+        self.assertIn("trap 'signal_transition reboot'   INT", init)
+        self.assertIn("trap 'signal_transition halt'     USR1", init)
+        self.assertIn("trap 'signal_transition poweroff' USR2", init)
+        # Each signal maps to the matching forced transition.
+        self.assertIn("$BB halt -f", init)
+        self.assertIn("$BB poweroff -f", init)
+        # The traps must be installed in the main shell, after the recovery
+        # supervisor starts and before PID 1 parks in its idle loop.
+        supervisor = init.index("log reboot-supervisor-started")
+        installed = init.index("log reboot-signal-traps-installed")
+        idle_loop = init.index("$BB sleep 3600 &")
+        self.assertLess(supervisor, installed)
+        self.assertLess(installed, idle_loop)
+
+    def test_pid1_idle_loop_is_interruptible_by_a_trap(self) -> None:
+        # A trap only runs between commands, so a foreground `sleep 3600` would
+        # sit on the signal for up to an hour. Backgrounding the sleep and
+        # waiting on it makes the transition immediate, because wait is
+        # interruptible.
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertIn("$BB sleep 3600 &\n    wait $!", init)
+        self.assertNotIn("\n    $BB sleep 3600\ndone", init)
+
+    def test_pid1_signal_delivery_harness(self) -> None:
+        harness = TOOLS_DIR / "test_pid1_signal_transitions.py"
+        result = subprocess.run(
+            [sys.executable, str(harness)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for signal_name in ("TERM", "INT", "USR1", "USR2"):
+            self.assertIn(f" {signal_name} ->", result.stdout)
 
     def test_health_confirm_restart_record_is_persistent(self) -> None:
         # Issue #41: the OTA health-confirm worker must leave persistent
@@ -1152,15 +1331,19 @@ class SourceTests(unittest.TestCase):
         first_write = source.index(
             "write_period(pcm, output, &reference, first_activity)"
         )
-        second_write = source.index(
-            "write_period(pcm, second, &reference, second_activity)"
-        )
-        amp_enable = source.index("enable_output_controls(card)")
-        self.assertLess(first_write, amp_enable)
-        self.assertLess(second_write, amp_enable)
+        power_amp = source.index("power_output_controls(card)")
+        unmute = source.index("unmute_output_controls(card)")
+        self.assertLess(power_amp, first_write)
+        self.assertLess(first_write, unmute)
         self.assertIn(
-            "pcm_writei(pcm, samples, PERIOD_SIZE)", source
+            "ready = prepare_initial_period(sources, root, output, &dynamics,",
+            source,
         )
+        self.assertIn(
+            "const size_t bytes = PERIOD_SIZE * OUTPUT_CHANNELS * sizeof(int16_t);",
+            source,
+        )
+        self.assertIn("pcm_writei(pcm, samples, PERIOD_SIZE)", source)
         self.assertIn(
             "le_aec_reference_publish(reference, samples, PERIOD_SIZE",
             source,
@@ -1338,7 +1521,7 @@ class SourceTests(unittest.TestCase):
         expected = {
             "sbin/wmt_configure": (
                 25744,
-                "2a57272037a34519e9f6f5dd64ab5a16ad304c81535c4aa7f15a8afae34aadb1",
+                "e0ff85f0ac2cb2b98718556470444cafd1fcd8865cdba27aa67e2c7d7a3303e0",
             ),
             "sbin/wmt_responder": (
                 21648,
@@ -1363,6 +1546,14 @@ class SourceTests(unittest.TestCase):
         }
         self.assertEqual(builder_pins, expected)
         self.assertEqual(verifier.CONNECTIVITY_HELPERS, expected)
+        self.assertEqual(
+            sum(int(item["size"]) for item in builder.CONNECTIVITY_ASSET_REQUIREMENTS.values()),
+            552507,
+        )
+        self.assertEqual(
+            sum(int(item["size"]) for item in verifier.CONNECTIVITY_ASSET_REQUIREMENTS.values()),
+            552507,
+        )
 
     def test_network_tools_are_pinned_and_manual_only(self) -> None:
         builder_script = TOOLS_DIR / "network-tools/build_wireless_tools.sh"
@@ -1481,22 +1672,22 @@ class VendorAssetContractTests(unittest.TestCase):
     def test_local_asset_contract_is_shared_and_contains_no_payload(self) -> None:
         expected = {
             "ROMv2_lm_patch_1_0_hdr.bin": {
-                "source": "system/vendor/firmware/ROMv2_lm_patch_1_0_hdr.bin",
-                "mode": 0o644, "size": 128720,
-                "sha256": "b4460117f51a43f3284594ec08d8c8861ecc0e42b17820987da03ecabdebac1e",
+                "source": "etc/firmware/ROMv2_lm_patch_1_0_hdr.bin",
+                "mode": 0o644, "size": 127596,
+                "sha256": "36d7edc7095f4cdfdaaa9c67061cf079199a55be85ab76ce82c9e9bcb34824a2",
             },
             "ROMv2_lm_patch_1_1_hdr.bin": {
-                "source": "system/vendor/firmware/ROMv2_lm_patch_1_1_hdr.bin",
-                "mode": 0o644, "size": 50148,
-                "sha256": "10c4ed22a10b8a136bffd7ffce4d552300d76f8e593627d2a9841c3b11a5697e",
+                "source": "etc/firmware/ROMv2_lm_patch_1_1_hdr.bin",
+                "mode": 0o644, "size": 50952,
+                "sha256": "cabdb842d354dd123d2d3d939f06304c1cfb045f407b5880444be326ded16d8d",
             },
             "WIFI_RAM_CODE_8163": {
-                "source": "system/vendor/firmware/WIFI_RAM_CODE_8163",
+                "source": "etc/firmware/WIFI_RAM_CODE_8163",
                 "mode": 0o644, "size": 373840,
                 "sha256": "9669cc9b03cfdc5e8fd4fd6e14c4c4050e8c196738ca4707eea12f14a6a8e64c",
             },
             "WMT_SOC.cfg": {
-                "source": "system/vendor/firmware/WMT_SOC.cfg",
+                "source": "etc/firmware/WMT_SOC.cfg",
                 "mode": 0o644, "size": 119,
                 "sha256": "302bd4462de99c028c04092e561c1500d65582ce42a93c4c72ccae6e2c99013d",
             },
@@ -1708,11 +1899,41 @@ class PolicyTests(unittest.TestCase):
         valid_web = "\n".join((
             "STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}",
             "STARTUP_READY_TIMEOUT_TICKS=${STARTUP_READY_TIMEOUT_TICKS:-600}",
+            "BT_READY_PATH=${BT_READY_PATH:-/run/libreecho/bluetooth-ready}",
+            "bluetooth_integration_state() {",
+            "    printf 'disabled\\n'",
+            "}",
+            "bluetooth_ready() {",
+            "    case \"$(bluetooth_integration_state)\" in",
+            "        disabled) return 0 ;;",
+            "        enabled) [ -f \"$BT_READY_PATH\" ] ;;",
+            "        *) return 1 ;;",
+            "    esac",
+            "}",
+            "airplay_integration_state() {",
+            "    printf 'disabled\\n'",
+            "}",
             "startup_services_ready() {",
-            "    for socket in network audio mic led bluetooth airplay; do",
+            "    for socket in network audio mic led; do",
             '        [ -S "/run/libreecho/$socket.sock" ] || return 1',
-            "        : \"$socket\"",
             "    done",
+            "    case \"$(airplay_integration_state)\" in",
+            "        disabled) ;;",
+            "        enabled)",
+            "            pidfile=/var/run/libreecho-airplayd.pid",
+            '            [ -S /run/libreecho/airplay.sock ] || return 1',
+            "            ;;",
+            "        *) return 1 ;;",
+            "    esac",
+            "    case \"$(bluetooth_integration_state)\" in",
+            "        disabled) ;;",
+            "        enabled)",
+            "            [ -s /var/run/libreecho-btd.pid ] || return 1",
+            "            [ -S /run/libreecho/bluetooth.sock ] || return 1",
+            "            bluetooth_ready || return 1",
+            "            ;;",
+            "        *) return 1 ;;",
+            "    esac",
             "}",
             "mark_startup_ready() {",
             "    count=0",
@@ -1733,13 +1954,89 @@ class PolicyTests(unittest.TestCase):
             "    start) start_service\n        mark_startup_ready >/dev/null 2>&1 & ;;",
             "esac",
         )) + "\n"
+        valid_agentd = "\n".join((
+            "AGENT_DEPENDENCY_TIMEOUT_SECONDS=${AGENT_DEPENDENCY_TIMEOUT_SECONDS:-90}",
+            "AGENT_DEPENDENCY_POLL_SECONDS=${AGENT_DEPENDENCY_POLL_SECONDS:-1}",
+            "PAYLOAD=/data/libreecho/features/assistant/payload.squashfs",
+            "RUNTIME_ROOT=/run/libreecho/features/assistant/root",
+            "mount_runtime() {",
+            "    mount -t squashfs -o loop,ro,none \"$PAYLOAD\" \"$RUNTIME_ROOT\"",
+            "}",
+            "unmount_runtime() { :; }",
+            "dependency_sockets_ready() {",
+            "    [ -S \"$WAKE_SOCKET\" ] &&",
+            "        [ -S \"$STT_SOCKET\" ] &&",
+            "        [ -S \"$AUDIO_SOCKET\" ] &&",
+            "        [ -S \"$TTS_SOCKET\" ]",
+            "}",
+            "missing_dependency_sockets() {",
+            "    printf 'wakeword,stt,audio,tts\\n'",
+            "}",
+            "wait_for_dependency_sockets() {",
+            "    elapsed=0",
+            "    while ! dependency_sockets_ready; do",
+            '        if [ "$elapsed" -ge "$AGENT_DEPENDENCY_TIMEOUT_SECONDS" ]; then',
+            '            echo "dependencies not ready after ${AGENT_DEPENDENCY_TIMEOUT_SECONDS}s: $(missing_dependency_sockets)" >&2',
+            "            return 1",
+            "        fi",
+            "        remaining=$((AGENT_DEPENDENCY_TIMEOUT_SECONDS - elapsed))",
+            "        poll_seconds=$AGENT_DEPENDENCY_POLL_SECONDS",
+            '        if [ "$poll_seconds" -gt "$remaining" ]; then',
+            "            poll_seconds=$remaining",
+            "        fi",
+            '        sleep "$poll_seconds"',
+            "        elapsed=$((elapsed + poll_seconds))",
+            "    done",
+            "}",
+            "start_service() {",
+            "    mount_runtime || return 1",
+            "    wait_for_dependency_sockets || {",
+            "        unmount_runtime",
+            "        return 1",
+            "    }",
+            "}",
+            "case \"${1:-}\" in",
+            "    start) start_service ;;",
+            "esac",
+        )) + "\n"
+
         with tempfile.TemporaryDirectory() as temporary:
             bundle = Path(temporary)
             led = bundle / "etc/init.d/libreecho-ledd.init"
             web = bundle / "etc/init.d/libreecho-web.init"
+            agentd = bundle / "etc/init.d/libreecho-agentd.init"
             led.parent.mkdir(parents=True)
             led.write_text(valid_led)
             web.write_text(valid_web)
+            agentd.write_text(valid_agentd)
+            feature_script = "\n".join((
+                "PAYLOAD=/data/libreecho/features/feature/payload.squashfs",
+                "RUNTIME_ROOT=/run/libreecho/features/feature/root",
+                "mount_runtime() {",
+                "    mount -t squashfs -o loop,ro,none \"$PAYLOAD\" \"$RUNTIME_ROOT\"",
+                "}",
+                "unmount_runtime() { :; }",
+                "start_service() {",
+                "    mount_runtime || return 1",
+                "}",
+                "case \"${1:-}\" in",
+                "    start) start_service ;;",
+                "esac",
+            )) + "\n"
+            for name in (
+                "libreecho-airplayd.init",
+                "libreecho-sttd.init",
+                "libreecho-ttsd.init",
+                "libreecho-waked.init",
+            ):
+                path = bundle / "etc/init.d" / name
+                path.write_text(feature_script)
+            (bundle / "etc/init.d/libreecho-airplayd.init").write_text(
+                feature_script
+                + "airplay_enabled_at_boot=1\\n"
+                + "integrations=$((integrations & 16))\\n"
+                + "# persistent AirPlay disable is read from the user config\\n"
+            )
 
             builder.validate_ui_startup_contract(bundle)
 
@@ -1785,7 +2082,7 @@ class PolicyTests(unittest.TestCase):
 
             web.write_text(valid_web.replace(
                 '        [ -S "/run/libreecho/$socket.sock" ] || return 1\n',
-                "",
+                '        : "$socket"\n',
             ))
             with self.assertRaisesRegex(SystemExit, "startup contract missing"):
                 builder.validate_ui_startup_contract(bundle)
@@ -1813,18 +2110,465 @@ class PolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "startup-animation"):
                 builder.validate_ui_startup_contract(bundle)
 
-    def test_streaming_voice_services_start_warm_in_dependency_order(self) -> None:
+    def test_production_boot_defers_payload_backed_services(self) -> None:
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
-        service_line = (
-            'services="logd networkd timed audiod micd waked sttd ledd buttond btd '
-            'airplayd radiod ttsd agentd web"'
+        self.assertIn(
+            'services="logd networkd timed audiod micd ledd buttond btd web"',
+            init_script,
         )
+        self.assertIn(
+            'services="logd networkd timed audiod micd ledd buttond btd wyomingd web"',
+            init_script,
+        )
+        self.assertIn("feature-services-deferred-until-staged", init_script)
+        for service in ("airplayd", "sttd", "ttsd", "agentd"):
+            self.assertNotIn(f"services=\"logd networkd timed audiod micd waked {service}", init_script)
+
+    def test_post_staging_reconcile_is_shared_boot_and_final_setup_contract(self) -> None:
+        helper = TOOLS_DIR / "initramfs/libreecho-reconcile-features"
+        init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+
+        self.assertTrue(helper.is_file())
+        self.assertTrue(helper.stat().st_mode & stat.S_IXUSR)
+        source = helper.read_text()
+        self.assertIn("FEATURE_RECONCILE_ETC_ROOT:-/etc", source)
+        self.assertIn("$ETC_ROOT/libreecho/service-profile", source)
+        self.assertIn("$ETC_ROOT/libreecho/feature-policy", source)
+        self.assertIn('"integrations"', source)
+        self.assertIn("integrations & 1", source)
+        self.assertIn("integrations & 16", source)
+        self.assertIn("$DATA_ROOT/libreecho/features/$feature/payload.squashfs", source)
+        self.assertIn("/staging", source)
+        self.assertIn('"$script" start', source)
+        self.assertIn("feature-services-reconcile-failed", source)
+        self.assertIn('return "$failed"', source)
+
+        order = (
+            'persisted_features="wakeword airplay2"',
+            'persisted_features=airplay2',
+            'persisted_features="wakeword stt airplay2 tts assistant"',
+            'persisted_features="stt airplay2 tts assistant"',
+        )
+        positions = [source.index(marker) for marker in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn(
+            "/usr/local/sbin/libreecho-reconcile-features",
+            init_script,
+        )
+        self.assertIn("libreecho-reconcile-features", builder_source)
+        self.assertIn("libreecho-reconcile-features", verifier_source)
+        self.assertIn(
+            'if init_script != read(stage / "libreecho-init"):',
+            builder_source,
+        )
+        self.assertNotIn(
+            'if init_script != read(stage / "init"):',
+            builder_source,
+        )
+
+    def test_post_staging_reconcile_executes_topology_and_failures(self) -> None:
+        helper = TOOLS_DIR / "initramfs/libreecho-reconcile-features"
+        busybox = shutil.which("busybox")
+        if busybox is None:
+            self.skipTest("busybox is required for the reconciliation fixture")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            etc = root / "etc"
+            data = root / "data"
+            run = root / "run"
+            var_run = root / "var-run"
+            init = root / "init.d"
+            states = root / "states"
+            actions = root / "actions"
+            sockets: list[socket.socket] = []
+            for path in (etc / "libreecho", data / "libreecho/config", run / "libreecho", var_run, init, states):
+                path.mkdir(parents=True, exist_ok=True)
+            (etc / "libreecho/service-profile").write_text("production\n")
+            (etc / "libreecho/feature-policy").write_text("community-noncommercial\n")
+            (data / "libreecho/config/web-config.json").write_text('{"integrations":20}\n')
+
+            services = {
+                "waked": ("wakeword", "wakeword.sock"),
+                "sttd": ("stt", "stt.sock"),
+                "airplayd": ("airplay2", "airplay.sock"),
+                "ttsd": ("tts", "tts.sock"),
+                "agentd": ("assistant", "agent.sock"),
+                "wyomingd": (None, None),
+            }
+            proc_lines = []
+            socket_paths = {}
+            for service, (feature, socket_name) in services.items():
+                if feature is not None:
+                    feature_dir = data / "libreecho/features" / feature
+                    feature_dir.mkdir(parents=True)
+                    (feature_dir / "payload.squashfs").write_bytes(b"verified-fixture")
+                socket_path = run / "libreecho" / socket_name if socket_name else None
+                socket_paths[service] = socket_path
+                if socket_path is not None:
+                    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    listener.bind(str(socket_path))
+                    listener.listen(1)
+                    sockets.append(listener)
+                    proc_lines.append(f"00000000: 00000002 00000000 00010000 0001 01 1 {socket_path}\n")
+                pidfile = var_run / f"libreecho-{service}.pid"
+                pidfile.write_text(f"{os.getpid()}\n")
+                stop_targets = f"'{pidfile}'"
+                if socket_path is not None:
+                    stop_targets += f" '{socket_path}'"
+                script = init / f"libreecho-{service}.init"
+                script.write_text(
+                    "#!/bin/sh\nset -eu\n"
+                    '[ -z "${ARGS+x}" ] || exit 9\n'
+                    f"state='{states / service}'\nactions='{actions}'\n"
+                    'case "${1:-}" in\n'
+                    '  start) printf "%s:start\\n" "${0##*/}" >>"$actions"; : >"$state"; '
+                    f"printf '%s\\n' '{os.getpid()}' >'{pidfile}' ;;\n"
+                    '  stop) printf "%s:stop\\n" "${0##*/}" >>"$actions"; rm -f "$state" '
+                    f"{stop_targets} ;;\n"
+                    '  status) test -f "$state" ;;\n'
+                    '  *) exit 2 ;;\nesac\n'
+                )
+                script.chmod(0o755)
+            proc_unix = root / "proc-net-unix"
+            proc_unix.write_text("".join(proc_lines))
+            env = {
+                **os.environ,
+                "BB": busybox,
+                "FEATURE_RECONCILE_ETC_ROOT": str(etc),
+                "FEATURE_RECONCILE_DATA_ROOT": str(data),
+                "FEATURE_RECONCILE_RUN_ROOT": str(run),
+                "FEATURE_RECONCILE_VAR_RUN_ROOT": str(var_run),
+                "FEATURE_RECONCILE_INIT_ROOT": str(init),
+                "FEATURE_RECONCILE_PROC_NET_UNIX": str(proc_unix),
+                "FEATURE_RECONCILE_LOG_FILE": str(root / "reconcile.log"),
+                "FEATURE_RECONCILE_KMSG": "/dev/null",
+                "FEATURE_RECONCILE_CONSOLE": "/dev/null",
+                "FEATURE_RECONCILE_READY_TIMEOUT_SECONDS": "1",
+                "ARGS": "--foreground --document-root /usr/local/share/libreecho/web",
+            }
+
+            subprocess.run(["sh", str(helper)], env=env, check=True)
+            self.assertEqual(
+                actions.read_text().splitlines(),
+                [
+                    "libreecho-wyomingd.init:stop",
+                    "libreecho-waked.init:start", "libreecho-sttd.init:start",
+                    "libreecho-airplayd.init:start", "libreecho-ttsd.init:start",
+                    "libreecho-agentd.init:start",
+                ],
+            )
+
+            actions.write_text("")
+            (data / "libreecho/config/web-config.json").write_text('{"integrations":4}\n')
+            subprocess.run(["sh", str(helper)], env=env, check=True)
+            disabled_actions = actions.read_text().splitlines()
+            self.assertIn("libreecho-airplayd.init:stop", disabled_actions)
+            self.assertNotIn("libreecho-airplayd.init:start", disabled_actions)
+
+            (data / "libreecho/features/assistant/payload.squashfs").unlink()
+            failed = subprocess.run(["sh", str(helper)], env=env, check=False)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn(
+                "feature-reconcile-payload-missing:assistant",
+                (root / "reconcile.log").read_text(),
+            )
+
+            (data / "libreecho/features/assistant/payload.squashfs").write_bytes(
+                b"verified-fixture"
+            )
+            airplay_socket = socket_paths["airplayd"]
+            self.assertIsNotNone(airplay_socket)
+            airplay_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            airplay_listener.bind(str(airplay_socket))
+            airplay_listener.listen(1)
+            sockets.append(airplay_listener)
+            (var_run / "libreecho-airplayd.pid").write_text(f"{os.getpid()}\n")
+            actions.write_text("")
+            (data / "libreecho/config/web-config.json").write_text(
+                '{"integrations":21}\n'
+            )
+            subprocess.run(["sh", str(helper)], env=env, check=True)
+            self.assertEqual(
+                actions.read_text().splitlines(),
+                [
+                    "libreecho-agentd.init:stop",
+                    "libreecho-sttd.init:stop",
+                    "libreecho-ttsd.init:stop",
+                    "libreecho-wyomingd.init:start",
+                    "libreecho-waked.init:start",
+                    "libreecho-airplayd.init:start",
+                ],
+            )
+            (etc / "libreecho/feature-policy").write_text("redistributable\n")
+            unsupported_ha = subprocess.run(["sh", str(helper)], env=env)
+            self.assertNotEqual(unsupported_ha.returncode, 0)
+            self.assertIn(
+                "feature-reconcile-home-assistant-requires-wakeword",
+                (root / "reconcile.log").read_text(),
+            )
+
+            invalid_env = env.copy()
+            invalid_env["FEATURE_RECONCILE_READY_TIMEOUT_SECONDS"] = "0"
+            invalid = subprocess.run(["sh", str(helper)], env=invalid_env)
+            self.assertNotEqual(invalid.returncode, 0)
+
+            ownerless_lock = run / "libreecho/reconcile-features.lock"
+            ownerless_lock.mkdir(parents=True, exist_ok=True)
+            lock_env = env.copy()
+            lock_env["FEATURE_RECONCILE_LOCK_TIMEOUT_SECONDS"] = "1"
+            started = time.monotonic()
+            blocked = subprocess.run(["sh", str(helper)], env=lock_env)
+            self.assertNotEqual(blocked.returncode, 0)
+            self.assertLess(time.monotonic() - started, 3)
+            self.assertTrue(ownerless_lock.is_dir())
+
+            for listener in sockets:
+                listener.close()
+
+    def test_health_and_reconcile_bounds_follow_persisted_topology(self) -> None:
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        helper = (TOOLS_DIR / "initramfs/libreecho-reconcile-features").read_text()
+        self.assertIn("health_airplay_enabled=0", init)
+        self.assertIn(
+            "[ $((health_integrations & 16)) -ne 0 ] && health_airplay_enabled=1",
+            init,
+        )
+        self.assertNotIn("wyomingd /run/libreecho/wyoming.sock", init)
+        self.assertIn("$BB awk -v port=29CC", init)
+        self.assertIn("LOCK_TIMEOUT_MAX_SECONDS=300", helper)
+        self.assertIn("READY_TIMEOUT_MAX_SECONDS=120", helper)
+        self.assertIn("feature-reconcile-invalid-timeout", helper)
+        self.assertIn("feature-reconcile-lock-ownership-lost", helper)
+        self.assertIn("feature-reconcile-lock-owner-missing\n                    return 1", helper)
+        self.assertIn("release_lock || rc=1", helper)
+
+        busybox = shutil.which("busybox")
+        if busybox:
+            with tempfile.TemporaryDirectory() as td:
+                lock = Path(td) / "reconcile.lock"
+                lock.mkdir()
+                (lock / "pid").write_text("999999\n")
+                start = helper.index("release_lock()\n")
+                end = helper.index("\n}\n", start) + 3
+                function = helper[start:end]
+                ownership_lost = subprocess.run(
+                    [
+                        "sh",
+                        "-c",
+                        f"""BB={busybox}
+LOCK={lock}
+LOCK_OWNER_PID=$$
+log() {{ :; }}
+{function}
+release_lock
+""",
+                    ]
+                )
+                self.assertNotEqual(ownership_lost.returncode, 0)
+                self.assertTrue(lock.is_dir())
+
+    def test_ota_health_requires_selected_wyoming_listener(self) -> None:
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertIn("home_assistant_integration_enabled()", init)
+
+        def shell_function(name: str) -> str:
+            start = init.index(f"{name}()\n")
+            end = init.index("\n    }\n", start) + 7
+            return init[start:end]
+
+        with tempfile.TemporaryDirectory() as td:
+            config = Path(td) / "web-config.json"
+            pidfile = Path(td) / "wyomingd.pid"
+            proc_tcp = Path(td) / "tcp"
+            config.write_text('{"integrations":1}\n')
+            pidfile.write_text(f"{os.getpid()}\n")
+            proc_tcp.write_text("")
+            functions = "\n".join(
+                shell_function(name)
+                for name in (
+                    "home_assistant_integration_enabled",
+                    "ota_health_services_ready",
+                )
+            )
+            functions = functions.replace(
+                "/data/libreecho/config/web-config.json", str(config)
+            ).replace(
+                "/var/run/libreecho-wyomingd.pid", str(pidfile)
+            ).replace("/proc/net/tcp", str(proc_tcp))
+            busybox = shutil.which("busybox")
+            if busybox is None:
+                self.skipTest("busybox is required for the OTA health fixture")
+            harness = f"""
+BB={busybox}
+SERVICE_PROFILE=production
+{functions}
+log() {{ :; }}
+startup_ready_marker_valid() {{ return 0; }}
+service_process_ready() {{ return 0; }}
+led_handoff_ready() {{ return 0; }}
+voice_stack_absent() {{ return 0; }}
+ota_health_services_ready
+"""
+            missing = subprocess.run(["sh", "-c", harness])
+            self.assertNotEqual(missing.returncode, 0)
+            proc_tcp.write_text(
+                "  0: 00000000:29CC 00000000:0000 0A 00000000:00000000 "
+                "00:00000000 00000000 0 0 0 1 0000000000000000 100 0 0 10 0\n"
+            )
+            ready = subprocess.run(["sh", "-c", harness])
+            self.assertEqual(ready.returncode, 0)
+
+            airplay_harness = f"""
+BB={busybox}
+SERVICE_PROFILE=production
+{functions}
+log() {{ :; }}
+startup_ready_marker_valid() {{ return 0; }}
+service_process_ready() {{ [ "$1" != airplayd ]; }}
+led_handoff_ready() {{ return 0; }}
+voice_stack_absent() {{ return 0; }}
+ota_health_services_ready
+"""
+            config.write_text('{"integrations":4}\n')
+            disabled = subprocess.run(["sh", "-c", airplay_harness])
+            self.assertEqual(disabled.returncode, 0)
+            config.write_text('{"integrations":20}\n')
+            enabled = subprocess.run(["sh", "-c", airplay_harness])
+            self.assertNotEqual(enabled.returncode, 0)
+            config.write_text('{"integrations":"invalid"}\n')
+            malformed = subprocess.run(["sh", "-c", airplay_harness])
+            self.assertNotEqual(malformed.returncode, 0)
+
+    def test_updater_identity_uses_compact_selected_topology(self) -> None:
+        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
+        start = updater.index("feature_daemon_required()\n")
+        end = updater.index("\n}\n", start) + 3
+        function = updater[start:end]
+        busybox = shutil.which("busybox")
+        if not busybox:
+            self.skipTest("busybox is required for updater shell behavior")
+        with tempfile.TemporaryDirectory() as td:
+            config = Path(td) / "web-config.json"
+            function = function.replace(
+                "/data/libreecho/config/web-config.json", str(config)
+            )
+            harness = f"""
+BB={busybox}
+CURRENT_SERVICE_PROFILE=production
+{function}
+feature_daemon_required tts
+"""
+            config.write_text('{"integrations":1}\n')
+            home_assistant = subprocess.run(["sh", "-c", harness])
+            self.assertNotEqual(home_assistant.returncode, 0)
+            config.write_text('{"integrations":0}\n')
+            local = subprocess.run(["sh", "-c", harness])
+            self.assertEqual(local.returncode, 0)
+
+    def test_feature_staging_requires_verified_service_liveness(self) -> None:
+        stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()
+        for marker in (
+            "feature_service_ready()",
+            'FEATURE_SOCKET=/run/libreecho/airplay.sock',
+            'FEATURE_SOCKET=/run/libreecho/stt.sock',
+            'FEATURE_SOCKET=/run/libreecho/tts.sock',
+            'FEATURE_SOCKET=/run/libreecho/agent.sock',
+            'FEATURE_SERVICE_READY_TIMEOUT_SECONDS=${FEATURE_SERVICE_READY_TIMEOUT_SECONDS:-30}',
+            '"$FEATURE_SERVICE_SCRIPT" status >/dev/null 2>&1',
+            '[ -S "$FEATURE_SOCKET" ]',
+            '$BB awk -v socket="$FEATURE_SOCKET"',
+            "/proc/net/unix >/dev/null 2>&1 || return 1",
+            "feature_service_ready || {",
+        ):
+            self.assertIn(marker, stager)
+
+    def test_feature_staging_removes_completed_staging_marker(self) -> None:
+        stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()
+        move = stager.index('$BB mv "$DEST/staging/payload.squashfs.new" "$DEST/payload.squashfs"')
+        manifest = stager.index('$BB cp "$MANIFEST_FILE" "$DEST/manifest.json"', move)
+        cleanup = stager.index('rmdir "$DEST/staging"', manifest)
+        first_sync = stager.index('$BB sync', manifest)
+        second_sync = stager.index('$BB sync', cleanup)
+        self.assertLess(move, manifest)
+        self.assertLess(manifest, first_sync)
+        self.assertLess(first_sync, cleanup)
+        self.assertLess(cleanup, second_sync)
+        self.assertIn('|| { echo FEATURE_STAGE_STAGING_CLEANUP_FAILED; exit 1; }', stager[cleanup:cleanup + 100])
+
+    def test_post_staging_reboot_starts_persisted_feature_services(self) -> None:
+        init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertIn("start_persisted_feature_services()", init_script)
+        start = init_script.index("start_persisted_feature_services()")
+        body = init_script[start:init_script.index("\n}\n", start) + 3]
+        self.assertIn(
+            "script=/usr/local/sbin/libreecho-reconcile-features", body
+        )
+        self.assertIn('"$script"', body)
+        self.assertIn('return "$rc"', body)
+        self.assertIn(
+            "    start_persisted_feature_services", init_script[init_script.index("start_ui_services()"):]
+        )
+
+    def test_disabled_airplay_staging_skips_liveness_but_enabled_requires_it(self) -> None:
+        stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()
+        self.assertIn("airplay_explicitly_disabled()", stager)
+        start = stager.index("airplay_explicitly_disabled()")
+        body = stager[start:stager.index("\n}\n", start) + 3]
+        self.assertIn('"integrations"', body)
+        self.assertIn("integrations & 16", body)
+        self.assertIn('[ $((integrations & 16)) -eq 0 ]', body)
+        decision = stager[stager.index("start_feature_service_if_enabled()"):]
+        self.assertIn('FEATURE_ID" = airplay2', decision)
+        self.assertIn("airplay_explicitly_disabled", decision)
+        self.assertIn("start_feature_service", decision)
+        self.assertLess(
+            decision.index("airplay_explicitly_disabled"),
+            decision.index("start_feature_service", decision.index("airplay_explicitly_disabled")),
+        )
+
+    def test_first_install_confirmation_requires_startup_ready_and_led_handoff(self) -> None:
+        init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertIn(
+            'STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}',
+            init_script,
+        )
+        self.assertIn("startup_ready_marker_valid()", init_script)
+        self.assertIn("startup-ready-marker-missing", init_script)
+        self.assertIn("led-handoff-not-ready", init_script)
+        self.assertIn("startup_ready_marker_valid || {", init_script)
+        self.assertLess(
+            init_script.index("startup_ready_marker_valid || {"),
+            init_script.index("libreecho-bootctl confirm \"$selected_slot\""),
+        )
+
+    def test_ui_startup_contract_covers_payload_services_and_airplay_default(self) -> None:
+        builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        for script in (
+            "libreecho-airplayd.init",
+            "libreecho-sttd.init",
+            "libreecho-ttsd.init",
+            "libreecho-agentd.init",
+        ):
+            self.assertIn(f'"etc/init.d/{script}"', builder_source)
+        self.assertIn("mount_runtime || return 1", builder_source)
+        self.assertIn("airplay_enabled_at_boot=1", builder_source)
+        self.assertIn("integrations & 16", builder_source)
+        self.assertIn("persistent AirPlay disable", builder_source)
+
+    def test_streaming_voice_services_defer_until_feature_staging(self) -> None:
+        init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        service_line = 'services="logd networkd timed audiod micd ledd buttond btd web"'
         self.assertIn(service_line, init_script)
         self.assertLess(service_line.index("audiod"), service_line.index("buttond"))
         self.assertLess(service_line.index("ledd"), service_line.index("buttond"))
-        self.assertLess(service_line.index("waked"), service_line.index("sttd"))
-        self.assertLess(service_line.index("sttd"), service_line.index("agentd"))
-        self.assertLess(service_line.index("ttsd"), service_line.index("agentd"))
+        self.assertIn("feature-services-deferred-until-staged", init_script)
+        for service in ("airplayd", "sttd", "ttsd", "agentd"):
+            self.assertNotIn(
+                f'services="logd networkd timed audiod micd {service}',
+                init_script,
+            )
 
     def test_hostname_is_derived_from_audited_idme_serial(self) -> None:
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
@@ -1999,8 +2743,10 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("ui-connectivity-services-disabled-for-diagnostic-profile", source)
         self.assertNotIn("USB_DIAGNOSTIC_MODE=1", source)
         self.assertNotIn("--allow-insecure-lan", source)
-        self.assertIn("ui-web-production-loopback-fallback", source)
-        self.assertIn("ui-web-production-authenticated-lan", source)
+        self.assertNotIn("ui-web-production-loopback-fallback", source)
+        self.assertIn("ui-web-production-lan", source)
+        self.assertIn("web_listen=0.0.0.0:8080", source)
+        self.assertNotIn("if [ -r /data/libreecho/config/users ]; then", source)
         self.assertNotIn("libreecho-update-fetch watch", source)
         self.assertIn(
             'if [ "$IMAGE_PROFILE" = ota ] && [ "$SERVICE_PROFILE" = production ]; then',
@@ -2650,6 +3396,67 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(channel.read_text(), "stable\\n")
             self.assertIn("DATA_CLEANUP_OK", result.stdout)
+
+    def _run_cleanup(self, data: Path):
+        return subprocess.run(
+            ["/bin/sh", str(TOOLS_DIR / "initramfs/libreecho-data-cleanup")],
+            env={
+                **os.environ,
+                "LIBREECHO_DATA_TEST_MODE": "1",
+                "DATA_ROOT": str(data),
+            },
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def test_userdata_cleanup_accepts_the_timer_schedule(self) -> None:
+        """timerd's saved schedule, and the temporary it renames over it.
+
+        The temporary is allowlisted too because a crash between write and
+        rename leaves it behind, and an unrecognised file that only appears
+        after a crash is the worst kind to discover on a device.
+        """
+        for name in ("timers", "timers.tmp"):
+            with tempfile.TemporaryDirectory() as temporary:
+                data = Path(temporary) / "data"
+                state = data / "libreecho/config" / name
+                state.parent.mkdir(parents=True)
+                state.write_text("countdown 1767225600 pasta\n")
+                result = self._run_cleanup(data)
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 0, output)
+                self.assertIn("DATA_CLEANUP_OK", output)
+                # Allowlisted, not merely tolerated. A tolerated file is
+                # reported on every boot, and these lines go to stderr, so
+                # checking stdout alone silently asserts nothing.
+                self.assertNotIn("DATA_CLEANUP_TOLERATED", output)
+                self.assertNotIn("DATA_CLEANUP_UNKNOWN", output)
+
+    def test_userdata_cleanup_accepts_the_capture_mux_bypass_flag(self) -> None:
+        """micd's capture-mux bypass flag must not fail the data contract.
+
+        The instruction for using it is "create this file", and mkdir -p is an
+        easy thing to type by mistake. An unrecognised directory under config/
+        is not tolerated the way an unrecognised file is: it fails the
+        contract, which blocks every service on the next boot with no network
+        and no UI. Both shapes have to be accepted here.
+        """
+        for make in (lambda p: p.write_text(""), lambda p: p.mkdir()):
+            with tempfile.TemporaryDirectory() as temporary:
+                data = Path(temporary) / "data"
+                flag = data / "libreecho/config/bypass-capture-mux"
+                flag.parent.mkdir(parents=True)
+                make(flag)
+                result = self._run_cleanup(data)
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 0, output)
+                self.assertIn("DATA_CLEANUP_OK", output)
+                # Allowlisted, not merely tolerated -- a tolerated file is
+                # reported on every boot, and those lines go to stderr, so
+                # checking stdout alone silently asserts nothing.
+                self.assertNotIn("DATA_CLEANUP_TOLERATED", output)
+                self.assertNotIn("DATA_CLEANUP_UNKNOWN", output)
 
     def test_schema2_disabled_record_is_exact(self) -> None:
         record = {

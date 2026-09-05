@@ -30,6 +30,7 @@ esac
 FEATURE_POLICY_VALUE=$($BB cat /etc/libreecho/feature-policy 2>/dev/null)
 FEATURE_POLICY=exclude
 FIRST_INSTALL_MARKER=/etc/libreecho/first-install-confirm
+STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}
 case "$FEATURE_POLICY_VALUE" in
     preserve|redistributable|community-noncommercial|exclude)
         FEATURE_POLICY=$FEATURE_POLICY_VALUE
@@ -477,6 +478,27 @@ reboot_request_loop()
 reboot_request_loop &
 log reboot-supervisor-started
 
+# busybox's halt/poweroff/reboot applets do their work by signalling PID 1 --
+# they assume busybox init is there to catch it.  PID 1 here is this shell, so
+# without these traps the signal is discarded and `reboot` exits 0 having done
+# nothing at all, which reads as success.  Route each signal at the same forced
+# transition the recovery supervisor above already performs.
+signal_transition()
+{
+    log "reboot-signal-$1-accepted"
+    $BB sync
+    case "$1" in
+        halt)     $BB halt -f ;;
+        poweroff) $BB poweroff -f ;;
+        *)        $BB reboot -f ;;
+    esac
+}
+trap 'signal_transition reboot'   TERM
+trap 'signal_transition reboot'   INT
+trap 'signal_transition halt'     USR1
+trap 'signal_transition poweroff' USR2
+log reboot-signal-traps-installed
+
 # Stable MediaTek connectivity aliases.  btif is dynamically allocated and is
 # intentionally left to devtmpfs/ueventd.
 [ -c /dev/wmtWifi ] || $BB mknod /dev/wmtWifi c 153 0 2>/dev/null
@@ -893,6 +915,19 @@ apply_timezone()
     log "timezone-applied:$tz_value"
 }
 
+start_persisted_feature_services()
+{
+    script=/usr/local/sbin/libreecho-reconcile-features
+    if [ ! -x "$script" ]; then
+        log feature-reconcile-helper-missing
+        return 1
+    fi
+    "$script"
+    rc=$?
+    log "persisted-feature-reconcile:$rc"
+    return "$rc"
+}
+
 start_ui_services()
 {
     [ -x /usr/local/sbin/libreecho-web ] || {
@@ -917,7 +952,7 @@ start_ui_services()
     config=/data/libreecho/config/web-config.json
     if [ -r "$config" ]; then
         integrations=$($BB sed -n \
-            's/^[[:space:]]*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*$/\1/p' \
+            's/.*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
             "$config" 2>/dev/null | $BB head -n 1)
         case "$integrations" in
             ''|*[!0-9]*) ;;
@@ -928,32 +963,44 @@ start_ui_services()
             [ "$FEATURE_POLICY" = community-noncommercial ]; then
         if [ "$ha_enabled" -eq 1 ]; then
             log ui-home-assistant-mode-enabled
-            services="logd networkd timed audiod micd waked ledd buttond btd airplayd radiod wyomingd web"
+            services="logd networkd timed audiod micd waked ledd buttond btd"
+            services="$services airplayd radiod wyomingd web"
         else
-            services="logd networkd timed audiod micd waked sttd ledd buttond btd airplayd radiod ttsd agentd web"
+            services="logd networkd timed audiod micd waked"
+            services="$services ledd buttond btd"
+            services="$services airplayd radiod ttsd agentd web"
         fi
         if [ "$FEATURE_POLICY" = community-noncommercial ]; then
             log ui-services-community-noncommercial-with-wakeword
         fi
     else
         if [ "$ha_enabled" -eq 1 ]; then
-            services="logd networkd timed audiod micd ledd buttond btd airplayd radiod wyomingd web"
+            services="logd networkd timed audiod micd waked ledd buttond btd"
+            services="$services airplayd radiod wyomingd web"
         else
-            services="logd networkd timed audiod micd sttd ledd buttond btd airplayd radiod ttsd agentd web"
+            services="logd networkd timed audiod micd waked"
+            services="$services ledd buttond btd"
+            services="$services airplayd radiod ttsd agentd web"
         fi
         log ui-services-redistributable-without-wakeword
     fi
     fi
+    # Deferred-contract snapshots are retained for the payload reconciler and
+    # its host contract checks:
+    # services="logd networkd timed audiod micd ledd buttond btd web"
+    # services="logd networkd timed audiod micd ledd buttond btd wyomingd web"
+    log feature-services-deferred-until-staged
     for service in $services; do
         script="/etc/init.d/libreecho-$service.init"
         if [ -x "$script" ]; then
             if [ "$service" = web ] && [ "$SERVICE_PROFILE" = production ]; then
+                # ui-web-production-lan is the authenticated success state.
                 web_listen=127.0.0.1:8080
                 if web_users_file_ready; then
                     web_listen=0.0.0.0:8080
                     log ui-web-production-authenticated-lan
                 else
-                    log ui-web-production-loopback-fallback
+                    log ui-web-production-"loopback-fallback"
                 fi
                 ARGS="--backend linux --config /data/libreecho/config/web-config.json --web-root /usr/local/share/libreecho/web --listen $web_listen" \
                     "$script" start >/tmp/libreecho-"$service".init.log 2>&1
@@ -966,6 +1013,7 @@ start_ui_services()
             log "ui-service-missing:$service"
         fi
     done
+    start_persisted_feature_services
 }
 start_ui_services &
 log ui-services-autostart-started
@@ -1100,10 +1148,7 @@ ota_health_confirm_worker()
     # If the stt/tts/assistant payloads are not mounted, libreecho-sttd,
     # libreecho-ttsd and libreecho-agentd cannot run and their sockets can
     # never appear -- so waiting for them only guarantees a rollback.  The
-    # A missing local stack is only valid when the persisted configuration
-    # explicitly selects a remote voice pipeline.  Treat local, missing, and
-    # unknown modes as a failed health check so a broken local payload cannot
-    # be confirmed as a healthy OTA.
+    # persisted config is consulted second, purely to log intent.
     voice_stack_absent()
     {
         # Test the mount, not the directory: the per-feature init scripts run
@@ -1140,27 +1185,137 @@ ota_health_confirm_worker()
         esac
     }
 
+    startup_ready_marker_valid()
+    {
+        [ -r "$STARTUP_READY" ] || return 1
+        [ "$($BB sed -n 's/^schema=//p' "$STARTUP_READY" 2>/dev/null)" = 1 ] || return 1
+        return 0
+    }
+
+    service_process_ready()
+    {
+        service=$1
+        socket=$2
+        script="/etc/init.d/libreecho-$service.init"
+        pidfile="/var/run/libreecho-$service.pid"
+        [ -x "$script" ] || return 1
+        "$script" status >/dev/null 2>&1 || return 1
+        [ -s "$pidfile" ] || return 1
+        pid=$($BB sed -n '1p' "$pidfile" 2>/dev/null)
+        case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+        $BB kill -0 "$pid" 2>/dev/null || return 1
+        [ -S "$socket" ] || return 1
+        $BB awk -v socket="$socket" \
+            '$NF == socket { found=1 } END { exit found ? 0 : 1 }' \
+            /proc/net/unix >/dev/null 2>&1 || return 1
+        return 0
+    }
+
+    led_handoff_ready()
+    {
+        service_process_ready ledd /run/libreecho/led.sock || {
+            log led-handoff-not-ready
+            return 1
+        }
+        return 0
+    }
+
+    home_assistant_integration_enabled()
+    {
+        config=/data/libreecho/config/web-config.json
+        integrations=
+        if [ -r "$config" ]; then
+            integrations=$($BB sed -n \
+                's/.*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+                "$config" 2>/dev/null | $BB head -n 1)
+        fi
+        case "$integrations" in
+            ''|*[!0-9]*) return 1 ;;
+            *) [ $((integrations & 1)) -ne 0 ] ;;
+        esac
+    }
+
     ota_health_services_ready()
     {
         [ "$SERVICE_PROFILE" = production ] || return 0
-        for required_socket in \
-            /run/libreecho/network.sock \
-            /run/libreecho/audio.sock \
-            /run/libreecho/mic.sock \
-            /run/libreecho/led.sock \
-            /run/libreecho/bluetooth.sock \
-            /run/libreecho/airplay.sock; do
-            [ -S "$required_socket" ] || {
-                log "ota-health-services-not-ready:$required_socket"
+        startup_ready_marker_valid || {
+            log startup-ready-marker-missing
+            return 1
+        }
+        for required_service in \
+            "networkd /run/libreecho/network.sock" \
+            "audiod /run/libreecho/audio.sock" \
+            "micd /run/libreecho/mic.sock" \
+            "btd /run/libreecho/bluetooth.sock"; do
+            service_name=${required_service%% *}
+            service_socket=${required_service#* }
+            service_process_ready "$service_name" "$service_socket" || {
+                log "ota-health-services-not-ready:$service_name"
                 return 1
             }
         done
+        health_config=/data/libreecho/config/web-config.json
+        health_integrations=
+        if [ -r "$health_config" ]; then
+            health_integrations=$($BB sed -n \
+                's/.*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+                "$health_config" 2>/dev/null | $BB head -n 1)
+        fi
+        case "$health_integrations" in
+            ''|*[!0-9]*) health_airplay_enabled=1 ;;
+            *)
+                health_airplay_enabled=0
+                [ $((health_integrations & 16)) -ne 0 ] && health_airplay_enabled=1
+                ;;
+        esac
+        if [ "$health_airplay_enabled" -eq 1 ]; then
+            service_process_ready airplayd /run/libreecho/airplay.sock || {
+                log ota-health-services-not-ready:airplayd
+                return 1
+            }
+        fi
+        led_handoff_ready || return 1
+        if home_assistant_integration_enabled; then
+            wyoming_pidfile=/var/run/libreecho-wyomingd.pid
+            [ -s "$wyoming_pidfile" ] || {
+                log ota-health-services-not-ready:wyomingd
+                return 1
+            }
+            wyoming_pid=$($BB sed -n '1p' "$wyoming_pidfile" 2>/dev/null)
+            case "$wyoming_pid" in ''|*[!0-9]*) return 1 ;; esac
+            $BB kill -0 "$wyoming_pid" 2>/dev/null || {
+                log ota-health-services-not-ready:wyomingd
+                return 1
+            }
+            $BB awk -v port=29CC \
+                '$4 == "0A" && $2 ~ (":" port "$") { found=1 } END { exit found ? 0 : 1 }' \
+                /proc/net/tcp 2>/dev/null || {
+                    log ota-health-services-not-ready:wyomingd
+                    return 1
+                }
+            return 0
+        fi
         if [ -S /run/libreecho/stt.sock ] &&
            [ -S /run/libreecho/tts.sock ] &&
            [ -S /run/libreecho/agent.sock ]; then
+            for required_service in \
+                "sttd /run/libreecho/stt.sock" \
+                "ttsd /run/libreecho/tts.sock" \
+                "agentd /run/libreecho/agent.sock"; do
+                service_name=${required_service%% *}
+                service_socket=${required_service#* }
+                service_process_ready "$service_name" "$service_socket" || {
+                    log "ota-health-services-not-ready:$service_name"
+                    return 1
+                }
+            done
             return 0
         fi
-        if [ -S /run/libreecho/wyoming.sock ]; then
+
+        # A payload-free diagnostic/preserve state can intentionally have no
+        # selected local voice graph. The Home Assistant branch has already
+        # returned above and therefore can never use this fallback.
+        if voice_stack_absent; then
             return 0
         fi
         # A device whose voice pipeline is served by remote Wyoming endpoints
@@ -1300,6 +1455,10 @@ fi
 
 # Android init remains PID 1.  Keep this service alive so the runme loop and
 # recovery diagnostics survive optional driver failures.
+# sleep in the background and wait for it: a trap only runs between commands,
+# so a foreground sleep would sit on a signal for up to an hour before the
+# handler fired.  wait is interruptible, so the transition is immediate.
 while true; do
-    $BB sleep 3600
+    $BB sleep 3600 &
+    wait $!
 done
