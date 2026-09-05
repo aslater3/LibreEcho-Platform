@@ -19,6 +19,16 @@ VALID_DTS = r'''
     #address-cells = <1>;
     #size-cells = <1>;
 
+    action_key {
+        compatible = "gpio-keys";
+        action@36 {
+            label = "Action Key";
+            linux,code = <0x8a>;
+            gpios = <&pio 36 1>;
+            debounce-interval = <20>;
+        };
+    };
+
     codec_mclk: puffin-codec-mclk {
         compatible = "fixed-clock";
         #clock-cells = <0>;
@@ -67,7 +77,20 @@ VALID_DTS = r'''
             mclk: mclk {};
         };
 
-        pmic: pmic@1000d000 { compatible = "mediatek,mt6323"; reg = <0x1000d000 0x1000>; };
+        pwrap@1000d000 {
+            compatible = "mediatek,mt8163-pwrap";
+            reg = <0x1000d000 0x1000>;
+            pmic: mt6323 {
+                compatible = "mediatek,mt6323";
+                mt6323keys {
+                    compatible = "mediatek,mt6323-keys";
+                    power {
+                        linux,keycodes = <0x71>;
+                        wakeup-source;
+                    };
+                };
+            };
+        };
         audiosys: audiosys@11220000 {
             compatible = "mediatek,mt8163-audiosys", "syscon";
             reg = <0x11220000 0x1000>;
@@ -222,6 +245,13 @@ class RadarPuffinDtbTests(unittest.TestCase):
     def test_rejects_wrong_external_amp_pin(self) -> None:
         dtb = self.compile_dts(VALID_DTS.replace('pinmux = <0x7a00>', 'pinmux = <0x1c00>'))
         with self.assertRaisesRegex(verifier.ContractError, "external amp"):
+            verifier.verify_dtb(dtb)
+
+    def test_rejects_wrong_action_gpio(self) -> None:
+        dtb = self.compile_dts(
+            VALID_DTS.replace("gpios = <&pio 36 1>;", "gpios = <&pio 9 1>;")
+        )
+        with self.assertRaisesRegex(verifier.ContractError, "GPIO36/KPCOL0"):
             verifier.verify_dtb(dtb)
 
 

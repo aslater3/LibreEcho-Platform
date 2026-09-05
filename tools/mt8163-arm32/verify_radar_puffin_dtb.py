@@ -23,6 +23,13 @@ SCPSYS = "/soc/scpsys@10006000"
 PINCTRL = "/soc/pinctrl@10005000"
 AFE = "/soc/mt_soc_dl1_pcm@11220000"
 AUDIOSYS = "/soc/audiosys@11220000"
+PMIC_KEYS = "/soc/pwrap@1000d000/mt6323/mt6323keys"
+PMIC_MUTE_KEY = PMIC_KEYS + "/power"
+ACTION_KEY = "/action_key"
+ACTION_BUTTON = ACTION_KEY + "/action@36"
+ACTION_GPIO = 36
+ACTION_KEYCODE = 0x8A
+MUTE_KEYCODE = 0x71
 AUDIO_24M_ID = 3
 AUDIO_POWER_DOMAIN_ID = 5
 CODEC_MCLK_HZ = 9_600_000
@@ -280,6 +287,24 @@ def verify_dtb(dtb: Path) -> None:
     if "mc" not in _strings(dtb, usb, "interrupt-names"):
         raise ContractError("USB node is missing the MUSB mc interrupt")
     _require_enabled_compatible(dtb, "issi,is31fl3236", "LED ring")
+
+    if _strings(dtb, PMIC_KEYS, "compatible") != ("mediatek,mt6323-keys",):
+        raise ContractError("PMIC key controller is missing")
+    if _cells(dtb, PMIC_MUTE_KEY, "linux,keycodes") != (MUTE_KEYCODE,):
+        raise ContractError("PMIC key is not declared as KEY_MUTE")
+    if "wakeup-source" not in _properties(dtb, PMIC_MUTE_KEY):
+        raise ContractError("PMIC mute key must remain a wakeup source")
+    if _strings(dtb, ACTION_KEY, "compatible") != ("gpio-keys",):
+        raise ContractError("action key controller is missing")
+    if " ".join(_strings(dtb, ACTION_BUTTON, "label")) != "Action Key":
+        raise ContractError("action key label changed")
+    if _cells(dtb, ACTION_BUTTON, "linux,code") != (ACTION_KEYCODE,):
+        raise ContractError("action key is not declared as KEY_HELP")
+    gpio_cells = _cells(dtb, ACTION_BUTTON, "gpios")
+    if gpio_cells != (_phandle(dtb, PINCTRL), ACTION_GPIO, 1):
+        raise ContractError("action key is not bound to PIO GPIO36/KPCOL0")
+    if _cells(dtb, ACTION_BUTTON, "debounce-interval") != (20,):
+        raise ContractError("action key debounce changed")
 
 
 def main() -> int:
