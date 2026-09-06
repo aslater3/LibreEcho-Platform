@@ -2,7 +2,9 @@
 # Signed A/B updater for the Amonet Biscuit layout.
 
 BB=/bin/busybox
-UPDATE_ROOT=/data/libreecho/update
+DATA_ROOT=/data
+FEATURE_ROOT=$DATA_ROOT/libreecho/features
+UPDATE_ROOT=$DATA_ROOT/libreecho/update
 INCOMING=$UPDATE_ROOT/incoming
 STAGING=$UPDATE_ROOT/staging
 STATE=$UPDATE_ROOT/state
@@ -23,12 +25,40 @@ BOOT_SECTORS=32768
 # Set once an install has begun writing progress to $STATE, so die() knows the
 # status file is mid-transaction and must not be left there.
 STATE_DIRTY=0
+ACTIVATION_STARTED=0
+ABORT_ATTEMPTED=0
 CURRENT_SERVICE_PROFILE=
 IDENTITY_SOURCE=
+FEATURE_TRANSACTION=/usr/local/sbin/libreecho-feature-transaction
+USERDATA_DEVICE=/dev/mmcblk0p16
+USERDATA_SYS=/sys/class/block/mmcblk0p16
+MOUNTS_FILE=/proc/mounts
+EXPDB_DEVICE=/dev/mmcblk0p7
+EXPDB_SYS=/sys/class/block/mmcblk0p7
+BOOT_DEVICE_ROOT=/dev
+BOOT_SYS_ROOT=/sys/class/block
+TRANSACTION_SLOT_FILE=$UPDATE_ROOT/transaction-slot
+TRANSACTION_BCB_FILE=$STAGING/bootctl.readback
+FEATURE_DIR=
+OTA_FORMAT=v1
+
+abort_v2_before_activation()
+{
+    [ "$OTA_FORMAT" = v2 ] || return 0
+    [ "$ACTIVATION_STARTED" -eq 0 ] || return 0
+    [ "$ABORT_ATTEMPTED" -eq 0 ] || return 0
+    [ -r "$UPDATE_ROOT/feature-commit" ] || [ -r "$UPDATE_ROOT/pending" ] || return 0
+    ABORT_ATTEMPTED=1
+    [ -x "$FEATURE_TRANSACTION" ] || return 0
+    $BB mkdir -p "$STAGING" 2>/dev/null || return 0
+    "$BOOTCTL" status > "$TRANSACTION_BCB_FILE" 2>/dev/null || return 0
+    "$FEATURE_TRANSACTION" abort-before-activation >/dev/null 2>&1 || true
+}
 
 die()
 {
     echo "ERROR:$1" >&2
+    abort_v2_before_activation
     # An aborted install used to leave $STATE at whatever step it reached
     # (typically "verifying" / 5), which makes the update subsystem report a
     # transfer in progress forever and blocks the next attempt. Record the
@@ -49,14 +79,14 @@ die()
 
 require_userdata()
 {
-    [ -b /dev/mmcblk0p16 ] &&
+    [ -b "$USERDATA_DEVICE" ] &&
         $BB grep -qx 'PARTNAME=userdata' \
-            /sys/class/block/mmcblk0p16/uevent 2>/dev/null &&
-        [ "$($BB cat /sys/class/block/mmcblk0p16/size 2>/dev/null)" = 2137088 ] &&
-        $BB grep -q ' /data ' /proc/mounts 2>/dev/null ||
+            "$USERDATA_SYS/uevent" 2>/dev/null &&
+        [ "$($BB cat "$USERDATA_SYS/size" 2>/dev/null)" = 2137088 ] &&
+        $BB grep -q " $DATA_ROOT " "$MOUNTS_FILE" 2>/dev/null ||
         die userdata_identity_or_mount_failed
     $BB mkdir -p "$INCOMING" "$UPDATE_ROOT" || die update_directory_failed
-    $BB chmod 0700 /data/libreecho "$UPDATE_ROOT" "$INCOMING" 2>/dev/null
+    $BB chmod 0700 "$DATA_ROOT/libreecho" "$UPDATE_ROOT" "$INCOMING" 2>/dev/null
 }
 
 channel_value()
@@ -90,17 +120,18 @@ target_device_for_slot()
     slot_name=$1
     case "$slot_name" in
         a)
-            target_device=/dev/mmcblk0p10
-            target_sys=/sys/class/block/mmcblk0p10
+            target_device=$BOOT_DEVICE_ROOT/mmcblk0p10
+            target_sys=$BOOT_SYS_ROOT/mmcblk0p10
             target_partname=boot_a_x
             ;;
         b)
-            target_device=/dev/mmcblk0p11
-            target_sys=/sys/class/block/mmcblk0p11
+            target_device=$BOOT_DEVICE_ROOT/mmcblk0p11
+            target_sys=$BOOT_SYS_ROOT/mmcblk0p11
             target_partname=boot_b_x
             ;;
         *) die boot_control_target ;;
     esac
+
     [ -b "$target_device" ] &&
         $BB grep -qx "PARTNAME=$target_partname" "$target_sys/uevent" 2>/dev/null &&
         [ "$($BB cat "$target_sys/size" 2>/dev/null)" = "$BOOT_SECTORS" ] ||
@@ -165,8 +196,200 @@ current_service_profile()
     esac
 }
 
+valid_v2_hash()
+{
+    value=$1
+    [ "${#value}" -eq 64 ] || return 1
+    case "$value" in *[!0-9a-f]*|'') return 1;; esac
+}
+
+valid_v2_uint()
+{
+    value=$1
+    case "$value" in 0|[1-9]|[1-9][0-9]*) ;; *) return 1;; esac
+    [ "$value" -ge 0 ] 2>/dev/null
+}
+
+valid_v2_token()
+{
+    value=$1
+    [ -n "$value" ] && [ "${#value}" -le 96 ] || return 1
+    case "$value" in
+        [A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._+~:-]*) ;;
+        *) return 1;;
+    esac
+}
+
+valid_v2_commit()
+{
+    value=$1
+    [ "${#value}" -eq 40 ] || return 1
+    case "$value" in *[!0-9a-f]*|'') return 1;; esac
+}
+
+valid_v2_asset()
+{
+    value=$1
+    [ -n "$value" ] && [ "${#value}" -le 128 ] || return 1
+    case "$value" in [A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._+:-]*) ;; *) return 1;; esac
+    case "$value" in *[!A-Za-z0-9._+:-]*|*/*|*\\*) return 1;; esac
+}
+
+v2_key_allowed()
+{
+    case "$1" in
+        format|manifest_version|board|soc|architecture|image_profile|transaction_type|transaction_id|version|update_channel|service_profile|feature_policy|minimum_updater_schema|feature_asset_base|commit_policy|feature_ids|boot_filename|boot_size|boot_sha256) return 0;;
+        feature_airplay2_action|feature_airplay2_activation|feature_airplay2_base_payload_sha256|feature_airplay2_base_manifest_sha256|feature_airplay2_daemon_path|feature_airplay2_daemon_sha256|feature_airplay2_release|feature_airplay2_source_commit|feature_airplay2_asset|feature_airplay2_size|feature_airplay2_sha256|feature_airplay2_manifest_asset|feature_airplay2_manifest_size|feature_airplay2_manifest_sha256) return 0;;
+        feature_tts_action|feature_tts_activation|feature_tts_base_payload_sha256|feature_tts_base_manifest_sha256|feature_tts_daemon_path|feature_tts_daemon_sha256|feature_tts_release|feature_tts_source_commit|feature_tts_asset|feature_tts_size|feature_tts_sha256|feature_tts_manifest_asset|feature_tts_manifest_size|feature_tts_manifest_sha256) return 0;;
+        feature_wakeword_action|feature_wakeword_activation|feature_wakeword_base_payload_sha256|feature_wakeword_base_manifest_sha256|feature_wakeword_daemon_path|feature_wakeword_daemon_sha256|feature_wakeword_release|feature_wakeword_source_commit|feature_wakeword_asset|feature_wakeword_size|feature_wakeword_sha256|feature_wakeword_manifest_asset|feature_wakeword_manifest_size|feature_wakeword_manifest_sha256) return 0;;
+        feature_stt_action|feature_stt_activation|feature_stt_base_payload_sha256|feature_stt_base_manifest_sha256|feature_stt_daemon_path|feature_stt_daemon_sha256|feature_stt_release|feature_stt_source_commit|feature_stt_asset|feature_stt_size|feature_stt_sha256|feature_stt_manifest_asset|feature_stt_manifest_size|feature_stt_manifest_sha256) return 0;;
+        feature_assistant_action|feature_assistant_activation|feature_assistant_base_payload_sha256|feature_assistant_base_manifest_sha256|feature_assistant_daemon_path|feature_assistant_daemon_sha256|feature_assistant_release|feature_assistant_source_commit|feature_assistant_asset|feature_assistant_size|feature_assistant_sha256|feature_assistant_manifest_asset|feature_assistant_manifest_size|feature_assistant_manifest_sha256) return 0;;
+        *) return 1;;
+    esac
+}
+
+v2_required_top()
+{
+    for key in format manifest_version board soc architecture image_profile transaction_type transaction_id version update_channel service_profile feature_policy minimum_updater_schema feature_asset_base commit_policy feature_ids boot_filename boot_size boot_sha256; do
+        case " $seen " in *" $key "*) ;; *) die v2_manifest_missing_field;; esac
+    done
+}
+
+verify_v2_manifest()
+{
+    seen=
+    while IFS='=' read -r key value; do
+        [ -n "$key" ] && [ -n "$value" ] || die v2_manifest_syntax
+        case "$key" in *[!a-z0-9_]*|'') die v2_manifest_key;; esac
+        case "$value" in *=*|*[!A-Za-z0-9._+~,:/-]*) die v2_manifest_value;; esac
+        v2_key_allowed "$key" || die v2_manifest_unknown_field
+        case " $seen " in *" $key "*) die v2_manifest_duplicate_field;; esac
+        seen="$seen $key"
+    done < "$STAGING/manifest"
+    v2_required_top
+    [ "$(manifest_value format)" = libreecho-ota-v2 ] || die v2_manifest_format
+    OTA_FORMAT=v2
+    [ "$(manifest_value transaction_type)" = system ] || die v2_transaction_type
+    [ "$(manifest_value manifest_version)" = 1 ] || die v2_manifest_version
+    [ "$(manifest_value board)" = radar_puffin ] || die v2_board
+    [ "$(manifest_value soc)" = mt8163 ] || die v2_soc
+    [ "$(manifest_value architecture)" = armv7 ] || die v2_architecture
+    [ "$(manifest_value image_profile)" = ota ] || die v2_image_profile
+    [ "$(manifest_value minimum_updater_schema)" = 2 ] || die v2_updater_schema
+    [ "$(manifest_value feature_asset_base)" = github-release-channel ] || die v2_asset_base
+    [ "$(manifest_value commit_policy)" = after-slot-confirm ] || die v2_commit_policy
+    valid_v2_token "$(manifest_value transaction_id)" || die v2_transaction_id
+    valid_v2_token "$(manifest_value version)" || die v2_version
+    valid_v2_token "$(manifest_value update_channel)" || die v2_update_channel
+    valid_v2_token "$(manifest_value service_profile)" || die v2_service_profile
+    valid_v2_token "$(manifest_value feature_policy)" || die v2_feature_policy
+    valid_v2_token "$(manifest_value feature_asset_base)" || die v2_asset_base
+    valid_v2_token "$(manifest_value commit_policy)" || die v2_commit_policy
+    [ "$(manifest_value boot_filename)" = boot.img ] || die v2_boot_required
+    [ "$(manifest_value boot_size)" = "$BOOT_SIZE" ] || die v2_boot_size
+    valid_v2_hash "$(manifest_value boot_sha256)" || die v2_boot_hash
+    ids=$(manifest_value feature_ids)
+    case "$ids" in ''|*[!a-z0-9_,]*) die v2_feature_ids;; esac
+    [ "$ids" = "airplay2,tts,wakeword,stt,assistant" ] || die v2_feature_set
+    previous=0
+    expected_keys='format manifest_version board soc architecture image_profile transaction_type transaction_id version update_channel service_profile feature_policy minimum_updater_schema feature_asset_base commit_policy boot_filename boot_size boot_sha256 feature_ids'
+    for feature in $(printf '%s' "$ids" | $BB tr ',' ' '); do
+        case "$feature" in airplay2) current=1;; tts) current=2;; wakeword) current=3;; stt) current=4;; assistant) current=5;; *) die v2_feature_id;; esac
+        [ "$current" -gt "$previous" ] || die v2_feature_order
+        previous=$current
+        expected_keys="$expected_keys feature_${feature}_action feature_${feature}_activation feature_${feature}_base_payload_sha256 feature_${feature}_base_manifest_sha256 feature_${feature}_daemon_path feature_${feature}_daemon_sha256 feature_${feature}_release feature_${feature}_source_commit"
+        action=$(manifest_value "feature_${feature}_action")
+        [ "$(manifest_value "feature_${feature}_activation")" = reboot ] || die v2_activation
+        valid_v2_hash "$(manifest_value "feature_${feature}_base_payload_sha256")" || die v2_preserve_identity
+        valid_v2_hash "$(manifest_value "feature_${feature}_base_manifest_sha256")" || die v2_preserve_identity
+        valid_v2_hash "$(manifest_value "feature_${feature}_daemon_sha256")" || die v2_daemon_hash
+        valid_v2_token "$(manifest_value "feature_${feature}_release")" || die v2_release
+        valid_v2_commit "$(manifest_value "feature_${feature}_source_commit")" || die v2_source_commit
+        case "$feature:$(manifest_value "feature_${feature}_daemon_path")" in
+            airplay2:usr/local/sbin/libreecho-audio-engine|tts:usr/local/sbin/libreecho-ttsd|wakeword:usr/local/sbin/libreecho-waked|stt:usr/local/sbin/libreecho-sttd|assistant:usr/local/sbin/libreecho-agentd) ;;
+            *) die v2_daemon_path;;
+        esac
+        case "$action" in
+            preserve)
+                for field in asset size sha256 manifest_asset manifest_size manifest_sha256; do
+                    [ -z "$(manifest_value "feature_${feature}_${field}")" ] || die v2_preserve_extra_field
+                done
+                ;;
+            runtime|replace)
+                asset=$(manifest_value "feature_${feature}_asset"); manifest_asset=$(manifest_value "feature_${feature}_manifest_asset")
+                valid_v2_asset "$asset" || die v2_asset_name
+                valid_v2_asset "$manifest_asset" || die v2_manifest_asset_name
+                for field in size manifest_size; do
+                    value=$(manifest_value "feature_${feature}_${field}"); valid_v2_uint "$value" || die v2_asset_field
+                done
+                valid_v2_hash "$(manifest_value "feature_${feature}_sha256")" || die v2_asset_field
+                valid_v2_hash "$(manifest_value "feature_${feature}_manifest_sha256")" || die v2_asset_field
+                prefix=libreecho-radar-puffin-$(manifest_value "feature_${feature}_release")-$feature
+                case "$action:$asset:$manifest_asset" in
+                    runtime:"$prefix.runtime.squashfs":"$prefix.runtime-manifest.json"|replace:"$prefix.payload.squashfs":"$prefix.manifest.json") ;;
+                    *) die v2_asset_identity;;
+                esac
+                expected_keys="$expected_keys feature_${feature}_asset feature_${feature}_size feature_${feature}_sha256 feature_${feature}_manifest_asset feature_${feature}_manifest_size feature_${feature}_manifest_sha256"
+                ;;
+            # remove/hot actions are intentionally not in the approved schema.
+            *) die v2_action_rejected;;
+        esac
+    done
+    actual_keys=$($BB sed 's/=.*//' "$STAGING/manifest" | $BB tr '\n' ' ')
+    [ "$actual_keys" = "$expected_keys " ] || die v2_manifest_noncanonical
+    version=$(manifest_value version)
+    FEATURE_POLICY=$(manifest_value feature_policy)
+    case "$FEATURE_POLICY" in preserve|redistributable|community-noncommercial|exclude) ;; *) die v2_feature_policy;; esac
+    SERVICE_PROFILE=$(manifest_value service_profile)
+    case "$SERVICE_PROFILE" in diagnostic|production) ;; *) die v2_service_profile;; esac
+    case "$FEATURE_POLICY:$SERVICE_PROFILE" in
+        preserve:diagnostic|preserve:production|exclude:diagnostic|redistributable:production|community-noncommercial:production) ;;
+        *) die v2_feature_policy_profile ;;
+    esac
+    UPDATE_CHANNEL=$(manifest_value update_channel)
+    case "$UPDATE_CHANNEL" in dev|stable) ;; *) die v2_update_channel;; esac
+    boot_sha=$(manifest_value boot_sha256)
+    return 0
+}
+
+stage_v2_assets()
+{
+    [ "$OTA_FORMAT" = v2 ] || return 0
+    [ -n "$FEATURE_DIR" ] || return 0
+    $BB mkdir -p "$STAGING/features" || die feature_staging_create
+    for feature in $(manifest_value feature_ids | $BB tr ',' ' '); do
+        action=$(manifest_value "feature_${feature}_action")
+        case "$action" in runtime|replace)
+            asset=$(manifest_value "feature_${feature}_asset"); manifest_asset=$(manifest_value "feature_${feature}_manifest_asset")
+            source_dir=$FEATURE_DIR/$feature
+            [ "$source_dir" != "$STAGING/features/$feature" ] && $BB mkdir -p "$STAGING/features/$feature"
+            for name in "$asset" "$manifest_asset"; do
+                source=$source_dir/$name; target_path=$STAGING/features/$feature/$name
+                [ "$source" = "$target_path" ] || { [ -f "$source" ] && [ ! -L "$source" ] || die feature_asset_missing; $BB mv "$source" "$target_path" || die feature_asset_stage; }
+                [ -f "$target_path" ] && [ ! -L "$target_path" ] || die feature_asset_type
+                if [ "$name" = "$asset" ]; then
+                    expected_size=$(manifest_value "feature_${feature}_size")
+                    expected_hash=$(manifest_value "feature_${feature}_sha256")
+                    [ "$(stat -c %s "$target_path" 2>/dev/null)" = "$expected_size" ] || die feature_asset_size
+                    [ "$(sha256sum "$target_path" 2>/dev/null | $BB awk '{print $1}')" = "$expected_hash" ] || die feature_asset_hash
+                else
+                    expected_size=$(manifest_value "feature_${feature}_manifest_size")
+                    expected_hash=$(manifest_value "feature_${feature}_manifest_sha256")
+                    [ "$(stat -c %s "$target_path" 2>/dev/null)" = "$expected_size" ] || die feature_manifest_size
+                    [ "$(sha256sum "$target_path" 2>/dev/null | $BB awk '{print $1}')" = "$expected_hash" ] || die feature_manifest_hash
+                fi
+            done
+            ;;
+        esac
+    done
+}
+
 verify_manifest()
 {
+    if [ "$(manifest_value format)" = libreecho-ota-v2 ]; then
+        verify_v2_manifest
+        return 0
+    fi
     required_keys='format manifest_version board soc architecture version boot_filename boot_size boot_sha256 feature_policy image_profile service_profile update_channel'
     allowed_keys="$required_keys feature_airplay2_payload_sha256 feature_airplay2_payload_size feature_airplay2_manifest_sha256 feature_airplay2_daemon_sha256 feature_tts_payload_sha256 feature_tts_payload_size feature_tts_manifest_sha256 feature_tts_daemon_sha256 feature_wakeword_payload_sha256 feature_wakeword_payload_size feature_wakeword_manifest_sha256 feature_wakeword_daemon_sha256 feature_stt_payload_sha256 feature_stt_payload_size feature_stt_manifest_sha256 feature_stt_daemon_sha256 feature_assistant_payload_sha256 feature_assistant_payload_size feature_assistant_manifest_sha256 feature_assistant_daemon_sha256"
     seen=
@@ -265,7 +488,9 @@ extract_and_verify()
 manifest.sig
 boot.img" ] || die package_member_contract
 
-    $BB rm -rf "$STAGING"
+    $BB rm -f "$STAGING/manifest" "$STAGING/manifest.sig" "$STAGING/boot.img" \
+        "$STAGING/boot-write.log" "$STAGING/bootctl.status" "$STAGING/bootctl.activate" \
+        "$TRANSACTION_BCB_FILE" 2>/dev/null
     $BB mkdir -p "$STAGING" || die staging_create_failed
     $BB tar -xf "$package" -C "$STAGING" manifest manifest.sig boot.img \
         2>/dev/null || die package_extract_failed
@@ -292,6 +517,17 @@ boot.img" ] || die package_member_contract
     [ "$header" = 414e44524f494421 ] || die boot_android_magic
     actual=$($BB sha256sum "$STAGING/boot.img" | $BB awk '{print $1}')
     [ "$actual" = "$boot_sha" ] || die boot_package_hash
+}
+
+reject_unsigned_v2_package()
+{
+    [ "$ALLOW_UNSIGNED" = 1 ] || return 0
+    package=$1
+    [ -f "$package" ] && [ ! -L "$package" ] || die package_not_regular
+    format=$($BB tar -xOf "$package" manifest 2>/dev/null |
+        $BB sed -n 's/^format=//p' | $BB head -n 1)
+    [ "$format" = libreecho-ota-v2 ] || return 0
+    die unsigned_v2_rejected
 }
 
 bootctl_status()
@@ -325,6 +561,28 @@ feature_file_sha256()
     printf '%s\n' "$digest"
 }
 
+transaction_status()
+{
+    transaction_state=none
+    [ -r "$PENDING" ] && transaction_state=pending
+    [ -r "$UPDATE_ROOT/feature-commit" ] && transaction_state=commit
+    [ -r "$UPDATE_ROOT/rolled-back" ] && transaction_state=rollback
+    echo "ota_transaction_state=$transaction_state"
+    [ "$transaction_state" = pending ] && echo ota_transaction_pending=1
+    [ "$transaction_state" = commit ] && echo ota_transaction_commit=1
+    [ "$transaction_state" = rollback ] && echo ota_transaction_rollback=1
+    if [ -r "$UPDATE_ROOT/feature-commit" ] && [ -r "$STAGING/manifest" ]; then
+        for feature in airplay2 tts wakeword stt assistant; do
+            candidate=$(sed -n "s/^feature_${feature}_new_payload_sha256=//p" "$UPDATE_ROOT/feature-commit" 2>/dev/null)
+            candidate_manifest=$(sed -n "s/^feature_${feature}_new_manifest_sha256=//p" "$UPDATE_ROOT/feature-commit" 2>/dev/null)
+            expected_daemon=$(manifest_value "feature_${feature}_daemon_sha256" 2>/dev/null)
+            [ -n "$candidate" ] && echo "feature_${feature}_candidate_payload_sha256=$candidate"
+            [ -n "$candidate_manifest" ] && echo "feature_${feature}_candidate_manifest_sha256=$candidate_manifest"
+            [ -n "$expected_daemon" ] && echo "feature_${feature}_candidate_daemon_sha256=$expected_daemon"
+        done
+    fi
+}
+
 feature_status()
 {
     for feature in airplay2 tts wakeword stt assistant; do
@@ -335,7 +593,7 @@ feature_status()
             stt) daemon=libreecho-sttd ;;
             assistant) daemon=libreecho-agentd ;;
         esac
-        feature_root=/data/libreecho/features/$feature
+        feature_root=$FEATURE_ROOT/$feature
         payload=$feature_root/payload.squashfs
         manifest=$feature_root/manifest.json
         payload_sha=$(feature_file_sha256 "$payload")
@@ -415,7 +673,7 @@ verify_preserved_feature_identity()
             stt) daemon=libreecho-sttd ;;
             assistant) daemon=libreecho-agentd ;;
         esac
-        feature_root=/data/libreecho/features/$feature
+        feature_root=$FEATURE_ROOT/$feature
         payload=$feature_root/payload.squashfs
         manifest=$feature_root/manifest.json
         expected_payload=$(preserved_identity_value "feature_${feature}_payload_sha256")
@@ -447,8 +705,8 @@ verify_preserved_feature_identity()
 
 clear_exact_development_marker()
 {
-    expdb=/dev/mmcblk0p7
-    expdb_sys=/sys/class/block/mmcblk0p7
+    expdb=$EXPDB_DEVICE
+    expdb_sys=$EXPDB_SYS
     [ -b "$expdb" ] &&
         $BB grep -qx 'PARTNAME=expdb' "$expdb_sys/uevent" 2>/dev/null &&
         [ "$($BB cat "$expdb_sys/size" 2>/dev/null)" = 20480 ] ||
@@ -480,7 +738,16 @@ install_package()
     extract_and_verify "$package"
     state_write verified 20 "$version"
     bootctl_status
-    if [ "$FEATURE_POLICY" = preserve ]; then
+    if [ "$OTA_FORMAT" = v2 ]; then
+        stage_v2_assets
+        [ -x "$FEATURE_TRANSACTION" ] || die feature_transaction_missing
+        printf '%s\n' "$target" > "$TRANSACTION_SLOT_FILE.tmp" || die transaction_slot_write
+        $BB mv "$TRANSACTION_SLOT_FILE.tmp" "$TRANSACTION_SLOT_FILE" || die transaction_slot_commit
+        "$FEATURE_TRANSACTION" preflight "$STAGING/manifest" prewrite ||
+            die feature_preflight
+        "$FEATURE_TRANSACTION" prepare-boot ||
+            die feature_prepare
+    elif [ "$FEATURE_POLICY" = preserve ]; then
         verify_preserved_feature_identity manifest
     fi
 
@@ -492,24 +759,27 @@ install_package()
         $BB sha256sum | $BB awk '{print $1}')
     [ "$written" = "$boot_sha" ] || die boot_write_hash
 
-    {
-        echo schema=1
-        echo "version=$version"
-        echo "slot=$target"
-        echo "boot_sha256=$boot_sha"
-        echo "update_channel=$UPDATE_CHANNEL"
-        echo "feature_policy=$FEATURE_POLICY"
-        if [ "$FEATURE_POLICY" = preserve ]; then
-            write_preserved_feature_identity
-        fi
-    } > "$PENDING.tmp" || die pending_write
-    $BB mv "$PENDING.tmp" "$PENDING" || die pending_commit
-    $BB sync
+    if [ "$OTA_FORMAT" != v2 ]; then
+        {
+            echo schema=1
+            echo "version=$version"
+            echo "slot=$target"
+            echo "boot_sha256=$boot_sha"
+            echo "update_channel=$UPDATE_CHANNEL"
+            echo "feature_policy=$FEATURE_POLICY"
+            if [ "$FEATURE_POLICY" = preserve ]; then
+                write_preserved_feature_identity
+            fi
+        } > "$PENDING.tmp" || die pending_write
+        $BB mv "$PENDING.tmp" "$PENDING" || die pending_commit
+        $BB sync
+    fi
 
     # Old development images leave this marker armed. Clear only its exact
     # prefix before the BCB commit; OTA-profile kernels do not recreate it.
     clear_exact_development_marker
     state_write activating 90 "$target"
+    ACTIVATION_STARTED=1
     "$BOOTCTL" activate "$target" > "$STAGING/bootctl.activate" ||
         die boot_control_activate
     state_write reboot-pending 100 "$target"
@@ -521,6 +791,27 @@ confirm_pending()
     require_userdata
     lock_take
     [ -r "$PENDING" ] || die no_pending_update
+    pending_schema=$($BB sed -n 's/^schema=//p' "$PENDING")
+    if [ "$pending_schema" = 2 ]; then
+        slot=$($BB sed -n 's/^slot=//p' "$PENDING")
+        version=$($BB sed -n 's/^version=//p' "$PENDING")
+        expected=$($BB sed -n 's/^boot_sha256=//p' "$PENDING")
+        target_device_for_slot "$slot"
+        actual=$($BB dd if="$target_device" bs=4096 count=4096 2>/dev/null | $BB sha256sum | $BB awk '{print $1}')
+        [ "$actual" = "$expected" ] || die pending_boot_hash
+        "$BOOTCTL" status > "$TRANSACTION_BCB_FILE" || die boot_control_running_readback
+        "$FEATURE_TRANSACTION" verify-running || die feature_runtime_not_ready
+        BOOT_CONFIRM="$BOOTCTL"
+        "$BOOT_CONFIRM" confirm "$slot" > "$UPDATE_ROOT/bootctl.confirm" || die boot_control_confirm
+        "$BOOTCTL" status > "$TRANSACTION_BCB_FILE" || die boot_control_readback
+        confirmed=$($BB sed -n 's/^selected_slot=//p' "$TRANSACTION_BCB_FILE")
+        confirmed_ok=$($BB sed -n "s/^slot_${slot}_success=//p" "$TRANSACTION_BCB_FILE")
+        [ "$confirmed" = "$slot" ] && [ "$confirmed_ok" = 1 ] || die boot_control_readback_ambiguous
+        "$FEATURE_TRANSACTION" commit-after-confirm || die feature_commit_pending
+        state_write installed 100 "$version"
+        echo "UPDATE_CONFIRMED slot=$slot version=$version"
+        return 0
+    fi
     slot=$($BB sed -n 's/^slot=//p' "$PENDING")
     version=$($BB sed -n 's/^version=//p' "$PENDING")
     expected=$($BB sed -n 's/^boot_sha256=//p' "$PENDING")
@@ -585,13 +876,20 @@ case "${1:-}" in
         # reset during OTA triage.
         [ ! -r "$UPDATE_ROOT/restart-record" ] ||
             { echo restart_record=1; $BB cat "$UPDATE_ROOT/restart-record"; }
+        transaction_status
         feature_status
         ;;
     install)
         shift
         if [ "${1:-}" = "--allow-unsigned" ]; then ALLOW_UNSIGNED=1; shift; fi
-        [ "$#" -eq 1 ] || die usage
-        install_package "$1"
+        [ "$#" -ge 1 ] || die usage
+        package=$1; shift
+        reject_unsigned_v2_package "$package"
+        while [ "$#" -gt 0 ]; do
+            [ "$1" = "--feature-dir" ] && [ "$#" -eq 2 ] || die usage
+            FEATURE_DIR=$2; shift 2
+        done
+        install_package "$package"
         ;;
     inspect)
         [ "$#" -eq 2 ] || die usage
@@ -608,6 +906,8 @@ case "${1:-}" in
         # daemon reads as "unsupported" -- a safe default.
         [ "$#" -eq 1 ] || die usage
         echo allow-unsigned
+        echo feature-transaction-v2
+        echo runtime-capsules
         ;;
     *)
         echo "Usage: libreecho-update status | inspect PACKAGE.tar | install [--allow-unsigned] PACKAGE.tar | confirm | capabilities" >&2

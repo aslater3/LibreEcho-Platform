@@ -156,8 +156,30 @@ remove_children() {
         remove_path "$child"
     done
 }
-remove_children "$DATA_ROOT/libreecho/update/incoming"
-remove_children "$DATA_ROOT/libreecho/update/staging"
+# A reboot-bound v2 transaction owns its referenced staging until either the
+# old slot is selected or the confirmed slot has completed its journal.  Older
+# images must recognize the marker and not delete candidate artifacts blindly.
+PRESERVE_V2_TRANSACTION=0
+PRESERVE_AMBIGUOUS_TRANSACTION=0
+for marker in "$DATA_ROOT/libreecho/update/pending" "$DATA_ROOT/libreecho/update/feature-commit"; do
+    [ ! -e "$marker" ] && [ ! -L "$marker" ] && continue
+    if [ -L "$marker" ] || [ ! -f "$marker" ]; then
+        PRESERVE_AMBIGUOUS_TRANSACTION=1
+        continue
+    fi
+    schema=$(sed -n 's/^schema=//p' "$marker" 2>/dev/null | head -n 1)
+    case "$schema" in
+        2) PRESERVE_V2_TRANSACTION=1 ;;
+        1) ;;
+        *) PRESERVE_AMBIGUOUS_TRANSACTION=1 ;;
+    esac
+done
+if [ "$PRESERVE_V2_TRANSACTION" -eq 0 ] && [ "$PRESERVE_AMBIGUOUS_TRANSACTION" -eq 0 ]; then
+    remove_children "$DATA_ROOT/libreecho/update/incoming"
+    remove_children "$DATA_ROOT/libreecho/update/staging"
+else
+    printf '%s\n' DATA_CLEANUP_V2_TRANSACTION_PRESERVED
+fi
 
 unknown=0
 unknown_item() {
@@ -233,7 +255,7 @@ check_children "$DATA_ROOT/libreecho/secrets" openai-codex.json
 TOLERATE_UNKNOWN_FILES=1
 check_children "$DATA_ROOT/libreecho/update" \
     channel incoming staging state pending installed rolled-back check-status \
-    automatic-updates install.lock bootctl.confirm restart-record first-install.pending \
+    automatic-updates install.lock bootctl.confirm bootctl.confirmed feature-commit committed-manifest committed-manifest.sig restart-record first-install.pending \
     first-install.confirmed
 TOLERATE_UNKNOWN_FILES=0
 
@@ -246,7 +268,7 @@ if [ -d "$DATA_ROOT/libreecho/features" ]; then
         case "$feature" in
             ''|*[!a-z0-9._-]*) unknown_item "$feature_dir"; continue ;;
         esac
-        check_children "$feature_dir" payload.squashfs manifest.json
+        check_children "$feature_dir" payload.squashfs manifest.json runtime.squashfs runtime-manifest.json
     done
 fi
 

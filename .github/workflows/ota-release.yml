@@ -38,7 +38,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y device-tree-compiler
+          sudo apt-get install --no-install-recommends -y device-tree-compiler espeak-ng-data squashfs-tools
           python -m pip install --disable-pip-version-check PyNaCl==1.5.0
 
       - name: Run maintained Platform suites
@@ -46,12 +46,14 @@ jobs:
         run: |
           set -euo pipefail
           python tools/mt8163-arm32/airplay/test_audio_period_buffer.py
+          python -m unittest -q tools/mt8163-arm32/feature_runtime/test_runtime_package.py
           cd tools/mt8163-arm32
           python -m unittest -q \
             test_build_wifi_dtb.py \
             test_verify_radar_puffin_dtb.py \
             test_recovery_image_tools.py \
-            test_source_offer_tools.py
+            test_source_offer_tools.py \
+            ota/test_ota_v2_implementation.py
 
       - name: Validate tracked Python and shell source
         shell: bash
@@ -62,9 +64,15 @@ jobs:
           python -m py_compile \
             tools/mt8163-arm32/build_recovery_image.py \
             tools/mt8163-arm32/verify_recovery_image.py \
-            tools/mt8163-arm32/ota/make_ota_bundle.py
+            tools/mt8163-arm32/ota/make_ota_bundle.py \
+            tools/mt8163-arm32/ota/feature_manifest.py \
+            tools/mt8163-arm32/feature_runtime/package_runtime.py \
+            tools/mt8163-arm32/feature_runtime/verify_runtime.py
           while IFS= read -r -d '' script; do
             bash -n "$script"
           done < <(git ls-files -z 'tools/mt8163-arm32/*.sh' 'tools/mt8163-arm32/**/*.sh')
           bash tools/mt8163-arm32/tts/test_package_feature_contract.sh
+          /bin/busybox sh -n tools/mt8163-arm32/initramfs/libreecho-feature-transaction
+          /bin/busybox sh -n tools/mt8163-arm32/initramfs/libreecho-update
+          /bin/busybox sh -n tools/mt8163-arm32/initramfs/libreecho-update-fetch
           git diff --check

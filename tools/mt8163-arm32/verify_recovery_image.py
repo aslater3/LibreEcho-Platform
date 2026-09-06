@@ -53,7 +53,7 @@ WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-INIT_SHA256 = "fdf851a563b291ab0440b196e46a06905c2beaa1494dadd4f4a0b8eb95042e5a"
+INIT_SHA256 = "7b60bf7f442e3f1af31e175eb3d983303b5ce20b0e506a41419ac2bda386f3a9"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -67,6 +67,7 @@ OVERLAY_FILES = {
     "vendor-assets/mt8163-v181-stock-v1.tsv": 0o644,
     "libreecho-update": 0o755,
     "libreecho-update-fetch": 0o755,
+    "libreecho-feature-transaction": 0o755,
     "ota-source.conf": 0o644,
     "regulatory.db": 0o644,
     "regulatory.db.p7s": 0o644,
@@ -81,6 +82,7 @@ OVERLAY_TARGETS = {
     ),
     "libreecho-update": "usr/local/sbin/libreecho-update",
     "libreecho-update-fetch": "usr/local/sbin/libreecho-update-fetch",
+    "libreecho-feature-transaction": "usr/local/sbin/libreecho-feature-transaction",
     "ota-source.conf": "etc/libreecho/ota-source.conf",
     "regulatory.db": "lib/firmware/regulatory.db",
     "regulatory.db.p7s": "lib/firmware/regulatory.db.p7s",

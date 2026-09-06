@@ -2938,7 +2938,13 @@ feature_daemon_required tts
             ("assistant", "libreecho-agentd"),
         ):
             self.assertIn(f"{feature}) daemon={daemon}", updater)
-        self.assertIn("feature_root=/data/libreecho/features/$feature", updater)
+        # The shipped updater keeps the production data root immutable and
+        # derives the feature path only from that local constant.  The host
+        # fixture rewrites this literal in its generated copy; production does
+        # not accept a caller-selected feature root.
+        self.assertIn("DATA_ROOT=/data", updater)
+        self.assertIn("FEATURE_ROOT=$DATA_ROOT/libreecho/features", updater)
+        self.assertIn("feature_root=$FEATURE_ROOT/$feature", updater)
         self.assertIn("payload=$feature_root/payload.squashfs", updater)
         self.assertIn("manifest=$feature_root/manifest.json", updater)
         for field in (
@@ -3305,7 +3311,11 @@ feature_daemon_required tts
         self.assertIn("cleanup_locks\n    trap - EXIT", fetcher)
         self.assertIn("record_channel()", fetcher)
         self.assertIn("record_channel \"$ROOT/installed\"", fetcher)
-        self.assertIn("install_lock\n    seed_channel\n    validate_source\n    install_unlock", fetcher)
+        self.assertIn(
+            "install_lock\n    seed_channel\n    validate_source\n"
+            "    prepare_https_client\n    install_unlock",
+            fetcher,
+        )
         automatic = fetcher[fetcher.index("set_automatic_updates()"):fetcher.index("die()")]
         self.assertIn("fetch_lock\n    install_lock", automatic)
 
