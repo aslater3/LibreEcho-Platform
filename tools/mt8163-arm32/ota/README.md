@@ -111,12 +111,74 @@ The expected identities are also copied into the persistent `pending`
 transaction at `UPDATE_READY`; confirmation rereads those values and repeats
 the checks immediately before `bootctl confirm`, so a feature staging operation
 between reboot boundaries cannot silently produce a hybrid. A mismatch leaves
-the slot unconfirmed and therefore rollback-eligible. This does not refresh
+A mismatch leaves the slot unconfirmed and therefore rollback-eligible. This does not refresh
 payloads or models; it prevents a candidate from being installed or confirmed
 when preserve would leave a different runtime behind.
 
-Manual browser upload streams the tar to `/data/libreecho/update/incoming` and
-invokes the target installer. OTA-profile images also check the stable public
+### v2 pre-confirm runtime acceptance
+
+Before `libreecho-update confirm` calls `libreecho-bootctl confirm`, the
+Platform transaction verifier requires all of the following from the running
+system, not from signed URL or manifest metadata alone:
+
+- `/proc/cmdline` slot suffix, the selected BCB slot, and the pending/journal
+  slot agree; the target may still have `slot_<target>_success=0`;
+- the running slot's complete 16 MiB redirected boot image hashes to the
+  signature-bound pending, journal, and staged manifest `boot_sha256`;
+- staged payload and feature-manifest files, canonical base payload/manifest
+  files, their sizes, and the signed manifest's daemon path/hash identities
+  match the durable transaction;
+- `replace` mounts the staged payload, while `runtime` mounts the canonical
+  base, staged capsule, and exact daemon bind target from `/proc/self/mountinfo`;
+- the selected service/profile/feature-policy graph supplies each required
+  feature's pidfile, live `/proc/<pid>/exe` hash, Unix socket, and
+  `/proc/net/unix` registration. Excluded wakeword is not required; and
+- every failed probe returns before BCB confirmation, leaving canonical feature
+  files untouched and the slot unconfirmed.
+
+`libreecho-update status` preserves the existing effective fields
+`feature_<id>_payload_sha256`, `feature_<id>_payload_size`,
+`feature_<id>_manifest_sha256`, `feature_<id>_running_daemon_sha256`, and
+`feature_<id>_effective`. During a v2 transaction it additionally emits
+`ota_transaction_state=pending|commit|rollback|none`, the corresponding
+`ota_transaction_<state>=1` marker, and (while the commit journal remains)
+`feature_<id>_candidate_payload_sha256`,
+`feature_<id>_candidate_manifest_sha256`, and
+`feature_<id>_candidate_daemon_sha256`.
+
+The UI/API currently has no fields for the pre-confirm evidence itself. The
+missing fields are: `candidate_boot_sha256`, `candidate_manifest_sha256`,
+`candidate_manifest_sig_sha256`, `candidate_mount_state`,
+`candidate_service_probe_state`, `candidate_probe_failure`, and per-feature
+`candidate_payload_sha256`, `candidate_manifest_sha256`,
+`candidate_daemon_sha256`, `candidate_mount_source`, `candidate_socket`, and
+`candidate_exe_sha256`. This Platform slice does not change Product/UI.
+
+The Platform v2 transaction gate uses target filesystem accounting rather than a
+logical byte sum. It reads the filesystem block size and each existing file's
+allocated blocks with the target `stat` implementation, and reads available
+blocks from `df -Pk`; every future file and policy value is rounded up to that
+filesystem block size. The download phase accounts for the control tar,
+extracted control members, existing final/partial downloads, and the configured
+metadata/evidence/journal/rename policy. The pre-write phase additionally
+reserves a rounded destination copy for every changed payload/manifest and a
+copy of each existing rollback file. A staged source is counted as already
+allocated and is never charged again. No cleanup operation is used to satisfy
+the gate, and a failed gate precedes boot or BCB writes.
+
+The conservative build policy is configurable through
+`LIBREECHO_TRANSACTION_RESERVE_BYTES` (default 262144),
+`LIBREECHO_TRANSACTION_METADATA_BYTES` (32768),
+`LIBREECHO_TRANSACTION_RETAINED_EVIDENCE_BYTES` (65536),
+`LIBREECHO_TRANSACTION_JOURNAL_BYTES` (32768), and
+`LIBREECHO_TRANSACTION_RENAME_BYTES` (16384). The transaction emits
+`phase`, `filesystem_block_bytes`, `required_blocks`, `required_bytes`,
+`available_bytes`, `reserve_bytes`, and `already_allocated_bytes` on stdout and
+in `/data/libreecho/update/free-space`. These defaults are conservative policy
+values, not MT8163 measurements; target-mounted validation must replace or
+confirm them before production release qualification.
+
+Manual browser upload streams the tar to `/data/libreecho/update/incoming` and invokes the target installer. OTA-profile images also check the stable public
 GitHub Release asset in `aslater3/LibreEcho`, configured in
 `/etc/libreecho/ota-source.conf`. The
 fetcher mounts the root-owned assistant feature payload read-only, verifies it

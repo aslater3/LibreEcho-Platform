@@ -21,7 +21,14 @@ ASSISTANT_MANIFEST=/data/libreecho/features/assistant/manifest.json
 CLIENT_ROOT=/run/libreecho/ota-client
 MAX_BYTES=33554432
 CURL_STDERR=/run/libreecho/ota-curl.stderr
+CURL_HEADERS=/run/libreecho/ota-curl.headers
 CURL_DIAGNOSTIC_MAX=160
+FEATURE_STAGE=$ROOT/staging/features
+FEATURE_TRANSACTION=/usr/local/sbin/libreecho-feature-transaction
+DATA_ROOT=/data
+PROC_ROOT=/proc
+RUN_ROOT=/run
+FEATURE_ROOT=$DATA_ROOT/libreecho/features
 
 sanitize_status_value()
 {
@@ -117,7 +124,7 @@ set_automatic_updates()
     $BB mkdir -p "$ROOT" || die update_directory_failed
     fetch_lock
     install_lock
-    $BB chmod 0700 /data/libreecho "$ROOT" 2>/dev/null
+    $BB chmod 0700 "$DATA_ROOT/libreecho" "$ROOT" 2>/dev/null
     channel=$(channel_value)
     [ "$channel" = dev ] || [ "$channel" = stable ] ||
         channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
@@ -151,9 +158,9 @@ require_environment()
 {
     [ "$($BB cat "$PROFILE" 2>/dev/null)" = ota ] || die ota_profile_required
     [ -x "$UPDATE" ] || die installer_missing
-    $BB grep -q ' /data ' /proc/mounts 2>/dev/null || die userdata_not_mounted
-    $BB mkdir -p "$INCOMING" /run/libreecho || die update_directory_failed
-    $BB chmod 0700 /data/libreecho "$ROOT" "$INCOMING" 2>/dev/null
+    $BB grep -q " $DATA_ROOT " "$PROC_ROOT/mounts" 2>/dev/null || die userdata_not_mounted
+    $BB mkdir -p "$INCOMING" "$RUN_ROOT/libreecho" || die update_directory_failed
+    $BB chmod 0700 "$DATA_ROOT/libreecho" "$ROOT" "$INCOMING" 2>/dev/null
 }
 
 channel_value()
@@ -202,7 +209,7 @@ set_channel()
     channel=${1:-}
     [ "$channel" = dev ] || [ "$channel" = stable ] || die source_channel
     [ "$($BB cat "$PROFILE" 2>/dev/null)" = ota ] || die ota_profile_required
-    $BB grep -q ' /data ' /proc/mounts 2>/dev/null || die userdata_not_mounted
+    $BB grep -q " $DATA_ROOT " "$PROC_ROOT/mounts" 2>/dev/null || die userdata_not_mounted
     $BB mkdir -p "$ROOT" || die update_directory_failed
     fetch_lock
     install_lock
@@ -297,7 +304,7 @@ prepare_https_client()
     [ "$actual_sha" = "$expected_sha" ] || die https_payload_hash
 
     $BB mkdir -p "$CLIENT_ROOT" || die https_mount_directory
-    if ! $BB grep -q " $CLIENT_ROOT " /proc/mounts 2>/dev/null; then
+    if ! $BB grep -q " $CLIENT_ROOT " "$PROC_ROOT/mounts" 2>/dev/null; then
         $BB mount -t squashfs -o loop,ro,nosuid,nodev,noatime \
             "$ASSISTANT_PAYLOAD" "$CLIENT_ROOT" || die https_payload_mount
     fi
@@ -318,9 +325,244 @@ record_channel()
 
 FETCH_LOCK_HELD=0
 INSTALL_LOCK_HELD=0
+TEMP_MANIFEST=
+TEMP_TRANSFER_PID=
+TEMP_READER_PID=
+MAX_STALE_MANIFESTS=32
+MAX_MANIFEST_ENTRIES=64
+MAX_MANIFEST_BYTES=4096
+
+owned_temp_basename()
+{
+    name=$1
+    case "$name" in
+        .control-fresh.*.capture) artifact_owner=${name#.control-fresh.}; artifact_owner=${artifact_owner%.capture} ;;
+        .control-fresh.*.fifo) artifact_owner=${name#.control-fresh.}; artifact_owner=${artifact_owner%.fifo} ;;
+        .control-fresh.*) artifact_owner=${name#.control-fresh.} ;;
+        .control-resume.*.capture) artifact_owner=${name#.control-resume.}; artifact_owner=${artifact_owner%.capture} ;;
+        .control-resume.*.fifo) artifact_owner=${name#.control-resume.}; artifact_owner=${artifact_owner%.fifo} ;;
+        .control-resume.*) artifact_owner=${name#.control-resume.} ;;
+        .control-range-probe.*.capture) artifact_owner=${name#.control-range-probe.}; artifact_owner=${artifact_owner%.capture} ;;
+        .control-range-probe.*.fifo) artifact_owner=${name#.control-range-probe.}; artifact_owner=${artifact_owner%.fifo} ;;
+        .control-range-probe.*) artifact_owner=${name#.control-range-probe.} ;;
+        *) return 1 ;;
+    esac
+    case "$artifact_owner" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    case "$name" in
+        ".control-fresh.$artifact_owner"|".control-fresh.$artifact_owner.capture"|".control-fresh.$artifact_owner.fifo"|".control-resume.$artifact_owner"|".control-resume.$artifact_owner.capture"|".control-resume.$artifact_owner.fifo"|".control-range-probe.$artifact_owner"|".control-range-probe.$artifact_owner.capture"|".control-range-probe.$artifact_owner.fifo")
+            OWNED_ARTIFACT_OWNER=$artifact_owner
+            return 0
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+owned_manifest_owner()
+{
+    manifest=$1
+    name=${manifest##*/}
+    case "$name" in
+        .control-owned.*) ;;
+        *) return 1 ;;
+    esac
+    owner=${name#.control-owned.}
+    case "$owner" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$manifest" = "$ROOT/$name" ] || return 1
+    printf '%s\n' "$owner"
+}
+
+owned_temp_path()
+{
+    path=$1
+    case "$path" in
+        "$CURL_HEADERS"|"$CURL_STDERR") return 0 ;;
+        "$ROOT"/*)
+            name=${path##*/}
+            [ "$path" = "$ROOT/$name" ] || return 1
+            owned_temp_basename "$name"
+            return $?
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+path_parent_has_symlink()
+{
+    path=$1
+    case "$path" in
+        /*) ;;
+        *) return 0 ;;
+    esac
+    current=/
+    rest=${path#/}
+    while [ -n "$rest" ]; do
+        component=${rest%%/*}
+        if [ "$rest" = "$component" ]; then
+            rest=
+        else
+            rest=${rest#*/}
+        fi
+        [ -n "$component" ] || continue
+        next=$current$component
+        [ "$next" = "$path" ] && break
+        [ -L "$next" ] && return 0
+        current=$next/
+    done
+    return 1
+}
+
+remove_temp_artifact()
+{
+    path=$1
+    [ -n "$path" ] || return 0
+    [ -L "$path" ] && return 0
+    path_parent_has_symlink "$path" && return 0
+    [ -f "$path" ] || [ -p "$path" ] || return 0
+    $BB rm -f "$path"
+}
+
+manifest_entry_path()
+{
+    path=$1
+    owner=$2
+    case "$path" in
+        pid:*)
+            pid=${path#pid:}
+            case "$pid" in ''|*[!0-9]*) return 1;; esac
+            return 0
+            ;;
+        "$CURL_HEADERS"|"$CURL_STDERR")
+            printf '%s\n' "$path"
+            return 0
+            ;;
+        "$ROOT"/*)
+            name=${path##*/}
+            [ "$path" = "$ROOT/$name" ] || return 1
+            owned_temp_basename "$name" || return 1
+            [ "$OWNED_ARTIFACT_OWNER" = "$owner" ] || return 1
+            printf '%s\n' "$ROOT/$name"
+            return 0
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+validate_owned_manifest()
+{
+    manifest=$1
+    owner=$2
+    size=$($BB stat -c %s "$manifest" 2>/dev/null)
+    case "$size" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$size" -le "$MAX_MANIFEST_BYTES" ] || return 1
+    entries=0
+    while IFS= read -r path || [ -n "$path" ]; do
+        entries=$((entries + 1))
+        [ "$entries" -le "$MAX_MANIFEST_ENTRIES" ] || return 1
+        manifest_entry_path "$path" "$owner" >/dev/null || return 1
+    done < "$manifest" || return 1
+    return 0
+}
+
+register_temp_artifact()
+{
+    path=$1
+    owned_temp_path "$path" || return 1
+    [ -n "$TEMP_MANIFEST" ] || return 0
+    printf '%s\n' "$path" >> "$TEMP_MANIFEST"
+}
+
+register_temp_pid()
+{
+    pid=$1
+    case "$pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ -n "$TEMP_MANIFEST" ] || return 0
+    printf 'pid:%s\n' "$pid" >> "$TEMP_MANIFEST"
+}
+
+reap_owned_child()
+{
+    pid=$1
+    case "$pid" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    if $BB kill -0 "$pid" 2>/dev/null; then
+        $BB kill "$pid" 2>/dev/null
+    fi
+    wait "$pid" 2>/dev/null
+}
+
+stop_owned_child()
+{
+    pid=$1
+    case "$pid" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    if $BB kill -0 "$pid" 2>/dev/null; then
+        $BB kill "$pid" 2>/dev/null
+    fi
+}
+
+cleanup_download_artifacts()
+{
+    reap_owned_child "$TEMP_TRANSFER_PID"
+    reap_owned_child "$TEMP_READER_PID"
+    TEMP_TRANSFER_PID=
+    TEMP_READER_PID=
+    if [ -n "$TEMP_MANIFEST" ] && [ -f "$TEMP_MANIFEST" ] && [ ! -L "$TEMP_MANIFEST" ]; then
+        owner=$(owned_manifest_owner "$TEMP_MANIFEST")
+        if [ -n "$owner" ] && validate_owned_manifest "$TEMP_MANIFEST" "$owner"; then
+            while IFS= read -r path || [ -n "$path" ]; do
+                case "$path" in
+                    pid:*) stop_owned_child "${path#pid:}" ;;
+                    *) canonical=$(manifest_entry_path "$path" "$owner") && remove_temp_artifact "$canonical" ;;
+                esac
+            done < "$TEMP_MANIFEST"
+            $BB rm -f "$TEMP_MANIFEST"
+        fi
+    fi
+}
+
+recover_stale_download_artifacts()
+{
+    recovered=0
+    for manifest in "$ROOT"/.control-owned.*; do
+        [ "$recovered" -lt "$MAX_STALE_MANIFESTS" ] || break
+        [ -f "$manifest" ] && [ ! -L "$manifest" ] || continue
+        owner=$(owned_manifest_owner "$manifest") || continue
+        validate_owned_manifest "$manifest" "$owner" || continue
+        while IFS= read -r path || [ -n "$path" ]; do
+            case "$path" in
+                pid:*) stop_owned_child "${path#pid:}" ;;
+                *) canonical=$(manifest_entry_path "$path" "$owner") && remove_temp_artifact "$canonical" ;;
+            esac
+        done < "$manifest"
+        $BB rm -f "$manifest"
+        recovered=$((recovered + 1))
+    done
+}
+
+download_signal()
+{
+    signal_name=$1
+    cleanup_download_artifacts
+    case "$signal_name" in
+        INT) exit 130 ;;
+        TERM) exit 143 ;;
+        *) exit 1 ;;
+    esac
+}
 
 cleanup_locks()
 {
+    cleanup_download_artifacts
     [ "$FETCH_LOCK_HELD" -eq 1 ] && $BB rmdir "$LOCK" 2>/dev/null
     [ "$INSTALL_LOCK_HELD" -eq 1 ] && $BB rmdir "$INSTALL_LOCK" 2>/dev/null
 }
@@ -329,7 +571,16 @@ fetch_lock()
 {
     $BB mkdir "$LOCK" 2>/dev/null || die download_busy
     FETCH_LOCK_HELD=1
+    recover_stale_download_artifacts
+    TEMP_MANIFEST=$ROOT/.control-owned.$$
+    if [ -e "$TEMP_MANIFEST" ] || [ -L "$TEMP_MANIFEST" ]; then
+        die download_temp_state
+    fi
+    : > "$TEMP_MANIFEST" || die download_temp_state
+    $BB chmod 0600 "$TEMP_MANIFEST" || die download_temp_state
     trap cleanup_locks EXIT
+    trap 'download_signal INT' INT
+    trap 'download_signal TERM' TERM
 }
 
 install_lock()
@@ -356,19 +607,199 @@ downloader_stderr()
     sanitize_status_value "$detail"
 }
 
-download_and_inspect()
+STREAM_CURL_RC=1
+STREAM_SIZE=0
+STREAM_TRUNCATED=0
+RESPONSE_HTTP_CODE=
+RESPONSE_RANGE_KIND=
+RESPONSE_RANGE_START=
+RESPONSE_RANGE_END=
+RESPONSE_RANGE_TOTAL=
+RESPONSE_CONTENT_LENGTH=
+
+bounded_curl()
+{
+    output=$1
+    headers=$2
+    limit=$3
+    deadline=$4
+    shift 4
+    trap cleanup_download_artifacts EXIT
+    trap 'download_signal INT' INT
+    trap 'download_signal TERM' TERM
+    fifo=$output.fifo
+    capture=$output.capture
+    register_temp_artifact "$output" || return 70
+    register_temp_artifact "$fifo" || return 70
+    register_temp_artifact "$capture" || return 70
+    register_temp_artifact "$headers" || return 70
+    register_temp_artifact "$CURL_STDERR" || return 70
+    $BB rm -f "$output" "$fifo" "$capture" "$headers"
+    $BB mkfifo "$fifo" || return 70
+    "$CURL" --fail --location --silent --show-error \
+        --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --cacert "$CA" --connect-timeout 20 --max-time "$deadline" \
+        --max-filesize "$MAX_BYTES" --dump-header "$headers" \
+        --stderr "$CURL_STDERR" --output "$fifo" "$@" &
+    transfer_pid=$!
+    TEMP_TRANSFER_PID=$transfer_pid
+    register_temp_pid "$transfer_pid" || { reap_owned_child "$transfer_pid"; return 70; }
+    $BB head -c "$limit" "$fifo" > "$capture" &
+    reader_pid=$!
+    TEMP_READER_PID=$reader_pid
+    register_temp_pid "$reader_pid" || { reap_owned_child "$reader_pid"; return 70; }
+    wait "$transfer_pid"
+    STREAM_CURL_RC=$?
+    TEMP_TRANSFER_PID=
+    if $BB kill -0 "$reader_pid" 2>/dev/null; then $BB kill "$reader_pid" 2>/dev/null; fi
+    wait "$reader_pid" 2>/dev/null
+    reader_rc=$?
+    TEMP_READER_PID=
+    $BB rm -f "$fifo"
+    [ "$reader_rc" -eq 0 ] || { $BB rm -f "$capture"; return "$reader_rc"; }
+    $BB mv "$capture" "$output" || return 23
+    STREAM_SIZE=$($BB stat -c %s "$output" 2>/dev/null)
+    case "$STREAM_SIZE" in ''|*[!0-9]*) return 23;; esac
+    [ "$STREAM_SIZE" -ge "$limit" ] && STREAM_TRUNCATED=1 || STREAM_TRUNCATED=0
+    return 0
+}
+
+parse_response_headers()
+{
+    parsed=$($BB tr -d '\r' < "$1" 2>/dev/null | $BB awk '
+        function reset() {
+            status=""; invalid=0; range=""; content=""; range_count=0; content_count=0
+        }
+        { if (substr($1, 1, 5) == "HTTP/") { reset(); status=$2; next } }
+        /^[Cc]ontent-[Rr]ange:/ {
+            value=$0; sub(/^[^:]*:[[:space:]]*/, "", value)
+            range_count++
+            if (range_count > 1 && value != range) invalid=1
+            range=value
+            next
+        }
+        /^[Cc]ontent-[Ll]ength:/ {
+            value=$0; sub(/^[^:]*:[[:space:]]*/, "", value)
+            content_count++
+            if (content_count > 1 && value != content) invalid=1
+            content=value
+            next
+        }
+        END {
+            if (status !~ /^[0-9][0-9][0-9]$/) exit 1
+            if (range_count > 0 && range !~ "^bytes [0-9]+-[0-9]+/[0-9]+$" && index(range, "bytes */") != 1) invalid=1
+            if (content_count > 0 && content !~ /^[0-9]+$/) invalid=1
+            if (invalid) exit 1
+            kind="none"; start=""; end=""; total=""
+            if (range ~ "^bytes [0-9]+-[0-9]+/[0-9]+$") {
+                kind="partial"; value=range
+                sub(/^bytes /, "", value); split(value, pair, "/")
+                split(pair[1], bounds, "-"); start=bounds[1]; end=bounds[2]; total=pair[2]
+            } else if (index(range, "bytes */") == 1 && range ~ "^bytes [^/]+/[0-9]+$") {
+                kind="unsatisfied"; split(range, pair, "/"); total=pair[2]
+            }
+            print status "|" kind "|" start "|" end "|" total "|" content
+        }
+    ')
+    [ -n "$parsed" ] || return 1
+    RESPONSE_HTTP_CODE=$($BB printf '%s' "$parsed" | $BB cut -d'|' -f1)
+    RESPONSE_RANGE_KIND=$($BB printf '%s' "$parsed" | $BB cut -d'|' -f2)
+    RESPONSE_RANGE_START=$($BB printf '%s' "$parsed" | $BB cut -d'|' -f3)
+    RESPONSE_RANGE_END=$($BB printf '%s' "$parsed" | $BB cut -d'|' -f4)
+    RESPONSE_RANGE_TOTAL=$($BB printf '%s' "$parsed" | $BB cut -d'|' -f5)
+    RESPONSE_CONTENT_LENGTH=$($BB printf '%s' "$parsed" | $BB cut -d'|' -f6)
+    return 0
+}
+
+probe_range()
+{
+    probe=$ROOT/.control-range-probe.$$
+    bounded_curl "$probe" "$CURL_HEADERS" 2 60 --range 0-0 "$url"
+    parse_response_headers "$CURL_HEADERS" || {
+        $BB rm -f "$probe" "$CURL_HEADERS" "$CURL_STDERR"
+        return 1
+    }
+    $BB rm -f "$probe" "$CURL_HEADERS" "$CURL_STDERR"
+    case "$RESPONSE_HTTP_CODE:$RESPONSE_RANGE_KIND:$STREAM_CURL_RC:$STREAM_TRUNCATED" in
+        206:partial:0:0|416:unsatisfied:22:*|416:unsatisfied:33:*) return 0;;
+        200:none:0:*) return 0;;
+        200:none:23:1)
+            case "$RESPONSE_CONTENT_LENGTH" in
+                ''|*[!0-9]*) return 1;;
+                *) [ "$RESPONSE_CONTENT_LENGTH" -gt 2 ] || return 1;;
+            esac
+            return 0
+            ;;
+        *) return 1;;
+    esac
+}
+
+quarantine_file()
+{
+    source=$1
+    [ -f "$source" ] && [ ! -L "$source" ] || return 0
+    $BB mkdir -p "$ROOT/quarantine" || die quarantine_create
+    target=$ROOT/quarantine/${source##*/}.bad
+    $BB rm -f "$target" 2>/dev/null
+    $BB mv "$source" "$target" || die quarantine_commit
+}
+
+inspect_control_part()
+{
+    [ -f "$PART" ] && [ ! -L "$PART" ] || return 1
+    size=$($BB stat -c %s "$PART" 2>/dev/null)
+    case "$size" in ''|*[!0-9]*) return 1;; esac
+    [ "$size" -gt 0 ] && [ "$size" -le "$MAX_BYTES" ] || return 1
+    inspection=$("$UPDATE" inspect "$PART" 2>/dev/null) || return 1
+    version=$(printf '%s\n' "$inspection" | $BB sed -n 's/^UPDATE_VALID version=//p')
+    case "$version" in ''|*[!A-Za-z0-9._+~-]*) return 1;; esac
+    printf '%s\n' "$version"
+}
+
+legacy_download_and_inspect()
 {
     [ ! -r "$ROOT/pending" ] || die update_already_pending
     check_status_write checking "" "" unknown
-    prepare_https_client
     check_status_write downloading "" "" true
-    $BB rm -f "$PART" "$CURL_STDERR"
+    [ ! -L "$PART" ] || die download_type
+    resume_args=
+    if [ -f "$PART" ] && [ ! -L "$PART" ]; then
+        part_size=$($BB stat -c %s "$PART" 2>/dev/null)
+        case "$part_size" in
+            0) ;;
+            ''|*[!0-9]*) quarantine_file "$PART" ;;
+            *)
+                [ "$part_size" -le "$MAX_BYTES" ] || { quarantine_file "$PART"; part_size=0; }
+                if [ "$part_size" -gt 0 ]; then
+                    version=$(inspect_control_part) || version=
+                    if [ -n "$version" ]; then
+                        $BB mv "$PART" "$PACKAGE" || die download_commit
+                        printf '%s\n' "$version"
+                        return 0
+                    fi
+                    remote_size=$(remote_content_length "$url") || remote_size=
+                    if [ -n "$remote_size" ]; then
+                        [ "$remote_size" -le "$MAX_BYTES" ] || die download_size
+                        if [ "$remote_size" -le "$part_size" ]; then
+                            quarantine_file "$PART"
+                            part_size=0
+                        else
+                            resume_args="--continue-at -"
+                        fi
+                    else
+                        resume_args="--continue-at -"
+                    fi
+                fi
+                ;;
+        esac
+    fi
+    [ -n "${resume_args:-}" ] || resume_args=
     http_code=$("$CURL" --fail --location --silent --show-error \
         --proto '=https' --proto-redir '=https' --tlsv1.2 \
         --cacert "$CA" --connect-timeout 20 --max-time 1800 \
         --max-filesize "$MAX_BYTES" --output "$PART" \
         --stderr "$CURL_STDERR" \
-        --write-out '%{http_code}' "$url")
+        --write-out '%{http_code}' $resume_args "$url")
     curl_rc=$?
     curl_detail=$(downloader_stderr)
     $BB rm -f "$CURL_STDERR"
@@ -402,9 +833,11 @@ download_and_inspect()
     [ -f "$PART" ] && [ ! -L "$PART" ] || die download_type
     size=$($BB stat -c %s "$PART" 2>/dev/null)
     [ "$size" -gt 0 ] && [ "$size" -le "$MAX_BYTES" ] || die download_size
-    $BB mv "$PART" "$PACKAGE" || die download_commit
-    inspection=$("$UPDATE" inspect "$PACKAGE") ||
+    inspection=$("$UPDATE" inspect "$PART") || {
+        quarantine_file "$PART"
         die downloaded_package_invalid true
+    }
+    $BB mv "$PART" "$PACKAGE" || die download_commit
     version=$(printf '%s\n' "$inspection" |
         $BB sed -n 's/^UPDATE_VALID version=//p')
     case "$version" in
@@ -413,16 +846,201 @@ download_and_inspect()
     echo "$version"
 }
 
+curl_failure()
+{
+    rc=$1; detail=$2; status=$3
+    case "$rc" in
+        22) case "$status" in 404) die asset_missing true "$rc" "$detail" "$status";; 401|403) die asset_access_denied true "$rc" "$detail" "$status";; 4??|5??) die download_http true "$rc" "$detail" "$status";; *) die download_status true "$rc" "$detail" "$status";; esac;;
+        5|6) die download_dns false "$rc" "$detail" "$status";;
+        7) die download_connect false "$rc" "$detail" "$status";;
+        28) die download_timeout false "$rc" "$detail" "$status";;
+        35|51|53|54|58|59|60|64|66|77) die download_tls false "$rc" "$detail" "$status";;
+        47) die download_status true "$rc" "$detail" "$status";;
+        63) die download_size true "$rc" "$detail" "$status";;
+        23) die download_write unknown "$rc" "$detail" "$status";;
+        *) die download_transport unknown "$rc" "$detail" "$status";;
+    esac
+}
+
+promote_control_part()
+{
+    inspection=$("$UPDATE" inspect "$PART") || { quarantine_file "$PART"; die downloaded_package_invalid true; }
+    version=$(printf '%s\n' "$inspection" | $BB sed -n 's/^UPDATE_VALID version=//p')
+    case "$version" in ''|*[!A-Za-z0-9._+~-]*) die downloaded_version;; esac
+    $BB mv "$PART" "$PACKAGE" || die download_commit
+    printf '%s\n' "$version"
+}
+
+fresh_control_download()
+{
+    fresh=$ROOT/.control-fresh.$$
+    bounded_curl "$fresh" "$CURL_HEADERS" $((MAX_BYTES + 1)) 1800 "$url"
+    curl_detail=$(downloader_stderr)
+    parse_response_headers "$CURL_HEADERS" || curl_failure "$STREAM_CURL_RC" "$curl_detail" ""
+    http_code=$RESPONSE_HTTP_CODE
+    if [ "$STREAM_CURL_RC" -ne 0 ] && [ "$STREAM_SIZE" -le "$MAX_BYTES" ]; then curl_failure "$STREAM_CURL_RC" "$curl_detail" "$http_code"; fi
+    [ "$http_code" = 200 ] && [ "$RESPONSE_RANGE_KIND" = none ] || die download_headers true "$STREAM_CURL_RC" "$curl_detail" "$http_code"
+    [ "$STREAM_SIZE" -gt 0 ] && [ "$STREAM_SIZE" -le "$MAX_BYTES" ] || { $BB rm -f "$fresh" "$CURL_HEADERS" "$CURL_STDERR"; die download_size true "$STREAM_CURL_RC" "$curl_detail" "$http_code"; }
+    case "$RESPONSE_CONTENT_LENGTH" in '' ) ;; *[!0-9]*) die download_headers true "$STREAM_CURL_RC" "$curl_detail" "$http_code";; *) [ "$RESPONSE_CONTENT_LENGTH" = "$STREAM_SIZE" ] || die download_size true "$STREAM_CURL_RC" "$curl_detail" "$http_code";; esac
+    inspection=$("$UPDATE" inspect "$fresh") || { $BB rm -f "$fresh" "$CURL_HEADERS" "$CURL_STDERR"; die downloaded_package_invalid true "$STREAM_CURL_RC" "$curl_detail" "$http_code"; }
+    [ ! -e "$PACKAGE" ] || die download_type
+    quarantine_file "$PART"
+    $BB mv "$fresh" "$PACKAGE" || die download_commit
+    $BB rm -f "$CURL_HEADERS" "$CURL_STDERR"
+    version=$(printf '%s\n' "$inspection" | $BB sed -n 's/^UPDATE_VALID version=//p')
+    case "$version" in ''|*[!A-Za-z0-9._+~-]*) die downloaded_version;; esac
+    printf '%s\n' "$version"
+}
+
+reset_and_fresh_control()
+{
+    [ "${RESET_USED:-0}" -eq 0 ] || die download_reset_limit
+    RESET_USED=1
+    fresh_control_download
+}
+
+validate_resume_response()
+{
+    expected_start=$1; expected_total=$2; expected_tail=$3
+    [ "$RESPONSE_HTTP_CODE" = 206 ] && [ "$RESPONSE_RANGE_KIND" = partial ] || return 1
+    [ "$RESPONSE_RANGE_START" = "$expected_start" ] && [ "$RESPONSE_RANGE_TOTAL" = "$expected_total" ] || return 1
+    expected_end=$((expected_total - 1))
+    [ "$RESPONSE_RANGE_END" = "$expected_end" ] && [ "$STREAM_SIZE" = "$expected_tail" ] || return 1
+    case "$RESPONSE_CONTENT_LENGTH" in '' ) return 0;; *[!0-9]*) return 1;; *) [ "$RESPONSE_CONTENT_LENGTH" = "$expected_tail" ];; esac
+}
+
+download_and_inspect()
+{
+    [ ! -r "$ROOT/pending" ] || die update_already_pending
+    check_status_write checking "" "" unknown
+    check_status_write downloading "" "" true
+    [ ! -L "$PART" ] || die download_type
+    RESET_USED=0
+    if [ -f "$PART" ]; then
+        part_size=$($BB stat -c %s "$PART" 2>/dev/null)
+        case "$part_size" in
+            0) ;;
+            ''|*[!0-9]*) quarantine_file "$PART";;
+            *)
+                [ "$part_size" -le "$MAX_BYTES" ] || { quarantine_file "$PART"; part_size=0; }
+                if [ "$part_size" -gt 0 ]; then
+                    version=$(inspect_control_part) || version=
+                    if [ -n "$version" ]; then promote_control_part; return 0; fi
+                    probe_range || die download_headers true "$STREAM_CURL_RC" "" "$RESPONSE_HTTP_CODE"
+                    case "$RESPONSE_HTTP_CODE:$RESPONSE_RANGE_KIND" in
+                        206:partial) [ "$RESPONSE_RANGE_START" = 0 ] && [ "$RESPONSE_RANGE_END" = 0 ] || die download_headers true "$STREAM_CURL_RC" "" "$RESPONSE_HTTP_CODE"; [ "$STREAM_SIZE" = 1 ] || die download_headers true "$STREAM_CURL_RC" "" "$RESPONSE_HTTP_CODE"; remote_size=$RESPONSE_RANGE_TOTAL;;
+                        200:none) remote_size=$RESPONSE_CONTENT_LENGTH;;
+                        416:unsatisfied) remote_size=$RESPONSE_RANGE_TOTAL;;
+                        *) die download_headers true "$STREAM_CURL_RC" "" "$RESPONSE_HTTP_CODE";;
+                    esac
+                    case "$remote_size" in '' ) ;; *[!0-9]*) die download_headers true "$STREAM_CURL_RC" "" "$RESPONSE_HTTP_CODE";; *) [ "$remote_size" -le "$MAX_BYTES" ] || die download_size true "$STREAM_CURL_RC" "" "$RESPONSE_HTTP_CODE";; esac
+                    case "$RESPONSE_HTTP_CODE:$RESPONSE_RANGE_KIND" in
+                        206:partial)
+                            if [ "$remote_size" -le "$part_size" ]; then reset_and_fresh_control; return 0; fi
+                            ;;
+                        416:unsatisfied)
+                            if [ "$remote_size" -eq "$part_size" ]; then version=$(inspect_control_part) || version=; [ -n "$version" ] && { promote_control_part; return 0; }; fi
+                            reset_and_fresh_control; return 0
+                            ;;
+                        200:none) reset_and_fresh_control; return 0;;
+                    esac
+                    resume=$ROOT/.control-resume.$$
+                    tail_limit=$((MAX_BYTES - part_size + 1))
+                    bounded_curl "$resume" "$CURL_HEADERS" "$tail_limit" 1800 --range "$part_size-" "$url"
+                    curl_detail=$(downloader_stderr)
+                    parse_response_headers "$CURL_HEADERS" || curl_failure "$STREAM_CURL_RC" "$curl_detail" ""
+                    case "$RESPONSE_HTTP_CODE:$RESPONSE_RANGE_KIND" in
+                        206:partial) validate_resume_response "$part_size" "$remote_size" "$((remote_size - part_size))" || { $BB rm -f "$resume" "$CURL_HEADERS" "$CURL_STDERR"; die download_headers true "$STREAM_CURL_RC" "$curl_detail" "$RESPONSE_HTTP_CODE"; }; cat "$resume" >> "$PART" || die download_write unknown "$STREAM_CURL_RC" "$curl_detail" "$RESPONSE_HTTP_CODE"; $BB rm -f "$resume" "$CURL_HEADERS" "$CURL_STDERR"; promote_control_part; return 0;;
+                        200:none) [ "$STREAM_CURL_RC" -eq 0 ] || [ -n "$RESPONSE_CONTENT_LENGTH" ] || curl_failure "$STREAM_CURL_RC" "$curl_detail" "$RESPONSE_HTTP_CODE"; reset_and_fresh_control; return 0;;
+                        416:unsatisfied) if [ "$RESPONSE_RANGE_TOTAL" = "$part_size" ]; then version=$(inspect_control_part) || version=; [ -n "$version" ] && { promote_control_part; return 0; }; fi; reset_and_fresh_control; return 0;;
+                        *) die download_headers true "$STREAM_CURL_RC" "$curl_detail" "$RESPONSE_HTTP_CODE";;
+                    esac
+                fi
+                ;;
+        esac
+    fi
+    fresh_control_download
+}
+
+download_feature_assets()
+{
+    [ "$(check_value_from_file "$ROOT/staging/manifest" format)" = libreecho-ota-v2 ] || return 0
+    [ -x "$FEATURE_TRANSACTION" ] || die feature_transaction_missing
+    $BB mkdir -p "$FEATURE_STAGE" || die feature_stage_create
+    "$FEATURE_TRANSACTION" preflight "$ROOT/staging/manifest" download ||
+        die download_space
+    ids=$(check_value_from_file "$ROOT/staging/manifest" feature_ids)
+    for feature in $(printf '%s' "$ids" | $BB tr ',' ' '); do
+        action=$(check_value_from_file "$ROOT/staging/manifest" "feature_${feature}_action")
+        case "$action" in
+            runtime|replace)
+                directory=$FEATURE_STAGE/$feature; $BB mkdir -p "$directory" || die feature_stage_create
+                for kind in asset manifest_asset; do
+                    asset=$(check_value_from_file "$ROOT/staging/manifest" "feature_${feature}_${kind}")
+                    case "$asset" in ''|*[!A-Za-z0-9._+:-]*|*/*|*\\*) die feature_asset_name;; esac
+                    expected_size=$(check_value_from_file "$ROOT/staging/manifest" "feature_${feature}_$([ "$kind" = asset ] && printf size || printf manifest_size)")
+                    expected_hash=$(check_value_from_file "$ROOT/staging/manifest" "feature_${feature}_$([ "$kind" = asset ] && printf sha256 || printf manifest_sha256)")
+                    part=$directory/$asset.part; final=$directory/$asset
+ if [ -f "$final" ] && [ ! -L "$final" ] &&
+     [ "$(stat -c %s "$final" 2>/dev/null)" = "$expected_size" ] &&
+     [ "$(sha256sum "$final" | $BB awk '{print $1}')" = "$expected_hash" ]; then
+     continue
+ fi
+ [ ! -e "$final" ] || quarantine_file "$final"
+ resume_args=
+ if [ -L "$part" ]; then die download_asset_type; fi
+ if [ -f "$part" ]; then
+                        part_size=$(stat -c %s "$part" 2>/dev/null)
+                        case "$part_size" in
+                            0) ;;
+                            ''|*[!0-9]*) quarantine_file "$part"; part_size=0 ;;
+                            *)
+                                if [ "$part_size" -eq "$expected_size" ]; then
+                                    if [ "$(sha256sum "$part" | $BB awk '{print $1}')" = "$expected_hash" ]; then
+                                        $BB mv "$part" "$final" || die download_asset_commit
+                                        continue
+                                    fi
+                                    quarantine_file "$part"
+                                    part_size=0
+                                elif [ "$part_size" -gt "$expected_size" ]; then
+                                    quarantine_file "$part"
+                                    part_size=0
+                                else
+                                    resume_args="--continue-at -"
+                                fi
+                                ;;
+                        esac
+                    fi
+                    asset_url="https://github.com/aslater3/LibreEcho/releases/download/radar-puffin-v$version/$asset"
+                    http_code=$("$CURL" --fail --location --silent --show-error --proto '=https' --proto-redir '=https' \
+                        --tlsv1.2 --cacert "$CA" --connect-timeout 20 --max-time 1800 --max-filesize "$expected_size" \
+                        --output "$part" --stderr "$CURL_STDERR" --write-out '%{http_code}' $resume_args "$asset_url")
+                    curl_rc=$?; curl_detail=$(downloader_stderr); $BB rm -f "$CURL_STDERR"
+                    [ "$curl_rc" -eq 0 ] && case "$http_code" in 2??) ;; *) die download_asset_http true "$curl_rc" "$curl_detail" "$http_code";; esac ||
+                        die download_asset_transport false "$curl_rc" "$curl_detail" "$http_code"
+                    [ -f "$part" ] && [ ! -L "$part" ] || die download_asset_type
+                    [ "$(stat -c %s "$part" 2>/dev/null)" = "$expected_size" ] || { quarantine_file "$part"; die download_asset_size; }
+                    [ "$(sha256sum "$part" | $BB awk '{print $1}')" = "$expected_hash" ] || { quarantine_file "$part"; die download_asset_hash; }
+                    $BB mv "$part" "$final" || die download_asset_commit
+                done
+                ;;
+            preserve) ;;
+            *) die feature_action_rejected;;
+        esac
+    done
+}
 check_or_install()
 {
-    action=$1
+    requested_action=$1
     require_environment
     fetch_lock
     install_lock
     seed_channel
     validate_source
+    prepare_https_client
     install_unlock
     version=$(download_and_inspect) || return 1
+    download_feature_assets
     installed=$($BB sed -n 's/^version=//p' "$ROOT/installed" 2>/dev/null)
     installed_channel=$(record_channel "$ROOT/installed")
     rolled_back=$($BB sed -n 's/^version=//p' "$ROOT/rolled-back" 2>/dev/null)
@@ -437,15 +1055,22 @@ check_or_install()
         echo "UPDATE_HELD version=$version"
         return 0
     fi
-    if [ "$action" = check ]; then
+    if [ "$requested_action" = check ]; then
         check_status_write update-available "$version" "" true
         echo "UPDATE_AVAILABLE version=$version"
         return 0
     fi
-    "$UPDATE" install "$PACKAGE" || {
-        check_status_write error "$version" install_failed true
-        return 1
-    }
+    if [ "$(check_value_from_file "$ROOT/staging/manifest" format)" = libreecho-ota-v2 ]; then
+        "$UPDATE" install "$PACKAGE" --feature-dir "$FEATURE_STAGE" || {
+            check_status_write error "$version" install_failed true
+            return 1
+        }
+    else
+        "$UPDATE" install "$PACKAGE" || {
+            check_status_write error "$version" install_failed true
+            return 1
+        }
+    fi
     check_status_write reboot-pending "$version" "" true
 }
 

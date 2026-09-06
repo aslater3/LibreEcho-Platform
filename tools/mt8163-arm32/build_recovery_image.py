@@ -39,7 +39,7 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "fdf851a563b291ab0440b196e46a06905c2beaa1494dadd4f4a0b8eb95042e5a"
+RECOVERY_INIT_SHA256 = "7b60bf7f442e3f1af31e175eb3d983303b5ce20b0e506a41419ac2bda386f3a9"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
@@ -409,6 +409,9 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         ),
         "libreecho-update": ("usr/local/sbin/libreecho-update", 0o755),
         "libreecho-update-fetch": ("usr/local/sbin/libreecho-update-fetch", 0o755),
+        "libreecho-feature-transaction": (
+            "usr/local/sbin/libreecho-feature-transaction", 0o755,
+        ),
         "ota-source.conf": ("etc/libreecho/ota-source.conf", 0o644),
         "libreecho-wifi": ("sbin/libreecho-wifi", 0o755),
         "udhcpc.script": ("etc/udhcpc.script", 0o755),

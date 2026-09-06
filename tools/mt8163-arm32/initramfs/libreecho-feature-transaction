@@ -1,0 +1,1348 @@
+#!/bin/busybox sh
+# Crash-safe reboot-bound feature transaction journal.
+# The signed manifest and its signature digest bind every prepared operation.
+BB=/bin/busybox
+ROOT=/data/libreecho/update
+STAGING=$ROOT/staging
+FEATURES=/data/libreecho/features
+BCB_FILE=$ROOT/staging/bootctl.readback
+JOURNAL=$ROOT/feature-commit
+PENDING=$ROOT/pending
+INSTALLED=$ROOT/installed
+COMMITTED_MANIFEST=$ROOT/committed-manifest
+COMMITTED_SIGNATURE=$ROOT/committed-manifest.sig
+# Bounded build policy for userdata peak-space accounting.  These defaults are
+# conservative policy values, not device measurements; deployment must replace
+# them with target evidence before release qualification.
+SPACE_RESERVE_BYTES=262144
+SPACE_METADATA_BYTES=32768
+SPACE_RETAINED_EVIDENCE_BYTES=65536
+SPACE_JOURNAL_BYTES=32768
+SPACE_RENAME_BYTES=16384
+SPACE_PHASE=prewrite
+SPACE_CONTROL_TAR=
+SPACE_DF=df
+SPACE_STAT=stat
+SPACE_STATUS=$ROOT/free-space
+SPACE_MAX=9223372036854775807
+SPACE_DF_BLOCK_BYTES=1024
+PROC_ROOT=/proc
+CMDLINE_FILE=$PROC_ROOT/cmdline
+MOUNTINFO_FILE=$PROC_ROOT/self/mountinfo
+PROC_NET_UNIX=$PROC_ROOT/net/unix
+VAR_RUN_ROOT=/var/run
+ETC_ROOT=/etc
+RUN_ROOT=/run
+CONFIG_FILE=/data/libreecho/config/web-config.json
+# Revalidation uses the recovery image's trusted key, not journal digests.
+VERIFY=/usr/local/libexec/libreecho-update-verify
+PUBLIC_KEY=/etc/libreecho/ota-public-key.hex
+TRANSACTION_SLOT_FILE=$ROOT/transaction-slot
+
+fail() { printf 'ERROR:%s\n' "$1" >&2; exit 1; }
+value() { $BB sed -n "s/^$1=//p" "$2" 2>/dev/null | $BB head -n 1; }
+valid_hash() { [ "${#1}" -eq 64 ] || return 1; case "$1" in *[!0-9a-f]*|'') return 1;; esac; }
+valid_uint() {
+    local value=$1
+    case "$value" in 0|[1-9]|[1-9][0-9]*) ;; *) return 1;; esac
+    [ "${#value}" -lt 19 ] ||
+        { [ "${#value}" -eq 19 ] && [ "$value" \< "9223372036854775808" ]; } ||
+        return 1
+}
+valid_token() { [ -n "$1" ] && [ "${#1}" -le 96 ] || return 1; case "$1" in [A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._+~:-]*) ;; *) return 1;; esac; }
+valid_commit() { [ "${#1}" -eq 40 ] || return 1; case "$1" in *[!0-9a-f]*|'') return 1;; esac; }
+valid_asset() { [ -n "$1" ] && [ "${#1}" -le 128 ] || return 1; case "$1" in [A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._+:-]*) ;; *) return 1;; esac; case "$1" in *[!A-Za-z0-9._+:-]*|*/*|*\\*) return 1;; esac; }
+
+key_allowed() {
+    case "$1" in
+        format|manifest_version|board|soc|architecture|image_profile|transaction_type|transaction_id|version|update_channel|service_profile|feature_policy|minimum_updater_schema|feature_asset_base|commit_policy|feature_ids|boot_filename|boot_size|boot_sha256) return 0;;
+        feature_airplay2_*|feature_tts_*|feature_wakeword_*|feature_stt_*|feature_assistant_*) return 0;;
+        *) return 1;;
+    esac
+}
+
+# Reject non-absolute, dot-containing, or symlinked path components.  This is
+# intentionally lexical plus component-wise: no operation follows a symlink,
+# including a dangling one, and no configured root may be the host filesystem.
+safe_path() {
+    local path=$1 current remainder old_ifs IFS
+    case "$path" in *[!A-Za-z0-9._/+:-]*) fail invalid-path ;; esac
+    case "$path" in
+        /|*//*|*/./*|*/../*|*/..|*/.) fail invalid-path ;;
+        /*) ;;
+        *) fail nonabsolute-path ;;
+    esac
+    [ "$path" != / ] || fail root-path
+    current=/
+    remainder=${path#/}
+    old_ifs=$IFS
+    IFS=/
+    set -f
+    set -- $remainder
+    set +f
+    IFS=$old_ifs
+    for component do
+        [ -n "$component" ] || continue
+        if [ "$current" = / ]; then current=/$component; else current=$current/$component; fi
+        [ ! -L "$current" ] || fail symlink-path
+    done
+}
+
+regular() {
+    safe_path "$1"
+    [ -f "$1" ] && [ ! -L "$1" ] || fail "$2-not-regular"
+}
+sync_file() { $BB sync 2>/dev/null || fail sync-failed; }
+atomic_write() {
+    local target=$1 tmp=$1.tmp; shift
+    safe_path "$target"; safe_path "$tmp"
+    [ ! -L "$tmp" ] || fail journal-temp-symlink
+    { "$@"; } > "$tmp" || fail journal-write
+    $BB chmod 0600 "$tmp" 2>/dev/null || fail journal-mode
+    $BB mv "$tmp" "$target" || fail journal-rename
+    sync_file
+}
+atomic_copy() {
+    local source=$1 target=$2 tmp=$2.tmp
+    regular "$source" intent-source
+    safe_path "$target"; safe_path "$tmp"
+    [ ! -L "$tmp" ] || fail journal-temp-symlink
+    $BB cp "$source" "$tmp" || fail journal-copy
+    $BB chmod 0600 "$tmp" 2>/dev/null || fail journal-mode
+    $BB mv "$tmp" "$target" || fail journal-rename
+    sync_file
+}
+
+# Return a content hash or the explicit absence marker.  Anything other than a
+# regular file is an ambiguity, never an absent file.
+hash_state() {
+    local path=$1 digest
+    safe_path "$path"
+    [ ! -L "$path" ] || fail symlink-path
+    if [ -e "$path" ]; then
+        [ -f "$path" ] || fail nonregular-path
+        digest=$(sha256sum "$path" 2>/dev/null | $BB awk '{print $1}') || fail hash-read
+        valid_hash "$digest" || fail hash-read
+        printf '%s\n' "$digest"
+    else
+        printf '%s\n' none
+    fi
+}
+
+verify_signed_manifest() {
+    local manifest=$1 signature=${2:-${1%/*}/manifest.sig}
+    regular "$manifest" manifest
+    regular "$signature" manifest-signature
+    "$VERIFY" "$PUBLIC_KEY" "$manifest" "$signature" >/dev/null 2>&1 || fail manifest-signature
+}
+
+check_manifest() {
+    local manifest=$1 seen key field_value ids old_index expected_keys feature index action field asset manifest_asset prefix actual_keys
+    verify_signed_manifest "$manifest" "${2:-}"
+    seen=
+    while IFS='=' read -r key field_value; do
+        [ -n "$key" ] && [ -n "$field_value" ] || fail manifest-syntax
+        case "$key" in *[!a-z0-9_]*|'') fail manifest-key;; esac
+        case "$field_value" in *=*|*[!A-Za-z0-9._+~,:/-]*) fail manifest-value;; esac
+        key_allowed "$key" || fail manifest-unknown-key
+        case " $seen " in *" $key "*) fail manifest-duplicate-key;; esac
+        seen="$seen $key"
+    done < "$manifest"
+    for key in format manifest_version board soc architecture image_profile transaction_type transaction_id version update_channel service_profile feature_policy minimum_updater_schema feature_asset_base commit_policy feature_ids boot_filename boot_size boot_sha256; do
+        case " $seen " in *" $key "*) ;; *) fail manifest-missing-key;; esac
+    done
+    [ "$(value format "$manifest")" = libreecho-ota-v2 ] || fail manifest-format
+    [ "$(value manifest_version "$manifest")" = 1 ] || fail manifest-version
+    [ "$(value board "$manifest")" = radar_puffin ] || fail manifest-board
+    [ "$(value soc "$manifest")" = mt8163 ] || fail manifest-soc
+    [ "$(value architecture "$manifest")" = armv7 ] || fail manifest-architecture
+    [ "$(value image_profile "$manifest")" = ota ] || fail manifest-image-profile
+    [ "$(value transaction_type "$manifest")" = system ] || fail transaction-type
+    [ "$(value minimum_updater_schema "$manifest")" = 2 ] || fail updater-schema
+    [ "$(value feature_asset_base "$manifest")" = github-release-channel ] || fail asset-base
+    [ "$(value commit_policy "$manifest")" = after-slot-confirm ] || fail commit-policy
+    valid_token "$(value transaction_id "$manifest")" || fail transaction-id
+    valid_token "$(value version "$manifest")" || fail version
+    valid_token "$(value update_channel "$manifest")" || fail update-channel
+    valid_token "$(value service_profile "$manifest")" || fail service-profile
+    case "$(value service_profile "$manifest")" in diagnostic|production) ;; *) fail service-profile;; esac
+    valid_token "$(value feature_policy "$manifest")" || fail feature-policy
+    case "$(value feature_policy "$manifest")" in preserve|redistributable|community-noncommercial|exclude) ;; *) fail feature-policy;; esac
+    case "$(value feature_policy "$manifest"):$(value service_profile "$manifest")" in
+        preserve:diagnostic|preserve:production|exclude:diagnostic|redistributable:production|community-noncommercial:production) ;;
+        *) fail feature-policy-profile;;
+    esac
+    [ "$(value boot_filename "$manifest")" = boot.img ] || fail boot-required
+    [ "$(value boot_size "$manifest")" = 16777216 ] || fail boot-size
+    valid_hash "$(value boot_sha256 "$manifest")" || fail boot-hash
+    ids=$(value feature_ids "$manifest")
+    case "$ids" in ''|*[!a-z0-9_,]*) fail feature-ids;; esac
+    [ "$ids" = "airplay2,tts,wakeword,stt,assistant" ] || fail feature-set
+    old_index=0; expected_keys='format manifest_version board soc architecture image_profile transaction_type transaction_id version update_channel service_profile feature_policy minimum_updater_schema feature_asset_base commit_policy boot_filename boot_size boot_sha256 feature_ids'
+    for feature in $(printf '%s' "$ids" | $BB tr ',' ' '); do
+        case "$feature" in airplay2) index=1;; tts) index=2;; wakeword) index=3;; stt) index=4;; assistant) index=5;; *) fail feature-id;; esac
+        [ "$index" -gt "$old_index" ] || fail feature-order
+        old_index=$index
+        expected_keys="$expected_keys feature_${feature}_action feature_${feature}_activation feature_${feature}_base_payload_sha256 feature_${feature}_base_manifest_sha256 feature_${feature}_daemon_path feature_${feature}_daemon_sha256 feature_${feature}_release feature_${feature}_source_commit"
+        action=$(value "feature_${feature}_action" "$manifest")
+        [ "$(value "feature_${feature}_activation" "$manifest")" = reboot ] || fail feature-activation
+        valid_hash "$(value "feature_${feature}_base_payload_sha256" "$manifest")" || fail feature-base-hash
+        valid_hash "$(value "feature_${feature}_base_manifest_sha256" "$manifest")" || fail feature-manifest-hash
+        case "$feature:$(value "feature_${feature}_daemon_path" "$manifest")" in airplay2:usr/local/sbin/libreecho-audio-engine|tts:usr/local/sbin/libreecho-ttsd|wakeword:usr/local/sbin/libreecho-waked|stt:usr/local/sbin/libreecho-sttd|assistant:usr/local/sbin/libreecho-agentd) ;; *) fail daemon-path;; esac
+        valid_hash "$(value "feature_${feature}_daemon_sha256" "$manifest")" || fail daemon-hash
+        valid_token "$(value "feature_${feature}_release" "$manifest")" || fail release
+        valid_commit "$(value "feature_${feature}_source_commit" "$manifest")" || fail source-commit
+        case "$action" in
+            preserve)
+                for field in asset size sha256 manifest_asset manifest_size manifest_sha256; do [ -z "$(value "feature_${feature}_${field}" "$manifest")" ] || fail feature-extra-field; done;;
+            runtime|replace)
+                asset=$(value "feature_${feature}_asset" "$manifest"); manifest_asset=$(value "feature_${feature}_manifest_asset" "$manifest")
+                valid_asset "$asset" || fail feature-asset-name; valid_asset "$manifest_asset" || fail feature-manifest-name
+                valid_uint "$(value "feature_${feature}_size" "$manifest")" || fail feature-size; valid_uint "$(value "feature_${feature}_manifest_size" "$manifest")" || fail feature-manifest-size
+                valid_hash "$(value "feature_${feature}_sha256" "$manifest")" || fail feature-hash; valid_hash "$(value "feature_${feature}_manifest_sha256" "$manifest")" || fail feature-manifest-hash
+                prefix=libreecho-radar-puffin-$(value "feature_${feature}_release" "$manifest")-$feature
+                case "$action:$asset:$manifest_asset" in runtime:"$prefix.runtime.squashfs":"$prefix.runtime-manifest.json"|replace:"$prefix.payload.squashfs":"$prefix.manifest.json") ;; *) fail feature-asset-identity;; esac
+                expected_keys="$expected_keys feature_${feature}_asset feature_${feature}_size feature_${feature}_sha256 feature_${feature}_manifest_asset feature_${feature}_manifest_size feature_${feature}_manifest_sha256";;
+            *) fail feature-action;;
+        esac
+    done
+    actual_keys=$($BB sed 's/=.*//' "$manifest" | $BB tr '\n' ' ')
+    [ "$actual_keys" = "$expected_keys " ] || fail manifest-noncanonical
+}
+
+space_round_bytes() {
+    local rounded_input=$1 block blocks
+    valid_uint "$rounded_input" || fail space-size
+    block=$SPACE_BLOCK_BYTES
+    valid_uint "$block" && [ "$block" -gt 0 ] || fail space-block-size
+    blocks=$((rounded_input / block))
+    [ $((rounded_input % block)) -eq 0 ] || {
+        [ "$blocks" -lt "$SPACE_MAX" ] || fail space-overflow
+        blocks=$((blocks + 1))
+    }
+    [ "$blocks" -le "$((SPACE_MAX / block))" ] || fail space-overflow
+    SPACE_ROUNDED=$((blocks * block))
+}
+
+space_add_required() {
+    local value=$1
+    valid_uint "$value" || fail space-size
+    [ "$SPACE_TOTAL" -le "$((SPACE_MAX - value))" ] || fail space-overflow
+    SPACE_TOTAL=$((SPACE_TOTAL + value))
+}
+
+space_add_accounted() {
+    local value=$1
+    valid_uint "$value" || fail space-size
+    [ "$SPACE_ACCOUNTED" -le "$((SPACE_MAX - value))" ] || fail space-overflow
+    SPACE_ACCOUNTED=$((SPACE_ACCOUNTED + value))
+}
+
+space_allocated_bytes() {
+    local path=$1 raw
+    [ -e "$path" ] || { printf '0\n'; return 0; }
+    [ ! -L "$path" ] || fail space-symlink
+    raw=$($SPACE_STAT -c '%b %B' "$path" 2>/dev/null) || fail space-stat
+    set -- $raw
+    [ "$#" -eq 2 ] || fail space-stat
+    valid_uint "$1" && valid_uint "$2" && [ "$2" -gt 0 ] || fail space-stat
+    [ "$1" -le "$((SPACE_MAX / $2))" ] || fail space-overflow
+    printf '%s\n' "$(( $1 * $2 ))"
+}
+
+space_file_size() {
+    local path=$1 raw
+    raw=$($SPACE_STAT -c %s "$path" 2>/dev/null) || fail space-stat
+    valid_uint "$raw" || fail space-stat
+    printf '%s\n' "$raw"
+}
+
+space_add_existing() {
+    local path=$1 allocated
+    allocated=$(space_allocated_bytes "$path")
+    space_add_accounted "$allocated"
+}
+
+space_add_backup() {
+    local path=$1 allocated
+    allocated=$(space_allocated_bytes "$path")
+    space_add_accounted "$allocated"
+    space_add_required "$allocated"
+}
+
+space_add_future_file() {
+    local path=$1 expected=$2 actual allocated
+    valid_uint "$expected" || fail space-size
+    if [ -e "$path" ]; then
+        [ -f "$path" ] && [ ! -L "$path" ] || fail space-staged-type
+        actual=$(space_file_size "$path")
+        allocated=$(space_allocated_bytes "$path")
+        space_add_accounted "$allocated"
+        if [ "$actual" = "$expected" ]; then
+            return 0
+        fi
+    fi
+    space_round_bytes "$expected"
+    space_add_required "$SPACE_ROUNDED"
+}
+
+space_add_resumable_file() {
+    local final=$1 part=$2 expected=$3 expected_hash=$4 actual allocated
+    valid_uint "$expected" || fail space-size
+    valid_hash "$expected_hash" || fail space-hash
+    if [ -e "$final" ]; then
+        [ -f "$final" ] && [ ! -L "$final" ] || fail space-staged-type
+        actual=$(space_file_size "$final")
+        allocated=$(space_allocated_bytes "$final")
+        space_add_accounted "$allocated"
+        if [ "$actual" = "$expected" ] &&
+            [ "$(sha256sum "$final" 2>/dev/null | $BB awk '{print $1}')" = "$expected_hash" ]; then
+            return 0
+        fi
+    elif [ -e "$part" ]; then
+        [ -f "$part" ] && [ ! -L "$part" ] || fail space-staged-type
+        actual=$(space_file_size "$part")
+        [ "$actual" -le "$expected" ] || fail space-staged-size
+        allocated=$(space_allocated_bytes "$part")
+        space_add_accounted "$allocated"
+        space_round_bytes "$expected"
+        [ "$allocated" -ge "$SPACE_ROUNDED" ] ||
+            space_add_required "$((SPACE_ROUNDED - allocated))"
+        return 0
+    fi
+    space_round_bytes "$expected"
+    space_add_required "$SPACE_ROUNDED"
+}
+
+space_add_policy() {
+    local policy
+    for policy in "$SPACE_RESERVE_BYTES" "$SPACE_METADATA_BYTES" \
+        "$SPACE_RETAINED_EVIDENCE_BYTES" "$SPACE_JOURNAL_BYTES" "$SPACE_RENAME_BYTES"; do
+        valid_uint "$policy" || fail space-policy
+        space_round_bytes "$policy"
+        space_add_required "$SPACE_ROUNDED"
+    done
+}
+
+space_add_control_evidence() {
+    local path
+    for path in "$SPACE_CONTROL_TAR" "$STAGING/manifest" "$STAGING/manifest.sig" "$STAGING/boot.img"; do
+        [ -n "$path" ] || continue
+        [ -e "$path" ] || continue
+        space_add_existing "$path"
+    done
+}
+
+space_initialize() {
+    local raw
+    safe_path "$ROOT"; safe_path "$STAGING"; safe_path "$FEATURES"
+    [ -d "$ROOT" ] && [ -d "$STAGING" ] || fail update-root
+    raw=$($SPACE_STAT -f -c %S "$ROOT" 2>/dev/null) || raw=$($SPACE_STAT -c %B "$ROOT" 2>/dev/null)
+    valid_uint "$raw" && [ "$raw" -gt 0 ] || fail space-block-size
+    SPACE_BLOCK_BYTES=$raw
+    SPACE_TOTAL=0
+    SPACE_ACCOUNTED=0
+    space_add_policy
+}
+
+space_available_bytes() {
+    local available
+    available=$($SPACE_DF -Pk "$ROOT" 2>/dev/null | $BB awk 'NR == 2 { print $4; exit }')
+    valid_uint "$available" || fail free-space-unavailable
+    [ "$available" -le "$((SPACE_MAX / SPACE_DF_BLOCK_BYTES))" ] || fail space-overflow
+    printf '%s\n' "$((available * SPACE_DF_BLOCK_BYTES))"
+}
+
+space_status_write() {
+    {
+        printf 'schema=1\nphase=%s\nfilesystem_block_bytes=%s\nrequired_blocks=%s\nrequired_bytes=%s\navailable_bytes=%s\nreserve_bytes=%s\nalready_allocated_bytes=%s\n' \
+            "$SPACE_PHASE" "$SPACE_BLOCK_BYTES" "$((SPACE_TOTAL / SPACE_BLOCK_BYTES))" \
+            "$SPACE_TOTAL" "$SPACE_AVAILABLE" "$SPACE_RESERVE_BYTES" "$SPACE_ACCOUNTED"
+    } > "$SPACE_STATUS.tmp" || fail space-status-write
+    $BB chmod 0600 "$SPACE_STATUS.tmp" 2>/dev/null || fail space-status-mode
+    $BB mv "$SPACE_STATUS.tmp" "$SPACE_STATUS" || fail space-status-rename
+    sync_file
+}
+
+space_gate() {
+    local manifest=$1 phase=${2:-$SPACE_PHASE} ids feature action asset manifest_asset payload_size manifest_size source_dir payload_hash manifest_hash
+    case "$phase" in download|prewrite) ;; *) fail space-phase;; esac
+    check_manifest "$manifest"
+    space_initialize
+    space_add_control_evidence
+    ids=$(value feature_ids "$manifest")
+    for feature in $(printf '%s' "$ids" | $BB tr ',' ' '); do
+        action=$(value "feature_${feature}_action" "$manifest")
+        case "$action" in
+            runtime|replace)
+                asset=$(value "feature_${feature}_asset" "$manifest")
+                manifest_asset=$(value "feature_${feature}_manifest_asset" "$manifest")
+                payload_size=$(value "feature_${feature}_size" "$manifest")
+                manifest_size=$(value "feature_${feature}_manifest_size" "$manifest")
+                source_dir=$STAGING/features/$feature
+                if [ "$phase" = download ]; then
+                    payload_hash=$(value "feature_${feature}_sha256" "$manifest")
+                    manifest_hash=$(value "feature_${feature}_manifest_sha256" "$manifest")
+                    space_add_resumable_file "$source_dir/$asset" "$source_dir/$asset.part" "$payload_size" "$payload_hash"
+                    space_add_resumable_file "$source_dir/$manifest_asset" "$source_dir/$manifest_asset.part" "$manifest_size" "$manifest_hash"
+                else
+                    space_add_existing "$source_dir/$asset"
+                    space_add_existing "$source_dir/$manifest_asset"
+                    feature_names "$action"
+                    space_round_bytes "$payload_size"; space_add_required "$SPACE_ROUNDED"
+                    space_round_bytes "$manifest_size"; space_add_required "$SPACE_ROUNDED"
+                    space_add_backup "$FEATURES/$feature/$payload_name"
+                    space_add_backup "$FEATURES/$feature/$manifest_name"
+                fi
+                ;;
+            preserve) ;;
+            *) fail feature-action;;
+        esac
+    done
+    available=$(space_available_bytes)
+    SPACE_AVAILABLE=$available
+    [ "$available" -ge "$SPACE_TOTAL" ] || fail insufficient-space
+    SPACE_PHASE=$phase
+    space_status_write
+    printf 'phase=%s\nfilesystem_block_bytes=%s\nrequired_blocks=%s\nrequired_bytes=%s\navailable_bytes=%s\nreserve_bytes=%s\nalready_allocated_bytes=%s\n' \
+        "$phase" "$SPACE_BLOCK_BYTES" "$((SPACE_TOTAL / SPACE_BLOCK_BYTES))" \
+        "$SPACE_TOTAL" "$available" "$SPACE_RESERVE_BYTES" "$SPACE_ACCOUNTED"
+}
+
+preflight() {
+    local manifest=$1 phase=${2:-prewrite}
+    safe_path "$ROOT"; safe_path "$STAGING"; safe_path "$FEATURES"
+    [ -d "$ROOT" ] && [ -d "$STAGING" ] || fail update-root
+    [ ! -L "$ROOT/pending" ] || fail symlink-path
+    [ ! -e "$ROOT/pending" ] || { regular "$ROOT/pending" pending; [ "$(value transaction_id "$manifest")" = "$(value transaction_id "$ROOT/pending")" ]; } || fail unrelated-pending
+    space_gate "$manifest" "$phase"
+}
+
+feature_names() {
+    local action=$1
+    payload_name=payload.squashfs; manifest_name=manifest.json
+    [ "$action" = runtime ] && payload_name=runtime.squashfs && manifest_name=runtime-manifest.json
+}
+
+# Build a complete intent before publishing either durable copy.  The old and
+# new hashes are captured before any promotion and are never recomputed from a
+# changed path during recovery.
+build_intent() {
+    local slot=$1 manifest=$STAGING/manifest sig=$STAGING/manifest.sig ids tx manifest_hash signature_hash intent_tmp feature action target_dir source_dir payload_name manifest_name asset ma source_payload source_manifest new_payload new_manifest old_payload old_manifest backup_payload backup_manifest
+    check_manifest "$manifest"
+    regular "$sig" manifest-signature
+    [ -s "$sig" ] || fail manifest-signature-empty
+    ids=$(value feature_ids "$manifest")
+    tx=$(value transaction_id "$manifest")
+    manifest_hash=$(sha256sum "$manifest" | $BB awk '{print $1}')
+    signature_hash=$(sha256sum "$sig" | $BB awk '{print $1}')
+    valid_hash "$manifest_hash" || fail manifest-hash
+    valid_hash "$signature_hash" || fail signature-hash
+    intent_tmp=$ROOT/feature-commit.new
+    safe_path "$intent_tmp"
+    {
+        printf '%s\n' schema=2 "transaction_id=$tx" "version=$(value version "$manifest")" "slot=$slot" "boot_sha256=$(value boot_sha256 "$manifest")" "manifest_sha256=$manifest_hash" "manifest_sig_sha256=$signature_hash" "feature_ids=$ids" phase=prepared
+        for feature in $(printf '%s' "$ids" | $BB tr ',' ' '); do
+            action=$(value "feature_${feature}_action" "$manifest")
+            feature_names "$action"
+            target_dir=$FEATURES/$feature; source_dir=$STAGING/features/$feature
+            safe_path "$target_dir"; safe_path "$source_dir"
+            [ -d "$target_dir" ] && [ ! -L "$target_dir" ] || fail feature-target-dir
+            case "$action" in
+                runtime|replace)
+                    safe_path "$source_dir"
+                    [ -d "$source_dir" ] && [ ! -L "$source_dir" ] || fail feature-source-dir
+                    asset=$(value "feature_${feature}_asset" "$manifest"); ma=$(value "feature_${feature}_manifest_asset" "$manifest")
+                    source_payload=$source_dir/$asset; source_manifest=$source_dir/$ma
+                    regular "$source_payload" feature-asset
+                    regular "$source_manifest" feature-manifest
+                    [ "$(stat -c %s "$source_payload" 2>/dev/null)" = "$(value "feature_${feature}_size" "$manifest")" ] || fail feature-size-readback
+                    [ "$(stat -c %s "$source_manifest" 2>/dev/null)" = "$(value "feature_${feature}_manifest_size" "$manifest")" ] || fail feature-manifest-size-readback
+                    new_payload=$(hash_state "$source_payload"); new_manifest=$(hash_state "$source_manifest")
+                    [ "$new_payload" = "$(value "feature_${feature}_sha256" "$manifest")" ] || fail feature-hash-readback
+                    [ "$new_manifest" = "$(value "feature_${feature}_manifest_sha256" "$manifest")" ] || fail feature-manifest-hash-readback
+                    old_payload=$(hash_state "$target_dir/$payload_name")
+                    old_manifest=$(hash_state "$target_dir/$manifest_name")
+                    ;;
+                preserve)
+                    source_payload=none; source_manifest=none
+                    new_payload=$(value "feature_${feature}_base_payload_sha256" "$manifest")
+                    new_manifest=$(value "feature_${feature}_base_manifest_sha256" "$manifest")
+                    old_payload=$(hash_state "$target_dir/payload.squashfs")
+                    old_manifest=$(hash_state "$target_dir/manifest.json")
+                    [ "$old_payload" = "$new_payload" ] || fail preserve-payload-mismatch
+                    [ "$old_manifest" = "$new_manifest" ] || fail preserve-manifest-mismatch
+                    payload_name=payload.squashfs; manifest_name=manifest.json
+                    ;;
+            esac
+            valid_hash "$new_payload" || fail new-payload-hash
+            valid_hash "$new_manifest" || fail new-manifest-hash
+            [ "$old_payload" = none ] || valid_hash "$old_payload" || fail old-payload-hash
+            [ "$old_manifest" = none ] || valid_hash "$old_manifest" || fail old-manifest-hash
+            backup_payload=previous-$feature-$payload_name
+            backup_manifest=previous-$feature-$manifest_name
+            printf '%s\n' "feature_${feature}_action=$action" "feature_${feature}_source_payload=${source_payload##*/}" "feature_${feature}_source_manifest=${source_manifest##*/}" "feature_${feature}_target_payload=$payload_name" "feature_${feature}_target_manifest=$manifest_name" "feature_${feature}_backup_payload=$backup_payload" "feature_${feature}_backup_manifest=$backup_manifest" "feature_${feature}_old_payload_sha256=$old_payload" "feature_${feature}_old_manifest_sha256=$old_manifest" "feature_${feature}_new_payload_sha256=$new_payload" "feature_${feature}_new_manifest_sha256=$new_manifest"
+        done
+    } > "$intent_tmp" || fail journal-write
+    $BB chmod 0600 "$intent_tmp" 2>/dev/null || fail journal-mode
+}
+
+publish_prepared_intent() {
+    local intent_tmp=$1
+    atomic_copy "$intent_tmp" "$PENDING"
+    atomic_copy "$intent_tmp" "$JOURNAL"
+    $BB rm -f "$intent_tmp" 2>/dev/null || fail journal-temp-cleanup
+    sync_file
+}
+
+prepare_boot() {
+    local manifest=$STAGING/manifest tx slot
+    safe_path "$ROOT"; safe_path "$STAGING"; safe_path "$FEATURES"
+    check_manifest "$manifest"
+    tx=$(value transaction_id "$manifest")
+    # A complete existing pair is already durable.  Do not recapture old hashes
+    # after a reboot or overwrite an in-flight confirmed journal.
+    if [ -e "$JOURNAL" ] || [ -e "$PENDING" ]; then
+        [ -e "$JOURNAL" ] && regular "$JOURNAL" journal
+        [ -e "$PENDING" ] && regular "$PENDING" pending
+        [ -e "$JOURNAL" ] && [ "$(value transaction_id "$JOURNAL")" != "$tx" ] && fail journal-belongs-to-other-transaction
+        [ -e "$PENDING" ] && [ "$(value transaction_id "$PENDING")" != "$tx" ] && fail pending-belongs-to-other-transaction
+        if [ -e "$JOURNAL" ] && [ "$(value phase "$JOURNAL")" != prepared ]; then
+            fail transaction-already-confirmed
+        fi
+        if [ -e "$JOURNAL" ] && [ -e "$PENDING" ]; then
+            printf 'prepared transaction_id=%s slot=%s\n' "$tx" "$(value slot "$JOURNAL")"
+            exit 0
+        fi
+    fi
+    SPACE_PHASE=prewrite
+    space_gate "$manifest" prewrite
+    slot=$(cat "$TRANSACTION_SLOT_FILE" 2>/dev/null)
+    case "$slot" in a|b) ;; *) fail target-slot;; esac
+    build_intent "$slot"
+    publish_prepared_intent "$ROOT/feature-commit.new"
+    printf 'prepared transaction_id=%s slot=%s\n' "$tx" "$slot"
+}
+
+running_slot() {
+    local slot
+    regular "$CMDLINE_FILE" cmdline
+    slot=$($BB tr -d '\000' < "$CMDLINE_FILE" | $BB sed -n 's/.*androidboot.slot_suffix=_\([ab]\).*/\1/p' 2>/dev/null)
+    case "$slot" in a|b) printf '%s\n' "$slot";; *) fail running-slot-unavailable;; esac
+}
+
+boot_partition() {
+    local slot=$1
+    case "$slot" in
+        a) BOOT_PARTITION=/dev/mmcblk0p10;;
+        b) BOOT_PARTITION=/dev/mmcblk0p11;;
+        *) fail boot-slot;;
+    esac
+    safe_path "$BOOT_PARTITION"
+}
+
+file_hash() {
+    local path=$1 digest
+    [ -f "$path" ] || fail file-not-regular
+    digest=$($BB sha256sum "$path" 2>/dev/null | $BB awk '{print $1}') || fail hash-read
+    valid_hash "$digest" || fail hash-read
+    printf '%s\n' "$digest"
+}
+
+verify_boot_identity() {
+    local slot=$1 expected actual
+    boot_partition "$slot"
+    expected=$(value boot_sha256 "$PENDING")
+    valid_hash "$expected" || fail pending-boot-hash
+    [ "$(value boot_sha256 "$JOURNAL")" = "$expected" ] || fail journal-boot-hash
+    [ "$(value boot_sha256 "$STAGING/manifest")" = "$expected" ] || fail manifest-boot-hash
+    if [ -f "$BOOT_PARTITION" ]; then
+        [ "$(stat -c %s "$BOOT_PARTITION" 2>/dev/null)" = 16777216 ] || fail running-boot-size
+    fi
+    actual=$($BB dd if="$BOOT_PARTITION" bs=4096 count=4096 2>/dev/null | $BB sha256sum | $BB awk '{print $1}')
+    [ "$actual" = "$expected" ] || fail running-boot-hash
+}
+
+verify_candidate_components() {
+    local ids feature action daemon_path base_payload base_manifest asset manifest_asset source_dir source_payload source_manifest
+    ids=$(value feature_ids "$JOURNAL")
+    [ "$ids" = "$(value feature_ids "$STAGING/manifest")" ] || fail feature-list-changed
+    for feature in $(printf '%s' "$ids" | $BB tr ',' ' '); do
+        action=$(value "feature_${feature}_action" "$JOURNAL")
+        daemon_path=$(value "feature_${feature}_daemon_path" "$STAGING/manifest")
+        case "$feature:$daemon_path" in
+            airplay2:usr/local/sbin/libreecho-audio-engine|tts:usr/local/sbin/libreecho-ttsd|wakeword:usr/local/sbin/libreecho-waked|stt:usr/local/sbin/libreecho-sttd|assistant:usr/local/sbin/libreecho-agentd) ;;
+            *) fail daemon-path-identity;;
+        esac
+        base_payload=$FEATURES/$feature/payload.squashfs
+        base_manifest=$FEATURES/$feature/manifest.json
+        [ "$(file_hash "$base_payload")" = "$(value "feature_${feature}_base_payload_sha256" "$STAGING/manifest")" ] || fail base-payload-hash
+        [ "$(file_hash "$base_manifest")" = "$(value "feature_${feature}_base_manifest_sha256" "$STAGING/manifest")" ] || fail base-manifest-hash
+        case "$action" in
+            preserve)
+                runtime_authority_ready "$feature" "$STAGING/manifest" || :
+                ;;
+            runtime|replace)
+                asset=$(value "feature_${feature}_asset" "$STAGING/manifest")
+                manifest_asset=$(value "feature_${feature}_manifest_asset" "$STAGING/manifest")
+                source_dir=$STAGING/features/$feature
+                source_payload=$source_dir/$asset
+                source_manifest=$source_dir/$manifest_asset
+                [ "$(stat -c %s "$source_payload" 2>/dev/null)" = "$(value "feature_${feature}_size" "$STAGING/manifest")" ] || fail staged-payload-size
+                [ "$(stat -c %s "$source_manifest" 2>/dev/null)" = "$(value "feature_${feature}_manifest_size" "$STAGING/manifest")" ] || fail staged-manifest-size
+                [ "$(file_hash "$source_payload")" = "$(value "feature_${feature}_sha256" "$STAGING/manifest")" ] || fail staged-payload-hash
+                [ "$(file_hash "$source_manifest")" = "$(value "feature_${feature}_manifest_sha256" "$STAGING/manifest")" ] || fail staged-manifest-hash
+                ;;
+            *) fail feature-action;;
+        esac
+    done
+}
+
+activate_mounts() {
+    local running ids feature action asset root manifest_asset overlay base daemon_path capsule
+    regular "$PENDING" pending
+    regular "$JOURNAL" journal
+    validate_intent
+    running=$(running_slot)
+    [ "$running" = "$(value slot "$PENDING")" ] || fail activation-slot
+    regular "$BCB_FILE" bcb-readback
+    [ "$(value selected_slot "$BCB_FILE")" = "$running" ] || fail activation-bcb-slot
+    verify_candidate_components
+    ids=$(value feature_ids "$JOURNAL")
+    # All mutable inputs are authenticated and hashed before the first mount.
+    for feature in $(printf '%s' "$ids" | $BB tr ',' ' '); do
+        action=$(value "feature_${feature}_action" "$STAGING/manifest")
+        asset=$(value "feature_${feature}_asset" "$STAGING/manifest")
+        root=$RUN_ROOT/libreecho/features/$feature/root
+        safe_path "$root"
+        case "$action" in
+            replace)
+                safe_path "$STAGING/features/$feature/$asset"
+                $BB mkdir -p "$root" || fail activation-mkdir
+                $BB mount -t squashfs -o loop,ro,nosuid,nodev,noatime "$STAGING/features/$feature/$asset" "$root" || fail activation-mount
+                ;;
+            runtime)
+                manifest_asset=$(value "feature_${feature}_manifest_asset" "$STAGING/manifest")
+                overlay=$RUN_ROOT/libreecho/features/$feature/runtime
+                base=$FEATURES/$feature/payload.squashfs
+                daemon_path=$(value "feature_${feature}_daemon_path" "$STAGING/manifest")
+                safe_path "$base"; safe_path "$STAGING/features/$feature/$asset"; safe_path "$overlay"; safe_path "$root/$daemon_path"
+                $BB mkdir -p "$root" "$overlay" || fail activation-mkdir
+                $BB mount -t squashfs -o loop,ro,nosuid,nodev,noatime "$base" "$root" || fail activation-base-mount
+                $BB mount -t squashfs -o loop,ro,nosuid,nodev,noatime "$STAGING/features/$feature/$asset" "$overlay" || fail activation-capsule-mount
+                $BB mount --bind "$overlay/$daemon_path" "$root/$daemon_path" || fail activation-bind-mount
+                ;;
+            preserve)
+                if runtime_authority_ready "$feature" "$STAGING/manifest"; then
+                    base=$FEATURES/$feature/payload.squashfs
+                    capsule=$FEATURES/$feature/runtime.squashfs
+                    overlay=$RUN_ROOT/libreecho/features/$feature/runtime
+                    daemon_path=$(value "feature_${feature}_daemon_path" "$STAGING/manifest")
+                    safe_path "$base"; safe_path "$overlay"; safe_path "$root/$daemon_path"
+                    $BB mkdir -p "$root" "$overlay" || fail activation-mkdir
+                    $BB mount -t squashfs -o loop,ro,nosuid,nodev,noatime "$base" "$root" || fail activation-base-mount
+                    $BB mount -t squashfs -o loop,ro,nosuid,nodev,noatime "$capsule" "$overlay" || fail activation-capsule-mount
+                    $BB mount --bind "$overlay/$daemon_path" "$root/$daemon_path" || fail activation-bind-mount
+                fi
+                ;;
+            *) fail activation-action;;
+        esac
+    done
+    verify_candidate_mounts
+    printf 'activation_validated slot=%s feature_ids=%s\n' "$running" "$ids"
+}
+
+mount_matches() {
+    local target=$1 source=$2
+    [ -r "$MOUNTINFO_FILE" ] || fail mountinfo-unavailable
+    $BB awk -v target="$target" -v source="$source" '
+        $5 == target { total++; dash=0; source_seen=0; mounted="";
+            for (i=6; i<=NF; i++) { if ($i == "-") { dash=1; continue }
+                if (dash && !source_seen) { source_seen=1; continue }
+                if (dash) { mounted=$i; break } }
+            if (mounted == source) good++
+        }
+        END { exit (total == 1 && good == 1) ? 0 : 1 }
+    ' "$MOUNTINFO_FILE" >/dev/null 2>&1 || fail candidate-mount-identity
+}
+
+verify_candidate_mounts() {
+    local ids feature action asset daemon_path root
+    ids=$(value feature_ids "$JOURNAL")
+    for feature in $(printf '%s' "$ids" | $BB tr ',' ' '); do
+        action=$(value "feature_${feature}_action" "$STAGING/manifest")
+        asset=$(value "feature_${feature}_asset" "$STAGING/manifest")
+        daemon_path=$(value "feature_${feature}_daemon_path" "$STAGING/manifest")
+        root=$RUN_ROOT/libreecho/features/$feature/root
+        case "$action" in
+            preserve)
+                if runtime_authority_ready "$feature" "$STAGING/manifest"; then
+                    mount_matches "$root" "$FEATURES/$feature/payload.squashfs"
+                    mount_matches "$RUN_ROOT/libreecho/features/$feature/runtime" "$FEATURES/$feature/runtime.squashfs"
+                    mount_matches "$root/$daemon_path" "$RUN_ROOT/libreecho/features/$feature/runtime/$daemon_path"
+                fi
+                ;;
+            replace)
+                mount_matches "$root" "$STAGING/features/$feature/$asset"
+                ;;
+            runtime)
+                mount_matches "$root" "$FEATURES/$feature/payload.squashfs"
+                mount_matches "$RUN_ROOT/libreecho/features/$feature/runtime" "$STAGING/features/$feature/$asset"
+                mount_matches "$root/$daemon_path" "$RUN_ROOT/libreecho/features/$feature/runtime/$daemon_path"
+                ;;
+            *) fail feature-action;;
+        esac
+    done
+}
+
+feature_in_manifest() {
+    local feature=$1 ids
+    ids=$(value feature_ids "$JOURNAL")
+    case ",$ids," in *,"$feature",*) return 0;; esac
+    return 1
+}
+
+feature_required() {
+    local feature=$1 profile policy integrations
+    profile=$($BB cat "$ETC_ROOT/libreecho/service-profile" 2>/dev/null)
+    policy=$($BB cat "$ETC_ROOT/libreecho/feature-policy" 2>/dev/null)
+    [ "$profile" = production ] || return 1
+    [ "$policy" != exclude ] || return 1
+    integrations=0
+    if [ -r "$CONFIG_FILE" ]; then
+        integrations=$($BB sed -n 's/.*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$CONFIG_FILE" 2>/dev/null | $BB head -n 1)
+        case "$integrations" in ''|*[!0-9]*) integrations=0;; esac
+    fi
+    if [ $((integrations & 1)) -ne 0 ]; then
+        case "$policy:$feature" in
+            preserve:wakeword|community-noncommercial:wakeword|*:airplay2) ;;
+            *) return 1;;
+        esac
+    else
+        case "$policy:$feature" in
+            preserve:wakeword|community-noncommercial:wakeword|*:stt|*:tts|*:assistant|*:airplay2) ;;
+            *) return 1;;
+        esac
+    fi
+    if [ "$feature" = airplay2 ] && [ $((integrations & 16)) -eq 0 ]; then
+        return 1
+    fi
+    feature_in_manifest "$feature"
+}
+
+service_probe() {
+    local feature=$1 service socket pidfile pid exe expected
+    case "$feature" in
+        airplay2) service=airplayd; socket=$RUN_ROOT/libreecho/airplay.sock;;
+        tts) service=ttsd; socket=$RUN_ROOT/libreecho/tts.sock;;
+        wakeword) service=waked; socket=$RUN_ROOT/libreecho/wakeword.sock;;
+        stt) service=sttd; socket=$RUN_ROOT/libreecho/stt.sock;;
+        assistant) service=agentd; socket=$RUN_ROOT/libreecho/agent.sock;;
+        *) fail service-feature;;
+    esac
+    pidfile=$VAR_RUN_ROOT/libreecho-$service.pid
+    regular "$pidfile" service-pidfile
+    pid=$($BB sed -n '1p' "$pidfile")
+    case "$pid" in ''|*[!0-9]*) fail service-pid;; esac
+    exe=$PROC_ROOT/$pid/exe
+    [ -f "$exe" ] || fail service-exe
+    expected=$(value "feature_${feature}_daemon_sha256" "$STAGING/manifest")
+    [ "$(file_hash "$exe")" = "$expected" ] || fail service-exe-hash
+    [ -S "$socket" ] || fail service-socket
+    $BB awk -v socket="$socket" '$NF == socket { found=1 } END { exit found ? 0 : 1 }' "$PROC_NET_UNIX" >/dev/null 2>&1 || fail service-socket-owner
+}
+
+verify_required_services() {
+    local feature
+    for feature in airplay2 tts wakeword stt assistant; do
+        feature_required "$feature" && service_probe "$feature"
+    done
+}
+
+verify_running() {
+    local ids running profile policy
+    regular "$PENDING" pending
+    regular "$JOURNAL" journal
+    validate_intent
+    ids=$(value feature_ids "$JOURNAL")
+    running=$(running_slot)
+    [ "$running" = "$(value slot "$PENDING")" ] || fail running-slot-mismatch
+    regular "$BCB_FILE" bcb-readback
+    [ "$(value selected_slot "$BCB_FILE")" = "$running" ] || fail bcb-running-slot-mismatch
+    case "$(value slot_${running}_success "$BCB_FILE")" in 0|1) ;; *) fail bcb-running-state;; esac
+    verify_boot_identity "$running"
+    profile=$($BB cat "$ETC_ROOT/libreecho/service-profile" 2>/dev/null)
+    [ "$profile" = "$(value service_profile "$STAGING/manifest")" ] || fail service-profile-identity
+    policy=$($BB cat "$ETC_ROOT/libreecho/feature-policy" 2>/dev/null)
+    [ "$policy" = "$(value feature_policy "$STAGING/manifest")" ] || fail feature-policy-identity
+    verify_candidate_components
+    verify_candidate_mounts
+    verify_required_services
+    printf 'running_verified slot=%s boot_sha256=%s\n' "$running" "$(value boot_sha256 "$PENDING")"
+}
+
+bcb_confirmed() {
+    local slot
+    regular "$BCB_FILE" bcb-readback
+    slot=$(value selected_slot "$BCB_FILE"); [ "$slot" = "$(value slot "$PENDING")" ] || return 1
+    [ "$(value slot_${slot}_success "$BCB_FILE")" = 1 ] || [ "$(value confirmed_slot "$BCB_FILE")" = "$slot" ] || return 1
+}
+
+bcb_known_unconfirmed() {
+    local selected pending_slot pending_success selected_success
+    regular "$BCB_FILE" bcb-readback
+    selected=$(value selected_slot "$BCB_FILE")
+    case "$selected" in a|b) ;; *) return 1;; esac
+    pending_slot=$(value slot "$PENDING")
+    pending_success=$(value "slot_${pending_slot}_success" "$BCB_FILE")
+    [ "$pending_success" = 0 ] || return 1
+    selected_success=$(value "slot_${selected}_success" "$BCB_FILE")
+    [ "$selected_success" = 0 ] || [ "$selected_success" = 1 ] || return 1
+}
+
+# Validate that the durable intent still describes the currently staged signed
+# manifest.  A renamed or substituted asset therefore cannot be promoted.
+validate_intent() {
+    local manifest sig tx ids feature action payload_name manifest_name
+    regular "$JOURNAL" journal
+    regular "$PENDING" pending
+    manifest=$STAGING/manifest; sig=$STAGING/manifest.sig
+    check_manifest "$manifest"; regular "$sig" manifest-signature
+    [ "$(value schema "$JOURNAL")" = 2 ] || fail journal-schema
+    [ "$(value schema "$PENDING")" = 2 ] || fail pending-schema
+    tx=$(value transaction_id "$JOURNAL")
+    [ "$tx" = "$(value transaction_id "$PENDING")" ] || fail journal-identity
+    [ "$tx" = "$(value transaction_id "$manifest")" ] || fail manifest-identity
+    [ "$(value version "$JOURNAL")" = "$(value version "$PENDING")" ] || fail pending-version-identity
+    [ "$(value slot "$JOURNAL")" = "$(value slot "$PENDING")" ] || fail pending-slot-identity
+    [ "$(value boot_sha256 "$JOURNAL")" = "$(value boot_sha256 "$PENDING")" ] || fail pending-boot-identity
+    [ "$(value manifest_sha256 "$JOURNAL")" = "$(sha256sum "$manifest" | $BB awk '{print $1}')" ] || fail manifest-changed
+    [ "$(value manifest_sig_sha256 "$JOURNAL")" = "$(sha256sum "$sig" | $BB awk '{print $1}')" ] || fail manifest-signature-changed
+    [ "$(value manifest_sha256 "$JOURNAL")" = "$(value manifest_sha256 "$PENDING")" ] || fail pending-manifest-identity
+    [ "$(value manifest_sig_sha256 "$JOURNAL")" = "$(value manifest_sig_sha256 "$PENDING")" ] || fail pending-signature-identity
+    ids=$(value feature_ids "$JOURNAL"); [ "$ids" = "$(value feature_ids "$manifest")" ] || fail feature-list-changed
+    for feature in $(printf '%s' "$ids" | $BB tr ',' ' '); do
+        action=$(value "feature_${feature}_action" "$JOURNAL")
+        [ "$action" = "$(value "feature_${feature}_action" "$manifest")" ] || fail feature-action-changed
+        case "$action" in
+            runtime|replace)
+                feature_names "$action"
+                [ "$(value "feature_${feature}_source_payload" "$JOURNAL")" = "$(value "feature_${feature}_asset" "$manifest")" ] || fail feature-source-changed
+                [ "$(value "feature_${feature}_source_manifest" "$JOURNAL")" = "$(value "feature_${feature}_manifest_asset" "$manifest")" ] || fail feature-source-changed
+                [ "$(value "feature_${feature}_target_payload" "$JOURNAL")" = "$payload_name" ] || fail feature-target-changed
+                [ "$(value "feature_${feature}_target_manifest" "$JOURNAL")" = "$manifest_name" ] || fail feature-target-changed
+                [ "$(value "feature_${feature}_new_payload_sha256" "$JOURNAL")" = "$(value "feature_${feature}_sha256" "$manifest")" ] || fail feature-new-hash-changed
+                [ "$(value "feature_${feature}_new_manifest_sha256" "$JOURNAL")" = "$(value "feature_${feature}_manifest_sha256" "$manifest")" ] || fail feature-new-hash-changed
+                ;;
+            preserve)
+                [ "$(value "feature_${feature}_old_payload_sha256" "$JOURNAL")" = "$(value "feature_${feature}_base_payload_sha256" "$manifest")" ] || fail preserve-hash-changed
+                [ "$(value "feature_${feature}_old_manifest_sha256" "$JOURNAL")" = "$(value "feature_${feature}_base_manifest_sha256" "$manifest")" ] || fail preserve-hash-changed
+                ;;
+            *) fail journal-action;;
+        esac
+    done
+}
+
+set_journal_phase() {
+    local phase=$1
+    safe_path "$JOURNAL"; safe_path "$JOURNAL.tmp"
+    { $BB sed "/^phase=/d" "$JOURNAL"; printf '%s\n' "phase=$phase"; } > "$JOURNAL.tmp" || fail journal-write
+    $BB chmod 0600 "$JOURNAL.tmp" 2>/dev/null || fail journal-mode
+    $BB mv "$JOURNAL.tmp" "$JOURNAL" || fail journal-rename
+    sync_file
+}
+
+move_expected() {
+    local source=$1 target=$2 expected=$3 actual
+    actual=$(hash_state "$source"); [ "$actual" = "$expected" ] || fail source-state
+    [ "$(hash_state "$target")" = none ] || fail destination-not-empty
+    $BB mv "$source" "$target" || fail promote-rename
+    sync_file
+}
+
+reconcile_operation() {
+    local feature=$1 action target_dir source_payload source_manifest target_payload target_manifest backup_payload backup_manifest old_payload new_payload old_manifest new_manifest target_state backup_state source_state obsolete state
+    action=$(value "feature_${feature}_action" "$JOURNAL")
+    case "$action" in
+        preserve)
+            target_dir=$FEATURES/$feature
+            [ "$(hash_state "$target_dir/payload.squashfs")" = "$(value "feature_${feature}_new_payload_sha256" "$JOURNAL")" ] || fail preserve-payload-state
+            [ "$(hash_state "$target_dir/manifest.json")" = "$(value "feature_${feature}_new_manifest_sha256" "$JOURNAL")" ] || fail preserve-manifest-state
+            return 0
+            ;;
+        runtime|replace) ;;
+        *) fail journal-action;;
+    esac
+    source_payload=$STAGING/features/$feature/$(value "feature_${feature}_source_payload" "$JOURNAL")
+    source_manifest=$STAGING/features/$feature/$(value "feature_${feature}_source_manifest" "$JOURNAL")
+    target_payload=$FEATURES/$feature/$(value "feature_${feature}_target_payload" "$JOURNAL")
+    target_manifest=$FEATURES/$feature/$(value "feature_${feature}_target_manifest" "$JOURNAL")
+    backup_payload=$STAGING/$(value "feature_${feature}_backup_payload" "$JOURNAL")
+    backup_manifest=$STAGING/$(value "feature_${feature}_backup_manifest" "$JOURNAL")
+    old_payload=$(value "feature_${feature}_old_payload_sha256" "$JOURNAL"); new_payload=$(value "feature_${feature}_new_payload_sha256" "$JOURNAL")
+    old_manifest=$(value "feature_${feature}_old_manifest_sha256" "$JOURNAL"); new_manifest=$(value "feature_${feature}_new_manifest_sha256" "$JOURNAL")
+    target_state=$(hash_state "$target_payload"); backup_state=$(hash_state "$backup_payload"); source_state=$(hash_state "$source_payload")
+    if [ "$target_state" = "$new_payload" ] && [ "$source_state" = none ]; then
+        [ "$backup_state" = "$old_payload" ] || { [ "$old_payload" = none ] && [ "$backup_state" = none ]; } || fail payload-backup-state
+    elif [ "$old_payload" != none ] && [ "$target_state" = "$old_payload" ] && [ "$backup_state" = none ] && [ "$source_state" = "$new_payload" ]; then
+        move_expected "$target_payload" "$backup_payload" "$old_payload"
+    elif [ "$target_state" = none ] && [ "$source_state" = "$new_payload" ] && [ "$backup_state" = "$old_payload" ]; then
+        :
+    else
+        fail payload-ambiguous
+    fi
+    target_state=$(hash_state "$target_payload"); backup_state=$(hash_state "$backup_payload"); source_state=$(hash_state "$source_payload")
+    if [ "$target_state" = "$new_payload" ] && [ "$source_state" = none ]; then
+        [ "$backup_state" = "$old_payload" ] || { [ "$old_payload" = none ] && [ "$backup_state" = none ]; } || fail payload-backup-state
+    elif [ "$target_state" = none ] && [ "$source_state" = "$new_payload" ]; then
+        [ "$old_payload" = none ] || [ "$backup_state" = "$old_payload" ] || fail payload-recovery-state
+        move_expected "$source_payload" "$target_payload" "$new_payload"
+    else
+        fail payload-ambiguous
+    fi
+    target_state=$(hash_state "$target_manifest"); backup_state=$(hash_state "$backup_manifest"); source_state=$(hash_state "$source_manifest")
+    if [ "$target_state" = "$new_manifest" ] && [ "$source_state" = none ]; then
+        [ "$backup_state" = "$old_manifest" ] || { [ "$old_manifest" = none ] && [ "$backup_state" = none ]; } || fail manifest-backup-state
+    elif [ "$old_manifest" != none ] && [ "$target_state" = "$old_manifest" ] && [ "$backup_state" = none ] && [ "$source_state" = "$new_manifest" ]; then
+        move_expected "$target_manifest" "$backup_manifest" "$old_manifest"
+    elif [ "$target_state" = none ] && [ "$source_state" = "$new_manifest" ] && [ "$backup_state" = "$old_manifest" ]; then
+        :
+    else
+        fail manifest-ambiguous
+    fi
+    target_state=$(hash_state "$target_manifest"); backup_state=$(hash_state "$backup_manifest"); source_state=$(hash_state "$source_manifest")
+    if [ "$target_state" = "$new_manifest" ] && [ "$source_state" = none ]; then
+        [ "$backup_state" = "$old_manifest" ] || { [ "$old_manifest" = none ] && [ "$backup_state" = none ]; } || fail manifest-backup-state
+    elif [ "$target_state" = none ] && [ "$source_state" = "$new_manifest" ]; then
+        [ "$old_manifest" = none ] || [ "$backup_state" = "$old_manifest" ] || fail manifest-recovery-state
+        move_expected "$source_manifest" "$target_manifest" "$new_manifest"
+    else
+        fail manifest-ambiguous
+    fi
+    # A full replacement changes the base against which a runtime capsule was
+    # validated. Never leave an older capsule available to a later boot.
+    if [ "$action" = replace ]; then
+        for obsolete in "$FEATURES/$feature/runtime.squashfs" "$FEATURES/$feature/runtime-manifest.json"; do
+            state=$(hash_state "$obsolete")
+            [ "$state" = none ] || valid_hash "$state" || fail obsolete-runtime-state
+            [ "$state" = none ] || $BB rm -f "$obsolete" || fail obsolete-runtime-cleanup
+        done
+        sync_file
+    fi
+}
+
+verify_installed_state() {
+    local ids installed_manifest feature action
+    ids=$(value feature_ids "$JOURNAL")
+    installed_manifest=$STAGING/manifest
+    [ -f "$installed_manifest" ] || installed_manifest=$COMMITTED_MANIFEST
+    for feature in $(printf '%s' "$ids" | $BB tr ',' ' '); do
+        action=$(value "feature_${feature}_action" "$JOURNAL")
+        case "$action" in
+            preserve)
+                reconcile_operation "$feature"
+                runtime_authority_ready "$feature" "$installed_manifest" || :
+                ;;
+            runtime|replace)
+                [ "$(hash_state "$FEATURES/$feature/$(value "feature_${feature}_target_payload" "$JOURNAL")")" = "$(value "feature_${feature}_new_payload_sha256" "$JOURNAL")" ] || fail installed-payload-state
+                [ "$(hash_state "$FEATURES/$feature/$(value "feature_${feature}_target_manifest" "$JOURNAL")")" = "$(value "feature_${feature}_new_manifest_sha256" "$JOURNAL")" ] || fail installed-manifest-state
+                if [ "$action" = replace ]; then
+                    [ "$(hash_state "$FEATURES/$feature/runtime.squashfs")" = none ] || fail obsolete-runtime-present
+                    [ "$(hash_state "$FEATURES/$feature/runtime-manifest.json")" = none ] || fail obsolete-runtime-manifest-present
+                    [ "$(hash_state "$(runtime_authority_manifest "$feature")")" = none ] || fail obsolete-runtime-authority
+                    [ "$(hash_state "$(runtime_authority_signature "$feature")")" = none ] || fail obsolete-runtime-authority-signature
+                else
+                    runtime_authority_ready "$feature" "$installed_manifest" || fail installed-runtime-authority-missing
+                fi
+                ;;
+            *) fail journal-action;;
+        esac
+    done
+}
+
+persist_committed_evidence() {
+    regular "$STAGING/manifest" manifest
+    regular "$STAGING/manifest.sig" manifest-signature
+    if [ -e "$COMMITTED_MANIFEST" ]; then
+        regular "$COMMITTED_MANIFEST" committed-manifest
+        [ "$(hash_state "$COMMITTED_MANIFEST")" = "$(value manifest_sha256 "$JOURNAL")" ] ||
+            atomic_copy "$STAGING/manifest" "$COMMITTED_MANIFEST"
+    else
+        atomic_copy "$STAGING/manifest" "$COMMITTED_MANIFEST"
+    fi
+    if [ -e "$COMMITTED_SIGNATURE" ]; then
+        regular "$COMMITTED_SIGNATURE" committed-manifest-signature
+        [ "$(hash_state "$COMMITTED_SIGNATURE")" = "$(value manifest_sig_sha256 "$JOURNAL")" ] ||
+            atomic_copy "$STAGING/manifest.sig" "$COMMITTED_SIGNATURE"
+    else
+        atomic_copy "$STAGING/manifest.sig" "$COMMITTED_SIGNATURE"
+    fi
+    check_manifest "$COMMITTED_MANIFEST" "$COMMITTED_SIGNATURE"
+}
+
+runtime_authority_manifest() {
+    printf '%s/committed-runtime-%s.manifest\n' "$ROOT" "$1"
+}
+
+runtime_authority_signature() {
+    printf '%s/committed-runtime-%s.sig\n' "$ROOT" "$1"
+}
+
+# A preserve generation may retain one effective runtime capsule, but it may
+# never make that choice from mutable capsule metadata.  The fixed per-feature
+# authority pair is a signed manifest from the last runtime generation.  There
+# are at most two files per known feature; no generation chain is retained.
+validate_runtime_authority() {
+    local feature=$1 current_manifest=$2 authority_manifest authority_signature field base capsule capsule_manifest
+    authority_manifest=$(runtime_authority_manifest "$feature")
+    authority_signature=$(runtime_authority_signature "$feature")
+    regular "$authority_manifest" runtime-authority-manifest
+    regular "$authority_signature" runtime-authority-signature
+    check_manifest "$authority_manifest" "$authority_signature"
+    [ "$(value feature_${feature}_action "$authority_manifest")" = runtime ] || fail runtime-authority-action
+    case "$(value feature_${feature}_action "$current_manifest")" in preserve|runtime) ;; *) fail runtime-authority-current-action;; esac
+    for field in base_payload_sha256 base_manifest_sha256 daemon_path daemon_sha256; do
+        [ "$(value feature_${feature}_${field} "$authority_manifest")" = "$(value feature_${feature}_${field} "$current_manifest")" ] || fail runtime-authority-conflict
+    done
+    base=$FEATURES/$feature/payload.squashfs
+    capsule=$FEATURES/$feature/runtime.squashfs
+    capsule_manifest=$FEATURES/$feature/runtime-manifest.json
+    [ "$(file_hash "$base")" = "$(value feature_${feature}_base_payload_sha256 "$authority_manifest")" ] || fail runtime-authority-base-payload
+    [ "$(file_hash "$FEATURES/$feature/manifest.json")" = "$(value feature_${feature}_base_manifest_sha256 "$authority_manifest")" ] || fail runtime-authority-base-manifest
+    [ "$(file_hash "$capsule")" = "$(value feature_${feature}_sha256 "$authority_manifest")" ] || fail runtime-authority-capsule
+    [ "$(file_hash "$capsule_manifest")" = "$(value feature_${feature}_manifest_sha256 "$authority_manifest")" ] || fail runtime-authority-capsule-manifest
+}
+
+# Return success when a complete retained runtime is present, and return 1
+# when the feature has no runtime evidence.  Any partial pair is corruption.
+runtime_authority_ready() {
+    local feature=$1 current_manifest=$2 authority_manifest authority_signature capsule capsule_manifest authority_state signature_state capsule_state capsule_manifest_state
+    authority_manifest=$(runtime_authority_manifest "$feature")
+    authority_signature=$(runtime_authority_signature "$feature")
+    capsule=$FEATURES/$feature/runtime.squashfs
+    capsule_manifest=$FEATURES/$feature/runtime-manifest.json
+    authority_state=$(hash_state "$authority_manifest")
+    signature_state=$(hash_state "$authority_signature")
+    capsule_state=$(hash_state "$capsule")
+    capsule_manifest_state=$(hash_state "$capsule_manifest")
+    if [ "$authority_state:$signature_state:$capsule_state:$capsule_manifest_state" = none:none:none:none ]; then
+        return 1
+    fi
+    [ "$authority_state" != none ] && [ "$signature_state" != none ] &&
+        [ "$capsule_state" != none ] && [ "$capsule_manifest_state" != none ] ||
+        fail runtime-authority-incomplete
+    validate_runtime_authority "$feature" "$current_manifest"
+}
+
+persist_runtime_authority() {
+    local ids feature action authority_manifest authority_signature authority_state signature_state capsule_state capsule_manifest_state
+    ids=$(value feature_ids "$STAGING/manifest")
+    for feature in $(printf '%s' "$ids" | $BB tr ',' ' '); do
+        action=$(value "feature_${feature}_action" "$STAGING/manifest")
+        authority_manifest=$(runtime_authority_manifest "$feature")
+        authority_signature=$(runtime_authority_signature "$feature")
+        authority_state=$(hash_state "$authority_manifest")
+        signature_state=$(hash_state "$authority_signature")
+        case "$action" in
+            runtime)
+                atomic_copy "$STAGING/manifest" "$authority_manifest"
+                atomic_copy "$STAGING/manifest.sig" "$authority_signature"
+                validate_runtime_authority "$feature" "$STAGING/manifest"
+                ;;
+            preserve)
+                if [ "$authority_state:$signature_state" = none:none ]; then
+                    capsule_state=$(hash_state "$FEATURES/$feature/runtime.squashfs")
+                    capsule_manifest_state=$(hash_state "$FEATURES/$feature/runtime-manifest.json")
+                    [ "$capsule_state:$capsule_manifest_state" = none:none ] || fail runtime-authority-missing
+                else
+                    runtime_authority_ready "$feature" "$STAGING/manifest" || fail runtime-authority-missing
+                fi
+                ;;
+            replace)
+                [ "$authority_state:$signature_state" = none:none ] ||
+                    { [ "$authority_state" != none ] && [ "$signature_state" != none ] || fail runtime-authority-incomplete; }
+                [ "$authority_state:$signature_state" = none:none ] || $BB rm -f "$authority_manifest" "$authority_signature" || fail runtime-authority-cleanup
+                ;;
+            *) fail runtime-authority-action;;
+        esac
+    done
+    sync_file
+}
+
+verify_committed_evidence() {
+    local ids feature action authority_manifest authority_signature
+    regular "$COMMITTED_MANIFEST" committed-manifest
+    regular "$COMMITTED_SIGNATURE" committed-manifest-signature
+    check_manifest "$COMMITTED_MANIFEST" "$COMMITTED_SIGNATURE"
+    regular "$INSTALLED" installed
+    [ "$(value schema "$INSTALLED")" = 2 ] || fail installed-schema
+    [ "$(value transaction_id "$INSTALLED")" = "$(value transaction_id "$COMMITTED_MANIFEST")" ] || fail installed-transaction-identity
+    [ "$(value manifest_sha256 "$INSTALLED")" = "$(sha256sum "$COMMITTED_MANIFEST" | $BB awk '{print $1}')" ] || fail installed-manifest-identity
+    [ "$(value manifest_sig_sha256 "$INSTALLED")" = "$(sha256sum "$COMMITTED_SIGNATURE" | $BB awk '{print $1}')" ] || fail installed-signature-identity
+    ids=$(value feature_ids "$COMMITTED_MANIFEST")
+    for feature in $(printf '%s' "$ids" | $BB tr ',' ' '); do
+        action=$(value "feature_${feature}_action" "$COMMITTED_MANIFEST")
+        authority_manifest=$(runtime_authority_manifest "$feature")
+        authority_signature=$(runtime_authority_signature "$feature")
+        case "$action" in
+            runtime)
+                runtime_authority_ready "$feature" "$COMMITTED_MANIFEST" || fail committed-runtime-authority-missing
+                ;;
+            preserve)
+                runtime_authority_ready "$feature" "$COMMITTED_MANIFEST" || :
+                ;;
+            replace)
+                [ "$(hash_state "$authority_manifest")" = none ] || fail obsolete-runtime-authority
+                [ "$(hash_state "$authority_signature")" = none ] || fail obsolete-runtime-authority-signature
+                [ "$(hash_state "$FEATURES/$feature/runtime.squashfs")" = none ] || fail obsolete-runtime-present
+                [ "$(hash_state "$FEATURES/$feature/runtime-manifest.json")" = none ] || fail obsolete-runtime-manifest-present
+                ;;
+            *) fail committed-action;;
+        esac
+    done
+}
+
+activate_committed() {
+    local ids feature action root daemon_path base capsule overlay capsule_manifest payload
+    safe_path "$ROOT"; safe_path "$FEATURES"; safe_path "$RUN_ROOT"
+    [ ! -e "$PENDING" ] && [ ! -e "$JOURNAL" ] || fail committed-transaction-pending
+    [ -e "$COMMITTED_MANIFEST" ] || [ -e "$COMMITTED_SIGNATURE" ] || exit 0
+    verify_committed_evidence
+    ids=$(value feature_ids "$COMMITTED_MANIFEST")
+    for feature in $(printf '%s' "$ids" | $BB tr ',' ' '); do
+        action=$(value "feature_${feature}_action" "$COMMITTED_MANIFEST")
+        root=$RUN_ROOT/libreecho/features/$feature/root
+        daemon_path=$(value "feature_${feature}_daemon_path" "$COMMITTED_MANIFEST")
+        safe_path "$root"; safe_path "$root/$daemon_path"
+        case "$action" in
+            preserve)
+                [ "$(file_hash "$FEATURES/$feature/payload.squashfs")" = "$(value "feature_${feature}_base_payload_sha256" "$COMMITTED_MANIFEST")" ] || fail committed-base-payload-hash
+                [ "$(file_hash "$FEATURES/$feature/manifest.json")" = "$(value "feature_${feature}_base_manifest_sha256" "$COMMITTED_MANIFEST")" ] || fail committed-base-manifest-hash
+                if runtime_authority_ready "$feature" "$COMMITTED_MANIFEST"; then
+                    base=$FEATURES/$feature/payload.squashfs
+                    capsule=$FEATURES/$feature/runtime.squashfs
+                    overlay=$RUN_ROOT/libreecho/features/$feature/runtime
+                    $BB mkdir -p "$root" "$overlay" || fail committed-mkdir
+                    $BB mount -t squashfs -o loop,ro,nosuid,nodev,noatime "$base" "$root" || fail committed-base-mount
+                    $BB mount -t squashfs -o loop,ro,nosuid,nodev,noatime "$capsule" "$overlay" || fail committed-capsule-mount
+                    $BB mount --bind "$overlay/$daemon_path" "$root/$daemon_path" || fail committed-bind-mount
+                fi
+                ;;
+            replace)
+                payload=$FEATURES/$feature/payload.squashfs
+                [ "$(file_hash "$payload")" = "$(value "feature_${feature}_sha256" "$COMMITTED_MANIFEST")" ] || fail committed-payload-hash
+                [ "$(file_hash "$FEATURES/$feature/manifest.json")" = "$(value "feature_${feature}_manifest_sha256" "$COMMITTED_MANIFEST")" ] || fail committed-manifest-hash
+                $BB mkdir -p "$root" || fail committed-mkdir
+                $BB mount -t squashfs -o loop,ro,nosuid,nodev,noatime "$payload" "$root" || fail committed-mount
+                ;;
+            runtime)
+                base=$FEATURES/$feature/payload.squashfs
+                capsule=$FEATURES/$feature/runtime.squashfs
+                capsule_manifest=$FEATURES/$feature/runtime-manifest.json
+                [ "$(file_hash "$base")" = "$(value "feature_${feature}_base_payload_sha256" "$COMMITTED_MANIFEST")" ] || fail committed-base-payload-hash
+                [ "$(file_hash "$FEATURES/$feature/manifest.json")" = "$(value "feature_${feature}_base_manifest_sha256" "$COMMITTED_MANIFEST")" ] || fail committed-base-manifest-hash
+                [ "$(file_hash "$capsule")" = "$(value "feature_${feature}_sha256" "$COMMITTED_MANIFEST")" ] || fail committed-capsule-hash
+                [ "$(file_hash "$capsule_manifest")" = "$(value "feature_${feature}_manifest_sha256" "$COMMITTED_MANIFEST")" ] || fail committed-capsule-manifest-hash
+                overlay=$RUN_ROOT/libreecho/features/$feature/runtime
+                $BB mkdir -p "$root" "$overlay" || fail committed-mkdir
+                $BB mount -t squashfs -o loop,ro,nosuid,nodev,noatime "$base" "$root" || fail committed-base-mount
+                $BB mount -t squashfs -o loop,ro,nosuid,nodev,noatime "$capsule" "$overlay" || fail committed-capsule-mount
+                $BB mount --bind "$overlay/$daemon_path" "$root/$daemon_path" || fail committed-bind-mount
+                ;;
+            *) fail committed-action;;
+        esac
+    done
+    for feature in $(printf '%s' "$ids" | $BB tr ',' ' '); do
+        action=$(value "feature_${feature}_action" "$COMMITTED_MANIFEST")
+        daemon_path=$(value "feature_${feature}_daemon_path" "$COMMITTED_MANIFEST")
+        root=$RUN_ROOT/libreecho/features/$feature/root
+        case "$action" in
+            preserve)
+                if runtime_authority_ready "$feature" "$COMMITTED_MANIFEST"; then
+                    mount_matches "$root" "$FEATURES/$feature/payload.squashfs"
+                    mount_matches "$RUN_ROOT/libreecho/features/$feature/runtime" "$FEATURES/$feature/runtime.squashfs"
+                    mount_matches "$root/$daemon_path" "$RUN_ROOT/libreecho/features/$feature/runtime/$daemon_path"
+                    [ "$(file_hash "$root/$daemon_path")" = "$(value "feature_${feature}_daemon_sha256" "$COMMITTED_MANIFEST")" ] || fail committed-daemon-hash
+                fi
+                ;;
+            replace)
+                mount_matches "$root" "$FEATURES/$feature/payload.squashfs"
+                [ "$(file_hash "$root/$daemon_path")" = "$(value "feature_${feature}_daemon_sha256" "$COMMITTED_MANIFEST")" ] || fail committed-daemon-hash
+                ;;
+            runtime)
+                mount_matches "$root" "$FEATURES/$feature/payload.squashfs"
+                mount_matches "$RUN_ROOT/libreecho/features/$feature/runtime" "$FEATURES/$feature/runtime.squashfs"
+                mount_matches "$root/$daemon_path" "$RUN_ROOT/libreecho/features/$feature/runtime/$daemon_path"
+                [ "$(file_hash "$root/$daemon_path")" = "$(value "feature_${feature}_daemon_sha256" "$COMMITTED_MANIFEST")" ] || fail committed-daemon-hash
+                ;;
+            *) fail committed-action;;
+        esac
+    done
+    printf 'committed_activation_validated feature_ids=%s\n' "$ids"
+}
+
+no_symlinks_tree() {
+    local link
+    [ -d "$STAGING" ] || return 0
+    link=$($BB find "$STAGING" -type l -print -quit 2>/dev/null)
+    [ -z "$link" ] || fail staging-symlink
+}
+
+cleanup_installed() {
+    verify_installed_state
+    no_symlinks_tree
+    if [ -d "$STAGING" ]; then $BB rm -rf "$STAGING" || fail staging-cleanup; sync_file; fi
+    if [ -e "$PENDING" ]; then
+        regular "$PENDING" pending
+        [ "$(value transaction_id "$PENDING")" = "$(value transaction_id "$JOURNAL")" ] || fail pending-cleanup-identity
+        $BB rm -f "$PENDING" || fail pending-cleanup
+        sync_file
+    fi
+    $BB rm -f "$JOURNAL" || fail journal-cleanup
+    sync_file
+}
+
+recover_installed() {
+    safe_path "$ROOT"; safe_path "$STAGING"; safe_path "$FEATURES"; safe_path "$JOURNAL"; safe_path "$PENDING"; safe_path "$INSTALLED"
+    [ -e "$JOURNAL" ] || exit 0
+    regular "$JOURNAL" journal
+    [ "$(value phase "$JOURNAL")" = installed ] || fail recovery-journal-phase
+    # Cleanup recovery is allowed only from the durable, signed evidence that
+    # was persisted before the installed marker was published.
+    verify_committed_evidence
+    cleanup_installed
+    printf 'cleanup-recovered transaction_id=%s\n' "$(value transaction_id "$INSTALLED")"
+}
+
+commit() {
+    local phase tx ids feature
+    safe_path "$ROOT"; safe_path "$STAGING"; safe_path "$FEATURES"; safe_path "$JOURNAL"; safe_path "$PENDING"; safe_path "$INSTALLED"; safe_path "$COMMITTED_MANIFEST"; safe_path "$COMMITTED_SIGNATURE"
+    if [ -f "$INSTALLED" ] && [ ! -e "$JOURNAL" ]; then printf 'already-installed\n'; exit 0; fi
+    # Recover a lost counterpart after an interrupted atomic journal boundary.
+    if [ ! -e "$JOURNAL" ] && [ -e "$PENDING" ]; then atomic_copy "$PENDING" "$JOURNAL"; fi
+    if [ ! -e "$PENDING" ] && [ -e "$JOURNAL" ]; then atomic_copy "$JOURNAL" "$PENDING"; fi
+    regular "$PENDING" pending; regular "$JOURNAL" journal
+    phase=$(value phase "$JOURNAL")
+    case "$phase" in prepared|confirmed|installed) ;; *) fail journal-phase;; esac
+    if [ "$phase" = installed ]; then
+        tx=$(value transaction_id "$JOURNAL")
+        verify_committed_evidence
+        cleanup_installed
+        printf 'installed transaction_id=%s\n' "$tx"
+        exit 0
+    fi
+    validate_intent
+    # This is deliberately before set_journal_phase and before every rename.
+    bcb_confirmed || fail bcb-readback-ambiguous
+    tx=$(value transaction_id "$JOURNAL")
+    [ "$tx" = "$(value transaction_id "$PENDING")" ] || fail journal-identity
+    [ "$phase" = confirmed ] || set_journal_phase confirmed
+    ids=$(value feature_ids "$JOURNAL")
+    for feature in $(printf '%s' "$ids" | $BB tr ',' ' '); do reconcile_operation "$feature"; done
+    persist_runtime_authority
+    persist_committed_evidence
+    atomic_write "$INSTALLED" printf '%s\n' schema=2 "transaction_id=$tx" "version=$(value version "$JOURNAL")" "slot=$(value slot "$JOURNAL")" "manifest_sha256=$(value manifest_sha256 "$JOURNAL")" "manifest_sig_sha256=$(value manifest_sig_sha256 "$JOURNAL")" "feature_ids=$ids" phase=installed
+    set_journal_phase installed
+    cleanup_installed
+    printf 'installed transaction_id=%s\n' "$tx"
+}
+
+abort_operation_untouched() {
+    local feature=$1 action source_payload source_manifest target_payload target_manifest backup_payload backup_manifest
+    action=$(value "feature_${feature}_action" "$JOURNAL")
+    [ "$action" = preserve ] && return 0
+    source_payload=$STAGING/features/$feature/$(value "feature_${feature}_source_payload" "$JOURNAL")
+    source_manifest=$STAGING/features/$feature/$(value "feature_${feature}_source_manifest" "$JOURNAL")
+    target_payload=$FEATURES/$feature/$(value "feature_${feature}_target_payload" "$JOURNAL")
+    target_manifest=$FEATURES/$feature/$(value "feature_${feature}_target_manifest" "$JOURNAL")
+    backup_payload=$STAGING/$(value "feature_${feature}_backup_payload" "$JOURNAL")
+    backup_manifest=$STAGING/$(value "feature_${feature}_backup_manifest" "$JOURNAL")
+    [ "$(hash_state "$backup_payload")" = none ] || fail abort-ambiguous
+    [ "$(hash_state "$backup_manifest")" = none ] || fail abort-ambiguous
+    [ "$(hash_state "$target_payload")" = "$(value "feature_${feature}_old_payload_sha256" "$JOURNAL")" ] || fail abort-ambiguous
+    [ "$(hash_state "$target_manifest")" = "$(value "feature_${feature}_old_manifest_sha256" "$JOURNAL")" ] || fail abort-ambiguous
+    [ "$(hash_state "$source_payload")" = "$(value "feature_${feature}_new_payload_sha256" "$JOURNAL")" ] || fail abort-ambiguous
+    [ "$(hash_state "$source_manifest")" = "$(value "feature_${feature}_new_manifest_sha256" "$JOURNAL")" ] || fail abort-ambiguous
+}
+
+abort() {
+    local ids feature tx
+    safe_path "$ROOT"; safe_path "$STAGING"; safe_path "$FEATURES"; safe_path "$JOURNAL"; safe_path "$PENDING"; safe_path "$INSTALLED"
+    [ ! -e "$JOURNAL" ] && [ ! -e "$PENDING" ] && exit 0
+    [ -e "$JOURNAL" ] && regular "$JOURNAL" journal || fail abort-ambiguous
+    [ -e "$PENDING" ] && regular "$PENDING" pending || fail abort-ambiguous
+    [ ! -e "$INSTALLED" ] || fail abort-installed
+    [ "$(value phase "$JOURNAL")" = prepared ] || fail abort-confirmed
+    validate_intent
+    bcb_confirmed && fail abort-confirmed
+    # A missing or incomplete BCB is not evidence that activation did not happen.
+    bcb_known_unconfirmed || fail abort-ambiguous
+    ids=$(value feature_ids "$JOURNAL")
+    for feature in $(printf '%s' "$ids" | $BB tr ',' ' '); do abort_operation_untouched "$feature"; done
+    no_symlinks_tree
+    tx=$(value transaction_id "$JOURNAL")
+    $BB rm -f "$PENDING" "$JOURNAL" || fail abort-cleanup
+    [ ! -e "$STAGING" ] || $BB rm -rf "$STAGING" || fail abort-cleanup
+    sync_file
+    printf 'aborted transaction_id=%s\n' "$tx"
+}
+
+bcb_fallback_safe() {
+    local selected pending_slot
+    regular "$BCB_FILE" bcb-readback
+    selected=$(value selected_slot "$BCB_FILE")
+    pending_slot=$(value slot "$PENDING")
+    case "$selected:$pending_slot" in
+        a:b|b:a) ;;
+        *) return 1 ;;
+    esac
+    [ "$(value slot_${pending_slot}_success "$BCB_FILE")" = 0 ] || return 1
+    [ "$(value slot_${selected}_success "$BCB_FILE")" = 1 ] || return 1
+}
+
+fallback() {
+    local rolled_back tx ids feature
+    safe_path "$ROOT"; safe_path "$STAGING"; safe_path "$FEATURES"; safe_path "$JOURNAL"; safe_path "$PENDING"; safe_path "$INSTALLED"
+    [ -e "$JOURNAL" ] && [ -e "$PENDING" ] || exit 0
+    regular "$JOURNAL" journal; regular "$PENDING" pending
+    [ ! -e "$INSTALLED" ] || fail fallback-installed
+    [ "$(value phase "$JOURNAL")" = prepared ] || fail fallback-confirmed
+    validate_intent
+    bcb_fallback_safe || fail fallback-bcb-ambiguous
+    ids=$(value feature_ids "$JOURNAL")
+    for feature in $(printf '%s' "$ids" | $BB tr ',' ' '); do abort_operation_untouched "$feature"; done
+    no_symlinks_tree
+    rolled_back=$ROOT/rolled-back
+    if [ -e "$rolled_back" ]; then
+        regular "$rolled_back" rolled-back
+        [ "$(value transaction_id "$rolled_back")" = "$(value transaction_id "$JOURNAL")" ] || fail fallback-identity
+    else
+        atomic_copy "$PENDING" "$rolled_back"
+    fi
+    tx=$(value transaction_id "$JOURNAL")
+    $BB rm -f "$PENDING" "$JOURNAL" || fail fallback-cleanup
+    [ ! -e "$STAGING" ] || $BB rm -rf "$STAGING" || fail fallback-cleanup
+    sync_file
+    printf 'fallback-cleaned transaction_id=%s\n' "$tx"
+}
+
+status() {
+    printf 'root=%s\n' "$ROOT"
+    [ ! -e "$PENDING" ] || { printf 'pending=1\n'; $BB cat "$PENDING"; }
+    [ ! -e "$JOURNAL" ] || { printf 'feature_commit=1\n'; $BB cat "$JOURNAL"; }
+    [ -e "$INSTALLED" ] && { printf 'installed=1\n'; $BB cat "$INSTALLED"; } || true
+}
+
+case "${1:-}" in
+ preflight) [ "$#" -ge 2 ] && [ "$#" -le 3 ] || fail usage; preflight "$2" "${3:-prewrite}";;
+ prepare-boot) [ "$#" -eq 1 ] || fail usage; prepare_boot;;
+ verify-running) [ "$#" -eq 1 ] || fail usage; verify_running;;
+ activate-mounts) [ "$#" -eq 1 ] || fail usage; activate_mounts;;
+ activate-committed) [ "$#" -eq 1 ] || fail usage; activate_committed;;
+ recover-installed) [ "$#" -eq 1 ] || fail usage; recover_installed;;
+ commit-after-confirm) [ "$#" -eq 1 ] || fail usage; commit;;
+ status) [ "$#" -eq 1 ] || fail usage; status;;
+ abort-before-activation) [ "$#" -eq 1 ] || fail usage; abort;;
+ fallback) [ "$#" -eq 1 ] || fail usage; fallback;;
+ *) fail usage;;
+esac

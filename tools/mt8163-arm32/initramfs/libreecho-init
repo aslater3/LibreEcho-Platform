@@ -848,12 +848,44 @@ start_persisted_feature_services()
     return "$rc"
 }
 
+activate_feature_transaction()
+{
+    transaction=/usr/local/sbin/libreecho-feature-transaction
+    [ -x "$transaction" ] || return 0
+    update=/data/libreecho/update
+    if [ -r "$update/feature-commit" ] &&
+        [ "$(sed -n 's/^phase=//p' "$update/feature-commit" 2>/dev/null)" = installed ]; then
+        "$transaction" recover-installed || { log feature-transaction-cleanup-recovery-rejected; return 1; }
+    fi
+    if [ ! -r "$update/pending" ]; then
+        "$transaction" activate-committed || { log feature-transaction-committed-rejected; return 1; }
+        return 0
+    fi
+    schema=$($BB sed -n 's/^schema=//p' "$update/pending" 2>/dev/null)
+    [ "$schema" = 2 ] || return 0
+    pending_slot=$($BB sed -n 's/^slot=//p' "$update/pending" 2>/dev/null)
+    running_slot=$($BB sed -n 's/.*androidboot.slot_suffix=_\([ab]\).*/\1/p' /proc/cmdline)
+    [ "$running_slot" = "$pending_slot" ] || { log feature-transaction-fallback-canonical; return 0; }
+    $BB mkdir -p "$update/staging" || { log feature-transaction-staging-failed; return 1; }
+    if /usr/local/sbin/libreecho-bootctl status > "$update/staging/bootctl.readback" 2>/dev/null; then
+        "$transaction" activate-mounts || { log feature-transaction-activation-rejected; return 1; }
+        log feature-transaction-candidate-mounted
+        return 0
+    fi
+    log feature-transaction-bcb-read-failed
+    return 1
+}
+
 start_ui_services()
 {
     [ -x /usr/local/sbin/libreecho-web ] || {
         log ui-services-not-installed
         return 0
     }
+    if ! activate_feature_transaction; then
+        log ui-services-blocked-by-feature-transaction
+        return 1
+    fi
     apply_timezone
     $BB mkdir -p /var/run /var/log /var/log/libreecho /run/libreecho
     if [ "$SERVICE_PROFILE" = production ] && [ "${DATA_CLEANUP_OK:-0}" -ne 1 ]; then
@@ -1015,6 +1047,17 @@ ota_health_confirm_worker()
     case "$pending_slot:$selected_slot" in
         a:a|b:b) ;;
         a:b|b:a)
+            if [ "$($BB sed -n 's/^schema=//p' /data/libreecho/update/pending 2>/dev/null)" = 2 ] &&
+               [ -r /data/libreecho/update/feature-commit ]; then
+                $BB mkdir -p /data/libreecho/update/staging
+                if /usr/local/sbin/libreecho-bootctl status > /data/libreecho/update/staging/bootctl.readback 2>/dev/null &&
+                   /usr/local/sbin/libreecho-feature-transaction fallback; then
+                    log "ota-v2-fallback-cleaned:$pending_slot:$selected_slot"
+                    return 0
+                fi
+                log ota-v2-fallback-preserved-for-recovery
+                return 0
+            fi
             $BB mv /data/libreecho/update/pending \
                 /data/libreecho/update/rolled-back
             {
