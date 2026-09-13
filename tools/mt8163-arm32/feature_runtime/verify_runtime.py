@@ -360,26 +360,40 @@ def cat_hash(payload: Path, member: str, expected_size: int) -> tuple[str, int]:
         )
     except OSError as exc:
         raise error("unable to read SquashFS member") from exc
-    assert process.stdout is not None
+    # Drain both pipes under one deadline; blocking read() followed by wait()
+    # does not bound a stalled reader or a full stderr pipe.
+    import selectors
+    import time
     value = hashlib.sha256()
     size = 0
+    deadline = time.monotonic() + 10
     try:
-        while True:
-            chunk = process.stdout.read(1024 * 1024)
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > expected_size:
-                process.kill()
-                process.wait(timeout=10)
-                raise error("SquashFS member is larger than its manifest")
-            value.update(chunk)
-        if process.wait(timeout=10) != 0:
-            raise error("unable to read SquashFS member")
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ, True)
+            selector.register(process.stderr, selectors.EVENT_READ, False)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(process.args, 10)
+                for key, _ in selector.select(remaining):
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                    elif key.data:
+                        size += len(chunk)
+                        if size > expected_size:
+                            raise error("SquashFS member is larger than its manifest")
+                        value.update(chunk)
+            if process.wait(timeout=max(0.001, deadline - time.monotonic())) != 0:
+                raise error("unable to read SquashFS member")
     except subprocess.TimeoutExpired as exc:
-        process.kill()
-        process.wait(timeout=10)
         raise error("timed out reading SquashFS member") from exc
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=10)
+        process.stdout.close()
+        process.stderr.close()
     return value.hexdigest(), size
 
 

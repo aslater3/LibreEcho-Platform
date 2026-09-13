@@ -12,6 +12,18 @@ ROOT = Path(__file__).resolve().parent
 
 
 class SSHRuntimeTests(unittest.TestCase):
+    def test_web_binding_survives_first_account_lifecycle(self):
+        source = (ROOT / 'initramfs/libreecho-init').read_text()
+        start = source.index('                # The control plane is intentionally')
+        selection = source[start:source.index('                ARGS=', start)]
+        for ready in ['false', 'true']:
+            result = subprocess.run(['sh', '-ec',
+                'log() { :; }; web_users_file_ready() { ' + ready + '; };\n' +
+                selection + '\nprintf "%s" "$web_listen"'],
+                capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, '0.0.0.0:8080')
+
     def test_account_polls_delete_and_preserve_uids(self):
         source = (ROOT / 'ssh/libreecho-ssh.init').read_text()
         functions = source[source.index('users_file_ready()'):source.index('dropbear_running()')]
@@ -34,9 +46,10 @@ class SSHRuntimeTests(unittest.TestCase):
                 result = subprocess.run(['sh', '-c', script], env=env, capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 records = (root / 'passwd').read_text().splitlines()
-                self.assertEqual([r.split(':')[0] for r in records], ['root'] + names)
+                self.assertEqual([r.split(':')[0] for r in records], ['root'] + [n.lower() for n in names])
                 return (root / 'state/accounts').read_text()
-            first = poll(['alice', 'bob'])
+            first = poll(['Alice', 'BOB'])
+            self.assertEqual(first, poll(['ALICE', 'Bob']))
             self.assertEqual(first, poll(['alice', 'bob']))
             self.assertEqual(first, poll(['alice', 'bob']))
             remaining = poll(['bob', 'carol'])

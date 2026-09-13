@@ -54,6 +54,31 @@ def run(command: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, text=True, capture_output=True, check=False)
 
 
+class MemberDeadlineTests(unittest.TestCase):
+    def test_stalled_stdout_and_full_stderr_are_bounded(self):
+        import importlib.util
+        import time
+        from unittest.mock import patch
+        spec = importlib.util.spec_from_file_location('runtime_verifier', VERIFIER)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / 'unsquashfs'
+            for body in ["import time; time.sleep(60)",
+                         "import os; os.write(2, b'x' * 2000000); os.write(1, b'ok')"]:
+                executable.write_text('#!' + sys.executable + '\n' + body + '\n')
+                executable.chmod(0o755)
+                with patch.object(module.shutil, 'which', return_value=str(executable)):
+                    start = time.monotonic()
+                    if 'sleep' in body:
+                        with self.assertRaisesRegex(module.CapsuleError, 'timed out'):
+                            module.cat_hash(Path('fixture'), '/member', 2)
+                    else:
+                        self.assertEqual(module.cat_hash(Path('fixture'), '/member', 2),
+                                         (hashlib.sha256(b'ok').hexdigest(), 2))
+                    self.assertLess(time.monotonic() - start, 15)
+
+
 class RuntimeCapsuleTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory(prefix="runtime-capsule-test-")
