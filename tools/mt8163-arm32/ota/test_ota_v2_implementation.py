@@ -1734,6 +1734,54 @@ done
         self.assertFalse((self.update_root / "staging").exists())
         self.assertIn("state=failed", (self.update_root / "state").read_text())
 
+    def test_v2_install_rejects_channel_mismatch_before_boot_write(self) -> None:
+        from feature_manifest import build_control_tar
+        boot_a = self.parts / "boot_a"
+        boot_before = boot_a.read_bytes()
+        for manifest_channel, device_channel in (("dev", "stable"), ("stable", "dev")):
+            self.manifest["update_channel"] = manifest_channel
+            self.package.write_bytes(build_control_tar(self.manifest, self.boot, KEY))
+            (self.update_root / "automatic-updates").write_text(
+                "channel=" + device_channel + "\n"
+            )
+            (self.root / "packaged-channel").write_text(device_channel + "\n")
+            result = self.invoke_updater("install", str(self.package))
+            self.assertNotEqual(result.returncode, 0, manifest_channel)
+            self.assertIn(
+                "v2_update_channel_mismatch", result.stderr, manifest_channel
+            )
+            self.assertEqual(boot_a.read_bytes(), boot_before, manifest_channel)
+        self.assertFalse(self.bootctl_log.exists())
+
+    def test_inspect_and_install_preserve_pending_v2_staging(self) -> None:
+        staging = self.update_root / "staging"
+        staging.mkdir(parents=True, exist_ok=True)
+        staged = {
+            "manifest": b"format=libreecho-ota-v2\n",
+            "manifest.sig": b"staged-signature\n",
+            "boot.img": self.boot,
+            "bootctl.readback": b"selected_slot=b\nslot_b_success=0\n",
+        }
+        for name, payload in staged.items():
+            (staging / name).write_bytes(payload)
+        # A reboot-bound v2 transaction publishes its durable journal before the
+        # slot is confirmed; inspect (and a second install) must refuse rather
+        # than delete and replace the staged manifest, signature, boot image and
+        # BCB readback that confirmation authenticates.
+        (self.update_root / "feature-commit").write_text(
+            "schema=2\nphase=prepared\ntransaction_id=txn-pending\n"
+        )
+        inspect = self.invoke_updater("inspect", str(self.package))
+        self.assertNotEqual(inspect.returncode, 0, inspect.stdout)
+        self.assertIn("transaction_pending", inspect.stderr)
+        install = self.invoke_updater("install", str(self.package))
+        self.assertNotEqual(install.returncode, 0, install.stdout)
+        self.assertIn("transaction_pending", install.stderr)
+        for name, payload in staged.items():
+            self.assertEqual((staging / name).read_bytes(), payload, name)
+        self.assertTrue((self.update_root / "feature-commit").exists())
+        self.assertFalse(self.bootctl_log.exists())
+
 
 class PreConfirmAcceptanceTests(unittest.TestCase):
     """Exercise verify-running with real scripts and private runtime fixtures."""

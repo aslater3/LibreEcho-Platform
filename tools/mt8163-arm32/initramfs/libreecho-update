@@ -348,6 +348,13 @@ verify_v2_manifest()
     esac
     UPDATE_CHANNEL=$(manifest_value update_channel)
     case "$UPDATE_CHANNEL" in dev|stable) ;; *) die v2_update_channel;; esac
+    # A v2 bundle must bind to the device's selected channel exactly as the v1
+    # path below does; otherwise a validly signed dev bundle could install on a
+    # stable device (and vice versa) because only the enum was checked.
+    device_channel=$(channel_value)
+    [ "$device_channel" = dev ] || [ "$device_channel" = stable ] ||
+        die device_update_channel
+    [ "$UPDATE_CHANNEL" = "$device_channel" ] || die v2_update_channel_mismatch
     boot_sha=$(manifest_value boot_sha256)
     return 0
 }
@@ -477,10 +484,22 @@ verify_manifest()
     [ "${#boot_sha}" -eq 64 ] || die manifest_boot_hash
 }
 
+transaction_pending()
+{
+    # A v1 update awaiting confirmation records $PENDING; a reboot-bound v2
+    # transaction records its durable journal as $UPDATE_ROOT/feature-commit.
+    [ -r "$PENDING" ] || [ -r "$UPDATE_ROOT/feature-commit" ]
+}
+
 extract_and_verify()
 {
     package=$1
     [ -f "$package" ] && [ ! -L "$package" ] || die package_not_regular
+    # The v2 confirmation path authenticates its staged manifest, signature,
+    # boot image and BCB readback. Re-extracting here would delete and replace
+    # that evidence -- even from an unrelated `inspect` -- and force a rollback,
+    # so refuse to touch $STAGING while a transaction is still pending.
+    transaction_pending && die transaction_pending
     [ "$($BB stat -c %s "$package" 2>/dev/null)" -le 33554432 ] ||
         die package_too_large
     members=$($BB tar -tf "$package" 2>/dev/null) || die package_tar_invalid
