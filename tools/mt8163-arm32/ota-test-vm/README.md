@@ -75,6 +75,16 @@ describes: it checks that the default image is unchanged, that the BCB follows
 the profile, that both scenarios land in `userdata`, and that an unknown
 scenario is refused.
 
+The maintained Platform unittest runner also invokes `test_vm_profile.py`.
+Its parser and pre-allocation rejection tests run on ordinary hosts. The boot
+matrix explicitly skips unless `LIBREECHO_VM_BOOT_TEST=1` is set. To enable it,
+use a disposable privileged environment, bind this tested VM directory at
+`/work`, supply the staged inputs and matching kernel/initramfs below, and run
+`python -m unittest -v test_vm_profile` from the parent tools directory. The
+matrix runs `vmtest.sh` and then boots the captured-slot, config-directory, and
+stray-file images with `boot-test.sh`, checking guest assertion and completion
+markers. A skip is not QEMU or hardware acceptance.
+
 ## Prerequisites
 
 - Docker with `linux/amd64` (privileged) **and** `linux/arm/v7` emulation
@@ -86,6 +96,7 @@ scenario is refused.
 ```
 stage/
   tools/
+    libreecho-data-cleanup      # from ../initramfs/ (required by build-initramfs.sh)
     libreecho-update            # from ../initramfs/
     libreecho-bootctl           # build static: gcc -static ../ota/libreecho_bootctl.c
     libreecho-update-verify     # from ../ota/ (or ../initramfs libexec)
