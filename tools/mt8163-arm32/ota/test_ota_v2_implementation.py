@@ -22,6 +22,7 @@ OTA = Path(__file__).resolve().parent
 TOOLS = OTA.parent
 sys.path.insert(0, str(OTA))
 TRANSACTION = TOOLS / "initramfs/libreecho-feature-transaction"
+INIT = TOOLS / "initramfs/libreecho-init"
 BOOT_SIZE = 16 * 1024 * 1024
 KEY = bytes(range(32))
 FEATURE_IDS = ("airplay2", "tts", "wakeword", "stt", "assistant")
@@ -67,6 +68,7 @@ def transaction_fixture(root: Path, env: dict[str, str], source: Path = TRANSACT
         "SPACE_STAT=stat": f"SPACE_STAT={shlex.quote(env.get('LIBREECHO_TRANSACTION_STAT_BIN', 'stat'))}",
         "controller=/usr/local/sbin/libreecho-airplayd": f"controller={shlex.quote(str(root / 'boot-airplayd'))}",
         "PROC_ROOT=/proc": f"PROC_ROOT={shlex.quote(env.get('LIBREECHO_PROC_ROOT', '/proc'))}",
+        "LOOP_SYS_ROOT=/sys/dev/block": f"LOOP_SYS_ROOT={shlex.quote(env.get('LIBREECHO_LOOP_SYS_ROOT', '/sys/dev/block'))}",
         "VAR_RUN_ROOT=/var/run": f"VAR_RUN_ROOT={shlex.quote(env.get('LIBREECHO_VAR_RUN_ROOT', '/var/run'))}",
         "ETC_ROOT=/etc": f"ETC_ROOT={shlex.quote(env.get('LIBREECHO_ETC_ROOT', '/etc'))}",
         "RUN_ROOT=/run": f"RUN_ROOT={shlex.quote(env.get('LIBREECHO_RUN_ROOT', '/run'))}",
@@ -81,6 +83,26 @@ def transaction_fixture(root: Path, env: dict[str, str], source: Path = TRANSACT
     slot.parent.mkdir(parents=True, exist_ok=True)
     slot.write_text(env.get("LIBREECHO_TRANSACTION_SLOT", "b") + "\n")
     return generated_host_fixture(source, root, values)
+
+
+def init_activate_fixture(root: Path, update: Path, transaction: Path, bootctl: Path, cmdline: Path, logfile: Path) -> Path:
+    """Extract libreecho-init's activate_feature_transaction for a host reboot run."""
+    text = INIT.read_text()
+    body = "activate_feature_transaction()" + text.split("activate_feature_transaction()", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+    body = body.replace("transaction=/usr/local/sbin/libreecho-feature-transaction", f"transaction={shlex.quote(str(transaction))}")
+    body = body.replace("update=/data/libreecho/update", f"update={shlex.quote(str(update))}")
+    body = body.replace("/usr/local/sbin/libreecho-bootctl", shlex.quote(str(bootctl)))
+    body = body.replace("/proc/cmdline", shlex.quote(str(cmdline)))
+    script = root / "libreecho-init.activate-fixture"
+    script.write_text(
+        "#!/bin/busybox sh\n"
+        "BB=/bin/busybox\n"
+        f"log() {{ printf 'LOG:%s\\n' \"$1\" >> {shlex.quote(str(logfile))}; }}\n"
+        + body +
+        "activate_feature_transaction\nexit $?\n"
+    )
+    script.chmod(0o755)
+    return script
 
 
 def updater_fixture(root: Path, env: dict[str, str], transaction: Path) -> Path:
@@ -582,6 +604,78 @@ class LoopMountIdentityTests(unittest.TestCase):
             self.assertNotEqual(invoke().returncode, 0)
 
 
+class LoopBindMountIdentityTests(unittest.TestCase):
+    """Verify mount_bind_matches against a genuine loop-backed capsule bind."""
+
+    def _fixture(self, root: Path):
+        capsule = root / "capsule.runtime.squashfs"
+        capsule.write_bytes(b"verified-capsule")
+        mount_root = "usr/local/sbin/libreecho-agentd"
+        overlay = root / "run/features/assistant/runtime"
+        source = overlay / mount_root
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b"daemon")
+        target = root / "run/features/assistant/root" / mount_root
+        mountinfo = root / "mountinfo"
+        sysroot = root / "sys"
+        loop = sysroot / "7:5" / "loop"
+        loop.mkdir(parents=True)
+        (loop / "backing_file").write_text(str(capsule) + "\n")
+        (loop / "offset").write_text("0\n")
+        (loop / "sizelimit").write_text("0\n")
+        prefix = TRANSACTION.read_text().split('case "${1:-}" in', 1)[0]
+        prefix = prefix.replace('MOUNTINFO_FILE=$PROC_ROOT/self/mountinfo', 'MOUNTINFO_FILE=' + str(mountinfo))
+        prefix = prefix.replace('LOOP_SYS_ROOT=/sys/dev/block', 'LOOP_SYS_ROOT=' + str(sysroot))
+        script = root / "check.sh"
+        script.write_text(prefix + '\nmount_bind_matches "$1" "$2" "$3" "$4"\n')
+        # A file bind-mounted out of a loop-backed SquashFS reports the loop
+        # block device and the bound file's path inside it as the mount root.
+        line = f"41 25 7:5 /{mount_root} {target} rw - squashfs /dev/loop5 rw\n"
+        args = [str(target), str(source), str(capsule), f"/{mount_root}"]
+
+        def invoke():
+            return run(['busybox', 'sh', str(script), *args], timeout=10)
+
+        return mountinfo, line, invoke, loop, source
+
+    def test_genuine_loop_backed_bind_root_and_negative_cases(self):
+        with tempfile.TemporaryDirectory(prefix="ota-bind-identity-") as temp:
+            root = Path(temp)
+            mountinfo, line, invoke, loop, source = self._fixture(root)
+            mountinfo.write_text(line)
+            result = invoke()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            # Real `mount --bind` never emits a "none <bind source>" row; the old
+            # synthetic row must not stand in for a verified bind identity.
+            synthetic = (
+                f"41 25 0:41 / {root}/run/features/assistant/root/usr/local/sbin/libreecho-agentd rw - none "
+                f"{root}/run/features/assistant/runtime/usr/local/sbin/libreecho-agentd rw\n"
+            )
+            mountinfo.write_text(synthetic)
+            self.assertNotEqual(invoke().returncode, 0, "synthetic-none-row")
+            # The bound file's path within the capsule SquashFS is the mount root.
+            mountinfo.write_text(line.replace(" /usr/local/sbin/libreecho-agentd ", " / "))
+            self.assertNotEqual(invoke().returncode, 0, "mount-root")
+            for field, value in (('backing_file', str(root / 'wrong')), ('offset', '4096'), ('sizelimit', '1')):
+                path = loop / field
+                previous = path.read_text()
+                path.write_text(value + "\n")
+                self.assertNotEqual(invoke().returncode, 0, field)
+                path.write_text(previous)
+            for bad in (
+                line + line,
+                line.replace("7:5", "7:6"),
+                line.replace("squashfs", "ext4"),
+                line.replace("/dev/loop5", "/dev/loop9"),
+            ):
+                mountinfo.write_text(bad)
+                self.assertNotEqual(invoke().returncode, 0, bad)
+            mountinfo.write_text(line)
+            source.unlink()
+            source.symlink_to(root / 'elsewhere')
+            self.assertNotEqual(invoke().returncode, 0, "non-regular-source")
+
+
 class TransactionFixtureTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(prefix="ota-v2-transaction-")
@@ -864,6 +958,59 @@ class TransactionFixtureTests(unittest.TestCase):
         self.assertFalse((self.root / "feature-commit").exists())
 
 
+class InitRebootResumeTests(TransactionFixtureTests):
+    """A reboot must resume a confirmed, BCB-confirmed commit before remounting.
+
+    The rename-boundary resume itself is proven by
+    ``TransactionFixtureTests.test_recovery_after_each_commit_rename_boundary_is_hash_idempotent``;
+    this regression drives the real ``libreecho-init`` reboot entry point against
+    that exact interrupted state (journal=confirmed with a staged rename already
+    applied) and requires the confirmed journal to be resumed instead of falling
+    through to candidate activation, which still needs the moved staging files.
+    """
+
+    def _bootctl(self) -> Path:
+        bootctl = self.root / "bootctl"
+        bootctl.write_text(
+            "#!/bin/sh\n"
+            "case \"${1:-}\" in\n"
+            "  status) echo selected_slot=b; echo inactive_slot=a; echo slot_b_success=1; echo slot_a_success=0 ;;\n"
+            "  *) exit 2 ;;\n"
+            "esac\n"
+        )
+        bootctl.chmod(0o755)
+        return bootctl
+
+    def _interrupt_commit(self) -> None:
+        self.assertEqual(self.invoke("prepare-boot").returncode, 0)
+        wrapper, fault_env = self.faulting_busybox(1)
+        crashed = self.invoke("commit-after-confirm", extra_env=fault_env)
+        self.assertNotEqual(crashed.returncode, 0, (crashed.stdout, crashed.stderr))
+        journal = self.root / "feature-commit"
+        self.assertIn("phase=confirmed", journal.read_text())
+        self.assertTrue((self.root / "pending").exists())
+        # Rebuild the same transaction fixture with an un-faulted busybox for boot.
+        self.invoke("status")
+
+    def test_reboot_resumes_confirmed_journal_before_candidate_activation(self) -> None:
+        self._interrupt_commit()
+        cmdline = self.root / "cmdline"
+        cmdline.write_text("androidboot.slot_suffix=_b\n")
+        log = self.root / "init.log"
+        transaction = self.root / "libreecho-feature-transaction.host-fixture"
+        script = init_activate_fixture(self.root, self.root, transaction, self._bootctl(), cmdline, log)
+        result = run([str(script)], timeout=180)
+        self.assertTrue(
+            (self.root / "installed").is_file(),
+            (result.returncode, result.stdout, result.stderr, log.read_text()),
+        )
+        self.assertFalse((self.root / "feature-commit").exists())
+        self.assertFalse((self.root / "pending").exists())
+        # The pre-fix path fell through to activate-mounts and rejected the
+        # already-moved staging files, leaving services blocked.
+        self.assertNotIn("feature-transaction-activation-rejected", log.read_text())
+
+
 class RuntimeHarnessTests(unittest.TestCase):
     """Execute the real shell entry points against only temporary host paths."""
 
@@ -1141,6 +1288,104 @@ cp "$src" "$out"
         self.assertIn("--continue-at -", log)
         self.assertNotIn(self.payload_name, log)
         self.assertFalse(self.bootctl_log.exists())
+
+    def test_corrupt_feature_asset_above_control_quarantine_cap_is_quarantined(self) -> None:
+        # A runtime capsule may be permitted up to 64 MiB by the capsule tooling.
+        # A corrupt download at the expected size must still be quarantined; the
+        # old fixed 32 MiB cap rejected it and left the wrong bytes in place, so
+        # every retry re-read the same corrupt .part instead of redownloading.
+        from feature_manifest import build_control_tar
+        size = 33554433  # one byte above the previous 32 MiB quarantine cap
+        correct = b"A" * size
+        corrupt = b"B" * size
+        record = feature("assistant", "replace")
+        record.update({
+            "base_payload_sha256": self.base_payload_hash,
+            "base_manifest_sha256": self.base_manifest_hash,
+            "asset": self.payload_name,
+            "size": size,
+            "sha256": hashlib.sha256(correct).hexdigest(),
+            "manifest_asset": self.manifest_name,
+            "manifest_size": len(self.new_manifest),
+            "manifest_sha256": hashlib.sha256(self.new_manifest).hexdigest(),
+        })
+        records = [record]
+        for feature_id in FEATURE_IDS[:-1]:
+            payload = f"{feature_id}-base-payload".encode()
+            metadata = f"{feature_id}-base-manifest".encode()
+            (self.features / feature_id / "payload.squashfs").write_bytes(payload)
+            (self.features / feature_id / "manifest.json").write_bytes(metadata)
+            preserved = feature(feature_id, "preserve")
+            preserved.update({
+                "base_payload_sha256": hashlib.sha256(payload).hexdigest(),
+                "base_manifest_sha256": hashlib.sha256(metadata).hexdigest(),
+            })
+            records.append(preserved)
+        value = manifest(records)
+        value["service_profile"] = "diagnostic"
+        value["boot_sha256"] = self.boot_hash
+        self.package.write_bytes(build_control_tar(value, self.boot, KEY))
+        (self.source_features / "assistant" / self.payload_name).write_bytes(corrupt)
+        (self.source_features / "assistant" / self.manifest_name).write_bytes(self.new_manifest)
+        # The recorded bytes and the served bytes share a size but not a hash.
+        self.assertEqual(len(corrupt), size)
+
+        curl = self.root / "fake-curl-quarantine"
+        curl.write_text("""#!/bin/sh
+out=; err=; headers=; url=
+printf '%s\\n' "$*" >> "$CURL_LOG"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output) out=$2; shift 2 ;;
+    --stderr) err=$2; shift 2 ;;
+    --dump-header) headers=$2; shift 2 ;;
+    --write-out) shift 2 ;;
+    *) url=$1; shift ;;
+  esac
+done
+case "$url" in
+  *.ota.tar) src=$SOURCE_PACKAGE ;;
+  *) name=${url##*/}; src=$SOURCE_FEATURES/assistant/$name ;;
+esac
+[ -f "$src" ] || exit 22
+size=$(stat -c %s "$src") || exit 63
+[ -z "$headers" ] || printf 'HTTP/1.1 200 OK\\r\\nContent-Length: %s\\r\\n\\r\\n' "$size" > "$headers"
+cp "$src" "$out"
+[ -z "$err" ] || : > "$err"
+[ -n "$headers" ] || printf '200'
+""")
+        curl.chmod(0o755)
+        config = self.root / "ota-source-quarantine.conf"
+        config.write_text("schema=1\ncheck_interval_seconds=3600\n")
+        curl_log = self.root / "curl-quarantine.log"
+        env = self.env | {
+            "LIBREECHO_FETCH_ROOT": str(self.update_root),
+            "LIBREECHO_UPDATE_BIN": str(TOOLS / "initramfs/libreecho-update"),
+            "LIBREECHO_FETCH_PROFILE": str(self.root / "profile"),
+            "LIBREECHO_FETCH_CONFIG": str(config),
+            "LIBREECHO_FETCH_CURL": str(curl),
+            "LIBREECHO_FETCH_CURL_STDERR": str(self.root / "curl-quarantine.stderr"),
+            "LIBREECHO_FETCH_PACKAGED_CHANNEL": str(self.root / "packaged-channel"),
+            "LIBREECHO_ASSISTANT_PAYLOAD": str(self.old_payload),
+            "LIBREECHO_ASSISTANT_MANIFEST": str(self.old_manifest),
+            "SOURCE_PACKAGE": str(self.package),
+            "SOURCE_FEATURES": str(self.source_features),
+            "CURL_LOG": str(curl_log),
+        }
+        transaction = transaction_fixture(self.root, env)
+        updater = updater_fixture(self.root, env, transaction)
+        fetcher = fetch_fixture(self.root, env, updater, transaction)
+        stage = self.update_root / "staging/features/assistant"
+        result = run(["/bin/busybox", "sh", str(fetcher), "check"], env=env)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        retained = self.update_root / ("quarantine-" + hashlib.sha256(corrupt).hexdigest() + ".bad")
+        self.assertEqual(retained.read_bytes(), corrupt)
+        self.assertFalse((stage / f"{self.payload_name}.part").exists(), "corrupt part must not persist")
+        # A retry issues a fresh download rather than pinning the wrong bytes.
+        before = curl_log.read_text().count(self.payload_name)
+        result = run(["/bin/busybox", "sh", str(fetcher), "check"], env=env | {"LIBREECHO_FETCH_CURL": str(curl)})
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertGreater(curl_log.read_text().count(self.payload_name), before)
 
     def test_control_part_contract_handles_complete_corrupt_partial_and_oversize(self) -> None:
         curl = self.root / "fake-curl-control-part"
@@ -2032,11 +2277,13 @@ class CommittedRuntimeLifecycleTests(unittest.TestCase):
         self.proc = self.root / "proc"
         self.run_root = self.root / "run"
         self.parts = self.root / "parts"
+        self.loop_sys = self.root / "loop-sys"
         for path in (
             self.staging / "features/assistant", self.features / "assistant",
             self.proc / "self", self.proc / "net", self.proc / "123",
             self.run_root / "libreecho/features/assistant/root",
             self.run_root / "libreecho/features/assistant/runtime", self.parts,
+            self.loop_sys,
         ):
             path.mkdir(parents=True, exist_ok=True)
         for feature_id in FEATURE_IDS[:-1]:
@@ -2070,8 +2317,19 @@ class CommittedRuntimeLifecycleTests(unittest.TestCase):
             f"  printf '%s\\n' \"$*\" >> {self.mount_log}\n"
             "  if [ \"${2:-}\" = --bind ]; then\n"
             "    source=$3; target=$4\n"
-            f"    mkdir -p \"$(dirname \"$target\")\"; cp {self.daemon} \"$target\"\n"
-            "    printf '41 25 0:41 / %s rw - none %s rw\\n' \"$target\" \"$source\" >> " + str(self.mountinfo) + "\n"
+            "    mkdir -p \"$(dirname \"$target\")\"; cp {self.daemon} \"$target\"\n"
+            f"    rel=${{source#{self.run_root}/libreecho/features/}}\n"
+            "    feature=${rel%%/*}\n"
+            "    case \"$feature\" in\n"
+            "      assistant) n=61 ;; tts) n=62 ;; airplay2) n=63 ;; wakeword) n=64 ;; stt) n=65 ;; *) n=69 ;;\n"
+            "    esac\n"
+            f"    overlay={self.run_root}/libreecho/features/$feature/runtime\n"
+            f"    img=$(awk -v mp=\"$overlay\" '$5==mp {{for(i=7;i<=NF;i++) if($i==\"-\"){{print $(i+2); exit}}}}' {self.mountinfo})\n"
+            f"    mkdir -p {self.loop_sys}/7:$n/loop\n"
+            f"    printf '%s\\n' \"$img\" > {self.loop_sys}/7:$n/loop/backing_file\n"
+            f"    printf '0\\n' > {self.loop_sys}/7:$n/loop/offset\n"
+            f"    printf '0\\n' > {self.loop_sys}/7:$n/loop/sizelimit\n"
+            f"    printf '41 25 7:%s /%s %s rw - squashfs /dev/loop%s rw\\n' \"$n\" \"${{rel#*/runtime/}}\" \"$target\" \"$n\" >> {self.mountinfo}\n"
             "  else\n"
             "    source=; target=\n"
             "    for arg do source=$target; target=$arg; done\n"
@@ -2150,6 +2408,7 @@ class CommittedRuntimeLifecycleTests(unittest.TestCase):
             "LIBREECHO_PROC_ROOT": str(self.proc),
             "LIBREECHO_CMDLINE_FILE": str(self.proc / "cmdline"),
             "LIBREECHO_MOUNTINFO_FILE": str(self.mountinfo),
+            "LIBREECHO_LOOP_SYS_ROOT": str(self.loop_sys),
             "LIBREECHO_PROC_NET_UNIX": str(self.proc / "net/unix"),
             "LIBREECHO_VAR_RUN_ROOT": str(self.var_run),
             "LIBREECHO_ETC_ROOT": str(self.root / "etc"),
@@ -2653,6 +2912,7 @@ class MultiFeatureRuntimeAuthorityTests(unittest.TestCase):
         self.parts = self.root / "parts"
         self.etc = self.root / "etc"
         self.daemons = self.root / "daemons"
+        self.loop_sys = self.root / "loop-sys"
         for feature_id in FEATURE_IDS:
             (self.staging / "features" / feature_id).mkdir(parents=True)
             (self.features / feature_id).mkdir(parents=True)
@@ -2661,6 +2921,7 @@ class MultiFeatureRuntimeAuthorityTests(unittest.TestCase):
             self.run_root / "libreecho/features",
             self.daemons,
             self.etc / "libreecho",
+            self.loop_sys,
         ):
             path.mkdir(parents=True, exist_ok=True)
         self.base = {}
@@ -2694,7 +2955,18 @@ if [ "${1:-}" = mount ]; then
         source=$3; target=$4
         mkdir -p "$(dirname "$target")"
         cp "$source" "$target"
-        printf '60 25 0:60 / %s rw - none %s rw\n' "$target" "$source" >> "__MOUNTINFO__"
+        rel=${source#"__RUN_ROOT__/libreecho/features/"}
+        feature=${rel%%/*}
+        case "$feature" in
+            assistant) n=61 ;; tts) n=62 ;; airplay2) n=63 ;; wakeword) n=64 ;; stt) n=65 ;; *) n=69 ;;
+        esac
+        overlay="__RUN_ROOT__/libreecho/features/$feature/runtime"
+        img=$(awk -v mp="$overlay" '$5==mp {for(i=7;i<=NF;i++) if($i=="-"){print $(i+2); exit}}' "__MOUNTINFO__")
+        mkdir -p "__LOOP_SYS__/7:$n/loop"
+        printf '%s\n' "$img" > "__LOOP_SYS__/7:$n/loop/backing_file"
+        printf '0\n' > "__LOOP_SYS__/7:$n/loop/offset"
+        printf '0\n' > "__LOOP_SYS__/7:$n/loop/sizelimit"
+        printf '60 25 7:%s /%s %s rw - squashfs /dev/loop%s rw\n' "$n" "${rel#*/runtime/}" "$target" "$n" >> "__MOUNTINFO__"
     else
         source=; target=
         for arg do
@@ -2730,6 +3002,7 @@ exec /bin/busybox "$@"
             .replace("__MOUNTINFO__", str(self.mountinfo))
             .replace("__RUN_ROOT__", str(self.run_root))
             .replace("__DAEMONS__", str(self.daemons))
+            .replace("__LOOP_SYS__", str(self.loop_sys))
         )
         self.busybox.chmod(0o755)
         self.signing_key = SigningKey.generate()
@@ -2747,6 +3020,7 @@ exec /bin/busybox "$@"
             "LIBREECHO_PROC_ROOT": str(self.proc),
             "LIBREECHO_CMDLINE_FILE": str(self.proc / "cmdline"),
             "LIBREECHO_MOUNTINFO_FILE": str(self.mountinfo),
+            "LIBREECHO_LOOP_SYS_ROOT": str(self.loop_sys),
             "LIBREECHO_PROC_NET_UNIX": str(self.proc / "net/unix"),
             "LIBREECHO_RUN_ROOT": str(self.run_root),
             "LIBREECHO_ETC_ROOT": str(self.etc),

@@ -684,6 +684,36 @@ EOF
         [ "$($BB cat "$loop/sizelimit" 2>/dev/null)" = 0 ] || fail candidate-mount-identity
 }
 
+mount_bind_matches() {
+    # A file bind-mounted out of a loop-backed SquashFS reports the loop block
+    # device as the mount source and the bound file's path inside that
+    # filesystem as the mount root, so a genuine bind row can never match the
+    # direct-source branch. Verify the bind identity against the loop backing
+    # image it was taken from instead of rejecting every real bind.
+    local target=$1 source=$2 image=$3 bind_root=$4 record device mount_root filesystem mounted loop
+    [ -r "$MOUNTINFO_FILE" ] || fail mountinfo-unavailable
+    record=$($BB awk -v target="$target" '
+        $5 == target {
+            total++;
+            for (i=7; i<=NF; i++) if ($i == "-") { row=$3 " " $4 " " $(i+1) " " $(i+2); break }
+        }
+        END { if (total != 1 || row == "") exit 1; print row }
+    ' "$MOUNTINFO_FILE") || fail candidate-mount-identity
+    read -r device mount_root filesystem mounted <<EOF
+$record
+EOF
+    case "$device" in 7:[0-9]*) ;; *) fail candidate-mount-identity;; esac
+    case "${device#7:}" in *[!0-9]*|'') fail candidate-mount-identity;; esac
+    [ "$mounted" = "/dev/loop${device#7:}" ] &&
+        [ "$filesystem" = squashfs ] && [ "$mount_root" = "$bind_root" ] ||
+        fail candidate-mount-identity
+    loop=$LOOP_SYS_ROOT/$device/loop
+    [ "$($BB cat "$loop/backing_file" 2>/dev/null)" = "$image" ] || fail candidate-mount-identity
+    regular "$source" candidate-mount-source
+    [ "$($BB cat "$loop/offset" 2>/dev/null)" = 0 ] &&
+        [ "$($BB cat "$loop/sizelimit" 2>/dev/null)" = 0 ] || fail candidate-mount-identity
+}
+
 verify_candidate_mounts() {
     local ids feature action asset daemon_path root
     ids=$(value feature_ids "$JOURNAL")
@@ -697,7 +727,7 @@ verify_candidate_mounts() {
                 if runtime_authority_ready "$feature" "$STAGING/manifest"; then
                     mount_matches "$root" "$FEATURES/$feature/payload.squashfs"
                     mount_matches "$RUN_ROOT/libreecho/features/$feature/runtime" "$FEATURES/$feature/runtime.squashfs"
-                    mount_matches "$root/$daemon_path" "$RUN_ROOT/libreecho/features/$feature/runtime/$daemon_path"
+                    mount_bind_matches "$root/$daemon_path" "$RUN_ROOT/libreecho/features/$feature/runtime/$daemon_path" "$FEATURES/$feature/runtime.squashfs" "/$daemon_path"
                 fi
                 ;;
             replace)
@@ -706,7 +736,7 @@ verify_candidate_mounts() {
             runtime)
                 mount_matches "$root" "$FEATURES/$feature/payload.squashfs"
                 mount_matches "$RUN_ROOT/libreecho/features/$feature/runtime" "$STAGING/features/$feature/$asset"
-                mount_matches "$root/$daemon_path" "$RUN_ROOT/libreecho/features/$feature/runtime/$daemon_path"
+                mount_bind_matches "$root/$daemon_path" "$RUN_ROOT/libreecho/features/$feature/runtime/$daemon_path" "$STAGING/features/$feature/$asset" "/$daemon_path"
                 ;;
             *) fail feature-action;;
         esac
@@ -1197,7 +1227,7 @@ activate_committed() {
                 if runtime_authority_ready "$feature" "$COMMITTED_MANIFEST"; then
                     mount_matches "$root" "$FEATURES/$feature/payload.squashfs"
                     mount_matches "$RUN_ROOT/libreecho/features/$feature/runtime" "$FEATURES/$feature/runtime.squashfs"
-                    mount_matches "$root/$daemon_path" "$RUN_ROOT/libreecho/features/$feature/runtime/$daemon_path"
+                    mount_bind_matches "$root/$daemon_path" "$RUN_ROOT/libreecho/features/$feature/runtime/$daemon_path" "$FEATURES/$feature/runtime.squashfs" "/$daemon_path"
                     [ "$(file_hash "$root/$daemon_path")" = "$(value "feature_${feature}_daemon_sha256" "$COMMITTED_MANIFEST")" ] || fail committed-daemon-hash
                 fi
                 ;;
@@ -1208,7 +1238,7 @@ activate_committed() {
             runtime)
                 mount_matches "$root" "$FEATURES/$feature/payload.squashfs"
                 mount_matches "$RUN_ROOT/libreecho/features/$feature/runtime" "$FEATURES/$feature/runtime.squashfs"
-                mount_matches "$root/$daemon_path" "$RUN_ROOT/libreecho/features/$feature/runtime/$daemon_path"
+                mount_bind_matches "$root/$daemon_path" "$RUN_ROOT/libreecho/features/$feature/runtime/$daemon_path" "$FEATURES/$feature/runtime.squashfs" "/$daemon_path"
                 [ "$(file_hash "$root/$daemon_path")" = "$(value "feature_${feature}_daemon_sha256" "$COMMITTED_MANIFEST")" ] || fail committed-daemon-hash
                 ;;
             *) fail committed-action;;

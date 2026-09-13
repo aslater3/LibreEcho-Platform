@@ -20,6 +20,12 @@ ASSISTANT_PAYLOAD=/data/libreecho/features/assistant/payload.squashfs
 ASSISTANT_MANIFEST=/data/libreecho/features/assistant/manifest.json
 CLIENT_ROOT=/run/libreecho/ota-client
 MAX_BYTES=33554432
+# Feature payloads and runtime capsules are permitted up to 64 MiB by the
+# capsule tooling, so their corrupt downloads must still be quarantined rather
+# than left in place to defeat every retry. Keep the smaller control-tar cap as
+# the default and pass this ceiling only for feature assets.
+QUARANTINE_MAX_BYTES=33554432
+FEATURE_ASSET_MAX_BYTES=67108864
 CURL_STDERR=/run/libreecho/ota-curl.stderr
 CURL_HEADERS=/run/libreecho/ota-curl.headers
 CURL_DIAGNOSTIC_MAX=160
@@ -769,13 +775,14 @@ probe_range()
 
 quarantine_file()
 {
-    local source target digest entry count size
+    local source limit target digest entry count size
     source=$1
+    limit=${2:-$QUARANTINE_MAX_BYTES}
     [ -e "$source" ] || [ -L "$source" ] || return 0
     [ -f "$source" ] && [ ! -L "$source" ] || die quarantine_type
     [ "$($BB stat -c %h "$source")" = 1 ] || die quarantine_type
     size=$($BB stat -c %s "$source") || die quarantine_size
-    [ "$size" -le 33554432 ] || die quarantine_size
+    [ "$size" -le "$limit" ] || die quarantine_size
     digest=$($BB sha256sum "$source" | $BB awk '{print $1}')
     printf '%s\n' "$digest" | $BB grep -Eq '^[a-f0-9]{64}$' || die quarantine_identity
     # Flat inert evidence is compatible with the older slot's cleanup contract.
@@ -1056,24 +1063,24 @@ download_feature_assets()
      [ "$(sha256sum "$final" | $BB awk '{print $1}')" = "$expected_hash" ]; then
      continue
  fi
- [ ! -e "$final" ] || quarantine_file "$final"
+ [ ! -e "$final" ] || quarantine_file "$final" "$FEATURE_ASSET_MAX_BYTES"
  resume_args=
  if [ -L "$part" ]; then die download_asset_type; fi
  if [ -f "$part" ]; then
                         part_size=$(stat -c %s "$part" 2>/dev/null)
                         case "$part_size" in
                             0) ;;
-                            ''|*[!0-9]*) quarantine_file "$part"; part_size=0 ;;
+                            ''|*[!0-9]*) quarantine_file "$part" "$FEATURE_ASSET_MAX_BYTES"; part_size=0 ;;
                             *)
                                 if [ "$part_size" -eq "$expected_size" ]; then
                                     if [ "$(sha256sum "$part" | $BB awk '{print $1}')" = "$expected_hash" ]; then
                                         $BB mv "$part" "$final" || die download_asset_commit
                                         continue
                                     fi
-                                    quarantine_file "$part"
+                                    quarantine_file "$part" "$FEATURE_ASSET_MAX_BYTES"
                                     part_size=0
                                 elif [ "$part_size" -gt "$expected_size" ]; then
-                                    quarantine_file "$part"
+                                    quarantine_file "$part" "$FEATURE_ASSET_MAX_BYTES"
                                     part_size=0
                                 else
                                     resume_args="--continue-at -"
@@ -1091,8 +1098,8 @@ download_feature_assets()
                     [ "$curl_rc" -eq 0 ] && case "$http_code" in 2??) ;; *) die download_asset_http true "$curl_rc" "$curl_detail" "$http_code";; esac ||
                         die download_asset_transport false "$curl_rc" "$curl_detail" "$http_code"
                     [ -f "$part" ] && [ ! -L "$part" ] || die download_asset_type
-                    [ "$(stat -c %s "$part" 2>/dev/null)" = "$expected_size" ] || { quarantine_file "$part"; die download_asset_size; }
-                    [ "$(sha256sum "$part" | $BB awk '{print $1}')" = "$expected_hash" ] || { quarantine_file "$part"; die download_asset_hash; }
+                    [ "$(stat -c %s "$part" 2>/dev/null)" = "$expected_size" ] || { quarantine_file "$part" "$FEATURE_ASSET_MAX_BYTES"; die download_asset_size; }
+                    [ "$(sha256sum "$part" | $BB awk '{print $1}')" = "$expected_hash" ] || { quarantine_file "$part" "$FEATURE_ASSET_MAX_BYTES"; die download_asset_hash; }
                     $BB mv "$part" "$final" || die download_asset_commit
                 done
                 ;;
