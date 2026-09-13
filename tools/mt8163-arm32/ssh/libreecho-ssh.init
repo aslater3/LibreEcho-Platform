@@ -131,7 +131,7 @@ sync_accounts()
                 printf "%s:x:%d:1000:LibreEcho SSH:%s/%s:/bin/sh\n", $1, uid, home_root, $1
                 printf "%s:%d\n", $1, uid > list
             }
-        ' "$account_list" "$USERS_FILE"
+        ' "$uid_map" "$USERS_FILE"
     } > "$PASSWD_FILE.le.tmp" || return 1
     {
         printf 'root:x:0:\n'
