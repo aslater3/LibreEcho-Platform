@@ -39,7 +39,7 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "4117bc4dc6fe45a05bc4c18e1805e38f95182cf3af539f955cb40e8fbd85b2ff"
+RECOVERY_INIT_SHA256 = "3d131fd269bcfd3368b7d62d84bac07f133d13d76b309210daf9d6efbc7b8355"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
@@ -1051,6 +1051,10 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
     copy_file("etc/libreecho/web-config.json", "etc/libreecho/web-config.json", 0o600)
     copy_file("etc/libreecho/airplay2.conf", "etc/libreecho/airplay2.conf", 0o644)
     copy_file("etc/libreecho/ntp.conf", "etc/libreecho/ntp.conf", 0o644)
+    copy_file(
+        "etc/libreecho/avahi-services/wyoming.service",
+        "etc/libreecho/avahi-services/wyoming.service", 0o644,
+    )
     if "etc/libreecho/users" in bundled_files:
         users_file = pinned_source(bundle, "etc/libreecho/users", "UI users file")
         if users_file.stat().st_mode & 0o077 or not read(users_file).strip():

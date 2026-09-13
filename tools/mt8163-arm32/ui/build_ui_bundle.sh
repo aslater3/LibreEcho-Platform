@@ -139,7 +139,8 @@ do
 done
 
 mkdir -p "$OUTPUT/sbin" "$OUTPUT/share/libreecho/web" \
-    "$OUTPUT/share/libreecho/sounds" "$OUTPUT/etc/init.d" "$OUTPUT/etc/libreecho"
+    "$OUTPUT/share/libreecho/sounds" "$OUTPUT/etc/init.d" \
+    "$OUTPUT/etc/libreecho/avahi-services"
 
 for binary in \
     libreecho-web libreecho-logd libreecho-networkd libreecho-timed \
@@ -170,6 +171,21 @@ install -m 0644 "$UI_SOURCE/config/airplay2.conf" \
     "$OUTPUT/etc/libreecho/airplay2.conf"
 install -m 0644 "$UI_SOURCE/config/ntp.conf" \
     "$OUTPUT/etc/libreecho/ntp.conf"
+wyoming_service="$UI_SOURCE/config/wyoming.service"
+[[ -f "$wyoming_service" && ! -L "$wyoming_service" && -s "$wyoming_service" ]] || {
+    echo "ERROR: missing or empty Wyoming service definition: $wyoming_service" >&2
+    exit 1
+}
+grep -Fq '<type>_wyoming._tcp</type>' "$wyoming_service" || {
+    echo "ERROR: Wyoming service definition has no _wyoming._tcp entry" >&2
+    exit 1
+}
+grep -Fq '<port>10700</port>' "$wyoming_service" || {
+    echo "ERROR: Wyoming service definition has no port 10700" >&2
+    exit 1
+}
+install -m 0644 "$wyoming_service" \
+    "$OUTPUT/etc/libreecho/avahi-services/wyoming.service"
 for sound in action-1.raw action-2.raw action-3.raw; do
     path="$UI_SOURCE/sounds/$sound"
     [[ -f "$path" && ! -L "$path" && -s "$path" ]] || {

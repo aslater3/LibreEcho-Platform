@@ -22,6 +22,8 @@ jobs:
   source_checks:
     name: Platform source checks
     runs-on: ubuntu-24.04
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
     steps:
       - name: Check out Platform source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
