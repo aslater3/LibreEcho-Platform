@@ -1,0 +1,56 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "timezone": "Europe/London",
+  "dependencyDashboard": true,
+  "dependencyDashboardTitle": "Dependency Dashboard",
+  "prConcurrentLimit": 6,
+  "prHourlyLimit": 2,
+  "automerge": false,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Track embedded/source-level upstream releases listed in the LibreEcho audit inventory",
+      "managerFilePatterns": [
+        "/^\\.github\\/renovate-upstreams\\.env$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>[a-zA-Z0-9-._]+) depName=(?<depName>[^\\s]+)(?: versioning=(?<versioning>[^\\s]+))?\\s+[A-Z0-9_]+_VERSION=(?<currentValue>[^\\s#]+)"
+      ],
+      "versioningTemplate": "{{#if versioning}}{{{versioning}}}{{else}}semver-coerced{{/if}}"
+    },
+    {
+      "customType": "regex",
+      "description": "Track the PyNaCl version pinned directly in GitHub Actions",
+      "managerFilePatterns": [
+        "/^\\.github\\/workflows\\/.*\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "PyNaCl==(?<currentValue>[0-9A-Za-z.+-]+)"
+      ],
+      "depNameTemplate": "PyNaCl",
+      "datasourceTemplate": "pypi",
+      "versioningTemplate": "pep440"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Embedded upstream changes are audit signals until explicitly approved",
+      "matchFileNames": [
+        ".github/renovate-upstreams.env"
+      ],
+      "dependencyDashboardApproval": true,
+      "groupName": "embedded upstream source dependencies"
+    },
+    {
+      "description": "Group GitHub Actions maintenance",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "groupName": "GitHub Actions"
+    }
+  ]
+}
