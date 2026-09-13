@@ -777,7 +777,13 @@ quarantine_file()
 {
     local source limit target digest entry count size
     source=$1
-    limit=${2:-$QUARANTINE_MAX_BYTES}
+    # Keep the default ceiling resolvable inside the function: callers that
+    # pass no limit (control tars) must not depend on a top-level variable
+    # being set, and feature assets pass the larger ceiling explicitly as $2.
+    limit=${2:-${QUARANTINE_MAX_BYTES:-33554432}}
+    case $limit in
+        ''|*[!0-9]*) limit=33554432 ;;
+    esac
     [ -e "$source" ] || [ -L "$source" ] || return 0
     [ -f "$source" ] && [ ! -L "$source" ] || die quarantine_type
     [ "$($BB stat -c %h "$source")" = 1 ] || die quarantine_type
