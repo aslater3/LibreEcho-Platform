@@ -55,6 +55,7 @@ jobs:
             test_verify_radar_puffin_dtb.py \
             test_recovery_image_tools.py \
             test_ssh_runtime.py \
+            test_vm_profile.py \
             test_vendor_import_compat.py \
             test_source_offer_tools.py \
             ota/test_ota_v2_implementation.py \
@@ -69,6 +70,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y espeak-ng-data squashfs-tools
           python -m py_compile \
+            tools/mt8163-arm32/test_vm_profile.py \
+            tools/mt8163-arm32/ota-test-vm/parse_profile.py \
             tools/mt8163-arm32/build_recovery_image.py \
             tools/mt8163-arm32/verify_recovery_image.py \
             tools/mt8163-arm32/ota/make_ota_bundle.py \
