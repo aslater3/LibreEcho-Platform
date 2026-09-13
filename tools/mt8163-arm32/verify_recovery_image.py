@@ -53,7 +53,7 @@ WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-INIT_SHA256 = "4117bc4dc6fe45a05bc4c18e1805e38f95182cf3af539f955cb40e8fbd85b2ff"
+INIT_SHA256 = "3d131fd269bcfd3368b7d62d84bac07f133d13d76b309210daf9d6efbc7b8355"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -133,6 +133,7 @@ UI_FIXED_NAMES = UI_BINARY_NAMES | UI_INIT_NAMES | {
     "etc/libreecho/web-config.json",
     "etc/libreecho/airplay2.conf",
     "etc/libreecho/ntp.conf",
+    "etc/libreecho/avahi-services/wyoming.service",
     "usr/local/share/libreecho/ui-manifest.txt",
     "usr/local/share/libreecho/sounds/action-1.raw",
     "usr/local/share/libreecho/sounds/action-2.raw",

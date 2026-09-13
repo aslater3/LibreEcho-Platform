@@ -2194,6 +2194,8 @@ class PolicyTests(unittest.TestCase):
         self.assertIn('"integrations"', source)
         self.assertIn("integrations & 1", source)
         self.assertIn("integrations & 16", source)
+        self.assertIn("airplay_explicitly_disabled", source)
+        self.assertIn("feature-reconcile-airplay-disabled", source)
         self.assertIn("$DATA_ROOT/libreecho/features/$feature/payload.squashfs", source)
         self.assertIn("/staging", source)
         self.assertIn('"$script" start', source)
@@ -2335,11 +2337,27 @@ class PolicyTests(unittest.TestCase):
             )
             airplay_socket = socket_paths["airplayd"]
             self.assertIsNotNone(airplay_socket)
-            airplay_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            airplay_listener.bind(str(airplay_socket))
-            airplay_listener.listen(1)
-            sockets.append(airplay_listener)
+            if not airplay_socket.exists():
+                airplay_listener = socket.socket(
+                    socket.AF_UNIX, socket.SOCK_STREAM
+                )
+                airplay_listener.bind(str(airplay_socket))
+                airplay_listener.listen(1)
+                sockets.append(airplay_listener)
             (var_run / "libreecho-airplayd.pid").write_text(f"{os.getpid()}\n")
+            actions.write_text("")
+            (data / "libreecho/config/web-config.json").write_text(
+                '{"integrations":5}\n'
+            )
+            subprocess.run(["sh", str(helper)], env=env, check=True)
+            home_assistant_only_actions = actions.read_text().splitlines()
+            self.assertIn(
+                "libreecho-airplayd.init:start", home_assistant_only_actions
+            )
+            self.assertNotIn(
+                "libreecho-airplayd.init:stop", home_assistant_only_actions
+            )
+
             actions.write_text("")
             (data / "libreecho/config/web-config.json").write_text(
                 '{"integrations":21}\n'
@@ -2388,6 +2406,12 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("health_airplay_enabled=0", init)
         self.assertIn(
             "[ $((health_integrations & 16)) -ne 0 ] && health_airplay_enabled=1",
+            init,
+        )
+        # Home Assistant discovery requires airplayd even when the AirPlay
+        # audio bit is clear, so the health gate must include the HA bit.
+        self.assertIn(
+            "[ $((health_integrations & 1)) -ne 0 ] && health_airplay_enabled=1",
             init,
         )
         self.assertNotIn("wyomingd /run/libreecho/wyoming.sock", init)
@@ -2492,6 +2516,16 @@ ota_health_services_ready
             config.write_text('{"integrations":20}\n')
             enabled = subprocess.run(["sh", "-c", airplay_harness])
             self.assertNotEqual(enabled.returncode, 0)
+            # Home Assistant (bit 1) keeps airplayd in the required discovery
+            # graph while AirPlay audio (bit 16) stays disabled, so an
+            # unavailable airplayd must fail the OTA health probe for the
+            # bit-1-only and Home-Assistant-plus-discovery masks.
+            for home_assistant_only in (1, 5):
+                config.write_text(f'{{"integrations":{home_assistant_only}}}\n')
+                ha_required = subprocess.run(["sh", "-c", airplay_harness])
+                self.assertNotEqual(
+                    ha_required.returncode, 0, home_assistant_only
+                )
             config.write_text('{"integrations":"invalid"}\n')
             malformed = subprocess.run(["sh", "-c", airplay_harness])
             self.assertNotEqual(malformed.returncode, 0)
@@ -2566,22 +2600,70 @@ feature_daemon_required tts
             "    start_persisted_feature_services", init_script[init_script.index("start_ui_services()"):]
         )
 
-    def test_disabled_airplay_staging_skips_liveness_but_enabled_requires_it(self) -> None:
+    def test_airplay_controller_staging_follows_discovery_and_audio_toggles(self) -> None:
         stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()
         self.assertIn("airplay_explicitly_disabled()", stager)
-        start = stager.index("airplay_explicitly_disabled()")
-        body = stager[start:stager.index("\n}\n", start) + 3]
-        self.assertIn('"integrations"', body)
-        self.assertIn("integrations & 16", body)
-        self.assertIn('[ $((integrations & 16)) -eq 0 ]', body)
-        decision = stager[stager.index("start_feature_service_if_enabled()"):]
-        self.assertIn('FEATURE_ID" = airplay2', decision)
-        self.assertIn("airplay_explicitly_disabled", decision)
-        self.assertIn("start_feature_service", decision)
-        self.assertLess(
-            decision.index("airplay_explicitly_disabled"),
-            decision.index("start_feature_service", decision.index("airplay_explicitly_disabled")),
-        )
+        self.assertIn("home_assistant_enabled()", stager)
+        self.assertIn("integrations & 16", stager)
+        self.assertIn("integrations & 1", stager)
+        self.assertIn("FEATURE_STAGE_AIRPLAY_DISABLED", stager)
+        self.assertIn("start_feature_service_if_enabled()", stager)
+
+        busybox = shutil.which("busybox")
+        if busybox is None:
+            self.skipTest("busybox is required for the feature staging fixture")
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "web-config.json"
+            functions = []
+            for name in (
+                "airplay_explicitly_disabled",
+                "home_assistant_enabled",
+                "start_feature_service_if_enabled",
+            ):
+                start = stager.index(f"{name}()\n")
+                end = stager.index("\n}\n", start) + 3
+                functions.append(stager[start:end])
+            source = "\n".join(functions).replace(
+                "/data/libreecho/config/web-config.json", str(config)
+            )
+
+            def stage(integrations: int, feature: str = "airplay2") -> list[str]:
+                config.write_text(f'{{"integrations":{integrations}}}\n')
+                harness = f"""
+BB={busybox}
+FEATURE_ID={feature}
+{source}
+start_feature_service() {{ echo FEATURE_STAGE_SERVICE_STARTED; }}
+start_feature_service_if_enabled
+"""
+                result = subprocess.run(
+                    ["sh", "-c", harness],
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                )
+                return result.stdout.splitlines()
+
+            self.assertEqual(stage(4), ["FEATURE_STAGE_AIRPLAY_DISABLED"])
+            for integrations in (5, 20, 21):
+                self.assertEqual(
+                    stage(integrations), ["FEATURE_STAGE_SERVICE_STARTED"]
+                )
+            self.assertEqual(
+                stage(4, feature="tts"), ["FEATURE_STAGE_SERVICE_STARTED"]
+            )
+
+    def test_home_assistant_discovery_service_is_packaged_with_ui(self) -> None:
+        ui_builder = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        image_builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        image_verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        service = "etc/libreecho/avahi-services/wyoming.service"
+        self.assertIn("config/wyoming.service", ui_builder)
+        self.assertIn(service, ui_builder)
+        self.assertIn(service, image_builder)
+        self.assertIn(service, image_verifier)
+        self.assertIn("<type>_wyoming._tcp</type>", ui_builder)
+        self.assertIn("<port>10700</port>", ui_builder)
 
     def test_first_install_confirmation_requires_startup_ready_and_led_handoff(self) -> None:
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()

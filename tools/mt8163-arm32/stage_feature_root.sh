@@ -77,9 +77,23 @@ airplay_explicitly_disabled()
     [ $((integrations & 16)) -eq 0 ]
 }
 
+home_assistant_enabled()
+{
+    config=/data/libreecho/config/web-config.json
+    [ -r "$config" ] || return 1
+    integrations=$($BB sed -n \
+        's/.*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "$config" 2>/dev/null | $BB sed -n '1p')
+    case "$integrations" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ $((integrations & 1)) -ne 0 ]
+}
+
 start_feature_service_if_enabled()
 {
-    if [ "$FEATURE_ID" = airplay2 ] && airplay_explicitly_disabled; then
+    if [ "$FEATURE_ID" = airplay2 ] && airplay_explicitly_disabled &&
+            ! home_assistant_enabled; then
         echo FEATURE_STAGE_AIRPLAY_DISABLED
         return 0
     fi

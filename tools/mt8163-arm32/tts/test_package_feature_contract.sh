@@ -6,10 +6,18 @@ root="$(mktemp -d /tmp/libreecho-tts-contract.XXXXXX)"
 trap 'rm -rf "$root"' EXIT
 
 payload="$root/tts.squashfs"
-payload_url="https://github.com/aslater3/LibreEcho/releases/download/"
-payload_url+="radar-puffin-build-70bcb92-8ef37f6bfbdc8cab-177f49b75ac9ce88/"
-payload_url+="libreecho-radar-puffin-build-70bcb92-8ef37f6bfbdc8cab-177f49b75ac9ce88-tts.squashfs"
-curl -fsSL --retry 3 -o "$payload" "$payload_url"
+payload_tag="radar-puffin-build-70bcb92-8ef37f6bfbdc8cab-177f49b75ac9ce88"
+payload_name="libreecho-radar-puffin-build-70bcb92-8ef37f6bfbdc8cab-177f49b75ac9ce88-tts.squashfs"
+api_args=(-fsSL --retry 6 --retry-all-errors --retry-delay 10)
+if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  api_args+=(--header "Authorization: Bearer $GITHUB_TOKEN")
+fi
+release_json="$(curl "${api_args[@]}" \
+  "https://api.github.com/repos/aslater3/LibreEcho/releases/tags/$payload_tag")"
+asset_id="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); n=sys.argv[2]; print(next(a["id"] for a in d["assets"] if a["name"] == n))' \
+  "$release_json" "$payload_name")"
+curl "${api_args[@]}" --header 'Accept: application/octet-stream' \
+  -o "$payload" "https://api.github.com/repos/aslater3/LibreEcho/releases/assets/$asset_id"
 printf '%s  %s\n' \
   53033508bd7e70048a2b89d214de93cbcbf9901753ef211af84077c39f051160 \
   "$payload" | sha256sum -c -

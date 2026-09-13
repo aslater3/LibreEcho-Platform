@@ -272,12 +272,12 @@ start_feature()
         wakeword) service=waked; socket=$RUN_ROOT/libreecho/wakeword.sock ;;
         *) log "feature-reconcile-unknown-feature:$feature"; return 1 ;;
     esac
-    if [ "$feature" = airplay2 ] && airplay_explicitly_disabled; then
+    if [ "$feature" = airplay2 ] && [ "$ha_enabled" -eq 0 ] &&
+            airplay_explicitly_disabled; then
         log feature-reconcile-airplay-disabled
         stop_disabled_airplay
         return $?
     fi
-
     payload=$DATA_ROOT/libreecho/features/$feature/payload.squashfs
     if [ ! -f "$payload" ]; then
         log "feature-reconcile-payload-missing:$feature"
