@@ -33,6 +33,15 @@ done
   echo "ERROR: eSpeak data is missing or is a symlink: $ESPEAK_DATA" >&2
   exit 1
 }
+if [[ ! -L "$ESPEAK_DATA/espeak-ng-data" &&
+      -d "$ESPEAK_DATA/espeak-ng-data" &&
+      -f "$ESPEAK_DATA/espeak-ng-data/phontab" ]]; then
+  ESPEAK_DATA="$ESPEAK_DATA/espeak-ng-data"
+fi
+[[ -f "$ESPEAK_DATA/phontab" && -f "$ESPEAK_DATA/phonindex" ]] || {
+  echo "ERROR: eSpeak data root is missing phontab/phonindex: $ESPEAK_DATA" >&2
+  exit 1
+}
 [[ -x "$PACKAGER" ]] || {
   echo "ERROR: feature packager is missing: $PACKAGER" >&2
   exit 1
@@ -41,7 +50,7 @@ done
 northern_male_sha=$(sha256sum "$NORTHERN_MALE_MODEL" | awk '{print $1}')
 female_sha=$(sha256sum "$FEMALE_MODEL" | awk '{print $1}')
 tokens_sha=$(sha256sum "$TOKENS" | awk '{print $1}')
-[[ "$northern_male_sha" == 786158f6507d49981889ece1803d8296adfcd34da847eb7e4ef69688ee148119 ]] || {
+[[ "$northern_male_sha" == d23e7891af7062eb188283dba94866e25ffd5b01a0d9fb9a23c71a39b75b2308 ]] || {
   echo "ERROR: Northern English male model hash is not the reviewed metadata-only derivative" >&2
   exit 1
 }
@@ -72,6 +81,11 @@ for voice in northern-male southern-female; do
   install -d "$model_dir"
   install -m 0644 "$TOKENS" "$model_dir/tokens.txt"
   cp -a "$ESPEAK_DATA" "$model_dir/espeak-ng-data"
+  [[ -f "$model_dir/espeak-ng-data/phontab" &&
+     -f "$model_dir/espeak-ng-data/phonindex" ]] || {
+    echo "ERROR: packaged eSpeak data is incomplete for $voice" >&2
+    exit 1
+  }
 done
 install -m 0644 "$NORTHERN_MALE_MODEL" \
   "$root/usr/local/share/libreecho/tts/models/northern-male/model.onnx"

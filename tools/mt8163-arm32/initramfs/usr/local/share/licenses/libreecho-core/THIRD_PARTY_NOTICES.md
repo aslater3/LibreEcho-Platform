@@ -25,10 +25,13 @@ recorded in `COMPONENTS.json`, the image manifest, and the release SPDX SBOM.
   compiler, source/config hashes, and output hash.
 - **musl 1.2.5** — MIT. The release rebuilds the ARM32 dynamic loader from the
   pinned upstream archive; build metadata records the compiler and output hash.
-- **wpa_supplicant 2.10** — BSD-3-Clause. The release rebuilds a static,
-  WEXT-only WPA2-PSK client with internal crypto from the pinned upstream
-  archive and public config, eliminating the previous libnl/glibc ambiguity.
-  The binary prints the included BSD terms with `wpa_supplicant -L`.
+- **wpa_supplicant 2.10** — BSD-3-Clause. The release rebuilds a static
+  WPA2-PSK client with nl80211 preferred and WEXT retained as a fallback, using
+  internal crypto, the pinned upstream archive, and the public config. The
+  binary prints the included BSD terms with `wpa_supplicant -L`.
+- **libnl 3.11.0** — LGPL-2.1-only. Its pinned upstream source is rebuilt as
+  static `libnl-3` and `libnl-genl-3` archives and linked into wpa_supplicant;
+  the complete corresponding source and build instructions accompany releases.
 - **LibreEcho MT8163 connectivity helpers** — GPL-2.0-only. All five ARM32
   helpers are rebuilt from the checked-in Platform sources; no extracted WMT
   userspace executable is shipped.

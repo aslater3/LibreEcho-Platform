@@ -19,6 +19,16 @@ VALID_DTS = r'''
     #address-cells = <1>;
     #size-cells = <1>;
 
+    action_key {
+        compatible = "gpio-keys";
+        action@36 {
+            label = "Action Key";
+            linux,code = <0x8a>;
+            gpios = <&pio 36 1>;
+            debounce-interval = <20>;
+        };
+    };
+
     codec_mclk: puffin-codec-mclk {
         compatible = "fixed-clock";
         #clock-cells = <0>;
@@ -67,7 +77,20 @@ VALID_DTS = r'''
             mclk: mclk {};
         };
 
-        pmic: pmic@1000d000 { compatible = "mediatek,mt6323"; reg = <0x1000d000 0x1000>; };
+        pwrap@1000d000 {
+            compatible = "mediatek,mt8163-pwrap";
+            reg = <0x1000d000 0x1000>;
+            pmic: mt6323 {
+                compatible = "mediatek,mt6323";
+                mt6323keys {
+                    compatible = "mediatek,mt6323-keys";
+                    power {
+                        linux,keycodes = <0x71>;
+                        wakeup-source;
+                    };
+                };
+            };
+        };
         audiosys: audiosys@11220000 {
             compatible = "mediatek,mt8163-audiosys", "syscon";
             reg = <0x11220000 0x1000>;
@@ -158,6 +181,35 @@ class RadarPuffinDtbTests(unittest.TestCase):
     def test_accepts_complete_audio_and_hardware_contract(self) -> None:
         verifier.verify_dtb(self.compile_dts(VALID_DTS))
 
+    def test_accepts_014_dual_role_usb_with_device_capability(self) -> None:
+        verifier.verify_dtb(self.compile_dts(
+            VALID_DTS.replace('dr_mode = "peripheral";', 'dr_mode = "otg";')
+        ))
+
+    def test_rejects_host_only_or_ambiguous_usb_modes(self) -> None:
+        for replacement in ('dr_mode = "host";', 'dr_mode = "unknown";',
+                            'dr_mode = "otg", "host";', ''):
+            with self.subTest(replacement=replacement):
+                dtb = self.compile_dts(VALID_DTS.replace(
+                    'dr_mode = "peripheral";', replacement))
+                with self.assertRaises(verifier.ContractError):
+                    verifier.verify_dtb(dtb)
+
+    def test_accepts_composite_audio_pinctrl_states(self) -> None:
+        source = VALID_DTS
+        for old, new in (
+            ("pinctrl-0 = <&pmic_idle>;", "pinctrl-0 = <&pmic_idle &mclk>;"),
+            ("pinctrl-1 = <&pmic_active>;", "pinctrl-1 = <&pmic_active &mclk>;"),
+            ("pinctrl-2 = <&i2s_idle>;", "pinctrl-2 = <&i2s_idle &mclk>;"),
+            ("pinctrl-3 = <&i2s_active>;", "pinctrl-3 = <&i2s_active &mclk>;"),
+            ("pinctrl-4 = <&audexamphigh>;", "pinctrl-4 = <&audexamphigh &mclk>;"),
+            ("pinctrl-5 = <&audexamplow>;", "pinctrl-5 = <&audexamplow &mclk>;"),
+            ("pinctrl-7 = <&audexampdacmuxhigh>;", "pinctrl-7 = <&audexampdacmuxhigh &mclk>;"),
+            ("pinctrl-8 = <&audexampdacmuxlow>;", "pinctrl-8 = <&audexampdacmuxlow &mclk>;"),
+        ):
+            source = source.replace(old, new)
+        verifier.verify_dtb(self.compile_dts(source))
+
     def test_rejects_topckgen_without_syscon(self) -> None:
         dtb = self.compile_dts(
             VALID_DTS.replace(
@@ -208,6 +260,37 @@ class RadarPuffinDtbTests(unittest.TestCase):
         dtb = self.compile_dts(VALID_DTS.replace('pinmux = <0x7a00>', 'pinmux = <0x1c00>'))
         with self.assertRaisesRegex(verifier.ContractError, "external amp"):
             verifier.verify_dtb(dtb)
+
+    def test_rejects_wrong_action_gpio(self) -> None:
+        dtb = self.compile_dts(
+            VALID_DTS.replace("gpios = <&pio 36 1>;", "gpios = <&pio 9 1>;")
+        )
+        with self.assertRaisesRegex(verifier.ContractError, "GPIO36/KPCOL0"):
+            verifier.verify_dtb(dtb)
+
+
+class UsbBootPolicyTests(unittest.TestCase):
+    def test_actual_boot_policy_pins_all_available_roles_to_device(self) -> None:
+        root = Path(__file__).resolve().parent
+        source = (root / "initramfs/libreecho-init").read_text()
+        start = source.index("                for role_sx in /sys/class/usb_role/*/role; do")
+        end = source.index("                done", start) + len("                done")
+        policy = source[start:end]
+        with tempfile.TemporaryDirectory() as directory:
+            role_root = Path(directory) / "roles"
+            for name in ("controller-a", "controller-b"):
+                target = role_root / name
+                target.mkdir(parents=True)
+                (target / "role").write_text("host")
+            policy = policy.replace("/sys/class/usb_role", str(role_root))
+            result = subprocess.run(
+                ["sh", "-eu", "-c", 'log() { printf "%s\\n" "$*"; };\n' + policy],
+                text=True, capture_output=True, timeout=5,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for role in role_root.glob("*/role"):
+                self.assertEqual(role.read_text(), "device")
+            self.assertEqual(result.stdout.count("usb-role-pinned-device:"), 2)
 
 
 if __name__ == "__main__":

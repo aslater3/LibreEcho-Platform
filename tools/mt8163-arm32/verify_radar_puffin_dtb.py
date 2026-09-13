@@ -4,7 +4,9 @@
 This checks the hardware semantics that made the accepted Linux 6.1 image
 usable.  It intentionally does not pin phandle numbers, which are build-order
 artifacts, but it does pin the providers, clock IDs, GPIO pinmux values, and
-accepted amp/DAC-mux control path.
+accepted amp/DAC-mux control path.  A pinctrl consumer may reference several
+provider states at once; validation therefore requires each named hardware
+state to be present rather than requiring a singleton phandle.
 """
 
 from __future__ import annotations
@@ -21,6 +23,13 @@ SCPSYS = "/soc/scpsys@10006000"
 PINCTRL = "/soc/pinctrl@10005000"
 AFE = "/soc/mt_soc_dl1_pcm@11220000"
 AUDIOSYS = "/soc/audiosys@11220000"
+PMIC_KEYS = "/soc/pwrap@1000d000/mt6323/mt6323keys"
+PMIC_MUTE_KEY = PMIC_KEYS + "/power"
+ACTION_KEY = "/action_key"
+ACTION_BUTTON = ACTION_KEY + "/action@36"
+ACTION_GPIO = 36
+ACTION_KEYCODE = 0x8A
+MUTE_KEYCODE = 0x71
 AUDIO_24M_ID = 3
 AUDIO_POWER_DOMAIN_ID = 5
 CODEC_MCLK_HZ = 9_600_000
@@ -238,7 +247,8 @@ def verify_dtb(dtb: Path) -> None:
     )
     for index, group in pin_groups:
         expected = _phandle(dtb, f"{PINCTRL}/{group}")
-        if _cells(dtb, AFE, f"pinctrl-{index}") != (expected,):
+        references = _cells(dtb, AFE, f"pinctrl-{index}")
+        if expected not in references:
             raise ContractError(f"AFE pinctrl-{index} does not reference {group}")
 
     _check_gpio_state(dtb, "audexamphigh", 0x7A00, "output-high", "external amp on")
@@ -272,11 +282,33 @@ def verify_dtb(dtb: Path) -> None:
     usb = _require_enabled_compatible(dtb, "mediatek,mt8163-usb20", "USB gadget")
     if "mediatek,mtk-musb" not in _strings(dtb, usb, "compatible"):
         raise ContractError("USB node does not select the MediaTek MUSB glue")
-    if _strings(dtb, usb, "dr_mode") != ("peripheral",):
-        raise ContractError("USB node is not in peripheral mode")
+    # 0.14 uses the same device-capable controller in dual-role mode. The
+    # audited init pins its boot role to device for recovery ADB; userspace may
+    # subsequently request host mode. Keep legacy peripheral images accepted,
+    # but never accept a host-only, absent, or ambiguous role declaration.
+    if _strings(dtb, usb, "dr_mode") not in (("peripheral",), ("otg",)):
+        raise ContractError("USB node must be device-capable (peripheral or otg)")
     if "mc" not in _strings(dtb, usb, "interrupt-names"):
         raise ContractError("USB node is missing the MUSB mc interrupt")
     _require_enabled_compatible(dtb, "issi,is31fl3236", "LED ring")
+
+    if _strings(dtb, PMIC_KEYS, "compatible") != ("mediatek,mt6323-keys",):
+        raise ContractError("PMIC key controller is missing")
+    if _cells(dtb, PMIC_MUTE_KEY, "linux,keycodes") != (MUTE_KEYCODE,):
+        raise ContractError("PMIC key is not declared as KEY_MUTE")
+    if "wakeup-source" not in _properties(dtb, PMIC_MUTE_KEY):
+        raise ContractError("PMIC mute key must remain a wakeup source")
+    if _strings(dtb, ACTION_KEY, "compatible") != ("gpio-keys",):
+        raise ContractError("action key controller is missing")
+    if " ".join(_strings(dtb, ACTION_BUTTON, "label")) != "Action Key":
+        raise ContractError("action key label changed")
+    if _cells(dtb, ACTION_BUTTON, "linux,code") != (ACTION_KEYCODE,):
+        raise ContractError("action key is not declared as KEY_HELP")
+    gpio_cells = _cells(dtb, ACTION_BUTTON, "gpios")
+    if gpio_cells != (_phandle(dtb, PINCTRL), ACTION_GPIO, 1):
+        raise ContractError("action key is not bound to PIO GPIO36/KPCOL0")
+    if _cells(dtb, ACTION_BUTTON, "debounce-interval") != (20,):
+        raise ContractError("action key debounce changed")
 
 
 def main() -> int:

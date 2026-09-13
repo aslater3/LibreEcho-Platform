@@ -5,6 +5,10 @@
   "source_url": "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz",
   "source_sha256": "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f",
   "config": "wpa_supplicant-2.10.config",
-  "drivers": ["wext"],
+  "drivers": ["nl80211", "wext"],
+  "libnl_version": "3.11.0",
+  "libnl_source_url": "https://github.com/thom311/libnl/releases/download/libnl3_11_0/libnl-3.11.0.tar.gz",
+  "libnl_source_sha256": "2a56e1edefa3e68a7c00879496736fdbf62fc94ed3232c0baba127ecfa76874d",
+  "libnl_license": "LGPL-2.1-only",
   "crypto": "internal"
 }
