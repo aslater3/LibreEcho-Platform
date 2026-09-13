@@ -1665,7 +1665,7 @@ class SourceTests(unittest.TestCase):
         self.assertIn('memset(&users[users_count]', auth_source)
         self.assertIn("digest[i] =", auth_source)
         self.assertIn("web_users_file_ready()", recovery_init)
-        self.assertIn("if web_users_file_ready; then", recovery_init)
+        self.assertIn("web_listen=0.0.0.0:8080", recovery_init)
         self.assertNotIn("[ ! -x /etc/init.d/libreecho-ssh.init ] ||", recovery_init)
         sync_accounts = supervisor.split("sync_accounts()", 1)[1].split("dropbear_running()", 1)[0]
         self.assertIn('chmod 0711 "$HOME_ROOT"', sync_accounts)

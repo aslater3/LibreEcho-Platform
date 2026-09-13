@@ -2816,6 +2816,32 @@ class CommittedRuntimeLifecycleTests(unittest.TestCase):
         archive = destination / ("rolled-back-history." + hashlib.sha256(old).hexdigest())
         self.assertEqual(archive.read_bytes(), old)
 
+    def test_successful_v2_then_failed_v2_preserves_verified_history(self) -> None:
+        self.commit_runtime_candidate()
+        installed = (self.update / "installed").read_bytes()
+        self.stage_signed_manifest("txn-failed-second-generation", "preserve")
+        self.env["LIBREECHO_TRANSACTION_SLOT"] = "a"
+        (self.parts / "boot_a").write_bytes(self.boot)
+        prepared = self.invoke("prepare-boot")
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        self.bcb.write_text("selected_slot=b\nslot_a_success=0\nslot_b_success=1\n")
+        (self.proc / "cmdline").write_text("androidboot.slot_suffix=_b\n")
+        signature = self.update / "committed-manifest.sig"
+        original_signature = signature.read_bytes()
+        signature.write_bytes(b"0" * 128 + b"\n")
+        self.assertNotEqual(self.invoke("fallback").returncode, 0)
+        self.assertTrue((self.update / "pending").exists())
+        signature.write_bytes(original_signature)
+        result = self.invoke("fallback")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.update / "installed").read_bytes(), installed)
+        self.assertFalse((self.update / "pending").exists())
+        self.assertFalse((self.update / "feature-commit").exists())
+        self.assertFalse(self.staging.exists())
+        self.stage_signed_manifest("txn-third-generation", "preserve")
+        prepared = self.invoke("prepare-boot")
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+
     def test_fallback_retains_verified_v1_bridge_install_record(self) -> None:
         self.assertEqual(self.invoke("prepare-boot").returncode, 0)
         self.bcb.write_text("selected_slot=a\nslot_b_success=0\nslot_a_success=1\n")

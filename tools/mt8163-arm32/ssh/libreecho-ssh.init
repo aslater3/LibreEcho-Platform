@@ -128,10 +128,10 @@ sync_accounts()
                     printf "%s:%d\n", tolower($1), known[tolower($1)] >> map
                 }
                 uid = known[tolower($1)]
-                printf "%s:x:%d:1000:LibreEcho SSH:%s/%s:/bin/sh\n", $1, uid, home_root, $1
-                printf "%s:%d\n", $1, uid > list
+                printf "%s:x:%d:1000:LibreEcho SSH:%s/%s:/bin/sh\n", tolower($1), uid, home_root, tolower($1)
+                printf "%s:%d\n", tolower($1), uid > list
             }
-        ' "$account_list" "$USERS_FILE"
+        ' "$uid_map" "$USERS_FILE"
     } > "$PASSWD_FILE.le.tmp" || return 1
     {
         printf 'root:x:0:\n'
