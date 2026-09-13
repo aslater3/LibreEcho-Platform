@@ -53,7 +53,7 @@ WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-INIT_SHA256 = "3d131fd269bcfd3368b7d62d84bac07f133d13d76b309210daf9d6efbc7b8355"
+INIT_SHA256 = "46ccbd87711ec65cb6fe338de044c64af03ebc6a4010e47293be6ce56344aade"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,

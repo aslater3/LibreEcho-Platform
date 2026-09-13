@@ -1370,6 +1370,23 @@ verify_prior_v1_install() {
     local selected expected actual
     [ -e "$INSTALLED" ] || return 0
     regular "$INSTALLED" installed
+    # A prior v2 generation has signed durable evidence, not the v1 record
+    # shape. Validate it before trusting its selected-slot boot hash.
+    if [ "$(value schema "$INSTALLED")" = 2 ]; then
+        provenance_record "$INSTALLED"
+        verify_committed_evidence
+        [ "$(value version "$INSTALLED")" = "$(value version "$COMMITTED_MANIFEST")" ] || fail fallback-installed-version
+        [ "$(value transaction_id "$INSTALLED")" != "$(value transaction_id "$PENDING")" ] || fail fallback-installed-current
+        selected=$(value selected_slot "$BCB_FILE")
+        [ "$(value slot "$INSTALLED")" = "$selected" ] &&
+            [ "$(running_slot)" = "$selected" ] || fail fallback-installed-slot
+        expected=$(value boot_sha256 "$COMMITTED_MANIFEST")
+        valid_hash "$expected" || fail fallback-installed-hash
+        boot_partition "$selected"
+        actual=$($BB dd if="$BOOT_PARTITION" bs=4096 count=4096 2>/dev/null | $BB sha256sum | $BB awk '{print $1}')
+        [ "$actual" = "$expected" ] || fail fallback-installed-hash
+        return 0
+    fi
     # Validate the complete writer contract before using first-value lookups.
     [ "$($BB stat -c %s "$INSTALLED")" -le 8192 ] || fail fallback-installed
     $BB awk -F= '
