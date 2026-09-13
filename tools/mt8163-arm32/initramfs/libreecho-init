@@ -1266,6 +1266,11 @@ ota_health_confirm_worker()
             *)
                 health_airplay_enabled=0
                 [ $((health_integrations & 16)) -ne 0 ] && health_airplay_enabled=1
+                # Home Assistant discovery keeps airplayd in the required
+                # service graph even when AirPlay audio is disabled, so the OTA
+                # health probe must not derive its requirement from the AirPlay
+                # bit alone.
+                [ $((health_integrations & 1)) -ne 0 ] && health_airplay_enabled=1
                 ;;
         esac
         if [ "$health_airplay_enabled" -eq 1 ]; then

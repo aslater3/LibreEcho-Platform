@@ -2408,6 +2408,12 @@ class PolicyTests(unittest.TestCase):
             "[ $((health_integrations & 16)) -ne 0 ] && health_airplay_enabled=1",
             init,
         )
+        # Home Assistant discovery requires airplayd even when the AirPlay
+        # audio bit is clear, so the health gate must include the HA bit.
+        self.assertIn(
+            "[ $((health_integrations & 1)) -ne 0 ] && health_airplay_enabled=1",
+            init,
+        )
         self.assertNotIn("wyomingd /run/libreecho/wyoming.sock", init)
         self.assertIn("$BB awk -v port=29CC", init)
         self.assertIn("LOCK_TIMEOUT_MAX_SECONDS=300", helper)
@@ -2510,6 +2516,16 @@ ota_health_services_ready
             config.write_text('{"integrations":20}\n')
             enabled = subprocess.run(["sh", "-c", airplay_harness])
             self.assertNotEqual(enabled.returncode, 0)
+            # Home Assistant (bit 1) keeps airplayd in the required discovery
+            # graph while AirPlay audio (bit 16) stays disabled, so an
+            # unavailable airplayd must fail the OTA health probe for the
+            # bit-1-only and Home-Assistant-plus-discovery masks.
+            for home_assistant_only in (1, 5):
+                config.write_text(f'{{"integrations":{home_assistant_only}}}\n')
+                ha_required = subprocess.run(["sh", "-c", airplay_harness])
+                self.assertNotEqual(
+                    ha_required.returncode, 0, home_assistant_only
+                )
             config.write_text('{"integrations":"invalid"}\n')
             malformed = subprocess.run(["sh", "-c", airplay_harness])
             self.assertNotEqual(malformed.returncode, 0)
