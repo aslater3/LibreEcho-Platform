@@ -54,6 +54,7 @@ jobs:
             test_build_wifi_dtb.py \
             test_verify_radar_puffin_dtb.py \
             test_recovery_image_tools.py \
+            test_qualification.py \
             test_ssh_runtime.py \
             test_vm_profile.py \
             test_vendor_import_compat.py \
