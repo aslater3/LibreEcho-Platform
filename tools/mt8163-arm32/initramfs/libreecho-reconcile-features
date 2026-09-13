@@ -241,8 +241,24 @@ airplay_explicitly_disabled()
     [ $((integrations & 16)) -eq 0 ]
 }
 
+shared_discovery_active()
+{
+    # On a shared-runtime image the boot-contained responder owns Avahi/D-Bus.
+    # Consumers bind that bus and must never spawn a second responder, so this
+    # is decided here rather than in the payload.
+    mdns_script=$INIT_ROOT/libreecho-mdnsd.init
+    [ -x "$mdns_script" ] || return 1
+    "$mdns_script" status >/dev/null 2>&1
+}
+
 stop_disabled_airplay()
 {
+    if [ ! -x "$INIT_ROOT/libreecho-airplayd.init" ]; then
+        # No AirPlay payload on this image.  Home Assistant discovery comes from
+        # the shared responder, so a missing AirPlay consumer is not an error.
+        log feature-reconcile-service-absent:airplayd
+        return 0
+    fi
     stop_service airplayd "$RUN_ROOT/libreecho/airplay.sock" || return 1
     log feature-reconcile-service-disabled:airplayd
     return 0
@@ -272,8 +288,11 @@ start_feature()
         wakeword) service=waked; socket=$RUN_ROOT/libreecho/wakeword.sock ;;
         *) log "feature-reconcile-unknown-feature:$feature"; return 1 ;;
     esac
-    if [ "$feature" = airplay2 ] && [ "$ha_enabled" -eq 0 ] &&
-            airplay_explicitly_disabled; then
+    # AirPlay is an independent consumer now: the AirPlay integration bit alone
+    # decides it, whether or not Home Assistant is selected.  Home Assistant
+    # discovery is served by the boot-contained shared responder and must not
+    # require this payload.
+    if [ "$feature" = airplay2 ] && airplay_explicitly_disabled; then
         log feature-reconcile-airplay-disabled
         stop_disabled_airplay
         return $?
@@ -294,7 +313,19 @@ start_feature()
         log "feature-reconcile-service-missing:$service"
         return 1
     fi
-    "$script" start >/tmp/libreecho-"$service".reconcile.log 2>&1
+    shared_discovery_env=
+    if [ "$feature" = airplay2 ] && shared_discovery_active; then
+        # Never two responders: the shared runtime owns Avahi/D-Bus, so the
+        # AirPlay consumer is told to bind it instead of starting its own from
+        # the retained legacy payload bytes.
+        shared_discovery_env=1
+        log feature-reconcile-shared-discovery-owner:airplayd
+    fi
+    if [ -n "$shared_discovery_env" ]; then
+        $BB env LIBREECHO_SHARED_DISCOVERY=1 "$script" start >/tmp/libreecho-"$service".reconcile.log 2>&1
+    else
+        "$script" start >/tmp/libreecho-"$service".reconcile.log 2>&1
+    fi
     rc=$?
     if [ "$rc" -ne 0 ]; then
         log "feature-reconcile-service-start-failed:$service:$rc"

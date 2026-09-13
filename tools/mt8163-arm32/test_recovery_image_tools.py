@@ -2351,10 +2351,10 @@ class PolicyTests(unittest.TestCase):
             )
             subprocess.run(["sh", str(helper)], env=env, check=True)
             home_assistant_only_actions = actions.read_text().splitlines()
-            self.assertIn(
+            self.assertNotIn(
                 "libreecho-airplayd.init:start", home_assistant_only_actions
             )
-            self.assertNotIn(
+            self.assertIn(
                 "libreecho-airplayd.init:stop", home_assistant_only_actions
             )
 
@@ -2362,6 +2362,12 @@ class PolicyTests(unittest.TestCase):
             (data / "libreecho/config/web-config.json").write_text(
                 '{"integrations":21}\n'
             )
+            (var_run / "libreecho-airplayd.pid").write_text(f"{os.getpid()}\n")
+            if not airplay_socket.exists():
+                airplay_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                airplay_listener.bind(str(airplay_socket))
+                airplay_listener.listen(1)
+                sockets.append(airplay_listener)
             subprocess.run(["sh", str(helper)], env=env, check=True)
             self.assertEqual(
                 actions.read_text().splitlines(),
@@ -2408,9 +2414,17 @@ class PolicyTests(unittest.TestCase):
             "[ $((health_integrations & 16)) -ne 0 ] && health_airplay_enabled=1",
             init,
         )
-        # Home Assistant discovery requires airplayd even when the AirPlay
-        # audio bit is clear, so the health gate must include the HA bit.
         self.assertIn(
+            "[ $((health_integrations & 16)) -ne 0 ] && health_airplay_enabled=1",
+            init,
+        )
+        # Home Assistant discovery is independently supervised; it must not
+        # make the AirPlay payload/consumer a health prerequisite.
+        self.assertIn(
+            "[ $((health_integrations & 1)) -ne 0 ] && health_discovery_enabled=1",
+            init,
+        )
+        self.assertNotIn(
             "[ $((health_integrations & 1)) -ne 0 ] && health_airplay_enabled=1",
             init,
         )
@@ -2468,15 +2482,27 @@ release_lock
                 shell_function(name)
                 for name in (
                     "home_assistant_integration_enabled",
+                    "shared_discovery_ready",
                     "ota_health_services_ready",
                 )
             )
+            mdns_init = Path(td) / "mdnsd.init"
+            mdns_init.write_text("#!/bin/sh\n[ \"${1:-}\" = status ]\n")
+            mdns_init.chmod(0o755)
+            mdns_socket = Path(td) / "system_bus_socket"
+            mdns_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            mdns_listener.bind(str(mdns_socket))
+            mdns_listener.listen(1)
+            busybox = shutil.which("busybox")
             functions = functions.replace(
                 "/data/libreecho/config/web-config.json", str(config)
             ).replace(
                 "/var/run/libreecho-wyomingd.pid", str(pidfile)
-            ).replace("/proc/net/tcp", str(proc_tcp))
-            busybox = shutil.which("busybox")
+            ).replace("/proc/net/tcp", str(proc_tcp)).replace(
+                "/etc/init.d/libreecho-mdnsd.init", str(mdns_init)
+            ).replace(
+                "/run/libreecho/mdns/dbus/system_bus_socket", str(mdns_socket)
+            )
             if busybox is None:
                 self.skipTest("busybox is required for the OTA health fixture")
             harness = f"""
@@ -2516,16 +2542,17 @@ ota_health_services_ready
             config.write_text('{"integrations":20}\n')
             enabled = subprocess.run(["sh", "-c", airplay_harness])
             self.assertNotEqual(enabled.returncode, 0)
-            # Home Assistant (bit 1) keeps airplayd in the required discovery
-            # graph while AirPlay audio (bit 16) stays disabled, so an
-            # unavailable airplayd must fail the OTA health probe for the
-            # bit-1-only and Home-Assistant-plus-discovery masks.
-            for home_assistant_only in (1, 5):
-                config.write_text(f'{{"integrations":{home_assistant_only}}}\n')
-                ha_required = subprocess.run(["sh", "-c", airplay_harness])
-                self.assertNotEqual(
-                    ha_required.returncode, 0, home_assistant_only
-                )
+            # Home Assistant discovery uses the independent shared responder;
+            # with its listener and mDNS socket ready, HA-only configurations
+            # pass without requiring the AirPlay consumer.
+            config.write_text('{"integrations":1}\n')
+            pidfile.write_text(f"{os.getpid()}\n")
+            proc_tcp.write_text(
+                "  0: 00000000:29CC 00000000:0000 0A 00000000:00000000 "
+                "00:00000000 00000000 0 0 0 1 0000000000000000 100 0 0 10 0\n"
+            )
+            subprocess.run(["sh", "-c", harness])
+            self.assertEqual(subprocess.run(["sh", "-c", harness]).returncode, 0)
             config.write_text('{"integrations":"invalid"}\n')
             malformed = subprocess.run(["sh", "-c", airplay_harness])
             self.assertNotEqual(malformed.returncode, 0)
