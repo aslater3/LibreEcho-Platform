@@ -1782,6 +1782,47 @@ done
         self.assertTrue((self.update_root / "feature-commit").exists())
         self.assertFalse(self.bootctl_log.exists())
 
+    def test_one_sided_prepared_intent_resumes_install(self) -> None:
+        # publish_prepared_intent writes $PENDING before $JOURNAL; an interruption
+        # between the two copies leaves a one-sided intent that prepare-boot
+        # rebuilds. The guard that protects a complete transaction's staged
+        # evidence must not block the retry that recovers this state.
+        (self.update_root / "pending").write_text(
+            "schema=2\nphase=prepared\ntransaction_id=txn-0.13.11-test\n"
+        )
+        self.assertFalse((self.update_root / "feature-commit").exists())
+        result = self.invoke_updater(
+            "install", str(self.package), "--feature-dir", str(self.source_features)
+        )
+        self.assertNotIn("transaction_pending", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("UPDATE_READY", result.stdout)
+        self.assertTrue((self.update_root / "feature-commit").exists())
+
+    def test_status_prefers_live_transaction_over_rollback_history(self) -> None:
+        # rolled-back is retained rollback history, not live state; a later
+        # pending or committing transaction must still be reported.
+        (self.update_root / "rolled-back").write_text("schema=1\nversion=bridge\n")
+        (self.update_root / "feature-commit").write_text(
+            "schema=2\nphase=prepared\ntransaction_id=txn-live\n"
+        )
+        committing = self.invoke_updater("status")
+        self.assertEqual(committing.returncode, 0, committing.stderr)
+        self.assertIn("ota_transaction_state=commit", committing.stdout)
+        self.assertNotIn("ota_transaction_state=rollback", committing.stdout)
+        (self.update_root / "feature-commit").unlink()
+        (self.update_root / "pending").write_text(
+            "schema=2\nphase=prepared\ntransaction_id=txn-live\n"
+        )
+        pending = self.invoke_updater("status")
+        self.assertEqual(pending.returncode, 0, pending.stderr)
+        self.assertIn("ota_transaction_state=pending", pending.stdout)
+        self.assertNotIn("ota_transaction_state=rollback", pending.stdout)
+        (self.update_root / "pending").unlink()
+        retained = self.invoke_updater("status")
+        self.assertEqual(retained.returncode, 0, retained.stderr)
+        self.assertIn("ota_transaction_state=rollback", retained.stdout)
+
 
 class PreConfirmAcceptanceTests(unittest.TestCase):
     """Exercise verify-running with real scripts and private runtime fixtures."""

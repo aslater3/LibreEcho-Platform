@@ -486,9 +486,13 @@ verify_manifest()
 
 transaction_pending()
 {
-    # A v1 update awaiting confirmation records $PENDING; a reboot-bound v2
-    # transaction records its durable journal as $UPDATE_ROOT/feature-commit.
-    [ -r "$PENDING" ] || [ -r "$UPDATE_ROOT/feature-commit" ]
+    # The durable v2 journal ($UPDATE_ROOT/feature-commit) marks a transaction
+    # whose staged manifest, signature, boot image and BCB readback are the
+    # evidence that confirmation authenticates, so those staged files must not
+    # be replaced. A bare $PENDING with no journal is a one-sided intent from an
+    # interrupted publish_prepared_intent that prepare-boot rebuilds, so it must
+    # not block the retry that recovers it.
+    [ -e "$UPDATE_ROOT/feature-commit" ]
 }
 
 extract_and_verify()
@@ -585,7 +589,10 @@ transaction_status()
     transaction_state=none
     [ -r "$PENDING" ] && transaction_state=pending
     [ -r "$UPDATE_ROOT/feature-commit" ] && transaction_state=commit
-    [ -r "$UPDATE_ROOT/rolled-back" ] && transaction_state=rollback
+    # The rolled-back marker is retained rollback history, not live state, so it
+    # must not mask a pending or committing transaction recorded above.
+    [ "$transaction_state" = none ] && [ -r "$UPDATE_ROOT/rolled-back" ] &&
+        transaction_state=rollback
     echo "ota_transaction_state=$transaction_state"
     [ "$transaction_state" = pending ] && echo ota_transaction_pending=1
     [ "$transaction_state" = commit ] && echo ota_transaction_commit=1
