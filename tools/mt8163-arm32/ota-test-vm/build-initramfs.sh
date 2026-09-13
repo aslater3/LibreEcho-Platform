@@ -13,6 +13,10 @@ cp /boot/vmlinuz-$KVER /work/vmlinuz
 echo "exported kernel: $KVER"
 R=/work/initramfs; rm -rf $R; mkdir -p $R/{bin,sbin,proc,sys,dev,data,tmp,tools,mods,fakesys}
 cp /bin/busybox $R/bin/busybox
+# Install guest-relative links for script shebangs and tools.
+for applet in $(/bin/busybox --list); do
+  ln -s busybox "$R/bin/$applet"
+done
 # static-ish e2fs tools for on-boot format (dynamic; add libs)
 cp /sbin/mke2fs $R/sbin/ 2>/dev/null; cp /sbin/mkfs.ext4 $R/sbin/ 2>/dev/null || true
 mkdir -p $R/lib/arm-linux-gnueabihf $R/lib

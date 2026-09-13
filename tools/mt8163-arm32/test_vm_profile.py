@@ -16,6 +16,20 @@ spec.loader.exec_module(parser)
 
 
 class ProfileTests(unittest.TestCase):
+    def test_guest_applets_resolve_inside_image(self):
+        source = (VM / 'build-initramfs.sh').read_text()
+        start = source.index('for applet in $(')
+        block = source[start:source.index('\ndone', start) + len('\ndone')]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'bin').mkdir()
+            (root / 'bin/busybox').write_text('fixture')
+            # Execute the real link-creation block with a deterministic applet list.
+            block = block.replace('/bin/busybox --list', 'printf "sh\\nfind\\nstat\\n"')
+            subprocess.run(['sh', '-ec', block], env=dict(os.environ, R=tmp), check=True, timeout=5)
+            for name in ['sh', 'find', 'stat']:
+                self.assertEqual((root / 'bin' / name).resolve(), root / 'bin/busybox')
+
     def test_structural_state_and_export(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'profile.json'
