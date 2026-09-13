@@ -3121,7 +3121,13 @@ start_feature_service_if_enabled
             ("assistant", "libreecho-agentd"),
         ):
             self.assertIn(f"{feature}) daemon={daemon}", updater)
-        self.assertIn("feature_root=/data/libreecho/features/$feature", updater)
+        # The shipped updater keeps the production data root immutable and
+        # derives the feature path only from that local constant.  The host
+        # fixture rewrites this literal in its generated copy; production does
+        # not accept a caller-selected feature root.
+        self.assertIn("DATA_ROOT=/data", updater)
+        self.assertIn("FEATURE_ROOT=$DATA_ROOT/libreecho/features", updater)
+        self.assertIn("feature_root=$FEATURE_ROOT/$feature", updater)
         self.assertIn("payload=$feature_root/payload.squashfs", updater)
         self.assertIn("manifest=$feature_root/manifest.json", updater)
         for field in (
@@ -3407,7 +3413,7 @@ start_feature_service_if_enabled
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
         self.assertIn("version=$(download_and_inspect) || return 1", fetcher)
         self.assertIn(
-            'if [ -n "$rolled_back" ] && [ "$version" = "$rolled_back" ] && [ "$channel" = "$rolled_back_channel" ]; then',
+            'if [ -n "$rolled_back" ] && [ "$version" = "$rolled_back" ] && [ "$channel" = "$rolled_back_channel" ] && candidate_matches_record "$ROOT/rolled-back"; then',
             fetcher,
         )
         self.assertIn("check_status_write error", fetcher)
@@ -3488,7 +3494,11 @@ start_feature_service_if_enabled
         self.assertIn("cleanup_locks\n    trap - EXIT", fetcher)
         self.assertIn("record_channel()", fetcher)
         self.assertIn("record_channel \"$ROOT/installed\"", fetcher)
-        self.assertIn("install_lock\n    seed_channel\n    validate_source\n    install_unlock", fetcher)
+        self.assertIn(
+            "install_lock\n    seed_channel\n    validate_source\n"
+            "    prepare_https_client\n    resolve_dev_release || return 1\n    install_unlock",
+            fetcher,
+        )
         automatic = fetcher[fetcher.index("set_automatic_updates()"):fetcher.index("die()")]
         self.assertIn("fetch_lock\n    install_lock", automatic)
 
@@ -3511,6 +3521,53 @@ start_feature_service_if_enabled
             'check_children "$DATA_ROOT/libreecho/update" \\\n    channel incoming',
             cleanup,
         )
+
+    def test_fetch_quarantine_survives_current_and_prior_cleanup(self) -> None:
+        """Run the real writer, then boot cleanup on its persistent output."""
+        fetch = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
+        function = 'quarantine_file()\n' + fetch.split('quarantine_file()\n', 1)[1].split('\ninspect_control_part()', 1)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            data = Path(temporary) / 'data'
+            root = data / 'libreecho/update'
+            root.mkdir(parents=True)
+            package = root / 'github-update.ota.tar'
+            package.write_bytes(b'previous verified candidate')
+            script = 'BB=busybox\ndie() { exit 1; }\n' + function + '\nquarantine_file "$ROOT/github-update.ota.tar"\n'
+            result = subprocess.run(['/bin/sh', '-c', script], env={**os.environ, 'ROOT': str(root)}, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            retained = list(root.glob('quarantine-*.bad'))
+            self.assertEqual(len(retained), 1)
+            self.assertEqual(retained[0].read_bytes(), b'previous verified candidate')
+            self.assertFalse((root / 'quarantine').exists())
+            for _ in range(2):  # candidate boot and fallback share userdata
+                result = self._run_cleanup(data)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(retained[0].read_bytes(), b'previous verified candidate')
+
+            # Repeated identical evidence is deduplicated, never overwritten.
+            package.write_bytes(b'previous verified candidate')
+            result = subprocess.run(['/bin/sh', '-c', script], env={**os.environ, 'ROOT': str(root)}, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(package.exists())
+            self.assertEqual(len(list(root.glob('quarantine-*.bad'))), 1)
+            # Reject a substituted target while preserving both source and link.
+            retained[0].unlink()
+            outside = Path(temporary) / 'outside'
+            outside.write_bytes(b'untouched')
+            retained[0].symlink_to(outside)
+            package.write_bytes(b'previous verified candidate')
+            result = subprocess.run(['/bin/sh', '-c', script], env={**os.environ, 'ROOT': str(root)}, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(outside.read_bytes(), b'untouched')
+            self.assertTrue(package.exists())
+            retained[0].unlink()
+            # Capacity exhaustion is explicit and does not evict history.
+            for i in range(8):
+                (root / ('quarantine-' + str(i) * 64 + '.bad')).write_bytes(b'history')
+            result = subprocess.run(['/bin/sh', '-c', script], env={**os.environ, 'ROOT': str(root)}, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(package.exists())
+            self.assertEqual(len(list(root.glob('quarantine-*.bad'))), 8)
 
     def test_userdata_cleanup_preserves_persisted_ota_channel(self) -> None:
         cleanup = TOOLS_DIR / "initramfs/libreecho-data-cleanup"

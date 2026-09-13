@@ -181,6 +181,20 @@ class RadarPuffinDtbTests(unittest.TestCase):
     def test_accepts_complete_audio_and_hardware_contract(self) -> None:
         verifier.verify_dtb(self.compile_dts(VALID_DTS))
 
+    def test_accepts_014_dual_role_usb_with_device_capability(self) -> None:
+        verifier.verify_dtb(self.compile_dts(
+            VALID_DTS.replace('dr_mode = "peripheral";', 'dr_mode = "otg";')
+        ))
+
+    def test_rejects_host_only_or_ambiguous_usb_modes(self) -> None:
+        for replacement in ('dr_mode = "host";', 'dr_mode = "unknown";',
+                            'dr_mode = "otg", "host";', ''):
+            with self.subTest(replacement=replacement):
+                dtb = self.compile_dts(VALID_DTS.replace(
+                    'dr_mode = "peripheral";', replacement))
+                with self.assertRaises(verifier.ContractError):
+                    verifier.verify_dtb(dtb)
+
     def test_accepts_composite_audio_pinctrl_states(self) -> None:
         source = VALID_DTS
         for old, new in (
@@ -253,6 +267,30 @@ class RadarPuffinDtbTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(verifier.ContractError, "GPIO36/KPCOL0"):
             verifier.verify_dtb(dtb)
+
+
+class UsbBootPolicyTests(unittest.TestCase):
+    def test_actual_boot_policy_pins_all_available_roles_to_device(self) -> None:
+        root = Path(__file__).resolve().parent
+        source = (root / "initramfs/libreecho-init").read_text()
+        start = source.index("                for role_sx in /sys/class/usb_role/*/role; do")
+        end = source.index("                done", start) + len("                done")
+        policy = source[start:end]
+        with tempfile.TemporaryDirectory() as directory:
+            role_root = Path(directory) / "roles"
+            for name in ("controller-a", "controller-b"):
+                target = role_root / name
+                target.mkdir(parents=True)
+                (target / "role").write_text("host")
+            policy = policy.replace("/sys/class/usb_role", str(role_root))
+            result = subprocess.run(
+                ["sh", "-eu", "-c", 'log() { printf "%s\\n" "$*"; };\n' + policy],
+                text=True, capture_output=True, timeout=5,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for role in role_root.glob("*/role"):
+                self.assertEqual(role.read_text(), "device")
+            self.assertEqual(result.stdout.count("usb-role-pinned-device:"), 2)
 
 
 if __name__ == "__main__":

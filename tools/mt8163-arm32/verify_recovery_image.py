@@ -38,7 +38,7 @@ ZIMAGE_MAGIC = 0x016F2818
 ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
 CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
-CONNECTIVITY_IMPORTER_SHA256 = "7601145a15750abce6a4c21d20326ecbdc1e4dc36e5670c0ca3cc9d1bf1f1326"
+CONNECTIVITY_IMPORTER_SHA256 = "e9d98d059d7f0082d28bad134bf72fa6b6c4318a104d7de4001d9984df0e0854"
 CONNECTIVITY_STOCK_SYSTEM_SHA256 = "56540b3a9ac4437901a5510d9fb5e09b1a8d0cc229548f0b08bb5c22d78684fe"
 CONNECTIVITY_EVIDENCE_MANIFEST_SHA256 = "d1eedd04efe0dbc78853f2b0f9357c092b4ca66242648908c0369956538441eb"
 WPA_SUPPLICANT_VERSION = "2.10"
@@ -53,7 +53,7 @@ WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-INIT_SHA256 = "a46983a33e6fc93e3179bb1395d60c4e3a390ca53ba2be557f5ba5297a27f1ce"
+INIT_SHA256 = "3d131fd269bcfd3368b7d62d84bac07f133d13d76b309210daf9d6efbc7b8355"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -65,8 +65,10 @@ OVERLAY_FILES = {
     "libreecho-data-cleanup": 0o755,
     "libreecho-vendor-import": 0o755,
     "vendor-assets/mt8163-v181-stock-v1.tsv": 0o644,
+    "vendor-assets/mt8163-v181-stock-v2.tsv": 0o644,
     "libreecho-update": 0o755,
     "libreecho-update-fetch": 0o755,
+    "libreecho-feature-transaction": 0o755,
     "ota-source.conf": 0o644,
     "regulatory.db": 0o644,
     "regulatory.db.p7s": 0o644,
@@ -79,8 +81,12 @@ OVERLAY_TARGETS = {
     "vendor-assets/mt8163-v181-stock-v1.tsv": (
         "etc/libreecho/vendor-assets/mt8163-v181-stock-v1.tsv"
     ),
+    "vendor-assets/mt8163-v181-stock-v2.tsv": (
+        "etc/libreecho/vendor-assets/mt8163-v181-stock-v2.tsv"
+    ),
     "libreecho-update": "usr/local/sbin/libreecho-update",
     "libreecho-update-fetch": "usr/local/sbin/libreecho-update-fetch",
+    "libreecho-feature-transaction": "usr/local/sbin/libreecho-feature-transaction",
     "ota-source.conf": "etc/libreecho/ota-source.conf",
     "regulatory.db": "lib/firmware/regulatory.db",
     "regulatory.db.p7s": "lib/firmware/regulatory.db.p7s",
@@ -1780,6 +1786,9 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         b"FASTBOOT_PLEASE", b"/run/libreecho-control/runme", b"functionfs", b"/dev/stpwmt", b"/dev/stpbt",
         b"PARTNAME=expdb", b"/sys/class/block/mmcblk0p7", b"20480", b"bs=15 count=1",
         b"stat -c '%t:%T'",
+        b"for role_sx in /sys/class/usb_role/*/role; do",
+        b'printf device > "$role_sx"', b"usb-role-pinned-device:",
+        b"usb-role-pin-failed:",
     ):
         if marker not in control.data:
             fail(f"libreecho-init lacks {marker!r}")
