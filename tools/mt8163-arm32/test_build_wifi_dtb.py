@@ -42,11 +42,13 @@ def _pinctrl_fixture() -> str:
         leaves[group].add(leaf)
 
     lines = [
-        "        pinctrl@10005000 {",
+        "        pio: pinctrl@10005000 {",
         '            compatible = "mediatek,mt8163-pinctrl";',
         "            reg = <0x10005000 0x1000>;",
         "            gpio-controller;",
         "            #gpio-cells = <2>;",
+        "            phandle = <0x155>;",
+        "            linux,phandle = <0x155>;",
         '            pinctrl-names = "default";',
         "            pinctrl-0 = <0x101>;",
     ]
@@ -223,6 +225,32 @@ class WifiDtbTransformerTests(unittest.TestCase):
                         fdtget, dtb, transformer.AFE_NODE, property_name
                     )
                     self.assertEqual(actual, (provider,), property_name)
+                pio = transformer.fdt_phandle(fdtget, dtb, transformer.PIO_NODE)
+                self.assertNotEqual(pio, 0x09)
+                self.assertEqual(
+                    transformer.fdt_hex_cells(
+                        fdtget, dtb, transformer.ACTION_BUTTON_NODE, "gpios"
+                    ),
+                    (pio, transformer.ACTION_GPIO, transformer.ACTION_GPIO_FLAGS),
+                )
+                self.assertEqual(
+                    transformer.fdt_hex_cells(
+                        fdtget, dtb, transformer.ACTION_BUTTON_NODE, "linux,code"
+                    ),
+                    (transformer.ACTION_KEYCODE,),
+                )
+                self.assertEqual(
+                    transformer.fdt_hex_cells(
+                        fdtget, dtb, transformer.MT6323_POWER_KEY_NODE, "linux,keycodes"
+                    ),
+                    transformer.MUTE_KEYCODE,
+                )
+                self.assertEqual(
+                    transformer.fdt_hex_cells(
+                        fdtget, dtb, transformer.MT6323_NODE, "interrupt-parent"
+                    ),
+                    (pio,),
+                )
                 seen_sha256 = hashlib.sha256(data).hexdigest()
                 seen_size = len(data)
                 return transformer.fdt_totalsize(data, "synthetic Wi-Fi EVT DTB")
