@@ -39,12 +39,12 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "805110e30c4a1cd505c6ff59822753eef475671a979bfe79aaba9d4cdb4a84eb"
+RECOVERY_INIT_SHA256 = "4117bc4dc6fe45a05bc4c18e1805e38f95182cf3af539f955cb40e8fbd85b2ff"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
 CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
-CONNECTIVITY_IMPORTER_SHA256 = "7601145a15750abce6a4c21d20326ecbdc1e4dc36e5670c0ca3cc9d1bf1f1326"
+CONNECTIVITY_IMPORTER_SHA256 = "e9d98d059d7f0082d28bad134bf72fa6b6c4318a104d7de4001d9984df0e0854"
 WPA_SUPPLICANT_VERSION = "2.10"
 WPA_SOURCE_SHA256 = "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f"
 WPA_SOURCE_URL = "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz"
@@ -404,8 +404,14 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         "vendor-assets/mt8163-v181-stock-v1.tsv": (
             "etc/libreecho/vendor-assets/mt8163-v181-stock-v1.tsv", 0o644,
         ),
+        "vendor-assets/mt8163-v181-stock-v2.tsv": (
+            "etc/libreecho/vendor-assets/mt8163-v181-stock-v2.tsv", 0o644,
+        ),
         "libreecho-update": ("usr/local/sbin/libreecho-update", 0o755),
         "libreecho-update-fetch": ("usr/local/sbin/libreecho-update-fetch", 0o755),
+        "libreecho-feature-transaction": (
+            "usr/local/sbin/libreecho-feature-transaction", 0o755,
+        ),
         "ota-source.conf": ("etc/libreecho/ota-source.conf", 0o644),
         "libreecho-wifi": ("sbin/libreecho-wifi", 0o755),
         "udhcpc.script": ("etc/udhcpc.script", 0o755),
@@ -1028,8 +1034,7 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
     for binary in (
         "libreecho-web", "libreecho-logd", "libreecho-networkd",
         "libreecho-timed", "libreecho-audiod", "libreecho-micd",
-        "libreecho-ledd", "libreecho-buttond", "libreecho-radiod",
-        "libreecho-btd",
+        "libreecho-ledd", "libreecho-buttond", "libreecho-radiod", "libreecho-btd",
         "libreecho-airplayd", "libreecho-wyomingd",
         "libreecho-sttd-wyoming", "libreecho-ttsd-wyoming",
     ):
@@ -1037,8 +1042,8 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
     for script in (
         "libreecho-web.init", "libreecho-logd.init", "libreecho-networkd.init",
         "libreecho-timed.init", "libreecho-audiod.init",
-        "libreecho-micd.init", "libreecho-ledd.init",
-        "libreecho-buttond.init", "libreecho-radiod.init", "libreecho-btd.init",
+        "libreecho-micd.init", "libreecho-ledd.init", "libreecho-buttond.init",
+        "libreecho-radiod.init", "libreecho-btd.init",
         "libreecho-airplayd.init", "libreecho-ttsd.init", "libreecho-waked.init",
         "libreecho-sttd.init", "libreecho-agentd.init", "libreecho-wyomingd.init",
     ):
@@ -1814,7 +1819,7 @@ def validate_stage(stage: Path) -> None:
 
     init_script = read(stage / "libreecho-init")
     for marker in (
-        b"FASTBOOT_PLEASE", b"/tmp/runme", b"functionfs", b"/dev/stpwmt", b"/dev/stpbt",
+        b"FASTBOOT_PLEASE", b"/run/libreecho-control/runme", b"functionfs", b"/dev/stpwmt", b"/dev/stpbt",
         b"PARTNAME=expdb", b"/sys/class/block/mmcblk0p7", b"20480", b"bs=15 count=1",
         b"stat -c '%t:%T'",
     ):

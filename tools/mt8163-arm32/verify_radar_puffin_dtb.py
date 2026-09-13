@@ -282,8 +282,12 @@ def verify_dtb(dtb: Path) -> None:
     usb = _require_enabled_compatible(dtb, "mediatek,mt8163-usb20", "USB gadget")
     if "mediatek,mtk-musb" not in _strings(dtb, usb, "compatible"):
         raise ContractError("USB node does not select the MediaTek MUSB glue")
-    if _strings(dtb, usb, "dr_mode") != ("peripheral",):
-        raise ContractError("USB node is not in peripheral mode")
+    # 0.14 uses the same device-capable controller in dual-role mode. The
+    # audited init pins its boot role to device for recovery ADB; userspace may
+    # subsequently request host mode. Keep legacy peripheral images accepted,
+    # but never accept a host-only, absent, or ambiguous role declaration.
+    if _strings(dtb, usb, "dr_mode") not in (("peripheral",), ("otg",)):
+        raise ContractError("USB node must be device-capable (peripheral or otg)")
     if "mc" not in _strings(dtb, usb, "interrupt-names"):
         raise ContractError("USB node is missing the MUSB mc interrupt")
     _require_enabled_compatible(dtb, "issi,is31fl3236", "LED ring")
