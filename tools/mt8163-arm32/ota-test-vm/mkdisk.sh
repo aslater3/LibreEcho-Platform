@@ -66,7 +66,7 @@ sgdisk -a 1 \
 # format userdata (p16) via offset loop
 START=$(sgdisk -i 16 $IMG | awk '/First sector/{print $3}')
 mke2fs -F -q -t ext4 -L userdata -E offset=$((START*512)) $IMG $((2137088/8*4)) 2>&1 | head -2 || \
-  { LOOP=$(losetup -o $((START*512)) --sizelimit $((2137088*512)) -f --show $IMG); mke2fs -F -q -t ext4 -L userdata $LOOP; losetup -d $LOOP; }
+  { LOOP=$(losetup -o $((START*512)) --sizelimit $((2137088*512)) -f --show $IMG); mke2fs -F -q -t ext4 -L userdata $LOOP; losetup -d "$LOOP"; LOOP=; }
 echo "userdata formatted"
 
 # Seed userdata (p16) ONLY when seeding was requested. With no --profile and no

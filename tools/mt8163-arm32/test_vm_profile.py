@@ -16,6 +16,43 @@ spec.loader.exec_module(parser)
 
 
 class ProfileTests(unittest.TestCase):
+    def test_mock_entrypoint_profile_and_fallback(self):
+        source = (VM.parent / 'emulation/entrypoint-mock.sh').read_text()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            web = root / 'web'
+            web.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+            web.chmod(0o755)
+            source = source.replace('/usr/local/sbin/libreecho-web', str(web))
+            source = source.replace('/data/libreecho/config', str(root / 'config'))
+            source = source.replace('/run/libreecho /var/log', str(root / 'run'))
+            source = source.replace('/etc/libreecho/web-config.json', str(root / 'default.json'))
+            (root / 'default.json').write_text('{}')
+            profile = root / 'profile.json'
+            for present in [False, True]:
+                if present: profile.write_text('{}')
+                result = subprocess.run(['sh', '-c', source], env=dict(os.environ, LE_MOCK_PROFILE=str(profile)), capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = result.stdout.splitlines()[1:]
+                self.assertEqual('--mock-config' in args, present)
+                if present: self.assertEqual(args[args.index('--mock-config') + 1], str(profile))
+                self.assertIn('--users-file', args)
+
+    def test_format_fallback_detaches_once(self):
+        source = (VM / 'mkdisk.sh').read_text()
+        start = source.index('{ LOOP=$(losetup')
+        block = source[start:source.index('}', start) + 1]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = 'LOOP=; START=0; IMG=fixture; ' + """
+losetup() { if [ "$1" = -d ]; then [ ! -e "$MARK" ] || return 99; touch "$MARK"; else printf 'fixture-loop'; fi; }
+mke2fs() { :; }
+trap 'if [ -n "$LOOP" ]; then losetup -d "$LOOP"; fi' EXIT
+""" + block
+            result = subprocess.run(['sh', '-ec', script], env=dict(os.environ, MARK=str(root / 'detached')), capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((root / 'detached').exists())
+
     def test_guest_applets_resolve_inside_image(self):
         source = (VM / 'build-initramfs.sh').read_text()
         start = source.index('for applet in $(')
