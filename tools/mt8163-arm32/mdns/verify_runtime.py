@@ -100,7 +100,8 @@ def verify(directory, expected_manifest, contract_path=None):
             raise ValueError('unexpected runtime entry: ' + name)
         actual.add(name)
         record = files[name]
-        if digest(path) != record['sha256'] or path.stat().st_mode & 0o7777 != record['mode']:
+        if (digest(path) != record['sha256'] or record.get('size') != path.stat().st_size or
+                path.stat().st_mode & 0o7777 != record['mode']):
             raise ValueError('runtime file changed: ' + name)
         executable_paths = EXECUTABLES | {mdns_contract.load()['loader']} | \
                 mdns_contract.category_paths(contract, 'executables') | \

@@ -62,7 +62,7 @@ def build_fixture(directory, omit=()):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(b'synthetic-runtime-fixture:' + name.encode())
         target.chmod(mode)
-        files[name] = {'sha256': digest(target), 'mode': mode}
+        files[name] = {'sha256': digest(target), 'size': target.stat().st_size, 'mode': mode}
     packages = {'schema': 'libreecho-mdns-packages/v1', 'packages': [
         {'package': name, 'file': name + '.deb', 'sha256': '0' * 64,
          'architecture': 'armhf', 'version': '0'}

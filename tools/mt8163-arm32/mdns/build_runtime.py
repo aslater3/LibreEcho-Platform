@@ -148,7 +148,7 @@ def build(archives, lock, output):
         (root / 'etc/group').chmod(0o644)
         contract_check(root, DEFAULT_CONTRACT)
         (staged / 'packages.json').write_text(json.dumps(document, sort_keys=True, indent=2) + '\n')
-        inventory = {p.relative_to(root).as_posix(): {'sha256': sha(p), 'mode': p.stat().st_mode & 0o777}
+        inventory = {p.relative_to(root).as_posix(): {'sha256': sha(p), 'size': p.stat().st_size, 'mode': p.stat().st_mode & 0o777}
                      for p in sorted(root.rglob('*')) if p.is_file()}
         manifest = {'schema': 'libreecho-mdns-runtime/v1', 'files': inventory,
                     'packages_sha256': sha(staged / 'packages.json'),
