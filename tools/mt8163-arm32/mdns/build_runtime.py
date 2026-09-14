@@ -77,9 +77,7 @@ def contract_check(root, contract):
             if not target.is_file() or target.is_symlink():
                 raise ValueError('runtime contract missing ' + label + ': ' + name)
             actual = target.stat().st_mode & 0o777
-            if mode == 0o755 and actual != mode:
-                raise ValueError('runtime contract mode mismatch for ' + name)
-            if mode != 0o755 and actual & 0o113:
+            if actual != mode:
                 raise ValueError('runtime contract mode mismatch for ' + name)
     loader = root / contract['loader']
     if not loader.is_file() or loader.is_symlink():

@@ -1157,7 +1157,12 @@ def add_mdns_runtime(stage: Path, runtime: Path, manifest: dict[str, object]) ->
         record = files[relative]
         if (not isinstance(record, dict) or record.get("sha256") != sha256(data) or
                 record.get("size") != len(data) or record.get("mode") not in (0o644, 0o755)):
-            raise SystemExit(f"ERROR: mDNS runtime record mismatch: {relative}")
+            raise SystemExit(
+                f"ERROR: mDNS runtime record mismatch: {relative} "
+                f"manifest_sha256={record.get('sha256')!r} actual_sha256={sha256(data)!r} "
+                f"manifest_size={record.get('size')!r} actual_size={len(data)} "
+                f"manifest_mode={record.get('mode')!r} actual_mode={source.stat().st_mode & 0o777!r}"
+            )
         target = stage / prefix / relative
         if target.exists() or target.is_symlink():
             raise SystemExit(f"ERROR: mDNS runtime collides with {target}")

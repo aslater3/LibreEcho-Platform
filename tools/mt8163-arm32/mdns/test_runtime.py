@@ -156,6 +156,15 @@ class VerifierTests(unittest.TestCase):
             self.assertEqual(record['manifest_sha256'], manifest_sha)
             self.assertEqual(record['contract_schema'], mdns_contract.load()['schema'])
 
+    def test_rejects_group_writable_data_file(self):
+        module = self.verifier
+        with tempfile.TemporaryDirectory() as directory:
+            runtime, _ = build_fixture(directory)
+            path = Path(runtime) / 'root' / 'etc/avahi/avahi-daemon.conf'
+            path.chmod(0o664)
+            with self.assertRaisesRegex(ValueError, 'runtime (file changed|data mode invalid)'):
+                module.verify(Path(runtime), digest(Path(runtime) / 'manifest.json'))
+
     def test_missing_runtime_inputs_fail_closed_per_category(self):
         contract = mdns_contract.load()
         cases = (

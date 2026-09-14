@@ -102,9 +102,13 @@ def verify(directory, expected_manifest, contract_path=None):
         record = files[name]
         if digest(path) != record['sha256'] or path.stat().st_mode & 0o7777 != record['mode']:
             raise ValueError('runtime file changed: ' + name)
-        if name in EXECUTABLES | mdns_contract.category_paths(contract, 'executables') | \
-                mdns_contract.category_paths(contract, 'libraries') and record['mode'] != 0o755:
+        executable_paths = EXECUTABLES | {mdns_contract.load()['loader']} | \
+                mdns_contract.category_paths(contract, 'executables') | \
+                mdns_contract.category_paths(contract, 'libraries')
+        if name in executable_paths and record['mode'] != 0o755:
             raise ValueError('runtime executable mode invalid: ' + name)
+        if name not in executable_paths and record['mode'] != 0o644:
+            raise ValueError('runtime data mode invalid: ' + name)
         if name in CONFIG_FILES | mdns_contract.category_paths(contract, 'config') | \
                 mdns_contract.category_paths(contract, 'licenses') | \
                 mdns_contract.category_paths(contract, 'accounts') and not _data_mode_ok(record['mode']):
