@@ -104,7 +104,8 @@ def verify(directory, expected_manifest, contract_path=None):
             raise ValueError('runtime file changed: ' + name)
         executable_paths = EXECUTABLES | {mdns_contract.load()['loader']} | \
                 mdns_contract.category_paths(contract, 'executables') | \
-                mdns_contract.category_paths(contract, 'libraries')
+                mdns_contract.category_paths(contract, 'libraries') | \
+                {name for name in files if name.startswith('usr/lib/') or name.startswith('lib/')}
         if name in executable_paths and record['mode'] != 0o755:
             raise ValueError('runtime executable mode invalid: ' + name)
         if name not in executable_paths and record['mode'] != 0o644:
