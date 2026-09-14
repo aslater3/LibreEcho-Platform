@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -19,6 +20,21 @@ from pathlib import Path
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 from generate_boot_envelope import generate as generate_boot_envelope
+
+
+def _load_mdns_contract_module():
+    """Load the checked-in shared mDNS runtime contract."""
+    path = Path(__file__).resolve().parent / "mdns" / "contract.py"
+    spec = importlib.util.spec_from_file_location("libreecho_mdns_contract", path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"ERROR: mDNS runtime contract loader is missing: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+MDNS_RUNTIME_SCHEMA = "libreecho-mdns-runtime/v1"
+MDNS_CONTRACT = _load_mdns_contract_module().load()
 
 
 ANDROID_MAGIC = b"ANDROID!"
@@ -39,7 +55,7 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "46ccbd87711ec65cb6fe338de044c64af03ebc6a4010e47293be6ce56344aade"
+RECOVERY_INIT_SHA256 = "fe2b0738af1960cab6a44a29298a10bb8216b89673814729c8ee9a6885bca3f6"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
@@ -392,6 +408,7 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         "init.rc": ("init.rc", 0o644),
         "init.recovery.mt8163.rc": ("init.recovery.mt8163.rc", 0o644),
         "libreecho-init": ("libreecho-init", 0o755),
+        "libreecho-mdnsd": ("etc/init.d/libreecho-mdnsd.init", 0o755),
         "libreecho-reconcile-features": (
             "usr/local/sbin/libreecho-reconcile-features", 0o755,
         ),
@@ -1084,6 +1101,134 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
     }
 
 
+def add_mdns_runtime(stage: Path, runtime: Path, manifest: dict[str, object]) -> None:
+    """Install the boot-contained shared Avahi/D-Bus discovery runtime.
+
+    This runtime is deliberately independent of feature policy and of the
+    AirPlay payload: a production image with no AirPlay squashfs still carries
+    it, and the shared responder never executes the Avahi/D-Bus bytes retained
+    inside legacy AirPlay payloads.
+    """
+    contract = MDNS_CONTRACT
+    if runtime.is_symlink() or not runtime.is_dir():
+        raise SystemExit(f"ERROR: mDNS runtime is not a directory: {runtime}")
+    runtime_manifest = runtime / "manifest.json"
+    if runtime_manifest.is_symlink() or not runtime_manifest.is_file():
+        raise SystemExit("ERROR: mDNS runtime manifest is missing")
+    try:
+        document = json.loads(runtime_manifest.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit("ERROR: mDNS runtime manifest is invalid") from exc
+    if document.get("schema") != MDNS_RUNTIME_SCHEMA:
+        raise SystemExit("ERROR: mDNS runtime manifest contract changed")
+    files = document.get("files")
+    if not isinstance(files, dict) or not files:
+        raise SystemExit("ERROR: mDNS runtime manifest carries no inventory")
+    root = runtime / "root"
+    if root.is_symlink() or not root.is_dir():
+        raise SystemExit("ERROR: mDNS runtime root is not a directory")
+
+    required = {contract["loader"]}
+    for category in ("executables", "libraries", "config", "accounts", "licenses"):
+        required |= set(contract[category])
+    missing = sorted(required - set(files))
+    if missing:
+        # Fail closed on a missing loader, library, executable, config or
+        # license record rather than shipping an unusable responder.
+        raise SystemExit(f"ERROR: mDNS runtime contract is missing {missing[0]}")
+    packages_path = runtime / "packages.json"
+    if packages_path.is_symlink() or not packages_path.is_file():
+        raise SystemExit("ERROR: mDNS runtime package lock is missing")
+    try:
+        packages = json.loads(packages_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit("ERROR: mDNS runtime package lock is invalid") from exc
+    if (packages.get("schema") != "libreecho-mdns-packages/v1" or
+            not set(contract["packages"]).issubset(
+                {record.get("package") for record in packages.get("packages", [])
+                 if isinstance(record, dict)})):
+        raise SystemExit("ERROR: mDNS runtime package lock lost a required package")
+
+    prefix = contract["image_runtime_root"]
+    runtime_records: dict[str, object] = {}
+    for relative in sorted(files):
+        source = pinned_source(root, relative, f"mDNS runtime {relative}")
+        data = read(source)
+        record = files[relative]
+        if (not isinstance(record, dict) or record.get("sha256") != sha256(data) or
+                record.get("size") != len(data) or record.get("mode") not in (0o644, 0o755)):
+            raise SystemExit(f"ERROR: mDNS runtime record mismatch: {relative}")
+        target = stage / prefix / relative
+        if target.exists() or target.is_symlink():
+            raise SystemExit(f"ERROR: mDNS runtime collides with {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        target.chmod(int(record["mode"]))
+        entry: dict[str, object] = {
+            "sha256": sha256(data), "size": len(data), "mode": f"{int(record['mode']):04o}",
+        }
+        if elf_identity(target) is not None:
+            info = readelf_contract(target)
+            if info[0] != 0x05000400:
+                raise SystemExit(f"ERROR: mDNS runtime is not ARMHF: {relative}")
+            if relative == contract["loader"]:
+                if info[1] is not None:
+                    raise SystemExit(f"ERROR: mDNS runtime loader has an interpreter: {relative}")
+            elif info[1] != contract["abi"]["interpreter"] or not info[3]:
+                raise SystemExit(f"ERROR: mDNS runtime ELF contract changed: {relative}")
+            entry["elf"] = {
+                "flags": f"0x{info[0]:08x}",
+                "interpreter": info[1],
+                "needed": list(info[2]),
+                "dynamic": info[3],
+            }
+        runtime_records[relative] = entry
+
+    marker = stage / contract["image_marker"]
+    if marker.exists() or marker.is_symlink():
+        raise SystemExit(f"ERROR: mDNS runtime marker collides with {marker}")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    runtime_manifest_sha = sha256(read(runtime_manifest))
+    marker_document = {
+        "schema": "libreecho-mdns-runtime-marker/v1",
+        "component": "libreecho-mdns",
+        "contract": contract["schema"],
+        "runtime_root": "/" + prefix,
+        "init": "/" + contract["init_wrapper"],
+        "abi": contract["abi"],
+        "runtime_dirs": contract["runtime_dirs"],
+        "manifest_sha256": runtime_manifest_sha,
+        "packages_sha256": document.get("packages_sha256"),
+        "files": len(runtime_records),
+        "readiness": "presence-is-not-readiness",
+        "source_offer_verified": document.get("source_offer_verified") is True,
+    }
+    marker_data = (json.dumps(marker_document, indent=2, sort_keys=True) + "\n").encode()
+    marker.write_bytes(marker_data)
+    marker.chmod(0o644)
+
+    manifest["mdns"] = {
+        "enabled": True,
+        "component": "libreecho-mdns",
+        "activation": "automatic-after-writable-runtime",
+        "autostart": True,
+        "ownership": "platform-boot-contained",
+        "discovery": "shared-avahi-dbus",
+        "protocol": "mdns",
+        "feature_payload_dependency": False,
+        "airplay_payload_dependency": False,
+        "single_responder": True,
+        "contract": contract["schema"],
+        "manifest_sha256": runtime_manifest_sha,
+        "runtime_root": "/" + prefix,
+        "marker": "/" + contract["image_marker"],
+        "marker_sha256": sha256(marker_data),
+        "init": "/" + contract["init_wrapper"],
+        "runtime_dirs": contract["runtime_dirs"],
+        "files": runtime_records,
+    }
+
+
 def add_airplay_bundle(stage: Path, nqptp: Path, shairport_sync: Path,
                        avahi_daemon: Path, dbus_daemon: Path,
                        runtime: Path, manifest: dict[str, object]) -> None:
@@ -1751,6 +1896,7 @@ def validate_stage(stage: Path) -> None:
         "etc/libreecho/image-profile", "etc/libreecho/service-profile",
         "etc/libreecho/feature-policy",
         "etc/libreecho/first-install-confirm",
+        "etc/init.d/libreecho-mdnsd.init",
         "usr/local/share/licenses/libreecho-core/THIRD_PARTY_NOTICES.md",
         "usr/local/share/licenses/libreecho-core/COMPONENTS.json",
         "usr/local/share/licenses/libreecho-core/GPL-2.0-only.txt",
@@ -1794,7 +1940,8 @@ def validate_stage(stage: Path) -> None:
     if "Requesting program interpreter" in output:
         raise SystemExit("ERROR: sbin/adbd is not static")
     init_script = read(stage / "init")
-    for relative in ("libreecho-init", "usr/local/sbin/libreecho-reconcile-features"):
+    for relative in ("libreecho-init", "usr/local/sbin/libreecho-reconcile-features",
+                     "etc/init.d/libreecho-mdnsd.init"):
         syntax = subprocess.run(
             ["sh", "-n", str(stage / relative)],
             capture_output=True, text=True,
@@ -2072,6 +2219,8 @@ def main() -> None:
                         help="source/license metadata emitted by build_wireless_tools.sh")
     parser.add_argument("--ui-bundle", type=Path,
                         help="staged static ARM32 LibreEcho-UI bundle")
+    parser.add_argument("--mdns-runtime", type=Path,
+                        help="boot-contained shared ARMHF Avahi/D-Bus discovery runtime")
     parser.add_argument("--ui-source", type=Path,
                         help="LibreEcho-UI source checkout used for the bundle")
     parser.add_argument("--expected-ui-commit",
@@ -2311,6 +2460,14 @@ def main() -> None:
             f"missing {missing}"
         )
 
+    if args.service_profile == "production" and args.mdns_runtime is None:
+        # Shared discovery is boot-contained Platform infrastructure: it must
+        # not be an optional feature-payload side effect, or an HA-selected
+        # image would silently depend on the AirPlay payload again.
+        raise SystemExit(
+            "ERROR: the production service profile requires --mdns-runtime "
+            "(boot-contained shared discovery runtime)"
+        )
     if args.feature_policy == "exclude":
         if args.service_profile != "diagnostic":
             raise SystemExit("ERROR: feature exclusion requires the diagnostic service profile")
@@ -2430,6 +2587,20 @@ def main() -> None:
             "hardware_ownership": "existing-control-plane",
             "files": {},
         },
+        "mdns": {
+            "enabled": False,
+            "component": "libreecho-mdns",
+            "activation": "manual-only",
+            "autostart": False,
+            "ownership": "platform-boot-contained",
+            "discovery": "shared-avahi-dbus",
+            "protocol": "mdns",
+            "feature_payload_dependency": False,
+            "airplay_payload_dependency": False,
+            "single_responder": True,
+            "runtime_dirs": {},
+            "files": {},
+        },
         "airplay": {
             "enabled": False,
             "activation": "manual-only",
@@ -2493,6 +2664,8 @@ def main() -> None:
                 stage, args.ui_bundle.resolve(), args.ui_source.resolve(),
                 args.expected_ui_commit, args.expected_ui_diff_sha256, manifest,
             )
+        if args.mdns_runtime is not None:
+            add_mdns_runtime(stage, args.mdns_runtime.resolve(), manifest)
         if airplay_payload_enabled:
             add_airplay_external_payload(
                 args.airplay_payload.resolve(), args.airplay_payload_manifest.resolve(), manifest,

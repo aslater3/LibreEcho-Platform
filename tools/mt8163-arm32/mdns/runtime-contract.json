@@ -1,0 +1,57 @@
+{
+  "schema": "libreecho-mdns-runtime-contract/v1",
+  "description": "Boot-contained shared Avahi/D-Bus discovery runtime for libreecho-mdnsd. Binary/runtime provenance and corresponding-source licensing are tracked separately from this ABI/runtime contract.",
+  "image_runtime_root": "usr/local/lib/libreecho-mdns/root",
+  "image_marker": "etc/libreecho/mdns-runtime.json",
+  "init_wrapper": "etc/init.d/libreecho-mdnsd.init",
+  "packages": [
+    "avahi-daemon",
+    "avahi-utils",
+    "dbus-daemon",
+    "dbus-bin",
+    "libc6"
+  ],
+  "abi": {
+    "class": "ELF32",
+    "machine": "ARM",
+    "float": "hard-float",
+    "interpreter": "/lib/ld-linux-armhf.so.3"
+  },
+  "loader": "lib/ld-linux-armhf.so.3",
+  "executables": [
+    "usr/sbin/avahi-daemon",
+    "usr/bin/dbus-daemon",
+    "usr/bin/dbus-send",
+    "usr/bin/avahi-browse"
+  ],
+  "libraries": [
+    "usr/lib/libavahi-client.so.3",
+    "usr/lib/libavahi-common.so.3",
+    "usr/lib/libavahi-core.so.7",
+    "usr/lib/libc.so.6",
+    "usr/lib/libcap.so.2",
+    "usr/lib/libdaemon.so.0",
+    "usr/lib/libdbus-1.so.3",
+    "usr/lib/libexpat.so.1"
+  ],
+  "config": [
+    "etc/avahi/avahi-daemon.conf",
+    "etc/dbus-1/system.conf"
+  ],
+  "accounts": [
+    "etc/passwd",
+    "etc/group"
+  ],
+  "licenses": [
+    "usr/share/licenses/libreecho-mdns/avahi-daemon/copyright",
+    "usr/share/licenses/libreecho-mdns/dbus-daemon/copyright",
+    "usr/share/licenses/libreecho-mdns/libc6/copyright"
+  ],
+  "runtime_dirs": {
+    "state_root": "/run/libreecho/mdns",
+    "bus": "/run/libreecho/mdns/dbus",
+    "services": "/run/libreecho/mdns/services",
+    "control_socket": "/run/libreecho/mdns.sock",
+    "pidfile": "/var/run/libreecho-mdnsd.pid"
+  }
+}

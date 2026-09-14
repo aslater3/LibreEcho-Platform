@@ -13,7 +13,7 @@ import struct
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import cast
+from typing import Any, cast
 
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -53,7 +53,7 @@ WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-INIT_SHA256 = "46ccbd87711ec65cb6fe338de044c64af03ebc6a4010e47293be6ce56344aade"
+INIT_SHA256 = "fe2b0738af1960cab6a44a29298a10bb8216b89673814729c8ee9a6885bca3f6"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -61,6 +61,7 @@ OVERLAY_FILES = {
     "init.rc": 0o644,
     "init.recovery.mt8163.rc": 0o644,
     "libreecho-init": 0o755,
+    "libreecho-mdnsd": 0o755,
     "libreecho-reconcile-features": 0o755,
     "libreecho-data-cleanup": 0o755,
     "libreecho-vendor-import": 0o755,
@@ -75,6 +76,7 @@ OVERLAY_FILES = {
 }
 OVERLAY_TARGETS = {
     "profile": "etc/profile",
+    "libreecho-mdnsd": "etc/init.d/libreecho-mdnsd.init",
     "libreecho-reconcile-features": "usr/local/sbin/libreecho-reconcile-features",
     "libreecho-data-cleanup": "usr/local/sbin/libreecho-data-cleanup",
     "libreecho-vendor-import": "usr/local/sbin/libreecho-vendor-import",
@@ -146,6 +148,13 @@ AIRPLAY_BINARY_NAMES = {
     "usr/local/sbin/libreecho-airplay-audio",
     "usr/local/sbin/libreecho-audio-engine",
 }
+MDNS_CONTRACT_SCHEMA = "libreecho-mdns-runtime-contract/v1"
+MDNS_RUNTIME_SCHEMA = "libreecho-mdns-runtime/v1"
+MDNS_MARKER_SCHEMA = "libreecho-mdns-runtime-marker/v1"
+MDNS_RUNTIME_PREFIX = "usr/local/lib/libreecho-mdns/root/"
+MDNS_MARKER = "etc/libreecho/mdns-runtime.json"
+MDNS_INIT = "etc/init.d/libreecho-mdnsd.init"
+MDNS_CONTRACT_CATEGORIES = ("executables", "libraries", "config", "accounts", "licenses")
 
 CONNECTIVITY_ASSET_REQUIREMENTS: dict[str, dict[str, str | int]] = {
     "ROMv2_lm_patch_1_0_hdr.bin": {
@@ -836,6 +845,109 @@ def validate_ui(entries: dict[str, Entry], manifest: dict[str, object],
     return True
 
 
+def mdns_contract() -> dict[str, Any]:
+    """Read the checked-in shared mDNS runtime contract."""
+    path = Path(__file__).resolve().parent / "mdns" / "runtime-contract.json"
+    try:
+        document = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"ERROR: mDNS runtime contract is unreadable: {path}") from exc
+    if not isinstance(document, dict) or document.get("schema") != MDNS_CONTRACT_SCHEMA:
+        raise SystemExit("ERROR: mDNS runtime contract schema changed")
+    return document
+
+
+def validate_mdns(entries: dict[str, Entry], manifest: dict[str, object],
+                  expected_mdns_runtime_manifest_sha256: str | None,
+                  expected_service_profile: str) -> bool:
+    """Fail closed on a missing loader, library, executable, config or license."""
+    raw_mdns = manifest.get("mdns", {"enabled": False})
+    if not isinstance(raw_mdns, dict) or not isinstance(raw_mdns.get("enabled"), bool):
+        fail("mDNS manifest record is malformed")
+    mdns = cast(dict[str, object], raw_mdns)
+    contract = mdns_contract()
+    present = sorted(name for name in entries if name.startswith(MDNS_RUNTIME_PREFIX))
+    if not mdns.get("enabled"):
+        if present or MDNS_MARKER in entries:
+            fail("mDNS runtime is disabled but members are present")
+        if expected_service_profile == "production":
+            fail("production image is missing the shared discovery runtime")
+        return False
+    if (expected_mdns_runtime_manifest_sha256 is not None and
+            mdns.get("manifest_sha256") != expected_mdns_runtime_manifest_sha256):
+        fail("mDNS runtime manifest identity mismatch")
+    for key in ("airplay_payload_dependency", "feature_payload_dependency"):
+        if mdns.get(key) is not False:
+            fail(f"mDNS runtime must not depend on another payload: {key}")
+    if mdns.get("single_responder") is not True:
+        fail("mDNS runtime must declare single-responder ownership")
+    if mdns.get("contract") != contract["schema"]:
+        fail("mDNS runtime contract identity mismatch")
+    if mdns.get("runtime_dirs") != contract["runtime_dirs"]:
+        fail("mDNS runtime directory contract mismatch")
+    raw_files = mdns.get("files")
+    if not isinstance(raw_files, dict) or not raw_files:
+        fail("mDNS runtime inventory is missing")
+    records = cast(dict[str, object], raw_files)
+    required = {contract["loader"]}
+    for category in MDNS_CONTRACT_CATEGORIES:
+        required |= set(contract[category])
+    missing = sorted(required - set(records))
+    if missing:
+        fail(f"mDNS runtime contract input missing: {missing[0]}")
+    for relative in sorted(records):
+        raw_record = records[relative]
+        if not isinstance(raw_record, dict):
+            fail(f"mDNS runtime record is malformed: {relative}")
+        record = cast(dict[str, object], raw_record)
+        digest = record.get("sha256")
+        size = record.get("size")
+        mode = record.get("mode")
+        if (not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest) or
+                not isinstance(size, int) or mode not in ("0644", "0755")):
+            fail(f"mDNS runtime record is invalid: {relative}")
+        member = require_member(
+            entries, MDNS_RUNTIME_PREFIX + relative, digest,
+            0o755 if mode == "0755" else 0o644,
+        )
+        if len(member.data) != size:
+            fail(f"mDNS runtime member size changed: {relative}")
+        info = elf_info(member.data)
+        if relative == contract["loader"]:
+            if info is None or info[:3] != (1, 40, 0x05000400) or info[3] is not None:
+                fail("mDNS runtime loader ELF contract changed")
+            continue
+        if info is None:
+            continue
+        if info[:3] != (1, 40, 0x05000400):
+            fail(f"mDNS runtime member is not ARM32 hard-float: {relative}")
+        if info[3] != contract["abi"]["interpreter"] or not info[5]:
+            fail(f"mDNS runtime member ELF contract changed: {relative}")
+
+    raw_marker = entries.get(MDNS_MARKER)
+    if raw_marker is None or not stat.S_ISREG(raw_marker.mode):
+        fail("mDNS runtime marker is missing")
+    if sha256(raw_marker.data) != mdns.get("marker_sha256"):
+        fail("mDNS runtime marker hash mismatch")
+    try:
+        marker = json.loads(raw_marker.data)
+    except json.JSONDecodeError:
+        fail("mDNS runtime marker is not JSON")
+    if (not isinstance(marker, dict) or marker.get("schema") != MDNS_MARKER_SCHEMA or
+            marker.get("contract") != contract["schema"] or
+            marker.get("readiness") != "presence-is-not-readiness" or
+            marker.get("manifest_sha256") != mdns.get("manifest_sha256") or
+            marker.get("runtime_dirs") != mdns.get("runtime_dirs") or
+            marker.get("init") != "/" + MDNS_INIT or
+            mdns.get("init") != "/" + MDNS_INIT):
+        fail("mDNS runtime marker contract mismatch")
+    init_entry = entries.get(MDNS_INIT)
+    if (init_entry is None or not stat.S_ISREG(init_entry.mode) or
+            stat.S_IMODE(init_entry.mode) != 0o755):
+        fail("mDNS init entry is missing from the image")
+    return True
+
+
 def validate_connectivity_runtime_symlinks(
         entries: dict[str, Entry], record: object) -> None:
     if not isinstance(record, dict):
@@ -1039,7 +1151,8 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                        expected_shairport_sync_sha256: str | None,
                        expected_avahi_daemon_sha256: str | None,
                        expected_dbus_daemon_sha256: str | None,
-                       expected_wpa_supplicant_sha256: str | None = None) -> bool:
+                       expected_wpa_supplicant_sha256: str | None = None,
+                       expected_mdns_runtime_manifest_sha256: str | None = None) -> bool:
     if ramdisk[:4] != b"\x1f\x8b\x08\x00":
         fail("ramdisk gzip header is not deterministic")
     try:
@@ -1779,9 +1892,35 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         b"$DATA_ROOT/libreecho/features/$feature/payload.squashfs",
         b"\"$script\" start",
         b"feature-services-reconcile-failed",
+        b"shared_discovery_active",
+        b"LIBREECHO_SHARED_DISCOVERY=1",
+        b"feature-reconcile-shared-discovery-owner:airplayd",
     ):
         if marker not in reconcile.data:
             fail(f"feature reconciliation helper lacks {marker!r}")
+    mdns_entry = verified_overlay["libreecho-mdnsd"]
+    for marker in (
+        b"MDNS_RUNTIME_ROOT:-/usr/local/lib/libreecho-mdns/root",
+        b"mdns-shared-runtime-unavailable",
+        b"mdns-competing-responder-refused",
+        b"mdns-competing-responder:",
+        b"mdns-orphan-reconcile:",
+        b"/run/libreecho/mdns",
+        b"ld-linux-armhf.so.3",
+        b"avahi-daemon",
+        b"dbus-daemon",
+    ):
+        if marker not in mdns_entry.data:
+            fail(f"shared mDNS init entry lacks {marker!r}")
+    for marker in (b"/data/libreecho/features/", b"payload.squashfs"):
+        if marker in mdns_entry.data:
+            fail("shared mDNS init entry is gated on a feature payload mount")
+    if b"avahi-daemon" in control.data and b"system_bus_socket" not in control.data:
+        fail("libreecho-init does not start the shared discovery runtime")
+    validate_mdns(
+        entries, manifest, expected_mdns_runtime_manifest_sha256,
+        expected_service_profile,
+    )
     for marker in (
         b"FASTBOOT_PLEASE", b"/run/libreecho-control/runme", b"functionfs", b"/dev/stpwmt", b"/dev/stpbt",
         b"PARTNAME=expdb", b"/sys/class/block/mmcblk0p7", b"20480", b"bs=15 count=1",
@@ -1892,6 +2031,9 @@ def main() -> None:
                         help="require this static ARM32 wireless-tools iwconfig utility")
     parser.add_argument("--expected-wpa-supplicant-sha256",
                         help="require this exact static ARM32 wpa_supplicant")
+    parser.add_argument("--expected-mdns-runtime-manifest-sha256",
+                        help="require this shared mDNS runtime manifest hash when "
+                             "the boot-contained discovery runtime is staged")
     parser.add_argument("--expected-image-profile", choices=("development", "ota"), required=True)
     parser.add_argument("--expected-service-profile", choices=("diagnostic", "production"),
                         required=True)
@@ -2080,6 +2222,7 @@ def main() -> None:
         args.expected_nqptp_sha256, args.expected_shairport_sync_sha256,
         args.expected_avahi_daemon_sha256, args.expected_dbus_daemon_sha256,
         args.expected_wpa_supplicant_sha256,
+        args.expected_mdns_runtime_manifest_sha256,
     )
     expected_connectivity = args.expected_connectivity_bundle != "none"
     if connectivity_enabled != expected_connectivity:
@@ -2092,6 +2235,10 @@ def main() -> None:
     network_activation = (
         network_record.get("activation", "passive")
         if isinstance(network_record, dict) else "passive"
+    )
+    mdns_record = manifest.get("mdns", {})
+    mdns_enabled = bool(
+        isinstance(mdns_record, dict) and mdns_record.get("enabled") is True
     )
     print(
         "arm32_recovery_image_contract=PASS android_v0=yes mtk_wrapper=yes "
@@ -2107,7 +2254,8 @@ def main() -> None:
         f"wakeword={'yes' if args.expected_wakeword_payload_sha256 else 'no'} "
         f"stt={'yes' if args.expected_stt_payload_sha256 else 'no'} "
         f"assistant={'yes' if args.expected_assistant_payload_sha256 else 'no'} "
-        f"network_activation={network_activation} status=PREPARED_NOT_FLASHED"
+        f"network_activation={network_activation} "
+        f"mdns={'yes' if mdns_enabled else 'no'} status=PREPARED_NOT_FLASHED"
     )
 
 

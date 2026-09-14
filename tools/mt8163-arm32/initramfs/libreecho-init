@@ -928,6 +928,32 @@ start_persisted_feature_services()
     return "$rc"
 }
 
+# The shared mDNS responder is boot-contained Platform infrastructure owned by
+# /etc/init.d/libreecho-mdnsd.init.  It is deliberately independent of feature
+# policy and of any AirPlay payload mount: Home Assistant discovery must work
+# when no AirPlay squashfs is installed.  Discovery degradation is reported but
+# never blocks the management UI or startup-ready, which stay separate gates.
+start_shared_discovery_runtime()
+{
+    case "$SERVICE_PROFILE" in
+        production) ;;
+        *)
+            log shared-discovery-runtime-skipped-diagnostic-profile
+            return 0
+            ;;
+    esac
+    if [ ! -x /etc/init.d/libreecho-mdnsd.init ]; then
+        log shared-discovery-runtime-unavailable
+        return 0
+    fi
+    if /etc/init.d/libreecho-mdnsd.init start >/tmp/libreecho-mdnsd.init.log 2>&1; then
+        log shared-discovery-runtime-started
+    else
+        log shared-discovery-runtime-degraded
+    fi
+    return 0
+}
+
 activate_feature_transaction()
 {
     transaction=/usr/local/sbin/libreecho-feature-transaction
@@ -1033,6 +1059,7 @@ start_ui_services()
     # its host contract checks:
     # services="logd networkd timed audiod micd ledd buttond btd web"
     # services="logd networkd timed audiod micd ledd buttond btd wyomingd web"
+    start_shared_discovery_runtime
     log feature-services-deferred-until-staged
     for service in $services; do
         script="/etc/init.d/libreecho-$service.init"
@@ -1273,6 +1300,15 @@ ota_health_confirm_worker()
         return 0
     }
 
+    shared_discovery_ready()
+    {
+        # The boot-contained shared responder, not an AirPlay payload socket.
+        [ -x /etc/init.d/libreecho-mdnsd.init ] || return 1
+        /etc/init.d/libreecho-mdnsd.init status >/dev/null 2>&1 || return 1
+        [ -S /run/libreecho/mdns/dbus/system_bus_socket ] || return 1
+        return 0
+    }
+
     home_assistant_integration_enabled()
     {
         config=/data/libreecho/config/web-config.json
@@ -1315,20 +1351,34 @@ ota_health_confirm_worker()
                 "$health_config" 2>/dev/null | $BB head -n 1)
         fi
         case "$health_integrations" in
-            ''|*[!0-9]*) health_airplay_enabled=1 ;;
+            ''|*[!0-9]*)
+                # An unreadable config keeps the historical fail-closed graph.
+                health_airplay_enabled=1
+                health_discovery_enabled=1
+                ;;
             *)
                 health_airplay_enabled=0
+                health_discovery_enabled=0
                 [ $((health_integrations & 16)) -ne 0 ] && health_airplay_enabled=1
-                # Home Assistant discovery keeps airplayd in the required
-                # service graph even when AirPlay audio is disabled, so the OTA
-                # health probe must not derive its requirement from the AirPlay
-                # bit alone.
-                [ $((health_integrations & 1)) -ne 0 ] && health_airplay_enabled=1
+                # Home Assistant discovery no longer derives its requirement
+                # from the AirPlay audio bit: the boot-contained shared
+                # responder provides discovery, so an HA-selected system with
+                # no AirPlay payload must not be asked for airplay.sock or the
+                # AirPlay squashfs.  A both-off system waits for no consumer
+                # registration at all.
+                [ $((health_integrations & 1)) -ne 0 ] && health_discovery_enabled=1
+                [ "$health_airplay_enabled" -eq 1 ] && health_discovery_enabled=1
                 ;;
         esac
         if [ "$health_airplay_enabled" -eq 1 ]; then
             service_process_ready airplayd /run/libreecho/airplay.sock || {
                 log ota-health-services-not-ready:airplayd
+                return 1
+            }
+        fi
+        if [ "$health_discovery_enabled" -eq 1 ]; then
+            shared_discovery_ready || {
+                log ota-health-shared-discovery-not-ready
                 return 1
             }
         fi
