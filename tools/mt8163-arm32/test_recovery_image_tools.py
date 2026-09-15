@@ -2501,7 +2501,7 @@ release_lock
             ).replace("/proc/net/tcp", str(proc_tcp)).replace(
                 "/etc/init.d/libreecho-mdnsd.init", str(mdns_init)
             ).replace(
-                "/run/libreecho/mdns/dbus/system_bus_socket", str(mdns_socket)
+                "$MDNS_RUNTIME_ROOT/run/dbus/system_bus_socket", str(mdns_socket)
             )
             if busybox is None:
                 self.skipTest("busybox is required for the OTA health fixture")
