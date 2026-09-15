@@ -921,8 +921,9 @@ def validate_mdns(entries: dict[str, Entry], manifest: dict[str, object],
             continue
         if info[:3] != (1, 40, 0x05000400):
             fail(f"mDNS runtime member is not ARM32 hard-float: {relative}")
-        if info[3] != contract["abi"]["interpreter"] or not info[5]:
-            fail(f"mDNS runtime member ELF contract changed: {relative}")
+        if relative in contract["executables"] and (
+                info[3] != contract["abi"]["interpreter"] or not info[5]):
+            fail(f"mDNS runtime executable ELF contract changed: {relative}")
 
     raw_marker = entries.get(MDNS_MARKER)
     if raw_marker is None or not stat.S_ISREG(raw_marker.mode):
