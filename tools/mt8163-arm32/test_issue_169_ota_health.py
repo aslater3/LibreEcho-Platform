@@ -53,8 +53,8 @@ class Issue169HealthContracts(unittest.TestCase):
         # General log() output can contain board identity, URLs or configuration
         # and therefore must never be copied wholesale to pmsg.
         log_start = self.init.index("\nlog()\n{")
-        pmsg_start = self.init.index("\npmsg_marker()\n{", log_start)
-        log_block = self.init[log_start:pmsg_start]
+        log_end = self.init.index("\n}\n", log_start) + len("\n}\n")
+        log_block = self.init[log_start:log_end]
         self.assertNotIn("pmsg", log_block)
 
 
