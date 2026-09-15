@@ -1179,8 +1179,9 @@ def add_mdns_runtime(stage: Path, runtime: Path, manifest: dict[str, object]) ->
             if relative == contract["loader"]:
                 if info[1] is not None:
                     raise SystemExit(f"ERROR: mDNS runtime loader has an interpreter: {relative}")
-            elif info[1] != contract["abi"]["interpreter"] or not info[3]:
-                raise SystemExit(f"ERROR: mDNS runtime ELF contract changed: {relative}")
+            elif relative in set(contract["executables"]):
+                if info[1] != contract["abi"]["interpreter"] or not info[3]:
+                    raise SystemExit(f"ERROR: mDNS runtime ELF contract changed: {relative}")
             entry["elf"] = {
                 "flags": f"0x{info[0]:08x}",
                 "interpreter": info[1],
