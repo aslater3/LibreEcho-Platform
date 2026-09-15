@@ -52,7 +52,9 @@ class Issue169HealthContracts(unittest.TestCase):
         self.assertIn('pmsg_marker "ota-confirm-failed-$last_check"', self.init)
         # General log() output can contain board identity, URLs or configuration
         # and therefore must never be copied wholesale to pmsg.
-        log_block = self.init[self.init.index("log()") : self.init.index("pmsg_marker()")]
+        log_start = self.init.index("\nlog()\n{")
+        pmsg_start = self.init.index("\npmsg_marker()\n{", log_start)
+        log_block = self.init[log_start:pmsg_start]
         self.assertNotIn("pmsg", log_block)
 
 
