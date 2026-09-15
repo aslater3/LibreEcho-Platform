@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: platform-checks-${{ github.workflow }}-${{ github.ref }}
@@ -28,64 +28,7 @@ jobs:
       - name: Check out Platform source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref }}
-          persist-credentials: true
-
-      - name: Apply audited issue 169 contract updates
-        if: github.event_name == 'pull_request' && github.actor != 'github-actions[bot]'
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-
-          old = "fe2b0738af1960cab6a44a29298a10bb8216b89673814729c8ee9a6885bca3f6"
-          new = "4c358bbc71ed2e14ebb0222653736e5478e80886d3614055d9f0f0e69935f05e"
-          changed = False
-          for name, symbol in (
-              ("tools/mt8163-arm32/build_recovery_image.py", "RECOVERY_INIT_SHA256"),
-              ("tools/mt8163-arm32/verify_recovery_image.py", "INIT_SHA256"),
-          ):
-              path = Path(name)
-              text = path.read_text()
-              old_pin = f'{symbol} = "{old}"'
-              new_pin = f'{symbol} = "{new}"'
-              if old_pin in text:
-                  if text.count(old_pin) != 1:
-                      raise SystemExit(f"ambiguous audited pin in {name}")
-                  path.write_text(text.replace(old_pin, new_pin))
-                  changed = True
-              elif text.count(new_pin) != 1:
-                  raise SystemExit(f"audited pin missing from {name}")
-
-          path = Path("tools/mt8163-arm32/test_recovery_image_tools.py")
-          text = path.read_text()
-          old_fixture = '"/run/libreecho/mdns/dbus/system_bus_socket", str(mdns_socket)'
-          new_fixture = '"$MDNS_RUNTIME_ROOT/run/dbus/system_bus_socket", str(mdns_socket)'
-          if old_fixture in text:
-              if text.count(old_fixture) != 1:
-                  raise SystemExit("ambiguous legacy shared-mDNS fixture path")
-              path.write_text(text.replace(old_fixture, new_fixture))
-              changed = True
-          elif text.count(new_fixture) != 1:
-              raise SystemExit("shared-mDNS health fixture path missing")
-
-          print(f"issue169_contract_updates_changed={int(changed)}")
-          PY
-          git diff --check
-          if git diff --quiet -- \
-              tools/mt8163-arm32/build_recovery_image.py \
-              tools/mt8163-arm32/verify_recovery_image.py \
-              tools/mt8163-arm32/test_recovery_image_tools.py; then
-            exit 0
-          fi
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add tools/mt8163-arm32/build_recovery_image.py \
-                  tools/mt8163-arm32/verify_recovery_image.py \
-                  tools/mt8163-arm32/test_recovery_image_tools.py
-          git commit -m 'test: repin recovery init and mDNS health fixture'
-          git push origin HEAD:${{ github.head_ref }}
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
