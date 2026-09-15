@@ -93,7 +93,9 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(document['abi']['interpreter'], '/lib/ld-linux-armhf.so.3')
         self.assertEqual(document['loader'], 'lib/ld-linux-armhf.so.3')
         self.assertIn('avahi-daemon', document['packages'])
-        self.assertTrue(document['runtime_dirs']['state_root'].startswith('/run/'))
+        runtime_root = '/' + document['image_runtime_root']
+        self.assertEqual(document['runtime_dirs']['state_root'], runtime_root)
+        self.assertEqual(document['runtime_dirs']['bus'], runtime_root + '/run/dbus')
         self.assertNotEqual(document['image_marker'], document['init_wrapper'])
 
     def test_builder_and_verifier_share_the_contract(self):
