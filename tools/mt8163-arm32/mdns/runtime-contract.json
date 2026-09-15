@@ -48,9 +48,9 @@
     "usr/share/licenses/libreecho-mdns/libc6/copyright"
   ],
   "runtime_dirs": {
-    "state_root": "/run/libreecho/mdns",
-    "bus": "/run/libreecho/mdns/dbus",
-    "services": "/run/libreecho/mdns/services",
+    "state_root": "/usr/local/lib/libreecho-mdns/root",
+    "bus": "/usr/local/lib/libreecho-mdns/root/run/dbus",
+    "services": "/usr/local/lib/libreecho-mdns/root/etc/avahi/services",
     "control_socket": "/run/libreecho/mdns.sock",
     "pidfile": "/var/run/libreecho-mdnsd.pid"
   }
