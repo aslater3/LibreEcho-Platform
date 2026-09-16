@@ -4069,5 +4069,182 @@ class UserdataRegressionIntegrationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
+class UiTlsPackagingTests(unittest.TestCase):
+    """Issue #250: the production UI bundle must ship real ARM32 TLS."""
+
+    verifier = TOOLS_DIR / "ui/verify_ui_tls.sh"
+
+    def test_ui_bundle_links_pinned_arm32_mbedtls(self) -> None:
+        bundle = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        self.assertIn("LIBREECHO_UI_MBEDTLS_ROOT", bundle)
+        # No default prefix: a bundle without the pinned dependency is not a
+        # production artifact, so the builder must fail closed instead.
+        self.assertIn("MBEDTLS_ROOT=${LIBREECHO_UI_MBEDTLS_ROOT:-}", bundle)
+        self.assertNotIn("LIBREECHO_UI_MBEDTLS_ROOT:-/", bundle)
+        self.assertIn('-I$MBEDTLS_ROOT/include', bundle)
+        self.assertIn('-L$MBEDTLS_ROOT/lib', bundle)
+        self.assertIn('WEB_TLS_LIBS="$TLS_LIBS"', bundle)
+        self.assertIn('RADIOD_TLS_LIBS="$TLS_LIBS"', bundle)
+        self.assertIn("-lmbedtls -lmbedx509 -lmbedcrypto", bundle)
+
+    def test_ui_bundle_verifies_compiled_and_packaged_tls(self) -> None:
+        bundle = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        self.assertIn("verify_ui_tls.sh", bundle)
+        self.assertIn('"$VERIFY_TLS" --prefix "$MBEDTLS_ROOT"', bundle)
+        self.assertIn('--binary "$UI_SOURCE/build/$binary"', bundle)
+        self.assertIn('--binary "$OUTPUT/sbin/$binary"', bundle)
+        self.assertIn("TLS_BINARIES=(libreecho-web libreecho-radiod)", bundle)
+
+    def test_mbedtls_dependency_is_pinned_and_provenanced(self) -> None:
+        lock = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())
+        self.assertEqual(lock["name"], "mbedtls")
+        self.assertEqual(lock["version"], "3.6.4")
+        self.assertEqual(lock["license"], "Apache-2.0")
+        self.assertRegex(lock["source_sha256"], r"^[0-9a-f]{64}$")
+        self.assertTrue(
+            lock["source_url"].endswith(f"mbedtls-{lock['version']}.tar.bz2")
+        )
+        self.assertIn("arm-linux-gnueabihf", lock["target"])
+        requirements = lock["build_requirements"]
+        for package in ("jinja2", "jsonschema"):
+            self.assertRegex(requirements[package], r"^\d+\.\d+\.\d+$")
+
+        builder = (TOOLS_DIR / "mbedtls/build_mbedtls.sh").read_text()
+        self.assertIn("SOURCE.lock", builder)
+        self.assertIn("source_sha256", builder)
+        self.assertIn("libmbedcrypto.a", builder)
+        self.assertIn("libmbedx509.a", builder)
+        self.assertIn("libmbedtls.a", builder)
+        self.assertIn("static", builder)
+        self.assertIn("ELF 32-bit", builder)
+        self.assertIn("build_requirements", builder)
+        self.assertIn("mbedtls-source.json", builder)
+        # Source acquisition stays outside the repository: the builder consumes
+        # a pinned archive and never downloads one.
+        self.assertNotIn("curl", builder)
+        self.assertNotIn("wget", builder)
+
+    def test_ui_tls_verifier_rejects_untrusted_and_stub_artifacts(self) -> None:
+        verifier = self.verifier
+        self.assertTrue(verifier.is_file(), verifier)
+        source = verifier.read_text()
+        for required in (
+            "tls.o",
+            "tls_stub.o",
+            "libreecho-tls",
+            "MBEDTLS_SYMBOL_PREFIX=mbedtls_",
+            "statically linked",
+            "mbedtls/ssl.h",
+            "libmbedtls.a",
+        ):
+            self.assertIn(required, source)
+
+    def run_tls_verifier(
+        self,
+        tmp: Path,
+        binary: Path,
+        *,
+        description: str,
+        objects: Path | None = None,
+    ) -> subprocess.CompletedProcess:
+        shims = tmp / "shims"
+        shims.mkdir(exist_ok=True)
+        (shims / "file").write_text('#!/bin/sh\nprintf "%s\\n" "$LE_TEST_FILE_DESCRIPTION"\n')
+        (shims / "readelf").write_text("#!/bin/sh\nexit 0\n")
+        for shim in ("file", "readelf"):
+            (shims / shim).chmod(0o755)
+        environment = os.environ.copy()
+        environment["PATH"] = f"{shims}:{environment['PATH']}"
+        environment["LE_TEST_FILE_DESCRIPTION"] = description
+        argv = ["bash", str(self.verifier), "--binary", str(binary)]
+        if objects is not None:
+            argv += ["--objects", str(objects)]
+        return subprocess.run(
+            argv, env=environment, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+    def test_ui_tls_verifier_accepts_real_tls_and_rejects_the_stub(self) -> None:
+        static_arm32 = (
+            "ELF 32-bit LSB executable, ARM, EABI5 version 1 (GNU/Linux), "
+            "statically linked, for GNU/Linux 3.2.0"
+        )
+        real_payload = (
+            "libreecho-tls CN=%s,O=LibreEcho 20200101000000 "
+            "-----BEGIN CERTIFICATE-----"
+        )
+        stub_payload = "LibreEcho listening on http://0.0.0.0:8080 HTTPS disabled"
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            objects = tmp / "objects"
+            objects.mkdir()
+            (objects / "tls.o").write_bytes(b"\x7fELF")
+            real = tmp / "libreecho-web"
+            real.write_text(real_payload)
+
+            accepted = self.run_tls_verifier(
+                tmp, real, description=static_arm32, objects=objects
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertIn("ui_tls=real", accepted.stdout)
+
+            stub = tmp / "libreecho-web-stub"
+            stub.write_text(stub_payload)
+            rejected = self.run_tls_verifier(
+                tmp, stub, description=static_arm32, objects=objects
+            )
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("real TLS implementation", rejected.stderr)
+
+            dynamic = tmp / "libreecho-web-dynamic"
+            dynamic.write_text(real_payload)
+            rejected = self.run_tls_verifier(
+                tmp, dynamic,
+                description=(
+                    "ELF 32-bit LSB executable, ARM, EABI5 version 1 "
+                    "(GNU/Linux), dynamically linked, interpreter "
+                    "/lib/ld-linux-armhf.so.3"
+                ),
+            )
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("not static ARM32", rejected.stderr)
+
+            stub_objects = tmp / "stub-objects"
+            stub_objects.mkdir()
+            (stub_objects / "tls.o").write_bytes(b"\x7fELF")
+            (stub_objects / "tls_stub.o").write_bytes(b"\x7fELF")
+            rejected = self.run_tls_verifier(
+                tmp, real, description=static_arm32, objects=stub_objects
+            )
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("tls_stub.c", rejected.stderr)
+
+    def test_ui_tls_verifier_rejects_incomplete_mbedtls_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            prefix = Path(tmp_name) / "mbedtls"
+            (prefix / "include/mbedtls").mkdir(parents=True)
+            (prefix / "lib").mkdir()
+            for header in ("ssl.h", "x509_crt.h", "pk.h", "entropy.h"):
+                (prefix / "include/mbedtls" / header).write_text("/* stub */\n")
+            (prefix / "include/mbedtls/build_info.h").write_text(
+                '#define MBEDTLS_VERSION_STRING         "3.6.4"\n'
+            )
+            for archive in ("libmbedcrypto.a", "libmbedx509.a", "libmbedtls.a"):
+                (prefix / "lib" / archive).write_text("not an archive\n")
+            result = subprocess.run(
+                ["bash", str(self.verifier), "--prefix", str(prefix)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("archive", result.stderr)
+
+            complete = subprocess.run(
+                ["bash", str(self.verifier), "--prefix", str(prefix / "missing")],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(complete.returncode, 1, complete.stdout)
+            self.assertIn("prefix is unavailable", complete.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

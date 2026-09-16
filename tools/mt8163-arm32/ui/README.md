@@ -7,6 +7,15 @@ directory owns the image-side build and packaging contract.
 daemons, web assets, init scripts, and the default configuration. The image
 records the UI commit, source diff identity, and a deterministic file manifest.
 
+The production bundle requires `LIBREECHO_UI_MBEDTLS_ROOT`, the pinned static
+ARM32 mbedTLS prefix built by `tools/mt8163-arm32/mbedtls` (see that directory's
+`README.md`). The builder passes its include path, library search path, and the
+`WEB_TLS_LIBS`/`RADIOD_TLS_LIBS` archive list to both `libreecho-web` and
+`libreecho-radiod`, then runs `ui/verify_ui_tls.sh` against the compiled and the
+stripped, staged binaries. A bundle that compiled `src/tls_stub.c`
+(`LE_TLS_AVAILABLE=0`), lost the mbedTLS link, or stopped being static ARM32
+fails the build instead of shipping an HTTPS toggle that cannot listen on 8443.
+
 The daemons are packaged as default boot services after the recovery control
 plane has configured loopback. They do not replace the existing kernel or
 initramfs control plane:

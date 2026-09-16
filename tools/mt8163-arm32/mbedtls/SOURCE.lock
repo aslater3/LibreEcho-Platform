@@ -1,0 +1,26 @@
+{
+  "name": "mbedtls",
+  "version": "3.6.4",
+  "license": "Apache-2.0",
+  "license_file": "LICENSE",
+  "source_url": "https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.4/mbedtls-3.6.4.tar.bz2",
+  "source_sha256": "ec35b18a6c593cf98c3e30db8b98ff93e8940a8c4e690e66b41dfc011d678110",
+  "target": "arm-linux-gnueabihf-static",
+  "build_requirements": {
+    "python3": ">=3.8",
+    "jinja2": "3.1.6",
+    "jsonschema": "4.25.1"
+  },
+  "build_command": "make -C library static CC=<arm-linux-gnueabihf-gcc> AR=<arm-linux-gnueabihf-ar>",
+  "outputs": [
+    "include/mbedtls/*.h",
+    "include/psa/*.h",
+    "lib/libmbedcrypto.a",
+    "lib/libmbedx509.a",
+    "lib/libmbedtls.a"
+  ],
+  "notes": [
+    "The release tarball ships generated PSA driver wrappers older than the Jinja templates that produce them, so the library Makefile regenerates them; the pinned jinja2/jsonschema versions are build requirements, not runtime dependencies.",
+    "The builder verifies the archive SHA-256, the generated ARM32 static archives, and the compiled-in version string; it never downloads source."
+  ]
+}
