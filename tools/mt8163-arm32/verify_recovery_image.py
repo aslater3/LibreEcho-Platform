@@ -53,7 +53,7 @@ WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-INIT_SHA256 = "5cc0b6e08191af5450a59fd2f3ff1efd56b1c0f15eb03f03f385ad20fe2f328b"
+INIT_SHA256 = "fae328ab1b6ae9197672d47f094ec6ae6fdff4232a703faef9196fb056d69ea8"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -102,6 +102,7 @@ UI_BINARY_NAMES = {
     "usr/local/sbin/libreecho-logd",
     "usr/local/sbin/libreecho-networkd",
     "usr/local/sbin/libreecho-timed",
+    "usr/local/sbin/libreecho-timerd",
     "usr/local/sbin/libreecho-audiod",
     "usr/local/sbin/libreecho-micd",
     "usr/local/sbin/libreecho-ledd",
@@ -118,6 +119,7 @@ UI_INIT_NAMES = {
     "etc/init.d/libreecho-logd.init",
     "etc/init.d/libreecho-networkd.init",
     "etc/init.d/libreecho-timed.init",
+    "etc/init.d/libreecho-timerd.init",
     "etc/init.d/libreecho-audiod.init",
     "etc/init.d/libreecho-micd.init",
     "etc/init.d/libreecho-ledd.init",

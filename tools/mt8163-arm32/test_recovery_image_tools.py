@@ -87,6 +87,47 @@ def newc_archive(*members: bytes, tail: bytes = b"") -> bytes:
     return b"".join(members) + newc_member(b"TRAILER!!!", 0) + tail
 
 
+def shell_for_blocks(source: str, header: str) -> list[str]:
+    """Return each ``for ... in \\ ... do ... done`` block introduced by ``header``."""
+    return [
+        source[match.start():source.index("done\n", match.end())]
+        for match in re.finditer(re.escape(header), source)
+    ]
+
+
+def shell_for_items(block: str) -> list[str]:
+    """Return the item list of a shell ``for <x> in \\ ... do`` block."""
+    head = block[:block.index("do\n")]
+    return head[head.index("\\\n"):].replace("\\\n", " ").split()
+
+
+def python_string_list(source: str, header: str) -> list[str]:
+    """Return the quoted names of the Python tuple introduced by ``header``."""
+    start = source.index(header) + len(header)
+    return re.findall(r'"([^"]+)"', source[start:source.index("):", start)])
+
+
+def production_service_graphs(init_source: str) -> list[list[str]]:
+    """Return every service list the PID 1 script can select, in file order.
+
+    A graph is a base ``services="..."`` assignment plus each following
+    ``services="$services ..."`` append.  The commented deferred-contract
+    snapshots are documentation and are ignored.
+    """
+    graphs: list[list[str]] = []
+    for line in init_source.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        appended = re.match(r'^\s*services="\$services ([^"]*)"\s*$', line)
+        if appended:
+            graphs[-1].extend(appended.group(1).split())
+            continue
+        base = re.match(r'^\s*services="([^"]*)"\s*$', line)
+        if base:
+            graphs.append(base.group(1).split())
+    return graphs
+
+
 class NewcTests(unittest.TestCase):
     def test_canonical_member_and_zero_padding(self) -> None:
         entries = verifier.parse_newc(
@@ -2985,6 +3026,246 @@ start_feature_service_if_enabled
         self.assertIn(
             'services="logd networkd timed audiod', init_source
         )
+
+    def test_timer_daemon_is_packaged_in_every_layer(self) -> None:
+        """Issue #162: the timer daemon must survive every packaging layer.
+
+        LibreEcho-UI builds libreecho-timerd and installs
+        etc/init.d/libreecho-timerd.init, but Platform dropped both: the bundle
+        builder neither verified nor staged them, and the image stage copies an
+        explicit whitelist that never named them either.  The published image
+        therefore had neither file.  The independent verifier requires the
+        exact UI file set, so every layer has to be checked, not just one.
+        """
+        bundle_source = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
+
+        binary_blocks = shell_for_blocks(bundle_source, "for binary in \\\n")
+        verify_block = next(
+            block for block in binary_blocks if "statically linked" in block
+        )
+        install_block = next(
+            block for block in binary_blocks if "install -m 0755" in block
+        )
+        script_blocks = shell_for_blocks(bundle_source, "for script in \\\n")
+        self.assertEqual(len(script_blocks), 1)
+
+        # The static ARM32 loop rejects a dynamic or non-ARM binary, so a
+        # daemon that is installed but never verified would ship unvalidated.
+        self.assertIn("libreecho-timerd", shell_for_items(verify_block))
+        self.assertIn("libreecho-timerd", shell_for_items(install_block))
+        self.assertIn("libreecho-timerd.init", shell_for_items(script_blocks[0]))
+
+        builder_binaries = python_string_list(builder_source, "    for binary in (\n")
+        builder_scripts = python_string_list(builder_source, "    for script in (\n")
+        self.assertIn("libreecho-timerd", builder_binaries)
+        self.assertIn("libreecho-timerd.init", builder_scripts)
+
+        self.assertIn("usr/local/sbin/libreecho-timerd", verifier.UI_BINARY_NAMES)
+        self.assertIn("etc/init.d/libreecho-timerd.init", verifier.UI_INIT_NAMES)
+
+        # Deriving the expectation from the verifier catches a layer that is
+        # edited without the others: the image manifest has to contain exactly
+        # the files the bundle stages and the builder copies.
+        verified_binaries = {Path(name).name for name in verifier.UI_BINARY_NAMES}
+        verified_scripts = {Path(name).name for name in verifier.UI_INIT_NAMES}
+        self.assertEqual(set(shell_for_items(install_block)), verified_binaries)
+        self.assertEqual(set(builder_binaries), verified_binaries)
+        self.assertEqual(set(shell_for_items(script_blocks[0])), verified_scripts)
+        self.assertEqual(set(builder_scripts), verified_scripts)
+
+    def test_timer_daemon_is_in_every_production_service_graph(self) -> None:
+        """Issue #162: packaging the daemon is useless unless it is started."""
+        init_source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        graphs = production_service_graphs(init_source)
+        self.assertEqual(len(graphs), 5, graphs)
+
+        # The diagnostic/payload-excluded graph stays deliberately scoped: a
+        # diagnostic slot carries no timer state and must not start timerd.
+        self.assertEqual(graphs[0], ["logd", "timed", "web"])
+        self.assertIn(
+            '[ "$SERVICE_PROFILE" = diagnostic ] || [ "$FEATURE_POLICY" = exclude ]',
+            init_source,
+        )
+
+        for graph in graphs[1:]:
+            self.assertIn("timerd", graph)
+            # The Web UI/API plane reads /run/libreecho/timer.sock, so the
+            # daemon has to be running before the web daemon starts.
+            self.assertLess(graph.index("timerd"), graph.index("web"))
+            # timerd rings through audiod, so it starts after the audio daemon.
+            self.assertLess(graph.index("audiod"), graph.index("timerd"))
+
+    def test_timer_socket_becomes_ready_through_the_boot_service_graph(self) -> None:
+        """Issue #162: the shipped graph must reach the timer readiness socket.
+
+        ``start_ui_services`` and ``apply_timezone`` are extracted verbatim from
+        the image's PID 1 script and executed with only their filesystem roots
+        redirected into a temporary sandbox, so the graph selection, the
+        init-script dispatch and the artifact-presence decision under test are
+        the shipped ones.  The daemons are stubs: this proves the Platform
+        startup contract (the graph reaches libreecho-timerd and the readiness
+        socket the Web/API plane connects to appears before web), not the timer
+        logic inside the LibreEcho-UI daemon.
+        """
+        init_source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        extracted = {}
+        for name in ("apply_timezone", "start_ui_services"):
+            match = re.search(rf"(?ms)^{name}\(\)\n.*?^}}\n", init_source)
+            if match is None:
+                self.fail(f"{name}() is not extractable from libreecho-init")
+            extracted[name] = match.group(0)
+
+        roots = (
+            "/usr/local/sbin", "/etc/init.d", "/var/run", "/var/log",
+            "/run/libreecho", "/data/libreecho", "/tmp/",
+        )
+        function_text = "".join(extracted.values())
+        for root in roots:
+            self.assertIn(root, function_text, root)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            sandbox = Path(temporary)
+            # One pass: a replacement must never be rescanned, or the sandbox
+            # prefix itself would be rewritten a second time.
+            redirected = re.sub(
+                "|".join(re.escape(root) for root in roots),
+                lambda found: f"{sandbox}{found.group(0)}",
+                function_text,
+            )
+            for root in roots:
+                self.assertIn(f"{sandbox}{root}", redirected, root)
+            self.assertNotIn('"/etc/init.d', redirected)
+
+            busybox_shim = sandbox / "bb"
+            busybox_shim.write_text('#!/bin/sh\nexec "$@"\n')
+            busybox_shim.chmod(0o755)
+            web_binary = sandbox / "usr/local/sbin/libreecho-web"
+            web_binary.parent.mkdir(parents=True)
+            web_binary.write_text("#!/bin/sh\nexit 0\n")
+            web_binary.chmod(0o755)
+
+            run_dir = sandbox / "run/libreecho"
+            run_dir.mkdir(parents=True)
+            # start_ui_services writes its per-service log there.
+            (sandbox / "tmp").mkdir()
+            started_dir = sandbox / "started"
+            started_dir.mkdir()
+            timer_socket = run_dir / "timer.sock"
+            services = {
+                service
+                for graph in production_service_graphs(init_source)
+                for service in graph
+            }
+            for service in sorted(services):
+                stub = sandbox / "etc/init.d" / f"libreecho-{service}.init"
+                stub.parent.mkdir(parents=True, exist_ok=True)
+                lines = [
+                    "#!/bin/sh",
+                    f"# Stub for libreecho-{service}: the real init script in the",
+                    "# LibreEcho-UI bundle starts the daemon it packages.",
+                    f'marker="{started_dir}/{service}"',
+                    f'timer_socket="{timer_socket}"',
+                    'case "${1:-}" in',
+                    "    start)",
+                    '        : >"$marker"',
+                ]
+                if service == "timerd":
+                    # The timer daemon publishes the readiness socket the
+                    # Web/API plane connects to; the stub publishes the same
+                    # path so the startup contract can be observed.
+                    lines.append(
+                        f"        {sys.executable} -c \"import socket, sys; "
+                        "s = socket.socket(socket.AF_UNIX); "
+                        's.bind(sys.argv[1]); s.close()" "$timer_socket"'
+                    )
+                lines += ["        ;;", "esac", "exit 0", ""]
+                stub.write_text("\n".join(lines))
+                stub.chmod(0o755)
+
+            harness = sandbox / "harness.sh"
+            harness.write_text(
+                "#!/bin/sh\n"
+                "set -u\n"
+                f'BB="{busybox_shim}"\n'
+                "SERVICE_PROFILE=$1\n"
+                "FEATURE_POLICY=$2\n"
+                "DATA_CLEANUP_OK=1\n"
+                f'INIT_TEST_LOG="{sandbox}/log"\n'
+                ': >"$INIT_TEST_LOG"\n'
+                "log() { printf '%s\\n' \"$*\" >>\"$INIT_TEST_LOG\"; }\n"
+                "pmsg_marker() { :; }\n"
+                "# Hooks PID 1 defines elsewhere; start_ui_services only has to\n"
+                "# observe their success here.\n"
+                "activate_feature_transaction() { return 0; }\n"
+                "start_shared_discovery_runtime() { :; }\n"
+                "start_persisted_feature_services() { :; }\n"
+                + redirected
+                + "\nstart_ui_services\nexit $?\n"
+            )
+            harness.chmod(0o755)
+
+            config = sandbox / "data/libreecho/config/web-config.json"
+            config.parent.mkdir(parents=True)
+            cases = (
+                ("production", "preserve", None, True),
+                ("production", "preserve", 1, True),
+                ("production", "redistributable", None, True),
+                ("diagnostic", "preserve", None, False),
+                ("production", "exclude", None, False),
+            )
+            for profile, policy, integrations, expect_timerd in cases:
+                label = f"{profile}/{policy}/integrations={integrations}"
+                if integrations is None:
+                    config.unlink(missing_ok=True)
+                else:
+                    config.write_text(f'{{"integrations": {integrations}}}\n')
+                shutil.rmtree(started_dir)
+                started_dir.mkdir()
+                timer_socket.unlink(missing_ok=True)
+
+                result = subprocess.run(
+                    ["/bin/sh", str(harness), profile, policy],
+                    env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                self.assertEqual(result.returncode, 0, f"{label}: {result.stderr}")
+                started = sorted(entry.name for entry in started_dir.iterdir())
+                log_lines = (sandbox / "log").read_text().splitlines()
+                if expect_timerd:
+                    self.assertIn("timerd", started, label)
+                    self.assertTrue(timer_socket.exists(), label)
+                    self.assertTrue(
+                        stat.S_ISSOCK(timer_socket.lstat().st_mode), label
+                    )
+                    self.assertIn("ui-service-start:timerd:0", log_lines, label)
+                    self.assertLess(
+                        log_lines.index("ui-service-start:timerd:0"),
+                        log_lines.index("ui-service-start:web:0"),
+                        label,
+                    )
+                    # Every service the graph starts must be one the image
+                    # verifier requires, otherwise the graph names an
+                    # unpackaged daemon.
+                    for service in started:
+                        self.assertIn(
+                            f"etc/init.d/libreecho-{service}.init",
+                            verifier.UI_INIT_NAMES,
+                            label,
+                        )
+                    self.assertNotIn("ui-service-missing", "\n".join(log_lines), label)
+                else:
+                    self.assertNotIn("timerd", started, label)
+                    self.assertFalse(timer_socket.exists(), label)
+                    self.assertEqual(started, ["logd", "timed", "web"], label)
+                    expected_log = (
+                        "feature-services-excluded"
+                        if policy == "exclude"
+                        else "ui-connectivity-services-disabled-for-diagnostic-profile"
+                    )
+                    self.assertIn(expected_log, log_lines, label)
 
     def test_remote_wyoming_clients_use_pinned_musl_runtime(self) -> None:
         bundle_source = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
