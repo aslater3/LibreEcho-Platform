@@ -21,6 +21,7 @@ MARKER=${MDNS_RUNTIME_MARKER:-/etc/libreecho/mdns-runtime.json}
 SUPERVISOR=${MDNS_SUPERVISOR:-/usr/local/sbin/libreecho-mdnsd}
 RUN_ROOT=${MDNS_RUN_ROOT:-/run/libreecho/mdns}
 STATE_ROOT=${MDNS_STATE_ROOT:-/var/lib/libreecho-mdns}
+MACHINE_ID=${MDNS_MACHINE_ID:-/var/lib/dbus/machine-id}
 PIDFILE=${MDNS_PIDFILE:-/var/run/libreecho-mdnsd.pid}
 PROC_ROOT=${MDNS_PROC_ROOT:-/proc}
 LOG=${MDNS_LOG:-/tmp/libreecho-mdnsd.log}
@@ -163,11 +164,12 @@ start_supervisor() {
 }
 
 start_daemon_pair() {
-    $BB mkdir -p "$BUS_DIR" "$SERVICES_DIR" "$STATE_ROOT" || return 1
-    if [ ! -s "$STATE_ROOT/machine-id" ]; then
-        # Runtime-local machine id: never a copy of device identity material.
-        printf '%s\n' '0f1e2d3c4b5a69788796a5b4c3d2e1f0' >"$STATE_ROOT/machine-id" || return 1
-        $BB chmod 0644 "$STATE_ROOT/machine-id"
+    $BB mkdir -p "$BUS_DIR" "$SERVICES_DIR" "$STATE_ROOT" "$($BB dirname "$MACHINE_ID")" || return 1
+    if [ ! -s "$MACHINE_ID" ]; then
+        # D-Bus reads only its standard machine-id locations. This image-local
+        # constant is runtime identity, never copied device identity material.
+        printf '%s\n' '0f1e2d3c4b5a69788796a5b4c3d2e1f0' >"$MACHINE_ID" || return 1
+        $BB chmod 0644 "$MACHINE_ID"
     fi
     $BB rm -f "$BUS_SOCKET"
     $BB sed "s#<listen>unix:path=/run/dbus/system_bus_socket</listen>#<listen>unix:path=$BUS_SOCKET</listen>#" \
@@ -210,7 +212,6 @@ start_daemon_pair() {
     # re-checks that the executable still resolves inside this runtime closure.
     printf '%s\n%s\n' "$pid" "$server_pid" >"$PIDFILE" || return 1
     $BB chmod 0644 "$PIDFILE"
-    : >"$CONTROL_SOCKET" 2>/dev/null || true
     log "mdns-shared-runtime-started:$pid:$server_pid"
     return 0
 }
