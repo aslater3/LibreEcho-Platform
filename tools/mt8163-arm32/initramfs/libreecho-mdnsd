@@ -19,9 +19,9 @@ BB=${BB:-/bin/busybox}
 RUNTIME_ROOT=${MDNS_RUNTIME_ROOT:-/usr/local/lib/libreecho-mdns/root}
 MARKER=${MDNS_RUNTIME_MARKER:-/etc/libreecho/mdns-runtime.json}
 SUPERVISOR=${MDNS_SUPERVISOR:-/usr/local/sbin/libreecho-mdnsd}
-RUN_ROOT=${MDNS_RUN_ROOT:-/run/libreecho/mdns}
-STATE_ROOT=${MDNS_STATE_ROOT:-/var/lib/libreecho-mdns}
-MACHINE_ID=${MDNS_MACHINE_ID:-/var/lib/dbus/machine-id}
+RUN_ROOT=${MDNS_RUN_ROOT:-$RUNTIME_ROOT/run}
+STATE_ROOT=${MDNS_STATE_ROOT:-$RUNTIME_ROOT/var/lib/dbus}
+MACHINE_ID=${MDNS_MACHINE_ID:-$STATE_ROOT/machine-id}
 PIDFILE=${MDNS_PIDFILE:-/var/run/libreecho-mdnsd.pid}
 PROC_ROOT=${MDNS_PROC_ROOT:-/proc}
 LOG=${MDNS_LOG:-/tmp/libreecho-mdnsd.log}
@@ -32,6 +32,8 @@ SERVICES_DIR=$RUN_ROOT/services
 BUS_CONFIG=$BUS_DIR/system.conf
 BUS_SOCKET=$BUS_DIR/system_bus_socket
 AVAHI_CONFIG=$RUNTIME_ROOT/etc/avahi/avahi-daemon.conf
+LOADER=/lib/ld-linux-armhf.so.3
+LIBRARY_PATH=/usr/lib:/lib
 
 log() {
     printf 'libreecho-mdnsd: %s\n' "$*" >>"$LOG" 2>/dev/null
@@ -164,7 +166,17 @@ start_supervisor() {
 }
 
 start_daemon_pair() {
-    $BB mkdir -p "$BUS_DIR" "$SERVICES_DIR" "$STATE_ROOT" "$($BB dirname "$MACHINE_ID")" || return 1
+    $BB mkdir -p "$BUS_DIR" "$RUNTIME_ROOT/run/avahi-daemon" "$SERVICES_DIR" \
+        "$STATE_ROOT" "$RUNTIME_ROOT/dev" || return 1
+    for spec in 'null 1 3' 'random 1 8' 'urandom 1 9'; do
+        set -- $spec
+        node=$RUNTIME_ROOT/dev/$1
+        if [ ! -c "$node" ]; then
+            $BB rm -f "$node"
+            $BB mknod "$node" c "$2" "$3" || return 1
+        fi
+        $BB chmod 0666 "$node" || return 1
+    done
     if [ ! -s "$MACHINE_ID" ]; then
         # D-Bus reads only its standard machine-id locations. This image-local
         # constant is runtime identity, never copied device identity material.
@@ -172,12 +184,9 @@ start_daemon_pair() {
         $BB chmod 0644 "$MACHINE_ID"
     fi
     $BB rm -f "$BUS_SOCKET"
-    $BB sed "s#<listen>unix:path=/run/dbus/system_bus_socket</listen>#<listen>unix:path=$BUS_SOCKET</listen>#" \
-        "$RUNTIME_ROOT/etc/dbus-1/system.conf" >"$BUS_CONFIG" || return 1
-    $BB chmod 0644 "$BUS_CONFIG"
-    LD_LIBRARY_PATH="$RUNTIME_ROOT/usr/lib:$RUNTIME_ROOT/lib" \
-        "$RUNTIME_ROOT/usr/bin/dbus-daemon" --nofork --nopidfile \
-        --config-file="$BUS_CONFIG" >>"$LOG" 2>&1 &
+    $BB chroot "$RUNTIME_ROOT" "$LOADER" --library-path "$LIBRARY_PATH" \
+        /usr/bin/dbus-daemon --nofork --nopidfile \
+        --config-file=/etc/dbus-1/system.conf >>"$LOG" 2>&1 &
     server_pid=$!
     count=0
     while [ "$count" -lt "$START_TIMEOUT" ]; do
@@ -191,10 +200,10 @@ start_daemon_pair() {
         $BB kill "$server_pid" 2>/dev/null
         return 1
     fi
-    DBUS_SYSTEM_BUS_ADDRESS="unix:path=$BUS_SOCKET" \
-        LD_LIBRARY_PATH="$RUNTIME_ROOT/usr/lib:$RUNTIME_ROOT/lib" \
-        "$RUNTIME_ROOT/usr/sbin/avahi-daemon" --no-chroot --no-drop-root --no-rlimits \
-        --file="$AVAHI_CONFIG" >>"$LOG" 2>&1 &
+    DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket \
+        $BB chroot "$RUNTIME_ROOT" "$LOADER" --library-path "$LIBRARY_PATH" \
+        /usr/sbin/avahi-daemon --no-chroot --no-drop-root --no-rlimits \
+        --file=/etc/avahi/avahi-daemon.conf >>"$LOG" 2>&1 &
     pid=$!
     count=0
     while [ "$count" -lt "$START_TIMEOUT" ]; do

@@ -54,6 +54,9 @@ def main():
         runtime_root = root / 'usr/local/lib/libreecho-mdns/root'
         shutil.copytree(args.runtime / 'root', runtime_root)
         (root / 'bin').mkdir(exist_ok=True)
+        (runtime_root / 'bin').mkdir(exist_ok=True)
+        shutil.copyfile('/bin/busybox', runtime_root / 'bin/busybox')
+        (runtime_root / 'bin/busybox').chmod(0o755)
         (root / 'dev').mkdir(exist_ok=True)
         (root / 'proc').mkdir(exist_ok=True)
         (root / 'tmp').mkdir(exist_ok=True)
@@ -72,19 +75,18 @@ def main():
                                     (str(Path(__file__).with_suffix('.sh')), 'test.sh')]:
             shutil.copyfile(source, root / destination)
             (root / destination).chmod(0o755)
-        # Keep the verified ARM binaries unchanged as *.arm and put tiny launchers
-        # at their production paths. This avoids relying on host-global binfmt
-        # while /proc/PID/exe still resolves inside the packaged runtime root.
-        for relative in ('usr/bin/dbus-daemon', 'usr/sbin/avahi-daemon'):
-            target = runtime_root / relative
-            arm = target.with_name(target.name + '.arm')
-            target.rename(arm)
-            target.write_text(
-                '#!/bin/busybox sh\n'
-                'root=/usr/local/lib/libreecho-mdns/root\n'
-                f'exec "$root/qemu" -L "$root" "$root/{relative}.arm" "$@"\n'
-            )
-            target.chmod(0o755)
+        # Keep the verified ARM executables at their production paths. Wrap only
+        # the packaged dynamic loader so the production init must invoke it
+        # explicitly; launching dbus-daemon directly must fail just as it does on
+        # the musl target where /lib/ld-linux-armhf.so.3 is absent.
+        target = runtime_root / 'lib/ld-linux-armhf.so.3'
+        arm = target.with_name(target.name + '.arm')
+        target.rename(arm)
+        target.write_text(
+            '#!/bin/busybox sh\n'
+            'exec /qemu -L / /lib/ld-linux-armhf.so.3.arm "$@"\n'
+        )
+        target.chmod(0o755)
         command = ['docker', 'run', '--rm', '--pull', 'never', '--network', 'none',
                    '--privileged',
                    '--mount', f'type=bind,source={root},target=/runtime']
