@@ -55,6 +55,21 @@ static int read_text(const char *path, char *output, size_t size)
     return 0;
 }
 
+/* Accept the alternate size only for the reviewed userdata contract.
+ * Exact decimal matching also rejects signs, suffixes and overflow input. */
+static int partition_sectors_match(const struct partition_contract *contract,
+                                   const char *text)
+{
+    char expected[32];
+
+    snprintf(expected, sizeof(expected), "%lu", contract->sectors);
+    if (strcmp(text, expected) == 0)
+        return 1;
+    return strcmp(contract->device, "/dev/mmcblk0p16") == 0 &&
+           strcmp(contract->name, "userdata") == 0 &&
+           contract->sectors == 2137088UL && strcmp(text, "2153472") == 0;
+}
+
 static int validate_partition(const struct partition_contract *contract)
 {
     char path[160], text[1024], expected[80];
@@ -66,7 +81,7 @@ static int validate_partition(const struct partition_contract *contract)
     }
     snprintf(path, sizeof(path), "%s/size", contract->sysfs);
     if (read_text(path, text, sizeof(text)) ||
-        strtoul(text, NULL, 10) != contract->sectors) {
+        !partition_sectors_match(contract, text)) {
         fprintf(stderr, "ERROR: %s sector contract failed\n", contract->name);
         return -1;
     }
