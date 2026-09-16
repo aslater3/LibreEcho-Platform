@@ -3,6 +3,17 @@
 # this metadata file before invoking it through adb-run-root.sh.
 
 BB=/bin/busybox
+
+# Exact reviewed post-Amonet Biscuit userdata sizes, in 512-byte sectors.
+# Do not accept arbitrary larger partitions or change any other partition.
+userdata_size_supported()
+{
+    case "$1" in
+        2137088|2153472) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 CONFIG=/tmp/libreecho-feature-stage.conf
 [ -r "$CONFIG" ] || { echo FEATURE_STAGE_CONFIG_MISSING; exit 1; }
 
@@ -126,7 +137,7 @@ if ! $BB grep -q ' /data ' /proc/mounts 2>/dev/null; then
     DEVICE=/dev/mmcblk0p16
     SYS=/sys/class/block/mmcblk0p16
     [ -b "$DEVICE" ] && $BB grep -qx 'PARTNAME=userdata' "$SYS/uevent" 2>/dev/null &&
-        [ "$($BB cat "$SYS/size" 2>/dev/null)" = 2137088 ] || {
+        userdata_size_supported "$($BB cat "$SYS/size" 2>/dev/null)" || {
         echo FEATURE_STAGE_USERDATA_IDENTITY_FAILED
         exit 1
     }
