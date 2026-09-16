@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Real ARMHF runtime smoke; Docker network none plus an isolated dummy link.
+"""Run the production mDNS init wrapper with the real ARMHF runtime under QEMU.
 
-Requires an already-present container image, static BusyBox, qemu-arm-static,
-and Docker access. This is local publication evidence, not LAN/hardware acceptance.
+The privileged disposable container supplies a private proc/network namespace and
+dummy multicast link. The wrapper must create its own D-Bus identity and runtime
+state; the fixture does not prepare those prerequisites for it. Requires an
+already-present container image, static BusyBox, qemu-arm-static, and Docker.
+This is production-startup evidence, not LAN/hardware acceptance.
 """
 import argparse
 import os
@@ -18,8 +21,14 @@ def main():
     parser.add_argument('--runtime', type=Path, required=True)
     parser.add_argument('--image', required=True, help='pre-existing local Docker image')
     parser.add_argument('--manifest-sha256', required=True)
+    parser.add_argument('--init-wrapper', type=Path, required=True)
+    parser.add_argument('--qemu', type=Path, default=Path('/usr/bin/qemu-arm-static'))
     args = parser.parse_args()
     verify(args.runtime, args.manifest_sha256)
+    if not args.init_wrapper.is_file() or args.init_wrapper.is_symlink():
+        raise SystemExit('production mDNS init wrapper is missing or unsafe')
+    if not args.qemu.is_file() or args.qemu.is_symlink():
+        raise SystemExit('qemu-arm-static is missing or unsafe')
     for mutation in ('binary', 'loader', 'extra', 'manifest'):
         with tempfile.TemporaryDirectory(prefix='mdns-mutation-') as temp:
             candidate = Path(temp) / 'runtime'
@@ -42,16 +51,42 @@ def main():
                    stdout=subprocess.DEVNULL, timeout=10)
     with tempfile.TemporaryDirectory(prefix='mdns-real-') as temp:
         root = Path(temp) / 'root'
-        shutil.copytree(args.runtime / 'root', root)
+        runtime_root = root / 'usr/local/lib/libreecho-mdns/root'
+        shutil.copytree(args.runtime / 'root', runtime_root)
         (root / 'bin').mkdir(exist_ok=True)
         (root / 'dev').mkdir(exist_ok=True)
+        (root / 'proc').mkdir(exist_ok=True)
+        (root / 'tmp').mkdir(exist_ok=True)
+        (root / 'tmp').chmod(0o1777)
+        (root / 'run').mkdir(exist_ok=True)
+        (root / 'var/run').mkdir(parents=True, exist_ok=True)
+        (root / 'etc/init.d').mkdir(parents=True, exist_ok=True)
+        (root / 'etc/libreecho').mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(args.runtime / 'manifest.json',
+                        root / 'etc/libreecho/mdns-runtime.json')
         for source, destination in [('/bin/busybox', 'bin/busybox'),
-                                    ('/usr/bin/qemu-arm-static', 'qemu'),
+                                    (str(args.qemu),
+                                     'usr/local/lib/libreecho-mdns/root/qemu'),
+                                    (str(args.init_wrapper),
+                                     'etc/init.d/libreecho-mdnsd.init'),
                                     (str(Path(__file__).with_suffix('.sh')), 'test.sh')]:
             shutil.copyfile(source, root / destination)
             (root / destination).chmod(0o755)
+        # Keep the verified ARM binaries unchanged as *.arm and put tiny launchers
+        # at their production paths. This avoids relying on host-global binfmt
+        # while /proc/PID/exe still resolves inside the packaged runtime root.
+        for relative in ('usr/bin/dbus-daemon', 'usr/sbin/avahi-daemon'):
+            target = runtime_root / relative
+            arm = target.with_name(target.name + '.arm')
+            target.rename(arm)
+            target.write_text(
+                '#!/bin/busybox sh\n'
+                'root=/usr/local/lib/libreecho-mdns/root\n'
+                f'exec "$root/qemu" -L "$root" "$root/{relative}.arm" "$@"\n'
+            )
+            target.chmod(0o755)
         command = ['docker', 'run', '--rm', '--pull', 'never', '--network', 'none',
-                   '--cap-add', 'NET_ADMIN', '--security-opt', 'no-new-privileges',
+                   '--privileged',
                    '--mount', f'type=bind,source={root},target=/runtime']
         for name in ('null', 'urandom', 'random'):
             (root / 'dev' / name).touch()
@@ -59,8 +94,12 @@ def main():
         # The namespace can chown runtime directories; restore only the mutable
         # paths before returning them to the unprivileged temporary-dir owner.
         command += ['--entrypoint', '/runtime/bin/busybox', args.image, 'sh', '-c',
+                    '/runtime/bin/busybox mount -t proc proc /runtime/proc; '
                     '/runtime/bin/busybox chroot /runtime /bin/busybox sh /test.sh; rc=$?; '
-                    f'/runtime/bin/busybox chown -R {os.getuid()}:{os.getgid()} /runtime/run /runtime/var; exit "$rc"']
+                    '/runtime/bin/busybox umount /runtime/proc; '
+                    f'/runtime/bin/busybox chown -R {os.getuid()}:{os.getgid()} '
+                    '/runtime/run /runtime/var /runtime/usr/local/lib/libreecho-mdns/root; '
+                    'exit "$rc"']
         completed = subprocess.run(command, capture_output=True, text=True, timeout=30)
         print(completed.stdout, end='')
         print(completed.stderr, end='')
