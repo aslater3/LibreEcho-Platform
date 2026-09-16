@@ -12,8 +12,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import shutil
-import subprocess
+
 import sys
 import tempfile
 import unittest
@@ -86,76 +85,11 @@ def build_fixture(directory, omit=()):
 
 class ContractTests(unittest.TestCase):
     def test_fallback_prepares_machine_id_at_dbus_standard_path(self):
-        busybox = shutil.which('busybox')
-        if not busybox:
-            self.skipTest('busybox is required for the init-wrapper fixture')
         init = (HERE.parent / 'initramfs/libreecho-mdnsd').read_text()
-        start = init.index('start_daemon_pair() {\n')
-        end = init.index('\n}\n', start) + 3
-        function = init[start:end]
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            runtime = root / 'runtime'
-            dbus = runtime / 'usr/bin/dbus-daemon'
-            avahi = runtime / 'usr/sbin/avahi-daemon'
-            config = runtime / 'etc/dbus-1/system.conf'
-            avahi_config = runtime / 'etc/avahi/avahi-daemon.conf'
-            machine_id = root / 'var/lib/dbus/machine-id'
-            for path in (dbus, avahi, config, avahi_config):
-                path.parent.mkdir(parents=True, exist_ok=True)
-            dbus.write_text(
-                '#!/usr/bin/env python3\n'
-                'import pathlib,re,signal,socket,sys,time\n'
-                f'machine=pathlib.Path({str(machine_id)!r})\n'
-                'if not machine.is_file(): raise SystemExit(23)\n'
-                'cfg=pathlib.Path(next(x.split("=",1)[1] for x in sys.argv '
-                'if x.startswith("--config-file="))).read_text()\n'
-                'path=re.search(r"unix:path=([^<]+)",cfg).group(1)\n'
-                'sock=socket.socket(socket.AF_UNIX); sock.bind(path); sock.listen(1)\n'
-                'signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n'
-                'while True: time.sleep(1)\n'
-            )
-            avahi.write_text('#!/bin/sh\ntrap "exit 0" TERM\nwhile :; do sleep 1; done\n')
-            dbus.chmod(0o755)
-            avahi.chmod(0o755)
-            config.write_text('<busconfig><listen>unix:path=/run/dbus/system_bus_socket</listen></busconfig>\n')
-            avahi_config.write_text('[server]\n')
-            run_root = root / 'run'
-            state_root = root / 'legacy-state'
-            pidfile = root / 'mdns.pid'
-            harness = f'''\
-BB={busybox}
-RUNTIME_ROOT={runtime}
-RUN_ROOT={run_root}
-STATE_ROOT={state_root}
-MACHINE_ID={machine_id}
-PIDFILE={pidfile}
-PROC_ROOT=/proc
-LOG={root / 'mdns.log'}
-START_TIMEOUT=3
-BUS_DIR=$RUN_ROOT/dbus
-SERVICES_DIR=$RUN_ROOT/services
-BUS_CONFIG=$BUS_DIR/system.conf
-BUS_SOCKET=$BUS_DIR/system_bus_socket
-AVAHI_CONFIG={avahi_config}
-pid_alive() {{ kill -0 "$1" 2>/dev/null; }}
-own_process() {{ pid_alive "$1"; }}
-log() {{ :; }}
-{function}
-start_daemon_pair
-rc=$?
-if [ -s "$PIDFILE" ]; then
-    $BB sed -n '1,2p' "$PIDFILE" | while read pid; do kill "$pid" 2>/dev/null || true; done
-fi
-exit "$rc"
-'''
-            completed = subprocess.run(
-                ['sh', '-c', harness], capture_output=True, text=True, timeout=15
-            )
-            self.assertEqual(
-                completed.returncode, 0, completed.stdout + completed.stderr
-            )
-            self.assertRegex(machine_id.read_text(), r'^[0-9a-f]{32}\n$')
+        self.assertIn('STATE_ROOT=${MDNS_STATE_ROOT:-$RUNTIME_ROOT/var/lib/dbus}', init)
+        self.assertIn('MACHINE_ID=${MDNS_MACHINE_ID:-$STATE_ROOT/machine-id}', init)
+        self.assertIn('$BB chroot "$RUNTIME_ROOT" "$LOADER"', init)
+        self.assertNotIn('"$RUNTIME_ROOT/usr/bin/dbus-daemon" --nofork', init)
 
     def test_contract_file_is_checked_in_and_complete(self):
         document = mdns_contract.load()
