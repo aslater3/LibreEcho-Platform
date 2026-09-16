@@ -4245,6 +4245,123 @@ class UiTlsPackagingTests(unittest.TestCase):
             self.assertEqual(complete.returncode, 1, complete.stdout)
             self.assertIn("prefix is unavailable", complete.stderr)
 
+    @staticmethod
+    def write_ar_fixture(path: Path, member: str) -> None:
+        """Write a minimal ar archive so the prefix check sees one member."""
+        payload = b"libreecho-mbedtls-prefix-fixture\n"
+        header = (
+            f"{member + '/':<16}{0:<12}{0:<6}{0:<6}{0o644:<8o}{len(payload):<10}`\n"
+        ).encode()
+        archive = b"!<arch>\n" + header + payload
+        if len(payload) % 2:
+            archive += b"\n"
+        path.write_bytes(archive)
+
+    def write_mbedtls_prefix(self, prefix: Path, *, archives: bool = True) -> None:
+        """Synthesise the mbedTLS prefix shape build_ui_bundle.sh requires."""
+        (prefix / "include/mbedtls").mkdir(parents=True)
+        (prefix / "lib").mkdir()
+        for header in ("ssl.h", "x509_crt.h", "pk.h", "entropy.h"):
+            (prefix / "include/mbedtls" / header).write_text("/* fixture */\n")
+        (prefix / "include/mbedtls/build_info.h").write_text(
+            '#define MBEDTLS_VERSION_STRING         "3.6.4"\n'
+        )
+        for archive in ("libmbedcrypto.a", "libmbedx509.a", "libmbedtls.a"):
+            target = prefix / "lib" / archive
+            if archives:
+                self.write_ar_fixture(target, archive.removesuffix(".a") + ".o")
+            else:
+                target.write_text("not an archive\n")
+
+    def run_ui_bundle(self, tmp: Path, mbedtls_root: str) -> subprocess.CompletedProcess:
+        """Run the bundle builder with a stand-in musl and cross toolchain.
+
+        Every mbedTLS guard runs before the UI checkout is touched, so a
+        stand-in toolchain exercises them without a cross build or a real UI
+        source tree.
+        """
+        musl = tmp / "stand-in-musl"
+        (musl / "usr/bin").mkdir(parents=True, exist_ok=True)
+        (musl / "usr/lib").mkdir(parents=True, exist_ok=True)
+        (musl / "sysroot/usr/include").mkdir(parents=True, exist_ok=True)
+        (musl / "sysroot/usr/include/errno.h").write_text("\n")
+        stand_in_cc = musl / "usr/bin/armv7-alpine-linux-musleabihf-gcc"
+        stand_in_cc.write_text("#!/bin/sh\nexit 0\n")
+        stand_in_cc.chmod(0o755)
+        toolchain = tmp / "stand-in-toolchain"
+        toolchain.mkdir(exist_ok=True)
+        for tool in ("arm-linux-gnueabihf-gcc", "arm-linux-gnueabihf-strip"):
+            (toolchain / tool).write_text("#!/bin/sh\nexit 0\n")
+            (toolchain / tool).chmod(0o755)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "LIBREECHO_UI_MUSL_NATIVE_ROOT": str(musl),
+                "LIBREECHO_UI_MUSL_SYSROOT": str(musl / "sysroot"),
+                "LIBREECHO_UI_MUSL_CC": str(stand_in_cc),
+                "LIBREECHO_UI_MUSL_NATIVE_LIB": str(musl / "usr/lib"),
+                "LIBREECHO_UI_CROSS_COMPILE": str(toolchain / "arm-linux-gnueabihf-"),
+                "LIBREECHO_UI_MBEDTLS_ROOT": mbedtls_root,
+            }
+        )
+        return subprocess.run(
+            [
+                "bash",
+                str(TOOLS_DIR / "ui/build_ui_bundle.sh"),
+                str(tmp / "ui-source"),
+                str(tmp / "ui-bundle-out"),
+            ],
+            env=environment, text=True, cwd=tmp,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+    def test_ui_bundle_fails_closed_without_a_usable_mbedtls_prefix(self) -> None:
+        """Issue #250: the builder must never produce a stub TLS bundle.
+
+        These are the builder's own guards, executed rather than grepped: the
+        builder used to run `make ... release` with no TLS library at all, so
+        the UI Makefile silently selected src/tls_stub.c and the published
+        image kept advertising an HTTPS toggle that could not listen.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            (tmp / "ui-source").mkdir()
+
+            unset = self.run_ui_bundle(tmp, "")
+            self.assertEqual(unset.returncode, 1, unset.stdout + unset.stderr)
+            self.assertIn("mbedTLS prefix", unset.stderr)
+
+            missing = self.run_ui_bundle(tmp, str(tmp / "absent-prefix"))
+            self.assertEqual(missing.returncode, 1, missing.stdout + missing.stderr)
+            self.assertIn("mbedTLS prefix is unavailable", missing.stderr)
+
+            empty = tmp / "empty-prefix"
+            self.write_mbedtls_prefix(empty, archives=False)
+            empty_result = self.run_ui_bundle(tmp, str(empty))
+            self.assertEqual(
+                empty_result.returncode, 1, empty_result.stdout + empty_result.stderr
+            )
+            self.assertIn("mbedTLS archive is empty", empty_result.stderr)
+
+            if shutil.which("ar") is None:
+                self.skipTest("ar is required to synthesise an mbedTLS prefix")
+            valid = tmp / "valid-prefix"
+            self.write_mbedtls_prefix(valid)
+            prefix_ok = subprocess.run(
+                ["bash", str(self.verifier), "--prefix", str(valid)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(prefix_ok.returncode, 0, prefix_ok.stderr)
+            self.assertIn("ui_tls_prefix=ok mbedtls_version=3.6.4", prefix_ok.stdout)
+            # A valid prefix must get past every TLS guard: the build then stops
+            # on the stand-in UI checkout, not on a TLS refusal.
+            reached = self.run_ui_bundle(tmp, str(valid))
+            self.assertNotEqual(reached.returncode, 0, reached.stdout + reached.stderr)
+            output = reached.stdout + reached.stderr
+            self.assertNotIn("mbedTLS prefix is unavailable", output)
+            self.assertNotIn("mbedTLS archive is empty", output)
+            self.assertNotIn("mbedTLS prefix (tools/mt8163-arm32/mbedtls)", output)
+
 
 if __name__ == "__main__":
     unittest.main()
