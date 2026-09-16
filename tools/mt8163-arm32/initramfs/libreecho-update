@@ -2,6 +2,17 @@
 # Signed A/B updater for the Amonet Biscuit layout.
 
 BB=/bin/busybox
+
+# Exact reviewed post-Amonet Biscuit userdata sizes, in 512-byte sectors.
+# Do not accept arbitrary larger partitions or change any other partition.
+userdata_size_supported()
+{
+    case "$1" in
+        2137088|2153472) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 DATA_ROOT=/data
 FEATURE_ROOT=$DATA_ROOT/libreecho/features
 UPDATE_ROOT=$DATA_ROOT/libreecho/update
@@ -82,7 +93,7 @@ require_userdata()
     [ -b "$USERDATA_DEVICE" ] &&
         $BB grep -qx 'PARTNAME=userdata' \
             "$USERDATA_SYS/uevent" 2>/dev/null &&
-        [ "$($BB cat "$USERDATA_SYS/size" 2>/dev/null)" = 2137088 ] &&
+        userdata_size_supported "$($BB cat "$USERDATA_SYS/size" 2>/dev/null)" &&
         $BB grep -q " $DATA_ROOT " "$MOUNTS_FILE" 2>/dev/null ||
         die userdata_identity_or_mount_failed
     $BB mkdir -p "$INCOMING" "$UPDATE_ROOT" || die update_directory_failed

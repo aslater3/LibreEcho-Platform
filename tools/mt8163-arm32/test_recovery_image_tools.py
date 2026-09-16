@@ -3557,5 +3557,20 @@ class MkimgHeaderTests(unittest.TestCase):
             verifier.validate_mkimg_header(bytes(hdr))
 
 
+
+
+class UserdataRegressionIntegrationTests(unittest.TestCase):
+    def test_userdata_regression_suite(self):
+        import subprocess
+        import sys
+        from pathlib import Path
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parent / 'test_userdata_geometry.py'),
+             '--require-compiler', "-v"],
+            text=True, capture_output=True, timeout=900,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
