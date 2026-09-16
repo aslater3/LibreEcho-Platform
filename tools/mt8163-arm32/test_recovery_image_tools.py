@@ -2626,6 +2626,12 @@ feature_daemon_required tts
         self.assertIn(
             "    start_persisted_feature_services", init_script[init_script.index("start_ui_services()"):]
         )
+        service_start = init_script[
+            init_script.index("start_ui_services()"):
+            init_script.index("start_ui_services &")
+        ]
+        self.assertIn('services="$services airplayd radiod ttsd web"', service_start)
+        self.assertNotIn('services="$services airplayd radiod ttsd agentd web"', service_start)
 
     def test_airplay_controller_staging_follows_discovery_and_audio_toggles(self) -> None:
         stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()

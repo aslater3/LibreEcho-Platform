@@ -1106,7 +1106,7 @@ start_ui_services()
         else
             services="logd networkd timed audiod micd waked"
             services="$services ledd buttond btd"
-            services="$services airplayd radiod ttsd agentd web"
+            services="$services airplayd radiod ttsd web"
         fi
         if [ "$FEATURE_POLICY" = community-noncommercial ]; then
             log ui-services-community-noncommercial-with-wakeword
@@ -1118,7 +1118,7 @@ start_ui_services()
         else
             services="logd networkd timed audiod micd waked"
             services="$services ledd buttond btd"
-            services="$services airplayd radiod ttsd agentd web"
+            services="$services airplayd radiod ttsd web"
         fi
         log ui-services-redistributable-without-wakeword
     fi
