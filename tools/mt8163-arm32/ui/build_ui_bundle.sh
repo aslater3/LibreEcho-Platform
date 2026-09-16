@@ -93,6 +93,7 @@ env LD_LIBRARY_PATH="$MUSL_NATIVE_LIB" \
 
 for binary in \
     libreecho-web libreecho-logd libreecho-networkd libreecho-timed \
+    libreecho-timerd \
     libreecho-audiod libreecho-micd libreecho-ledd libreecho-buttond \
     libreecho-radiod libreecho-btd \
     libreecho-airplayd libreecho-wyomingd
@@ -144,6 +145,7 @@ mkdir -p "$OUTPUT/sbin" "$OUTPUT/share/libreecho/web" \
 
 for binary in \
     libreecho-web libreecho-logd libreecho-networkd libreecho-timed \
+    libreecho-timerd \
     libreecho-audiod libreecho-micd libreecho-ledd libreecho-buttond \
     libreecho-radiod libreecho-btd \
     libreecho-airplayd libreecho-wyomingd \
@@ -155,6 +157,7 @@ done
 
 for script in \
     libreecho-web.init libreecho-logd.init libreecho-networkd.init libreecho-timed.init \
+    libreecho-timerd.init \
     libreecho-audiod.init libreecho-micd.init libreecho-ledd.init \
     libreecho-buttond.init libreecho-radiod.init libreecho-btd.init \
     libreecho-airplayd.init libreecho-ttsd.init \

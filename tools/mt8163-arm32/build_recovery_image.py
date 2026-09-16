@@ -55,7 +55,7 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "5cc0b6e08191af5450a59fd2f3ff1efd56b1c0f15eb03f03f385ad20fe2f328b"
+RECOVERY_INIT_SHA256 = "fae328ab1b6ae9197672d47f094ec6ae6fdff4232a703faef9196fb056d69ea8"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
@@ -1050,7 +1050,8 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
 
     for binary in (
         "libreecho-web", "libreecho-logd", "libreecho-networkd",
-        "libreecho-timed", "libreecho-audiod", "libreecho-micd",
+        "libreecho-timed", "libreecho-timerd",
+        "libreecho-audiod", "libreecho-micd",
         "libreecho-ledd", "libreecho-buttond", "libreecho-radiod", "libreecho-btd",
         "libreecho-airplayd", "libreecho-wyomingd",
         "libreecho-sttd-wyoming", "libreecho-ttsd-wyoming",
@@ -1058,7 +1059,7 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
         copy_file(f"sbin/{binary}", f"usr/local/sbin/{binary}", 0o755, True)
     for script in (
         "libreecho-web.init", "libreecho-logd.init", "libreecho-networkd.init",
-        "libreecho-timed.init", "libreecho-audiod.init",
+        "libreecho-timed.init", "libreecho-timerd.init", "libreecho-audiod.init",
         "libreecho-micd.init", "libreecho-ledd.init", "libreecho-buttond.init",
         "libreecho-radiod.init", "libreecho-btd.init",
         "libreecho-airplayd.init", "libreecho-ttsd.init", "libreecho-waked.init",
