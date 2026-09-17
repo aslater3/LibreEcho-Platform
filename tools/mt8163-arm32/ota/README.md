@@ -248,6 +248,37 @@ repository variable `ENABLE_SELF_HOSTED_OTA` is exactly `true`. Until a
 dedicated runner is provisioned, Kernel and UI branch checks run independently
 in their respective private repositories and main merges do not queue a build.
 
+## Update check record
+
+A completed check persists its result in `/data/libreecho/update/check-status`
+as a `schema=1`, line-based record: `source`, `channel`, `status`,
+`source_reachable`, `latest_version`, `last_check_epoch`, `last_success_epoch`,
+`error`, `error_exit`, `error_detail`, `http_status`, `resolved_release_tag`,
+and `ota_sha256`. Every check rewrites the record as a whole, so a key always
+describes the current check and is never inherited from an earlier one.
+
+`resolved_release_tag` and `ota_sha256` name the candidate the check resolved:
+the immutable GitHub release tag the dev release pointer resolved to (for
+example `radar-puffin-build-<sha7>-<source-set>-<artifact-set>`) and the OTA
+package SHA-256 the device verifies its download against. Both are sanitised and
+bounded like every other record value and then format checked against the dev
+pointer grammar; a malformed, oversized, or unexpected value is recorded as
+empty rather than as an identity the device never resolved. They stay empty for
+a `stable` candidate, which has no immutable tag of its own, and for
+`checking`, `downloading`, `not-checked`, and every failed check, so a status
+that reports an update can never display a tag left behind by an earlier check.
+A stable check also stays empty when `DEV_RELEASE_TAG`/`DEV_OTA_SHA256` are
+inherited from the process environment: `resolve_dev_release` clears both before
+its channel gate, and the identity is only recorded from a `dev` resolution, so
+an exported value is never persisted as an identity the device resolved.
+The two keys are additive to `schema=1`: a reader that does not know them
+ignores them, and a record written by an earlier image simply does not contain
+them.
+
+Exposing these two values through `GET /api/v1/system/update` and the system
+page is the LibreEcho-UI half of the same contract (LibreEcho-Platform#165) and
+is not part of this repository.
+
 ## Development marker
 
 The current development image writes `FASTBOOT_PLEASE` to `expdb` and resets
