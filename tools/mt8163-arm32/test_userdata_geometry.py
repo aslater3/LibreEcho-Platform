@@ -50,6 +50,8 @@ class UserdataShellGeometryTests(unittest.TestCase):
         for name, constant in (('build_recovery_image.py', 'RECOVERY_INIT_SHA256'), ('verify_recovery_image.py', 'INIT_SHA256')):
             source = (ROOT / name).read_text()
             match = re.search(r'^' + constant + r' = "([0-9a-f]{64})"$', source, re.M)
+            if match is None and name == 'verify_recovery_image.py':
+                match = re.search(r"'INIT_SHA256 = \"([0-9a-f]{64})\"'", source)
             self.assertIsNotNone(match)
             self.assertEqual(match[1], expected)
 

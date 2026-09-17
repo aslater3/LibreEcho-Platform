@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
-import importlib.util
 import json
 import os
 import re
@@ -20,21 +19,6 @@ from pathlib import Path
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 from generate_boot_envelope import generate as generate_boot_envelope
-
-
-def _load_mdns_contract_module():
-    """Load the checked-in shared mDNS runtime contract."""
-    path = Path(__file__).resolve().parent / "mdns" / "contract.py"
-    spec = importlib.util.spec_from_file_location("libreecho_mdns_contract", path)
-    if spec is None or spec.loader is None:
-        raise SystemExit(f"ERROR: mDNS runtime contract loader is missing: {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-MDNS_RUNTIME_SCHEMA = "libreecho-mdns-runtime/v1"
-MDNS_CONTRACT = _load_mdns_contract_module().load()
 
 
 ANDROID_MAGIC = b"ANDROID!"
@@ -74,6 +58,9 @@ LIBNL_SOURCE_URL = (
 WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
+SSH_PASSWORD_HASH_RE = re.compile(
+    r"\$(?:1|5|6|2[abxy]?|y|gy)\$[^$:\r\n]{1,64}\$[^:\r\n]{1,512}\Z"
+)
 
 CONNECTIVITY_ASSET_REQUIREMENTS: dict[str, dict[str, str | int]] = {
     "ROMv2_lm_patch_1_0_hdr.bin": {
@@ -408,7 +395,6 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         "init.rc": ("init.rc", 0o644),
         "init.recovery.mt8163.rc": ("init.recovery.mt8163.rc", 0o644),
         "libreecho-init": ("libreecho-init", 0o755),
-        "libreecho-mdnsd": ("etc/init.d/libreecho-mdnsd.init", 0o755),
         "libreecho-reconcile-features": (
             "usr/local/sbin/libreecho-reconcile-features", 0o755,
         ),
@@ -827,8 +813,6 @@ def validate_ui_startup_contract(bundle: Path) -> None:
             "unmount_runtime()",
             "mount_runtime || return 1",
             "start) start_service",
-            # AirPlay is enabled by default; the persisted integration bit is
-            # the explicit, user-controlled disable (not a boot-time default).
             "airplay_enabled_at_boot=1",
             "integrations & 16",
             "persistent AirPlay disable",
@@ -1051,7 +1035,7 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
     for binary in (
         "libreecho-web", "libreecho-logd", "libreecho-networkd",
         "libreecho-timed", "libreecho-audiod", "libreecho-micd",
-        "libreecho-ledd", "libreecho-buttond", "libreecho-radiod", "libreecho-btd",
+        "libreecho-ledd", "libreecho-buttond", "libreecho-btd",
         "libreecho-airplayd", "libreecho-wyomingd",
         "libreecho-sttd-wyoming", "libreecho-ttsd-wyoming",
     ):
@@ -1060,7 +1044,7 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
         "libreecho-web.init", "libreecho-logd.init", "libreecho-networkd.init",
         "libreecho-timed.init", "libreecho-audiod.init",
         "libreecho-micd.init", "libreecho-ledd.init", "libreecho-buttond.init",
-        "libreecho-radiod.init", "libreecho-btd.init",
+        "libreecho-btd.init",
         "libreecho-airplayd.init", "libreecho-ttsd.init", "libreecho-waked.init",
         "libreecho-sttd.init", "libreecho-agentd.init", "libreecho-wyomingd.init",
     ):
@@ -1068,10 +1052,6 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
     copy_file("etc/libreecho/web-config.json", "etc/libreecho/web-config.json", 0o600)
     copy_file("etc/libreecho/airplay2.conf", "etc/libreecho/airplay2.conf", 0o644)
     copy_file("etc/libreecho/ntp.conf", "etc/libreecho/ntp.conf", 0o644)
-    copy_file(
-        "etc/libreecho/avahi-services/wyoming.service",
-        "etc/libreecho/avahi-services/wyoming.service", 0o644,
-    )
     if "etc/libreecho/users" in bundled_files:
         users_file = pinned_source(bundle, "etc/libreecho/users", "UI users file")
         if users_file.stat().st_mode & 0o077 or not read(users_file).strip():
@@ -1098,140 +1078,6 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
         "diff_sha256": expected_diff_sha256,
         "manifest_sha256": sha256(manifest_data),
         "files": files,
-    }
-
-
-def add_mdns_runtime(stage: Path, runtime: Path, manifest: dict[str, object]) -> None:
-    """Install the boot-contained shared Avahi/D-Bus discovery runtime.
-
-    This runtime is deliberately independent of feature policy and of the
-    AirPlay payload: a production image with no AirPlay squashfs still carries
-    it, and the shared responder never executes the Avahi/D-Bus bytes retained
-    inside legacy AirPlay payloads.
-    """
-    contract = MDNS_CONTRACT
-    if runtime.is_symlink() or not runtime.is_dir():
-        raise SystemExit(f"ERROR: mDNS runtime is not a directory: {runtime}")
-    runtime_manifest = runtime / "manifest.json"
-    if runtime_manifest.is_symlink() or not runtime_manifest.is_file():
-        raise SystemExit("ERROR: mDNS runtime manifest is missing")
-    try:
-        document = json.loads(runtime_manifest.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SystemExit("ERROR: mDNS runtime manifest is invalid") from exc
-    if document.get("schema") != MDNS_RUNTIME_SCHEMA:
-        raise SystemExit("ERROR: mDNS runtime manifest contract changed")
-    files = document.get("files")
-    if not isinstance(files, dict) or not files:
-        raise SystemExit("ERROR: mDNS runtime manifest carries no inventory")
-    root = runtime / "root"
-    if root.is_symlink() or not root.is_dir():
-        raise SystemExit("ERROR: mDNS runtime root is not a directory")
-
-    required = {contract["loader"]}
-    for category in ("executables", "libraries", "config", "accounts", "licenses"):
-        required |= set(contract[category])
-    missing = sorted(required - set(files))
-    if missing:
-        # Fail closed on a missing loader, library, executable, config or
-        # license record rather than shipping an unusable responder.
-        raise SystemExit(f"ERROR: mDNS runtime contract is missing {missing[0]}")
-    packages_path = runtime / "packages.json"
-    if packages_path.is_symlink() or not packages_path.is_file():
-        raise SystemExit("ERROR: mDNS runtime package lock is missing")
-    try:
-        packages = json.loads(packages_path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SystemExit("ERROR: mDNS runtime package lock is invalid") from exc
-    if (packages.get("schema") != "libreecho-mdns-packages/v1" or
-            not set(contract["packages"]).issubset(
-                {record.get("package") for record in packages.get("packages", [])
-                 if isinstance(record, dict)})):
-        raise SystemExit("ERROR: mDNS runtime package lock lost a required package")
-
-    prefix = contract["image_runtime_root"]
-    runtime_records: dict[str, object] = {}
-    for relative in sorted(files):
-        source = pinned_source(root, relative, f"mDNS runtime {relative}")
-        data = read(source)
-        record = files[relative]
-        if (not isinstance(record, dict) or record.get("sha256") != sha256(data) or
-                record.get("size") != len(data) or record.get("mode") not in (0o644, 0o755)):
-            raise SystemExit(
-                f"ERROR: mDNS runtime record mismatch: {relative} "
-                f"manifest_sha256={record.get('sha256')!r} actual_sha256={sha256(data)!r} "
-                f"manifest_size={record.get('size')!r} actual_size={len(data)} "
-                f"manifest_mode={record.get('mode')!r} actual_mode={source.stat().st_mode & 0o777!r}"
-            )
-        target = stage / prefix / relative
-        if target.exists() or target.is_symlink():
-            raise SystemExit(f"ERROR: mDNS runtime collides with {target}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-        target.chmod(int(record["mode"]))
-        entry: dict[str, object] = {
-            "sha256": sha256(data), "size": len(data), "mode": f"{int(record['mode']):04o}",
-        }
-        if elf_identity(target) is not None:
-            info = readelf_contract(target)
-            if info[0] != 0x05000400:
-                raise SystemExit(f"ERROR: mDNS runtime is not ARMHF: {relative}")
-            if relative == contract["loader"]:
-                if info[1] is not None:
-                    raise SystemExit(f"ERROR: mDNS runtime loader has an interpreter: {relative}")
-            elif relative in set(contract["executables"]):
-                if info[1] != contract["abi"]["interpreter"] or not info[3]:
-                    raise SystemExit(f"ERROR: mDNS runtime ELF contract changed: {relative}")
-            entry["elf"] = {
-                "flags": f"0x{info[0]:08x}",
-                "interpreter": info[1],
-                "needed": list(info[2]),
-                "dynamic": info[3],
-            }
-        runtime_records[relative] = entry
-
-    marker = stage / contract["image_marker"]
-    if marker.exists() or marker.is_symlink():
-        raise SystemExit(f"ERROR: mDNS runtime marker collides with {marker}")
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    runtime_manifest_sha = sha256(read(runtime_manifest))
-    marker_document = {
-        "schema": "libreecho-mdns-runtime-marker/v1",
-        "component": "libreecho-mdns",
-        "contract": contract["schema"],
-        "runtime_root": "/" + prefix,
-        "init": "/" + contract["init_wrapper"],
-        "abi": contract["abi"],
-        "runtime_dirs": contract["runtime_dirs"],
-        "manifest_sha256": runtime_manifest_sha,
-        "packages_sha256": document.get("packages_sha256"),
-        "files": len(runtime_records),
-        "readiness": "presence-is-not-readiness",
-        "source_offer_verified": document.get("source_offer_verified") is True,
-    }
-    marker_data = (json.dumps(marker_document, indent=2, sort_keys=True) + "\n").encode()
-    marker.write_bytes(marker_data)
-    marker.chmod(0o644)
-
-    manifest["mdns"] = {
-        "enabled": True,
-        "component": "libreecho-mdns",
-        "activation": "automatic-after-writable-runtime",
-        "autostart": True,
-        "ownership": "platform-boot-contained",
-        "discovery": "shared-avahi-dbus",
-        "protocol": "mdns",
-        "feature_payload_dependency": False,
-        "airplay_payload_dependency": False,
-        "single_responder": True,
-        "contract": contract["schema"],
-        "manifest_sha256": runtime_manifest_sha,
-        "runtime_root": "/" + prefix,
-        "marker": "/" + contract["image_marker"],
-        "marker_sha256": sha256(marker_data),
-        "init": "/" + contract["init_wrapper"],
-        "runtime_dirs": contract["runtime_dirs"],
-        "files": runtime_records,
     }
 
 
@@ -1743,69 +1589,89 @@ def add_assistant_external_payload(payload: Path, payload_manifest: Path,
     }
 
 
-def add_ssh_bundle(stage: Path, dropbear: Path, dropbearkey: Path, scp: Path,
-                   manifest: dict[str, object]) -> None:
-    """Install the opt-in deferred WebUI-account SSH bundle."""
+def read_ssh_password_hash(path: Path) -> str:
+    """Read one build-local crypt(3) hash without accepting a plaintext secret."""
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit(f"ERROR: SSH password hash is not a regular file: {path}")
+    if path.stat().st_mode & 0o022:
+        raise SystemExit(f"ERROR: SSH password hash is group/world-writable: {path}")
+    data = read(path)
+    if data.endswith(b"\n"):
+        data = data[:-1]
+    if not data or b"\n" in data or b"\r" in data:
+        raise SystemExit("ERROR: SSH password hash must be exactly one line")
+    try:
+        value = data.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise SystemExit("ERROR: SSH password hash is not ASCII") from exc
+    if not SSH_PASSWORD_HASH_RE.fullmatch(value):
+        raise SystemExit("ERROR: SSH password hash is not a supported salted crypt(3) hash")
+    return value
+
+
+def add_ssh_bundle(stage: Path, dropbear: Path, dropbearkey: Path,
+                   password_hash: Path, manifest: dict[str, object]) -> None:
+    """Install the opt-in password-only root SSH bundle."""
+    hash_value = read_ssh_password_hash(password_hash)
     files: dict[str, object] = {}
-    ssh_init = Path(__file__).resolve().parent / "ssh/libreecho-ssh.init"
-    if ssh_init.is_symlink() or not ssh_init.is_file():
-        raise SystemExit(f"ERROR: SSH supervisor is not a regular file: {ssh_init}")
+
+    (stage / "root").mkdir(parents=True, exist_ok=True)
+    (stage / "root").chmod(0o755)
+    (stage / "etc/dropbear").mkdir(parents=True, exist_ok=True)
+    (stage / "etc/dropbear").chmod(0o700)
 
     account_files = {
         "etc/passwd": (b"root:x:0:0:root:/root:/bin/sh\n", 0o644),
-        "etc/group": (b"root:x:0:\nlibreecho-ssh:x:1000:\n", 0o644),
+        "etc/group": (b"root:x:0:\n", 0o644),
         "etc/shells": (b"/bin/sh\n", 0o644),
+        "etc/shadow": (f"root:{hash_value}:0:0:99999:7:::\n".encode("ascii"), 0o600),
     }
     for relative, (data, mode) in account_files.items():
         target = stage / relative
         if target.exists() or target.is_symlink():
             raise SystemExit(f"ERROR: SSH account file collides with {target}")
-        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
         target.chmod(mode)
-        files[relative] = {
+        record: dict[str, object] = {
             "path": "/" + relative,
-            "sha256": sha256(data),
             "size": len(data),
             "mode": f"{mode:04o}",
         }
+        if relative == "etc/shadow":
+            record["secret_content_not_recorded"] = True
+        else:
+            record["sha256"] = sha256(data)
+        files[relative] = record
 
     for relative, source in (
         ("sbin/dropbear", dropbear),
         ("sbin/dropbearkey", dropbearkey),
-        ("usr/bin/scp", scp),
-        ("etc/init.d/libreecho-ssh.init", ssh_init),
     ):
         if source.is_symlink() or not source.is_file():
-            raise SystemExit(f"ERROR: SSH asset is not a regular file: {source}")
+            raise SystemExit(f"ERROR: SSH binary is not a regular file: {source}")
         data = read(source)
-        if relative in {"sbin/dropbear", "sbin/dropbearkey", "usr/bin/scp"} and b"authorized_keys" in data:
+        if b"authorized_keys" in data:
             raise SystemExit(f"ERROR: public-key authorization marker found in {source}")
         target = stage / relative
         if target.exists() or target.is_symlink():
-            raise SystemExit(f"ERROR: SSH asset collides with {target}")
-        target.parent.mkdir(parents=True, exist_ok=True)
+            raise SystemExit(f"ERROR: SSH binary collides with {target}")
         target.write_bytes(data)
         target.chmod(0o755)
-        record: dict[str, object] = {
+        files[relative] = {
             "path": str(source.resolve()),
             "sha256": sha256(data),
             "size": len(data),
             "mode": "0755",
+            "elf": require_elf_contract(target, 0x05000400, None, (), False),
         }
-        if relative in {"sbin/dropbear", "sbin/dropbearkey", "usr/bin/scp"}:
-            record["elf"] = require_elf_contract(target, 0x05000400, None, (), False)
-        files[relative] = record
 
     manifest["ssh"] = {
         "enabled": True,
-        "activation": "deferred-after-webui-bootstrap",
-        "autostart": True,
-        "authentication": "webui-users-sha256",
-        "account_source": "/data/libreecho/config/users",
-        "privilege_policy": "non-root-ephemeral-users",
+        "activation": "manual-only",
+        "autostart": False,
+        "authentication": "password-only",
         "public_key_auth": False,
-        "root_login": False,
+        "root_login": True,
         "host_keys": "generated-ephemerally-under-/tmp/dropbear",
         "files": files,
     }
@@ -1902,7 +1768,6 @@ def validate_stage(stage: Path) -> None:
         "etc/libreecho/image-profile", "etc/libreecho/service-profile",
         "etc/libreecho/feature-policy",
         "etc/libreecho/first-install-confirm",
-        "etc/init.d/libreecho-mdnsd.init",
         "usr/local/share/licenses/libreecho-core/THIRD_PARTY_NOTICES.md",
         "usr/local/share/licenses/libreecho-core/COMPONENTS.json",
         "usr/local/share/licenses/libreecho-core/GPL-2.0-only.txt",
@@ -1936,9 +1801,6 @@ def validate_stage(stage: Path) -> None:
         if ident is not None and ident != (1, 40):
             raise SystemExit(f"ERROR: non-ARM32 ELF in initramfs: {path} class={ident[0]} machine={ident[1]}")
 
-    # /init is intentionally a script.  Only the native helper is required
-    # to be a static ARM32 ELF here; treating the script as an ELF was the
-    # stale-builder bug that allowed the stock PID 1 back into the image.
     output = subprocess.run(
         ["readelf", "-l", str(stage / "sbin/adbd")], check=True,
         text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -1946,8 +1808,7 @@ def validate_stage(stage: Path) -> None:
     if "Requesting program interpreter" in output:
         raise SystemExit("ERROR: sbin/adbd is not static")
     init_script = read(stage / "init")
-    for relative in ("libreecho-init", "usr/local/sbin/libreecho-reconcile-features",
-                     "etc/init.d/libreecho-mdnsd.init"):
+    for relative in ("libreecho-init", "usr/local/sbin/libreecho-reconcile-features"):
         syntax = subprocess.run(
             ["sh", "-n", str(stage / relative)],
             capture_output=True, text=True,
@@ -1976,7 +1837,7 @@ def validate_stage(stage: Path) -> None:
 
     init_script = read(stage / "libreecho-init")
     for marker in (
-        b"FASTBOOT_PLEASE", b"/run/libreecho-control/runme", b"functionfs", b"/dev/stpwmt", b"/dev/stpbt",
+        b"FASTBOOT_PLEASE", b"/tmp/runme", b"functionfs", b"/dev/stpwmt", b"/dev/stpbt",
         b"PARTNAME=expdb", b"/sys/class/block/mmcblk0p7", b"20480", b"bs=15 count=1",
         b"stat -c '%t:%T'",
     ):
@@ -2225,8 +2086,6 @@ def main() -> None:
                         help="source/license metadata emitted by build_wireless_tools.sh")
     parser.add_argument("--ui-bundle", type=Path,
                         help="staged static ARM32 LibreEcho-UI bundle")
-    parser.add_argument("--mdns-runtime", type=Path,
-                        help="boot-contained shared ARMHF Avahi/D-Bus discovery runtime")
     parser.add_argument("--ui-source", type=Path,
                         help="LibreEcho-UI source checkout used for the bundle")
     parser.add_argument("--expected-ui-commit",
@@ -2265,13 +2124,13 @@ def main() -> None:
                         help="manifest for the external assistant feature payload")
 
     parser.add_argument("--ssh-enabled", action="store_true",
-                        help="explicitly enable deferred WebUI-account SSH")
+                        help="explicitly enable the password-only root SSH bundle")
     parser.add_argument("--dropbear", type=Path,
-                        help="static ARM32 Dropbear server with WebUI auth")
+                        help="static ARM32 password-only Dropbear server")
     parser.add_argument("--dropbearkey", type=Path,
                         help="static ARM32 Dropbear host-key utility")
-    parser.add_argument("--scp", type=Path,
-                        help="static ARM32 scp server-side transfer executable")
+    parser.add_argument("--ssh-root-password-hash", type=Path,
+                        help="build-local salted root crypt(3) hash file")
 
     parser.add_argument("--wmt-config-helper", type=Path,
                         help="reviewed static ARM32 configure-only WMT helper")
@@ -2350,7 +2209,7 @@ def main() -> None:
     ssh_options = {
         "dropbear": args.dropbear,
         "dropbearkey": args.dropbearkey,
-        "scp": args.scp,
+        "ssh_root_password_hash": args.ssh_root_password_hash,
     }
     ssh_enabled = args.ssh_enabled
     if ssh_enabled and not all(value is not None for value in ssh_options.values()):
@@ -2466,14 +2325,6 @@ def main() -> None:
             f"missing {missing}"
         )
 
-    if args.service_profile == "production" and args.mdns_runtime is None:
-        # Shared discovery is boot-contained Platform infrastructure: it must
-        # not be an optional feature-payload side effect, or an HA-selected
-        # image would silently depend on the AirPlay payload again.
-        raise SystemExit(
-            "ERROR: the production service profile requires --mdns-runtime "
-            "(boot-contained shared discovery runtime)"
-        )
     if args.feature_policy == "exclude":
         if args.service_profile != "diagnostic":
             raise SystemExit("ERROR: feature exclusion requires the diagnostic service profile")
@@ -2576,13 +2427,11 @@ def main() -> None:
         },
         "ssh": {
             "enabled": False,
-            "activation": "deferred-after-webui-bootstrap",
-            "autostart": True,
-            "authentication": "webui-users-sha256",
-            "account_source": "/data/libreecho/config/users",
-            "privilege_policy": "non-root-ephemeral-users",
+            "activation": "manual-only",
+            "autostart": False,
+            "authentication": "password-only",
             "public_key_auth": False,
-            "root_login": False,
+            "root_login": True,
             "host_keys": "generated-ephemerally-under-/tmp/dropbear",
             "files": {},
         },
@@ -2591,20 +2440,6 @@ def main() -> None:
             "activation": "manual-only",
             "autostart": False,
             "hardware_ownership": "existing-control-plane",
-            "files": {},
-        },
-        "mdns": {
-            "enabled": False,
-            "component": "libreecho-mdns",
-            "activation": "manual-only",
-            "autostart": False,
-            "ownership": "platform-boot-contained",
-            "discovery": "shared-avahi-dbus",
-            "protocol": "mdns",
-            "feature_payload_dependency": False,
-            "airplay_payload_dependency": False,
-            "single_responder": True,
-            "runtime_dirs": {},
             "files": {},
         },
         "airplay": {
@@ -2670,8 +2505,6 @@ def main() -> None:
                 stage, args.ui_bundle.resolve(), args.ui_source.resolve(),
                 args.expected_ui_commit, args.expected_ui_diff_sha256, manifest,
             )
-        if args.mdns_runtime is not None:
-            add_mdns_runtime(stage, args.mdns_runtime.resolve(), manifest)
         if airplay_payload_enabled:
             add_airplay_external_payload(
                 args.airplay_payload.resolve(), args.airplay_payload_manifest.resolve(), manifest,
@@ -2695,8 +2528,7 @@ def main() -> None:
         if stt_payload_enabled:
             add_stt_external_payload(
                 args.stt_payload.resolve(),
-                args.stt_payload_manifest.resolve(),
-                manifest,
+                args.stt_payload_manifest.resolve(), manifest,
             )
         if assistant_payload_enabled:
             add_assistant_external_payload(
@@ -2708,7 +2540,7 @@ def main() -> None:
         if ssh_enabled:
             add_ssh_bundle(
                 stage, args.dropbear.resolve(), args.dropbearkey.resolve(),
-                args.scp.resolve(), manifest,
+                args.ssh_root_password_hash.resolve(), manifest,
             )
         if connectivity_enabled:
             add_connectivity_bundle(
