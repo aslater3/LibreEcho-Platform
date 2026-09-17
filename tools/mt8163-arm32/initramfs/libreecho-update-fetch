@@ -48,6 +48,29 @@ sanitize_status_value()
         $BB cut -c 1-"$CURL_DIAGNOSTIC_MAX"
 }
 
+# The candidate identity a completed check resolved: the immutable release tag
+# the development pointer named and the OTA package SHA-256 the device verifies
+# its download against.  Both are sanitised and bounded like every other record
+# value and then format checked against the pointer grammar that
+# read_dev_release_pointer enforces, so a malformed, oversized, or unexpected
+# value is recorded as absent instead of as an identity the device never
+# resolved.
+candidate_release_tag()
+{
+    value=$(sanitize_status_value "${1:-}")
+    printf '%s\n' "$value" |
+        $BB grep -Eq '^radar-puffin-(build|nightly)-[a-f0-9]{7}-[a-f0-9]{16}-[a-f0-9]{16}$' ||
+        return 0
+    printf '%s\n' "$value"
+}
+
+candidate_ota_sha256()
+{
+    value=$(sanitize_status_value "${1:-}")
+    printf '%s\n' "$value" | $BB grep -Eq '^[a-f0-9]{64}$' || return 0
+    printf '%s\n' "$value"
+}
+
 check_value()
 {
     $BB sed -n "s/^$1=//p" "$CHECK_STATUS" 2>/dev/null
@@ -62,6 +85,8 @@ check_status_write()
     error_exit=${5:-}
     error_detail=${6:-}
     http_status=${7:-}
+    release_tag=$(candidate_release_tag "${8:-}")
+    ota_sha256=$(candidate_ota_sha256 "${9:-}")
     status=$(sanitize_status_value "$status")
     latest=$(sanitize_status_value "$latest")
     error=$(sanitize_status_value "$error")
@@ -107,6 +132,11 @@ check_status_write()
         echo "error_exit=$error_exit"
         echo "error_detail=$error_detail"
         echo "http_status=$http_status"
+        # Resolved candidate identity, empty unless this check proved it.  The
+        # record is rewritten whole, so any status that carries no identity
+        # clears a tag or digest a previous check left behind.
+        echo "resolved_release_tag=$release_tag"
+        echo "ota_sha256=$ota_sha256"
     } > "$CHECK_STATUS.tmp" &&
         $BB mv "$CHECK_STATUS.tmp" "$CHECK_STATUS"
 }
@@ -262,6 +292,8 @@ set_channel()
         echo error_exit=
         echo error_detail=
         echo http_status=
+        echo resolved_release_tag=
+        echo ota_sha256=
     } > "$CHECK_STATUS.tmp" || die channel_status_write
     $BB mv "$CHECK_STATUS.tmp" "$CHECK_STATUS" || die channel_status_commit
     cleanup_locks
@@ -1131,6 +1163,17 @@ candidate_matches_record()
     [ "$candidate_boot" = "$recorded_boot" ]
 }
 
+check_status_write_candidate()
+{
+    # A terminal check result records the identity of the candidate the check
+    # resolved.  It stays empty for a stable candidate, which has no immutable
+    # tag of its own, and for every in-flight or failed status, which never
+    # passes it -- so a completed check can never display a tag from an earlier
+    # check.
+    check_status_write "$1" "$2" "" true "" "" "" \
+        "${DEV_RELEASE_TAG:-}" "${DEV_OTA_SHA256:-}"
+}
+
 check_or_install()
 {
     requested_action=$1
@@ -1152,18 +1195,18 @@ check_or_install()
     rolled_back=$($BB sed -n 's/^version=//p' "$ROOT/rolled-back" 2>/dev/null)
     rolled_back_channel=$(record_channel "$ROOT/rolled-back")
     if [ "$version" = "$installed" ] && [ "$channel" = "$installed_channel" ] && candidate_matches_record "$ROOT/installed"; then
-        check_status_write up-to-date "$version" "" true
+        check_status_write_candidate up-to-date "$version"
         echo "UPDATE_CURRENT version=$version"
         return 0
     fi
     if [ -n "$rolled_back" ] && [ "$version" = "$rolled_back" ] && [ "$channel" = "$rolled_back_channel" ] && candidate_matches_record "$ROOT/rolled-back"; then
-        check_status_write update-held-after-rollback "$version" "" true
+        check_status_write_candidate update-held-after-rollback "$version"
         echo "UPDATE_HELD version=$version"
         return 0
     fi
     download_feature_assets
     if [ "$requested_action" = check ]; then
-        check_status_write update-available "$version" "" true
+        check_status_write_candidate update-available "$version"
         echo "UPDATE_AVAILABLE version=$version"
         return 0
     fi
@@ -1178,7 +1221,7 @@ check_or_install()
             return 1
         }
     fi
-    check_status_write reboot-pending "$version" "" true
+    check_status_write_candidate reboot-pending "$version"
 }
 
 watch_updates()
