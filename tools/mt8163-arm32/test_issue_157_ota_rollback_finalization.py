@@ -80,6 +80,11 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
         self.assertIn("detail=//p", resume)
         self.assertIn("s/^slot=//p", resume)
         self.assertIn('ota_rollback_publish_terminal "$resume_slot"', resume)
+        # The cleanup post-condition the rollback branch asserts is required
+        # here too, or an interrupted staging cleanup would be published as a
+        # finished rollback.
+        self.assertIn("/data/libreecho/update/staging", resume)
+        self.assertIn("log ota-rollback-resume-cleanup-incomplete", resume)
         # Fail closed: a refused publication is retried, not forced, and the
         # slot the history record names is the only one that may be published.
         self.assertIn("log ota-rollback-resume-evidence-invalid", resume)
@@ -400,17 +405,23 @@ class _BootWorkerFixture:
         self._write(
             root / "usr/local/sbin/libreecho-feature-transaction",
             "#!/bin/sh\n"
-            "# Stub for the packaged recovery helper: it retires the live\n"
-            "# schema-2 transaction exactly as the shipped helper does, and\n"
-            "# then optionally dies mid-boot the way a power loss does.\n"
+            "# Stub for the packaged recovery helper.  The shipped helper\n"
+            "# records its fallback history, retires the pending record and the\n"
+            "# feature commit, and only then removes its staging tree, so the\n"
+            "# stub keeps that order: an interruption can be placed on either\n"
+            "# side of the staging cleanup.\n"
             "set -u\n"
             f'update="{self.update}"\n'
             f'printf \'%s\\n\' "${{1:-}}" >>"{self.fallbacks}"\n'
             '[ "${1:-}" = fallback ] || exit 0\n'
-            'rm -f "$update/pending" "$update/feature-commit"\n'
-            'rm -rf "$update/staging"\n'
             "printf 'schema=2\\ntransaction_id=deadbeef\\nversion=%s\\nslot=%s\\n' \\\n"
             f"    '{ROLLBACK_VERSION}' '{ROLLBACK_SLOT}' >\"$update/rolled-back\"\n"
+            'rm -f "$update/pending" "$update/feature-commit"\n'
+            'if [ "${INTERRUPT_BEFORE_STAGING_CLEANUP:-0}" = 1 ]; then\n'
+            '    kill -KILL "$PPID"\n'
+            "    exit 0\n"
+            "fi\n"
+            'rm -rf "$update/staging"\n'
             'if [ "${INTERRUPT_AFTER_CLEANUP:-0}" = 1 ]; then\n'
             '    kill -KILL "$PPID"\n'
             "fi\n"
@@ -510,14 +521,22 @@ class _BootWorkerFixture:
             "detail=health-confirm-failed:web-status\n",
         )
 
-    def boot(self, interrupted: bool = False) -> subprocess.CompletedProcess[str]:
-        """Run one boot of the shipped worker against the sandbox root."""
+    def boot(self, interrupt_at: str | None = None) -> subprocess.CompletedProcess[str]:
+        """Run one boot of the shipped worker against the sandbox root.
+
+        ``interrupt_at`` places the power loss inside the recovery helper:
+        "staging" before its staging cleanup, "cleanup" once it is done, and
+        ``None`` for a boot that completes.
+        """
         return subprocess.run(
             [BUSYBOX, "sh", str(self.harness)],
             env={
                 "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                 "BOOT_LOG": str(self.boot_log),
-                "INTERRUPT_AFTER_CLEANUP": "1" if interrupted else "0",
+                "INTERRUPT_BEFORE_STAGING_CLEANUP": (
+                    "1" if interrupt_at == "staging" else "0"
+                ),
+                "INTERRUPT_AFTER_CLEANUP": "1" if interrupt_at == "cleanup" else "0",
             },
             text=True,
             capture_output=True,
@@ -587,7 +606,7 @@ class RollbackFinalizationResumesAfterInterruption(unittest.TestCase):
         self.fx.seed_failed_candidate()
         # Boot 1: the rollback branch retires the transaction and the device
         # loses power before the terminal status is published.
-        interrupted = self.fx.boot(interrupted=True)
+        interrupted = self.fx.boot(interrupt_at="cleanup")
         self.assertEqual(interrupted.returncode, -signal.SIGKILL, interrupted.stderr)
         self.fx.assert_cleanup_happened()
         self.assert_untouched_failed_candidate()
@@ -629,6 +648,36 @@ class RollbackFinalizationResumesAfterInterruption(unittest.TestCase):
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         self.assert_terminal_publication(self.fx.markers())
         self.assertEqual(self.fx.fallbacks.read_text().splitlines(), ["fallback"])
+
+    def test_interrupted_staging_cleanup_is_not_published_as_finalized(self) -> None:
+        self.fx.seed_failed_candidate()
+        # Boot 1: the helper records the fallback history and retires the
+        # pending record and the feature commit, then the device loses power
+        # before its staging tree is removed -- the boundary `fallback` leaves
+        # when it is interrupted between those two steps.
+        interrupted = self.fx.boot(interrupt_at="staging")
+        self.assertEqual(interrupted.returncode, -signal.SIGKILL, interrupted.stderr)
+        for gone in ("pending", "feature-commit"):
+            self.assertFalse((self.fx.update / gone).exists(), gone)
+        self.assertTrue((self.fx.update / "rolled-back").is_file())
+        self.assertTrue((self.fx.update / "staging").exists())
+        self.assert_untouched_failed_candidate()
+
+        # Boot 2: the transaction is gone but the cleanup post-condition is
+        # not proven, so the device must not report a finalized rollback and
+        # the staging tree stays the helper's to remove.
+        refused = self.fx.boot()
+        self.assertEqual(refused.returncode, 0, refused.stderr)
+        self.assertIn("ota-rollback-resume-cleanup-incomplete", self.fx.markers())
+        self.assert_untouched_failed_candidate()
+        self.assertTrue((self.fx.update / "staging").exists())
+
+        # Boot 3: once the cleanup is complete the same boot publishes.
+        shutil.rmtree(self.fx.update / "staging")
+        recovered = self.fx.boot()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assert_terminal_publication(self.fx.markers())
+        self.assertFalse(self.fx.reboots.exists())
 
     def test_unpublished_check_record_is_recovered_from_a_terminal_state(self) -> None:
         # The state half was published before the interruption, so the pending

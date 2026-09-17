@@ -1260,6 +1260,14 @@ ota_health_confirm_worker()
     {
         [ ! -e /data/libreecho/update/pending ] || return 0
         [ ! -e /data/libreecho/update/feature-commit ] || return 0
+        [ ! -e /data/libreecho/update/staging ] || {
+            # The helper retires the transaction before it removes its staging
+            # tree, so a leftover staging tree means the cleanup was
+            # interrupted.  Keep every record rather than claiming a
+            # finalization whose post-conditions are not proven.
+            log ota-rollback-resume-cleanup-incomplete
+            return 0
+        }
         resume_state=$($BB sed -n 's/^state=//p' /data/libreecho/update/state 2>/dev/null)
         case "$resume_state" in
             restarting)
