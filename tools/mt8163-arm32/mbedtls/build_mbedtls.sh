@@ -213,6 +213,70 @@ probe_mv_no_replace || {
   cat "$work/mv-probe.log" >&2
   exit 1
 }
+
+# The lock names a specific float ABI and mbedtls-source.json publishes that
+# value verbatim, but the compiler is a caller argument: a soft-float
+# `arm-linux-gnueabi-gcc` still emits `ELF 32-bit LSB relocatable, ARM` objects,
+# so the archive check below would accept it and the prefix would ship with a
+# provenance record that misstates its own ABI - and the production hard-float
+# UI link may then reject the cached prefix.  Probe what the compiler actually
+# emits instead of trusting its filename or the recorded target text.
+cc_target=$(read_lock_field target)
+case "$cc_target" in
+  *eabihf*) cc_float_abi=hard ;;
+  *eabi)    cc_float_abi=soft ;;
+  *)
+    printf 'ERROR: unsupported mbedTLS target ABI in SOURCE.lock: %s\n' "$cc_target" >&2
+    exit 1
+    ;;
+esac
+# Prefer the compiler's own cross readelf, so the attributes are read by the
+# toolchain that produced them.
+READELF_BIN="${CC%gcc}readelf"
+[[ -x "$READELF_BIN" ]] || READELF_BIN=readelf
+command -v "$READELF_BIN" >/dev/null 2>&1 || {
+  printf 'ERROR: readelf is required to validate the mbedTLS compiler ABI\n' >&2
+  exit 1
+}
+abi_dir="$work/abi-probe"
+mkdir -p "$abi_dir"
+printf 'int libreecho_mbedtls_abi_probe;\n' > "$abi_dir/probe.c"
+"$CC" -c "$abi_dir/probe.c" -o "$abi_dir/probe.o" >"$work/abi-probe.log" 2>&1 || {
+  printf 'ERROR: the mbedTLS cross compiler could not compile a probe object: %s\n' \
+    "$CC" >&2
+  cat "$work/abi-probe.log" >&2
+  exit 1
+}
+[[ -f "$abi_dir/probe.o" && ! -L "$abi_dir/probe.o" ]] || {
+  printf 'ERROR: the mbedTLS cross compiler produced no probe object: %s\n' \
+    "$CC" >&2
+  exit 1
+}
+# Read the attributes into a file rather than piping into `grep -q`: the short
+# circuit would leave the reader writing into a closed pipe, and `pipefail`
+# reports that instead of the match.
+abi_attrs="$work/abi-probe.attrs"
+"$READELF_BIN" -A "$abi_dir/probe.o" > "$abi_attrs" 2>"$work/abi-probe-readelf.log" || {
+  printf 'ERROR: cannot read the mbedTLS probe object attributes: %s\n' \
+    "$abi_dir/probe.o" >&2
+  cat "$work/abi-probe-readelf.log" >&2
+  exit 1
+}
+if [[ "$cc_float_abi" == hard ]]; then
+  grep -q 'Tag_ABI_VFP_args: VFP registers' "$abi_attrs" || {
+    printf 'ERROR: compiler does not target the pinned hard-float ABI (%s): %s\n' \
+      "$cc_target" "$CC" >&2
+    exit 1
+  }
+else
+  if grep -q 'Tag_ABI_VFP_args' "$abi_attrs"; then
+    printf 'ERROR: compiler does not target the pinned soft-float ABI (%s): %s\n' \
+      "$cc_target" "$CC" >&2
+    exit 1
+  fi
+fi
+rm -rf "$abi_dir"
+
 tar -xjf "$ARCHIVE" -C "$work"
 src="$work/mbedtls-$mbedtls_version"
 [[ -f "$src/LICENSE" && -f "$src/library/Makefile" && -f "$src/include/mbedtls/ssl.h" ]] || {

@@ -4703,7 +4703,25 @@ class UiTlsPackagingTests(unittest.TestCase):
                 """
             )
         )
-        for shim in ("sha256sum", "file", "make"):
+        # The builder validates the compiler ABI from a probe object's ARM
+        # attributes.  The stand-in reports the hard-float set by default and a
+        # soft-float set on request, so both the accept and reject paths are
+        # exercised without a second cross toolchain on the host.
+        (shims / "readelf").write_text(
+            "#!/bin/sh\n"
+            'case "${LE_TEST_READELF_ABI:-hard}" in\n'
+            "  soft)\n"
+            '    printf "%s\\n" "Attribute Section: aeabi" "Tag_CPU_name: \\"7-A\\""\n'
+            "    ;;\n"
+            "  unreadable) exit 1 ;;\n"
+            "  *)\n"
+            '    printf "%s\\n" "Attribute Section: aeabi" "Tag_CPU_name: \\"7-A\\"" \\\n'
+            '      "Tag_ABI_VFP_args: VFP registers"\n'
+            "    ;;\n"
+            "esac\n"
+            "exit 0\n"
+        )
+        for shim in ("sha256sum", "file", "make", "readelf"):
             (shims / shim).chmod(0o755)
 
         toolchain = tmp / "toolchain"
@@ -4713,6 +4731,21 @@ class UiTlsPackagingTests(unittest.TestCase):
             "#!/bin/sh\n"
             'if [ "${1:-}" = "--version" ]; then\n'
             '  printf "%s\\n" "arm-linux-gnueabihf-gcc (fixture) 13.2.1"\n'
+            "  exit 0\n"
+            "fi\n"
+            "# The builder probes the compiler ABI with a compile; the ABI itself is\n"
+            "# reported by the readelf stand-in, so only the output must exist here.\n"
+            'if [ "${1:-}" = "-c" ]; then\n'
+            "  out=\n"
+            "  while [ $# -gt 0 ]; do\n"
+            '    case $1 in\n'
+            "      -o) out=$2; shift 2 ;;\n"
+            "      *) shift ;;\n"
+            "    esac\n"
+            "  done\n"
+            '  [ -n "$out" ] || exit 1\n'
+            '  printf "fixture object\\n" > "$out"\n'
+            "  exit 0\n"
             "fi\n"
             "exit 0\n"
         )
@@ -4777,6 +4810,7 @@ class UiTlsPackagingTests(unittest.TestCase):
         race_output: Path | None = None,
         python_version: str | None = None,
         tmpdir: Path | None = None,
+        readelf_abi: str | None = None,
     ) -> tuple[subprocess.CompletedProcess, Path]:
         lock = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())
         environment = os.environ.copy()
@@ -4802,6 +4836,11 @@ class UiTlsPackagingTests(unittest.TestCase):
             environment["TMPDIR"] = str(tmpdir)
         environment["LE_TEST_FILE_DESCRIPTION"] = (
             "ELF 32-bit LSB relocatable, ARM, EABI5 version 1 (SYSV)"
+        )
+        # Always set, so the host environment cannot make an ABI-rejection case
+        # look acceptable (or the reverse).
+        environment["LE_TEST_READELF_ABI"] = (
+            readelf_abi if readelf_abi is not None else "hard"
         )
         output = fixture["workdir"] / name if output is None else output
         # The argument is passed verbatim, so a caller can exercise an output path
@@ -5088,6 +5127,60 @@ class UiTlsPackagingTests(unittest.TestCase):
                 supported.returncode, 0, supported.stdout + supported.stderr
             )
             self.assertTrue((supported_output / "mbedtls-source.json").is_file())
+
+    def test_mbedtls_builder_validates_the_compiler_float_abi(self) -> None:
+        """Codex review: the pinned hard-float ABI must be verified, not assumed.
+
+        A soft-float `arm-linux-gnueabi-gcc` still emits objects that satisfy the
+        generic ARM32 relocatable check, so the prefix could be published while
+        `mbedtls-source.json` recorded the locked `arm-linux-gnueabihf-static`
+        target: the provenance would misstate the artifact, and the production
+        hard-float UI link may reject the cached prefix.  The builder now probes
+        the compiler's own output attributes before doing any work.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+
+            # A compiler whose objects carry VFP argument registers satisfies the
+            # locked hard-float target, and the build still publishes.
+            accepted, accepted_output = self.run_mbedtls_builder(
+                fixture, leaked_path=False, name="hard-float-abi"
+            )
+            self.assertEqual(
+                accepted.returncode, 0, accepted.stdout + accepted.stderr
+            )
+            self.assertTrue((accepted_output / "mbedtls-source.json").is_file())
+
+            # A soft-float compiler is refused before extraction or compilation,
+            # and never publishes a prefix.
+            rejected, rejected_output = self.run_mbedtls_builder(
+                fixture,
+                leaked_path=False,
+                name="soft-float-abi",
+                readelf_abi="soft",
+            )
+            self.assertEqual(
+                rejected.returncode, 1, rejected.stdout + rejected.stderr
+            )
+            self.assertIn("hard-float ABI", rejected.stderr)
+            self.assertFalse(rejected_output.exists(), rejected.stdout + rejected.stderr)
+            self.assertNotIn("mbedtls_archives=", rejected.stdout)
+
+            # An unreadable attribute section is an unverifiable compiler, so it
+            # fails closed rather than being treated as acceptable.
+            unreadable, unreadable_output = self.run_mbedtls_builder(
+                fixture,
+                leaked_path=False,
+                name="unreadable-abi",
+                readelf_abi="unreadable",
+            )
+            self.assertEqual(
+                unreadable.returncode, 1, unreadable.stdout + unreadable.stderr
+            )
+            self.assertIn("cannot read the mbedTLS probe object attributes", unreadable.stderr)
+            self.assertFalse(
+                unreadable_output.exists(), unreadable.stdout + unreadable.stderr
+            )
 
     def test_ui_tls_verifier_rejects_a_prefix_with_headers_off_the_pin(self) -> None:
         """Codex review: the consumed headers must be bound to the pin.

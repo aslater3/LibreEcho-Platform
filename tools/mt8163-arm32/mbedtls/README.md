@@ -26,13 +26,16 @@ tools/mt8163-arm32/mbedtls/build_mbedtls.sh \
 The builder:
 
 1. verifies the archive SHA-256 against `SOURCE.lock`;
-2. verifies the pinned build requirements;
-3. builds only the static ARM32 libraries (`make -C library static`);
-4. verifies every archive member is an ARM32 ELF object, that no dynamic
+2. verifies the pinned build requirements and the locked interpreter floor;
+3. probes what `--cc` actually emits and refuses a compiler whose objects do not
+   carry the float ABI named by the lock's `target` (a soft-float
+   `arm-linux-gnueabi-gcc` would otherwise publish hard-float provenance);
+4. builds only the static ARM32 libraries (`make -C library static`);
+5. verifies every archive member is an ARM32 ELF object, that no dynamic
    library was produced, that the headers exist, that the compiled-in version
    string matches the lock, and that no private build path leaked into the
    archives;
-5. writes `mbedtls-source.json` into the output prefix with the license, source
+6. writes `mbedtls-source.json` into the output prefix with the license, source
    URL, source-archive hash, compiler, Python, build requirements, the SHA-256
    of each produced archive, the SHA-256 of `build_info.h`, and a digest over
    the complete include tree, so the verifier can bind the headers a consumer
