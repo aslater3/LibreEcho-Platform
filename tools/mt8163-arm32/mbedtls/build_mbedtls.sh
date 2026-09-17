@@ -36,8 +36,15 @@ done
 # output that only the stage had created - after the whole build had already run.
 # Normalise the separator and reject a path that still cannot name a sibling.
 output_argument=$OUTPUT
-while [[ "$OUTPUT" == */ ]]; do OUTPUT=${OUTPUT%/}; done
-while [[ "$OUTPUT" == */. ]]; do OUTPUT=${OUTPUT%/.}; done
+# Strip trailing separators and trailing '/.' components until neither rule can
+# make further progress.  A single ordered pass leaves '/prefix//.' as
+# '/prefix/', which would place STAGE inside OUTPUT and create OUTPUT early.
+while :; do
+  previous_output=$OUTPUT
+  while [[ "$OUTPUT" == */ ]]; do OUTPUT=${OUTPUT%/}; done
+  while [[ "$OUTPUT" == */. ]]; do OUTPUT=${OUTPUT%/.}; done
+  [[ "$OUTPUT" == "$previous_output" ]] && break
+done
 case "$OUTPUT" in
   ""|.|..|*/..)
     printf 'ERROR: unsafe mbedTLS prefix output path: %s\n' "$output_argument" >&2

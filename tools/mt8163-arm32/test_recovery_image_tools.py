@@ -5032,23 +5032,25 @@ class UiTlsPackagingTests(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as tmp_name:
             fixture = self.prepare_mbedtls_builder(Path(tmp_name))
-            output = fixture["workdir"] / "trailing-output"
 
-            published, published_output = self.run_mbedtls_builder(
-                fixture,
-                leaked_path=False,
-                name="trailing-output",
-                output=f"{output}{os.sep}",
-            )
-            self.assertEqual(
-                published.returncode, 0, published.stdout + published.stderr
-            )
-            self.assertEqual(published_output, output)
-            self.assertEqual(
-                sorted(path.name for path in output.iterdir()),
-                ["LICENSE", "include", "lib", "mbedtls-source.json"],
-                published.stdout + published.stderr,
-            )
+            for index, suffix in enumerate((os.sep, os.sep * 2 + ".", os.sep * 3 + ".")):
+                with self.subTest(suffix=suffix):
+                    output = fixture["workdir"] / f"trailing-output-{index}"
+                    published, published_output = self.run_mbedtls_builder(
+                        fixture,
+                        leaked_path=False,
+                        name=f"trailing-output-{index}",
+                        output=f"{output}{suffix}",
+                    )
+                    self.assertEqual(
+                        published.returncode, 0, published.stdout + published.stderr
+                    )
+                    self.assertEqual(published_output, output)
+                    self.assertEqual(
+                        sorted(path.name for path in output.iterdir()),
+                        ["LICENSE", "include", "lib", "mbedtls-source.json"],
+                        published.stdout + published.stderr,
+                    )
 
     def test_mbedtls_builder_enforces_the_locked_python_floor(self) -> None:
         """Codex review: the advertised interpreter floor must be enforced.
