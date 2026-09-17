@@ -242,6 +242,12 @@ validate_source()
 
 resolve_dev_release()
 {
+    # The identity belongs to this resolution alone.  Clear it before the
+    # channel gate: an inherited or exported DEV_RELEASE_TAG/DEV_OTA_SHA256 is
+    # not evidence that this device resolved anything, and a stable check
+    # resolves no immutable tag at all, so neither value may survive here.
+    DEV_RELEASE_TAG=
+    DEV_OTA_SHA256=
     [ "$channel" = dev ] || return 0
     # bounded_curl owns a download-only EXIT trap; isolate it from lock cleanup.
     pointer_identity=$(read_dev_release_pointer) || return 1
@@ -1165,13 +1171,19 @@ candidate_matches_record()
 
 check_status_write_candidate()
 {
-    # A terminal check result records the identity of the candidate the check
-    # resolved.  It stays empty for a stable candidate, which has no immutable
-    # tag of its own, and for every in-flight or failed status, which never
-    # passes it -- so a completed check can never display a tag from an earlier
-    # check.
-    check_status_write "$1" "$2" "" true "" "" "" \
-        "${DEV_RELEASE_TAG:-}" "${DEV_OTA_SHA256:-}"
+    # A terminal check result records the identity of the candidate this check
+    # resolved.  Only a dev resolution proves one: a stable candidate has no
+    # immutable tag of its own.  Gate on the channel as well as clearing it in
+    # resolve_dev_release, so a value inherited from the environment is never
+    # recorded as an identity this device resolved.  The record is rewritten
+    # whole, so a status written without an identity clears a tag or digest an
+    # earlier check left behind.
+    if [ "${channel:-}" = dev ]; then
+        check_status_write "$1" "$2" "" true "" "" "" \
+            "${DEV_RELEASE_TAG:-}" "${DEV_OTA_SHA256:-}"
+    else
+        check_status_write "$1" "$2" "" true "" "" "" "" ""
+    fi
 }
 
 check_or_install()

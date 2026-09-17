@@ -349,5 +349,78 @@ class UpdateCheckWiringTests(unittest.TestCase):
         self.assertEqual(values.get('ota_sha256'), '')
 
 
+class UpdateCheckInheritedIdentityTests(unittest.TestCase):
+    """An identity is recorded only when this check resolved one.
+
+    `DEV_RELEASE_TAG` and `DEV_OTA_SHA256` are ordinary shell variables, so a
+    value exported into the process environment, or left behind by an earlier
+    dev resolution, must never be recorded as an identity a stable check
+    resolved.  These cases run the real `resolve_dev_release` function so the
+    channel gate that produces the guarantee is the shipped code, not a stub.
+    """
+
+    REAL_RESOLVER_MARKERS = ('resolve_dev_release()\n', '\nset_channel()')
+    PACKAGE = b'libreecho-ota\n'
+    PACKAGE_SHA256 = hashlib.sha256(PACKAGE).hexdigest()
+
+    def make_root(self, tmp, channel):
+        root = Path(tmp)
+        (root/'automatic-updates').write_text(f'channel={channel}\n')
+        (root/'image-profile').write_text('ota\n')
+        (root/'incoming').mkdir()
+        (root/'incoming/github-update.ota.tar').write_bytes(self.PACKAGE)
+        (root/'staging').mkdir()
+        (root/'staging/manifest').write_text('update_channel=dev\n')
+        return root
+
+    def run_check(self, tmp, channel, export_identity=False, real_resolver=False):
+        """Run one `check` in a fresh process against the shared root directory."""
+        script = (ORCHESTRATION_STUBS + region(RECORD_REGION_MARKERS)
+                  + region(FAILURE_REGION_MARKERS)
+                  + (region(self.REAL_RESOLVER_MARKERS) if real_resolver else '')
+                  + region(CANDIDATE_REGION_MARKERS)
+                  + 'check_or_install check\nrc=$?\nprintf "RC=%s\\n" "$rc"\nexit "$rc"\n')
+        env = os.environ | dict(TEST_ROOT=tmp, TEST_BB=BUSYBOX, TEST_CHANNEL=channel,
+                                TEST_TAG=TAG, TEST_SHA=self.PACKAGE_SHA256,
+                                TEST_VERSION='0.14.0', TEST_MATCH='1')
+        if export_identity:
+            env['DEV_RELEASE_TAG'] = TAG
+            env['DEV_OTA_SHA256'] = self.PACKAGE_SHA256
+        result = subprocess.run(['sh', '-c', script], env=env, text=True, capture_output=True)
+        record = (Path(tmp)/'check-status').read_text() if (Path(tmp)/'check-status').exists() else ''
+        return result, record
+
+    def test_stable_check_ignores_an_exported_dev_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.make_root(tmp, 'stable')
+            result, record = self.run_check(tmp, 'stable', export_identity=True,
+                                            real_resolver=True)
+            values = field_map(record)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(values['status'], 'update-available')
+        self.assertEqual(values['channel'], 'stable')
+        self.assertEqual(values.get('resolved_release_tag'), '')
+        self.assertEqual(values.get('ota_sha256'), '')
+
+    def test_dev_to_stable_transition_clears_both_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.make_root(tmp, 'dev')
+            dev_result, dev_record = self.run_check(tmp, 'dev')
+            dev_values = field_map(dev_record)
+            (Path(tmp)/'automatic-updates').write_text('channel=stable\n')
+            result, record = self.run_check(tmp, 'stable', export_identity=True,
+                                            real_resolver=True)
+            values = field_map(record)
+        self.assertEqual(dev_result.returncode, 0, dev_result.stderr)
+        self.assertEqual(dev_values['channel'], 'dev')
+        self.assertEqual(dev_values.get('resolved_release_tag'), TAG)
+        self.assertEqual(dev_values.get('ota_sha256'), self.PACKAGE_SHA256)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(values['status'], 'update-available')
+        self.assertEqual(values['channel'], 'stable')
+        self.assertEqual(values.get('resolved_release_tag'), '')
+        self.assertEqual(values.get('ota_sha256'), '')
+
+
 if __name__ == '__main__':
     unittest.main()

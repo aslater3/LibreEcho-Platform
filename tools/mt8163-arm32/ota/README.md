@@ -267,6 +267,10 @@ empty rather than as an identity the device never resolved. They stay empty for
 a `stable` candidate, which has no immutable tag of its own, and for
 `checking`, `downloading`, `not-checked`, and every failed check, so a status
 that reports an update can never display a tag left behind by an earlier check.
+A stable check also stays empty when `DEV_RELEASE_TAG`/`DEV_OTA_SHA256` are
+inherited from the process environment: `resolve_dev_release` clears both before
+its channel gate, and the identity is only recorded from a `dev` resolution, so
+an exported value is never persisted as an identity the device resolved.
 The two keys are additive to `schema=1`: a reader that does not know them
 ignores them, and a record written by an earlier image simply does not contain
 them.
