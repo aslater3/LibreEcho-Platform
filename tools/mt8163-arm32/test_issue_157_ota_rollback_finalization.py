@@ -80,11 +80,24 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
         self.assertIn("detail=//p", resume)
         self.assertIn("s/^slot=//p", resume)
         self.assertIn('ota_rollback_publish_terminal "$resume_slot"', resume)
-        # The cleanup post-condition the rollback branch asserts is required
-        # here too, or an interrupted staging cleanup would be published as a
-        # finished rollback.
-        self.assertIn("/data/libreecho/update/staging", resume)
-        self.assertIn("log ota-rollback-resume-cleanup-incomplete", resume)
+        # The helper retires the transaction before it removes its staging
+        # tree, and it will not resume that cleanup once the transaction is
+        # gone, so the resume finishes it under the same validation the helper
+        # applies and publishes only afterwards.
+        cleanup = extract_function(self.init, "ota_rollback_resume_staging_cleanup")
+        self.assertIn("/data/libreecho/update/staging", cleanup)
+        # The three shapes the helper's own validation rejects must be refused
+        # here as well, so removal is never reached for an unvalidated path.
+        self.assertIn('[ -L "$resume_staging" ]', cleanup)
+        self.assertIn('[ ! -d "$resume_staging" ]', cleanup)
+        self.assertIn("-type l", cleanup)
+        self.assertIn("log ota-rollback-resume-staging-unsafe", cleanup)
+        self.assertIn("log ota-rollback-resume-staging-cleanup-failed", cleanup)
+        self.assertIn('$BB rm -rf "$resume_staging"', cleanup)
+        self.assertLess(
+            resume.index("ota_rollback_resume_staging_cleanup || return 0"),
+            resume.index('ota_rollback_publish_terminal "$resume_slot"'),
+        )
         # Fail closed: a refused publication is retried, not forced, and the
         # slot the history record names is the only one that may be published.
         self.assertIn("log ota-rollback-resume-evidence-invalid", resume)
@@ -649,7 +662,7 @@ class RollbackFinalizationResumesAfterInterruption(unittest.TestCase):
         self.assert_terminal_publication(self.fx.markers())
         self.assertEqual(self.fx.fallbacks.read_text().splitlines(), ["fallback"])
 
-    def test_interrupted_staging_cleanup_is_not_published_as_finalized(self) -> None:
+    def test_interrupted_staging_cleanup_is_finished_by_the_next_boot(self) -> None:
         self.fx.seed_failed_candidate()
         # Boot 1: the helper records the fallback history and retires the
         # pending record and the feature commit, then the device loses power
@@ -663,21 +676,100 @@ class RollbackFinalizationResumesAfterInterruption(unittest.TestCase):
         self.assertTrue((self.fx.update / "staging").exists())
         self.assert_untouched_failed_candidate()
 
-        # Boot 2: the transaction is gone but the cleanup post-condition is
-        # not proven, so the device must not report a finalized rollback and
-        # the staging tree stays the helper's to remove.
-        refused = self.fx.boot()
-        self.assertEqual(refused.returncode, 0, refused.stderr)
-        self.assertIn("ota-rollback-resume-cleanup-incomplete", self.fx.markers())
-        self.assert_untouched_failed_candidate()
-        self.assertTrue((self.fx.update / "staging").exists())
-
-        # Boot 3: once the cleanup is complete the same boot publishes.
-        shutil.rmtree(self.fx.update / "staging")
+        # Boot 2: the helper exits immediately once the transaction is gone, so
+        # no production path would finish that cleanup -- the worker has to do
+        # it, and it publishes the terminal records only afterwards.  No
+        # operator action and no second rollback are involved.
         recovered = self.fx.boot()
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("ota-rollback-resume-staging-cleaned", self.fx.markers())
+        self.assertFalse((self.fx.update / "staging").exists())
         self.assert_terminal_publication(self.fx.markers())
+        self.assertEqual(self.fx.fallbacks.read_text().splitlines(), ["fallback"])
         self.assertFalse(self.fx.reboots.exists())
+
+    def test_staging_tree_that_cannot_be_validated_is_left_for_recovery(self) -> None:
+        self.fx.seed_failed_candidate()
+        self.assertEqual(
+            self.fx.boot(interrupt_at="staging").returncode, -signal.SIGKILL
+        )
+        self.assertTrue((self.fx.update / "staging").is_dir())
+        # A symlink in the tree is exactly what the helper's own validation
+        # refuses, so the worker must not force the removal either.
+        unsafe = self.fx.update / "staging" / "manifest"
+        unsafe.symlink_to("/etc/passwd")
+
+        refused = self.fx.boot()
+        self.assertEqual(refused.returncode, 0, refused.stderr)
+        self.assertIn("ota-rollback-resume-staging-unsafe", self.fx.markers())
+        self.assert_untouched_failed_candidate()
+        self.assertTrue(unsafe.is_symlink())
+
+        # Boot 3: once the unsafe entry is gone, the same boot finishes the
+        # cleanup and publishes.
+        unsafe.unlink()
+        recovered = self.fx.boot()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertFalse((self.fx.update / "staging").exists())
+        self.assert_terminal_publication(self.fx.markers())
+
+    def test_unvalidated_staging_shape_is_left_for_recovery(self) -> None:
+        # The removal the resume performs is only ever reached for a staging
+        # tree the helper would itself accept.  Every shape that validation
+        # rejects -- a symlinked tree, a tree that is not a directory, and a
+        # dangling symlink -- must be left exactly as found, with the terminal
+        # records still unpublished, and the same boot must finish the cleanup
+        # and publish once the shape is gone.  Otherwise a refusal would be
+        # indistinguishable from the stranding this path exists to fix.
+        for shape in ("symlink-tree", "not-a-directory", "dangling-symlink"):
+            with self.subTest(shape=shape):
+                tmp = Path(tempfile.mkdtemp(prefix="libreecho-boot-worker-"))
+                self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+                fx = _BootWorkerFixture(tmp)
+                fx.seed_failed_candidate()
+                self.assertEqual(
+                    fx.boot(interrupt_at="staging").returncode, -signal.SIGKILL
+                )
+                staging = fx.update / "staging"
+                self.assertTrue(staging.is_dir())
+                shutil.rmtree(staging)
+                outside = tmp / "outside"
+                if shape == "symlink-tree":
+                    outside.mkdir()
+                    (outside / "keep").write_text("keep\n")
+                    staging.symlink_to(outside)
+                elif shape == "not-a-directory":
+                    staging.write_text("not-a-tree\n")
+                else:
+                    staging.symlink_to(outside)
+
+                refused = fx.boot()
+                self.assertEqual(refused.returncode, 0, refused.stderr)
+                self.assertIn("ota-rollback-resume-staging-unsafe", fx.markers())
+                self.assertNotIn(
+                    "ota-rollback-terminal-publication-resumed", fx.markers()
+                )
+                self.assertEqual(fx.read_update("state")["state"], "restarting")
+                self.assertEqual(
+                    fx.read_update("check-status")["status"], "reboot-pending"
+                )
+                # Refusing means leaving it alone, not deleting it by another
+                # route.
+                if shape == "not-a-directory":
+                    self.assertEqual(staging.read_text(), "not-a-tree\n")
+                else:
+                    self.assertTrue(staging.is_symlink())
+                    self.assertEqual(os.readlink(staging), str(outside))
+                if shape == "symlink-tree":
+                    self.assertEqual((outside / "keep").read_text(), "keep\n")
+
+                staging.unlink()
+                recovered = fx.boot()
+                self.assertEqual(recovered.returncode, 0, recovered.stderr)
+                self.assertFalse((fx.update / "staging").exists())
+                self.assertIn(
+                    "ota-rollback-terminal-publication-resumed:b", fx.markers()
+                )
 
     def test_unpublished_check_record_is_recovered_from_a_terminal_state(self) -> None:
         # The state half was published before the interruption, so the pending

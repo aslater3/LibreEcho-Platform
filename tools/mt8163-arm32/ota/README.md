@@ -106,6 +106,20 @@ and idempotent across repeated boots and interruptions, and it leaves
 configuration, installed feature authority, active payloads, and boot
 partitions untouched.
 
+The helper retires `pending`/`feature-commit` before it removes its staging
+tree, and it exits immediately once the live transaction is gone, so an
+interruption between those two steps leaves a cleanup that only the boot worker
+can finish. The worker therefore completes it on the next boot, and publishes
+the terminal records only afterwards: the removal is validated the way the
+helper validates it, so a staging tree that is a symlink, is not a directory,
+contains a symlink, or cannot be removed is refused with
+`ota-rollback-resume-staging-unsafe` (or
+`ota-rollback-resume-staging-cleanup-failed`) and left for operator recovery
+with the failed candidate's records still in place. A refused or interrupted
+attempt is retried on every subsequent boot and logs
+`ota-rollback-resume-staging-cleaned` before the publication marker
+`ota-rollback-terminal-publication-resumed`.
+
 ## Signed bundle v1
 
 The transport is a deterministic POSIX tar with these exact members:

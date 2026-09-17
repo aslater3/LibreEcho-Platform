@@ -1247,27 +1247,47 @@ ota_health_confirm_worker()
         return 0
     }
 
+    # The recovery helper retires the transaction and only then removes its
+    # staging tree, and it refuses to run again once the transaction is gone,
+    # so an interruption between those two steps leaves a cleanup that no
+    # other production path finishes: without it a later boot would report
+    # neither a live transaction nor a finished rollback, on every boot.  A
+    # replacement for the legacy single-slot updater and the recovery runner
+    # both own the same tree, so the removal is validated the way the helper
+    # validates it -- a staging tree that is a symlink, is not a directory,
+    # contains a symlink, or cannot be removed is left for recovery instead.
+    ota_rollback_resume_staging_cleanup()
+    {
+        resume_staging=/data/libreecho/update/staging
+        [ -e "$resume_staging" ] || [ -L "$resume_staging" ] || return 0
+        if [ -L "$resume_staging" ] ||
+           [ ! -d "$resume_staging" ] ||
+           [ -n "$($BB find "$resume_staging" -type l -print -quit 2>/dev/null)" ]; then
+            log ota-rollback-resume-staging-unsafe
+            return 1
+        fi
+        $BB rm -rf "$resume_staging" || {
+            log ota-rollback-resume-staging-cleanup-failed
+            return 1
+        }
+        $BB sync
+        log ota-rollback-resume-staging-cleaned
+        return 0
+    }
+
     # A rollback retires the live transaction before its terminal records are
     # published, so a power loss -- or a failed write -- in between leaves a
     # device whose only remaining evidence is the finalized `rolled-back`
     # history record.  No later boot re-enters the rollback branch, because the
     # transaction that branch retires is already gone, so the interrupted
-    # publication is completed here on every boot instead of waiting for an
-    # operator, until both records are written.  Fail closed: a live
-    # transaction keeps its own recovery path, and nothing is published unless
-    # the history record names the slot that actually rolled back.
+    # cleanup and publication are completed here on every boot instead of
+    # waiting for an operator, until both records are written.  Fail closed: a
+    # live transaction keeps its own recovery path, and nothing is published
+    # unless the history record names the slot that actually rolled back.
     ota_rollback_resume_terminal()
     {
         [ ! -e /data/libreecho/update/pending ] || return 0
         [ ! -e /data/libreecho/update/feature-commit ] || return 0
-        [ ! -e /data/libreecho/update/staging ] || {
-            # The helper retires the transaction before it removes its staging
-            # tree, so a leftover staging tree means the cleanup was
-            # interrupted.  Keep every record rather than claiming a
-            # finalization whose post-conditions are not proven.
-            log ota-rollback-resume-cleanup-incomplete
-            return 0
-        }
         resume_state=$($BB sed -n 's/^state=//p' /data/libreecho/update/state 2>/dev/null)
         case "$resume_state" in
             restarting)
@@ -1300,6 +1320,10 @@ ota_health_confirm_worker()
                 return 0
                 ;;
         esac
+        # The staging cleanup is the helper step an interruption can cut
+        # short, and the helper will not resume it, so the terminal records are
+        # only published once it is finished -- or the boot retries.
+        ota_rollback_resume_staging_cleanup || return 0
         if ota_rollback_publish_terminal "$resume_slot"; then
             log "ota-rollback-terminal-publication-resumed:$resume_slot"
         else
