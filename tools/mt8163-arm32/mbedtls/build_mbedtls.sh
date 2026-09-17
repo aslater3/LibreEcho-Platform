@@ -212,6 +212,22 @@ def digest(path: pathlib.Path) -> str:
     return value.hexdigest()
 
 
+def include_tree_digest(root: pathlib.Path) -> str:
+    """Digest every header the UI compiles against.
+
+    The verifier reproduces this walk over the prefix it is about to use, so a
+    stale or hand-edited header cannot be consumed while the archives still
+    match their recorded digests.
+    """
+    value = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        value.update(path.relative_to(root).as_posix().encode("utf-8") + b"\0")
+        value.update(hashlib.sha256(path.read_bytes()).hexdigest().encode("ascii"))
+    return value.hexdigest()
+
+
 record = {
     "name": lock["name"],
     "version": lock["version"],
@@ -227,6 +243,7 @@ record = {
         for name in ("libmbedcrypto.a", "libmbedx509.a", "libmbedtls.a")
     },
     "include_sha256": digest(output / "include" / "mbedtls" / "build_info.h"),
+    "include_tree_sha256": include_tree_digest(output / "include"),
 }
 (output / "mbedtls-source.json").write_text(
     json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"

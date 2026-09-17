@@ -112,6 +112,22 @@ json_field() {
   sed -n "s/.*\"$2\": *\"\([^\"]*\)\".*/\1/p" "$1" | head -n 1
 }
 
+include_tree_sha256() {
+  # Digest the complete include tree exactly the way build_mbedtls.sh records
+  # it: sorted relative paths paired with each file's SHA-256, hashed in that
+  # order.  Both sides must walk the same tree, so a stale or hand-edited
+  # header changes the digest.
+  local root=$1 relative
+  (
+    cd "$root" || exit 1
+    find . -type f -print | LC_ALL=C sort | while IFS= read -r path; do
+      relative=${path#./}
+      printf '%s\0' "$relative"
+      sha256sum "$path" | awk '{printf "%s", $1}'
+    done
+  ) | sha256sum | awk '{print $1}'
+}
+
 verify_prefix() {
   local prefix=$1
   [[ -d "$prefix" && ! -L "$prefix" ]] || {
@@ -210,6 +226,25 @@ verify_prefix() {
       exit 1
     }
   done
+
+  # The complete include tree the UI compiles against, not only the version text:
+  # a stale or hand-edited header in a cached prefix would otherwise be consumed
+  # while the archives still match their recorded digests.
+  local recorded_include recorded_tree actual_include actual_tree
+  recorded_include=$(json_field "$source_json" include_sha256)
+  recorded_tree=$(json_field "$source_json" include_tree_sha256)
+  [[ "$recorded_include" =~ ^[0-9a-f]{64}$ && "$recorded_tree" =~ ^[0-9a-f]{64}$ ]] || {
+    printf 'ERROR: mbedtls-source.json records no SHA-256 for the include tree: %s\n' \
+      "$source_json" >&2
+    exit 1
+  }
+  actual_include=$(sha256sum "$prefix/include/mbedtls/build_info.h" | awk '{print $1}')
+  actual_tree=$(include_tree_sha256 "$prefix/include")
+  [[ "$actual_include" == "$recorded_include" && "$actual_tree" == "$recorded_tree" ]] || {
+    printf 'ERROR: UI ARM32 mbedTLS prefix headers do not match the provenance record: %s\n' \
+      "$prefix" >&2
+    exit 1
+  }
   printf 'ui_tls_prefix=ok mbedtls_version=%s mbedtls_archive_members=%s\n' \
     "$version" "$members"
 }

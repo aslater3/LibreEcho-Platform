@@ -4372,6 +4372,17 @@ class UiTlsPackagingTests(unittest.TestCase):
             archive += b"\n"
         path.write_bytes(archive)
 
+    @staticmethod
+    def include_tree_digest(root: Path) -> str:
+        """Digest the include tree exactly as build_mbedtls.sh records it."""
+        value = hashlib.sha256()
+        for path in sorted(root.rglob("*")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            value.update(path.relative_to(root).as_posix().encode("utf-8") + b"\0")
+            value.update(hashlib.sha256(path.read_bytes()).hexdigest().encode("ascii"))
+        return value.hexdigest()
+
     def write_mbedtls_prefix(
         self,
         prefix: Path,
@@ -4388,9 +4399,11 @@ class UiTlsPackagingTests(unittest.TestCase):
         """
         lock = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())
         (prefix / "include/mbedtls").mkdir(parents=True)
+        (prefix / "include/psa").mkdir()
         (prefix / "lib").mkdir()
         for header in ("ssl.h", "x509_crt.h", "pk.h", "entropy.h"):
             (prefix / "include/mbedtls" / header).write_text("/* fixture */\n")
+        (prefix / "include/psa/crypto.h").write_text("/* fixture */\n")
         (prefix / "include/mbedtls/build_info.h").write_text(
             '#define MBEDTLS_VERSION_STRING         "%s"\n'
             % (version or lock["version"])
@@ -4423,6 +4436,9 @@ class UiTlsPackagingTests(unittest.TestCase):
                     "include_sha256": hashlib.sha256(
                         (prefix / "include/mbedtls/build_info.h").read_bytes()
                     ).hexdigest(),
+                    "include_tree_sha256": self.include_tree_digest(
+                        prefix / "include"
+                    ),
                 },
                 indent=2,
                 sort_keys=True,
@@ -4700,6 +4716,57 @@ class UiTlsPackagingTests(unittest.TestCase):
             self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
             self.assertIn("mbedtls_archives=3", clean.stdout)
             self.assertTrue((clean_output / "mbedtls-source.json").is_file())
+
+    def test_ui_tls_verifier_rejects_a_prefix_with_headers_off_the_pin(self) -> None:
+        """Codex review: the consumed headers must be bound to the pin.
+
+        A cached prefix can keep the archives and the provenance record while a
+        header is stale or hand-edited.  Verifying only that the headers exist
+        and that build_info.h still prints the pinned version would link and
+        compile the UI against declarations that do not belong to the recorded
+        archives, so the recorded include-tree digest is enforced for every
+        header in the tree, not only for the version text.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            if shutil.which("ar") is None:
+                self.skipTest("ar is required to synthesise an mbedTLS prefix")
+
+            consumed = tmp / "rewritten-consumed-header"
+            self.write_mbedtls_prefix(consumed)
+            (consumed / "include/mbedtls/ssl.h").write_text("/* rewritten */\n")
+            rejected = self.run_tls_prefix(consumed)
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("headers do not match", rejected.stderr)
+
+            linked = tmp / "rewritten-linked-header"
+            self.write_mbedtls_prefix(linked)
+            (linked / "include/psa/crypto.h").write_text("/* rewritten */\n")
+            rejected = self.run_tls_prefix(linked)
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("headers do not match", rejected.stderr)
+
+            # The pinned version text is preserved, so only the digest can catch
+            # this: the prefix must not be accepted on the version alone.
+            version_text = tmp / "rewritten-build-info"
+            self.write_mbedtls_prefix(version_text)
+            build_info = version_text / "include/mbedtls/build_info.h"
+            build_info.write_text(build_info.read_text() + "\n/* rewritten */\n")
+            rejected = self.run_tls_prefix(version_text)
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("headers do not match", rejected.stderr)
+
+            # A prefix without the recorded include digests fails closed too.
+            unrecorded = tmp / "unrecorded-include-digests"
+            self.write_mbedtls_prefix(unrecorded)
+            record = json.loads((unrecorded / "mbedtls-source.json").read_text())
+            del record["include_tree_sha256"]
+            (unrecorded / "mbedtls-source.json").write_text(
+                json.dumps(record, indent=2, sort_keys=True) + "\n"
+            )
+            rejected = self.run_tls_prefix(unrecorded)
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("include", rejected.stderr)
 
 
 if __name__ == "__main__":
