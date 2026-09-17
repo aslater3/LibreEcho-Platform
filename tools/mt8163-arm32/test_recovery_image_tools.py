@@ -4086,7 +4086,17 @@ class UiTlsPackagingTests(unittest.TestCase):
         self.assertIn('-L$MBEDTLS_ROOT/lib', bundle)
         self.assertIn('WEB_TLS_LIBS="$TLS_LIBS"', bundle)
         self.assertIn('RADIOD_TLS_LIBS="$TLS_LIBS"', bundle)
-        self.assertIn("-lmbedtls -lmbedx509 -lmbedcrypto", bundle)
+        # The linkage names the archives inside the prefix the verifier just
+        # checked, by absolute path: a search path or a caller-supplied archive
+        # list could otherwise resolve a different API-compatible mbedTLS.
+        self.assertIn(
+            'TLS_LIBS="$MBEDTLS_ROOT/lib/libmbedtls.a'
+            ' $MBEDTLS_ROOT/lib/libmbedx509.a'
+            ' $MBEDTLS_ROOT/lib/libmbedcrypto.a"',
+            bundle,
+        )
+        self.assertNotIn("LIBREECHO_UI_TLS_LIBS", bundle)
+        self.assertNotIn("-lmbedtls", bundle)
 
     def test_ui_bundle_verifies_compiled_and_packaged_tls(self) -> None:
         bundle = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
@@ -4446,7 +4456,13 @@ class UiTlsPackagingTests(unittest.TestCase):
             + "\n"
         )
 
-    def run_ui_bundle(self, tmp: Path, mbedtls_root: str) -> subprocess.CompletedProcess:
+    def run_ui_bundle(
+        self,
+        tmp: Path,
+        mbedtls_root: str,
+        *,
+        env_extra: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess:
         """Run the bundle builder with a stand-in musl and cross toolchain.
 
         Every mbedTLS guard runs before the UI checkout is touched, so a
@@ -4477,6 +4493,8 @@ class UiTlsPackagingTests(unittest.TestCase):
                 "LIBREECHO_UI_MBEDTLS_ROOT": mbedtls_root,
             }
         )
+        if env_extra:
+            environment.update(env_extra)
         return subprocess.run(
             [
                 "bash",
@@ -4487,6 +4505,74 @@ class UiTlsPackagingTests(unittest.TestCase):
             env=environment, text=True, cwd=tmp,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
+
+    def test_ui_bundle_binds_the_link_to_the_verified_prefix(self) -> None:
+        """Codex review: the linked archives must be the verified ones.
+
+        `LIBREECHO_UI_TLS_LIBS` let a caller - or an inherited environment -
+        replace the archive list after `verify_ui_tls.sh` had checked the
+        prefix, so an API-compatible mbedTLS could be linked while the recorded
+        provenance described the pinned one.  The linkage must come from the
+        verified prefix itself, and the override must not reach the link line.
+        """
+        decoy = "/opt/decoy-mbedtls/lib/libmbedtls.a"
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            if shutil.which("ar") is None:
+                self.skipTest("ar is required to synthesise an mbedTLS prefix")
+            if shutil.which("git") is None:
+                self.skipTest("git is required to stage a stand-in UI checkout")
+            prefix = tmp / "prefix"
+            self.write_mbedtls_prefix(prefix)
+
+            # The builder records the UI source identity before it dispatches
+            # the build, so the stand-in checkout has to be a real repository.
+            source = tmp / "ui-source"
+            source.mkdir()
+            (source / "Makefile").write_text("release:\n\t@true\n")
+            for command in (
+                ("init", "--quiet"),
+                ("config", "user.email", "fixture@example.invalid"),
+                ("config", "user.name", "Fixture"),
+                ("add", "Makefile"),
+                ("commit", "--quiet", "-m", "fixture"),
+            ):
+                subprocess.run(
+                    ["git", *command], cwd=source, check=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+
+            record = tmp / "make-record.txt"
+            shim = tmp / "make-shim"
+            shim.write_text(
+                "#!/bin/sh\n"
+                'printf "%s\\n" "$*" >> "$LE_TEST_MAKE_RECORD"\n'
+                "exit 0\n"
+            )
+            shim.chmod(0o755)
+
+            result = self.run_ui_bundle(
+                tmp,
+                str(prefix),
+                env_extra={
+                    "MAKE": str(shim),
+                    "LE_TEST_MAKE_RECORD": str(record),
+                    "LIBREECHO_UI_TLS_LIBS": decoy,
+                },
+            )
+            # The stand-in UI checkout produces no binaries, so the builder
+            # stops on the compiled-artifact check after the link dispatch.
+            self.assertTrue(record.is_file(), result.stdout + result.stderr)
+            invocations = record.read_text().splitlines()
+            self.assertTrue(invocations, result.stdout + result.stderr)
+            for invocation in invocations:
+                self.assertNotIn(decoy, invocation)
+                self.assertNotIn("-lmbedtls", invocation)
+            release = [line for line in invocations if "release" in line]
+            self.assertTrue(release, invocations)
+            for line in release:
+                for archive in ("libmbedtls.a", "libmbedx509.a", "libmbedcrypto.a"):
+                    self.assertIn(f"{prefix}/lib/{archive}", line)
 
     def test_ui_bundle_fails_closed_without_a_usable_mbedtls_prefix(self) -> None:
         """Issue #250: the builder must never produce a stub TLS bundle.

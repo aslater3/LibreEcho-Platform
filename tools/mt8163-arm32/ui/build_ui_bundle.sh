@@ -19,7 +19,6 @@ CROSS_COMPILE=${LIBREECHO_UI_CROSS_COMPILE:-/usr/bin/arm-linux-gnueabihf-}
 CC_BIN=${LIBREECHO_UI_CC:-gcc}
 STRIP_BIN=${LIBREECHO_UI_STRIP:-${CROSS_COMPILE}strip}
 MBEDTLS_ROOT=${LIBREECHO_UI_MBEDTLS_ROOT:-}
-TLS_LIBS=${LIBREECHO_UI_TLS_LIBS:--lmbedtls -lmbedx509 -lmbedcrypto}
 GC_LDFLAGS=${LIBREECHO_UI_GC_LDFLAGS:--static -Wl,--gc-sections}
 USERS_SOURCE=${LIBREECHO_WEB_USERS_FILE:-}
 MUSL_NATIVE_ROOT=${LIBREECHO_UI_MUSL_NATIVE_ROOT:-/path/to/musl-native-root}
@@ -67,6 +66,13 @@ command -v "$MAKE_BIN" >/dev/null 2>&1 || {
     exit 1
 }
 "$VERIFY_TLS" --prefix "$MBEDTLS_ROOT"
+
+# Bind the linkage to the prefix that was just verified.  The archives are named
+# by absolute path rather than through a library search path, and the list is not
+# caller-supplied, so no other API-compatible mbedTLS can be linked while the
+# recorded provenance describes the pinned one.
+MBEDTLS_ROOT=$(cd -- "$MBEDTLS_ROOT" && pwd)
+TLS_LIBS="$MBEDTLS_ROOT/lib/libmbedtls.a $MBEDTLS_ROOT/lib/libmbedx509.a $MBEDTLS_ROOT/lib/libmbedcrypto.a"
 if [[ -n "$USERS_SOURCE" ]]; then
     [[ -f "$USERS_SOURCE" && ! -L "$USERS_SOURCE" ]] || {
         echo "ERROR: LibreEcho web users file must be a regular file: $USERS_SOURCE" >&2

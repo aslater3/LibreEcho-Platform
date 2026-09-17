@@ -33,8 +33,10 @@ The builder:
    string matches the lock, and that no private build path leaked into the
    archives;
 5. writes `mbedtls-source.json` into the output prefix with the license, source
-   URL, source-archive hash, compiler, Python, build requirements, and the
-   SHA-256 of each produced archive.
+   URL, source-archive hash, compiler, Python, build requirements, the SHA-256
+   of each produced archive, the SHA-256 of `build_info.h`, and a digest over
+   the complete include tree, so the verifier can bind the headers a consumer
+   compiles against to the build that produced them.
 
 ## Build requirements
 
