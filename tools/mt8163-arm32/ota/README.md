@@ -134,6 +134,19 @@ record without its durable journal was never prepared or activated, so it is
 preserved for the update flow that rebuilds it instead of being retired as a
 rollback whose staged tree still holds the candidate.
 
+A schema-1 (v1 updater) rollback has neither of those things to resume: the boot
+worker retires that transaction by moving the `pending` record itself, so the
+record an interrupted finalization leaves behind carries no `transaction_id` and
+has no durable v2 journal beside it. The worker publishes for it as well --
+otherwise a check record the failed candidate left at `reboot-pending` would stay
+frozen on every later boot, because the rollback branch can no longer be entered
+once the pending record has been moved -- and it runs neither v2 cleanup for that
+record, matching it on its `schema=1` contents and on the absence of `pending`
+and `feature-commit`. A surviving live record logs
+`ota-rollback-resume-live-record-present:<record>` and keeps its own recovery
+path, and the check record is rewritten only when its `latest_version` equals the
+version in `rolled-back`, exactly as for a schema-2 rollback.
+
 ## Signed bundle v1
 
 The transport is a deterministic POSIX tar with these exact members:

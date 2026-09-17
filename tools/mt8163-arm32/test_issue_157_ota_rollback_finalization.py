@@ -137,6 +137,41 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
         )
         self.assertEqual(self.worker.count("\n    ota_rollback_resume_terminal\n"), 1)
 
+    def test_legacy_schema_one_rollback_is_resumed_without_the_v2_cleanups(self) -> None:
+        # A schema-1 rollback retires its transaction by moving the pending
+        # record itself, so the record an interrupted finalization leaves behind
+        # carries no transaction id.  The resume must still publish for it --
+        # otherwise its check record is stranded at `reboot-pending` forever --
+        # and must not run the v2 cleanups, which exist for the helper's own
+        # retirement steps and have no matching evidence on a legacy device.
+        resume = extract_function(self.init, "ota_rollback_resume_terminal")
+        self.assertIn("s/^transaction_id=//p", resume)
+        self.assertIn("s/^schema=//p", resume)
+        self.assertIn('if [ -n "$resume_transaction" ]; then', resume)
+        self.assertIn('[ "$resume_schema" = 1 ] || {', resume)
+        self.assertIn("ota-rollback-resume-legacy-publication", resume)
+        self.assertIn(
+            'log "ota-rollback-resume-live-record-present:$resume_live"', resume
+        )
+        # Both v2 cleanups sit inside the branch that only a record naming a
+        # transaction reaches, and the single publisher follows both branches.
+        self.assertLess(
+            resume.index('if [ -n "$resume_transaction" ]; then'),
+            resume.index("ota_rollback_resume_live_records || return 0"),
+        )
+        self.assertLess(
+            resume.index("ota_rollback_resume_live_records || return 0"),
+            resume.index("ota_rollback_resume_staging_cleanup || return 0"),
+        )
+        self.assertLess(
+            resume.index("ota_rollback_resume_staging_cleanup || return 0"),
+            resume.index("ota-rollback-resume-legacy-publication"),
+        )
+        self.assertLess(
+            resume.index("ota-rollback-resume-legacy-publication"),
+            resume.index('ota_rollback_publish_terminal "$resume_slot"'),
+        )
+
     def test_v2_finalization_verifies_postconditions_before_claiming_cleanup(self) -> None:
         confirm = extract_function(self.init, "ota_v2_fallback_confirmed")
         for live_record in ("pending", "feature-commit", "staging", "rolled-back"):
@@ -432,6 +467,18 @@ class _BootWorkerFixture:
             f'    reboot) printf \'%s\\n\' "$*" >>"{self.reboots}"; exit 0 ;;\n'
             "    sleep) exit 0 ;;\n"
             "    sync) exit 0 ;;\n"
+            "    mv)\n"
+            f'        "{BUSYBOX}" "$@"\n'
+            "        rc=$?\n"
+            "        # A power loss placed on the rename the terminal publication\n"
+            "        # performs between its two records: the state record reaches\n"
+            "        # disk and the check record never does.\n"
+            '        if [ "${INTERRUPT_AFTER_STATE_RENAME:-0}" = 1 ] &&\n'
+            '           [ "${3##*/}" = state ]; then\n'
+            '            kill -KILL "$PPID"\n'
+            "        fi\n"
+            '        exit "$rc"\n'
+            "        ;;\n"
             "esac\n"
             f'exec "{BUSYBOX}" "$@"\n',
         )
@@ -552,6 +599,53 @@ class _BootWorkerFixture:
             f"latest_version={ROLLBACK_VERSION}\nlast_check_epoch=1\n",
         )
 
+    def seed_legacy_failed_candidate(self, latest_version: str = ROLLBACK_VERSION) -> None:
+        """A schema-1 (v1 updater) rollback boundary: the candidate staged on
+        slot ``b``, the health-confirm failure record the worker wrote before
+        it rebooted, and the check record the failed candidate left.
+
+        The v1 updater's pending record *is* the rollback evidence -- the boot
+        worker retires that transaction by moving the record itself -- so it
+        carries no transaction id, and the durable v2 journal the schema-2
+        rollback has does not exist for it.
+        """
+        self.write_update(
+            "pending",
+            f"schema=1\nversion={ROLLBACK_VERSION}\nslot={ROLLBACK_SLOT}\n"
+            f"boot_sha256={'0' * 64}\nupdate_channel=dev\nfeature_policy=preserve\n",
+        )
+        self.write_update(
+            "state",
+            "schema=1\nstate=restarting\nprogress=0\n"
+            "detail=health-confirm-failed:web-status\n",
+        )
+        self.write_update(
+            "check-status",
+            "schema=1\nsource=github-releases\nchannel=dev\n"
+            "status=reboot-pending\nsource_reachable=true\n"
+            f"latest_version={latest_version}\nlast_check_epoch=1\n",
+        )
+
+    def seed_legacy_rollback_record(self, latest_version: str = ROLLBACK_VERSION) -> None:
+        """The legacy device once the moved pending record is the rollback
+        history and the check record is still the failed candidate's."""
+        self.write_update(
+            "rolled-back",
+            f"schema=1\nversion={ROLLBACK_VERSION}\nslot={ROLLBACK_SLOT}\n"
+            f"boot_sha256={'0' * 64}\nupdate_channel=dev\nfeature_policy=preserve\n",
+        )
+        self.write_update(
+            "state",
+            "schema=1\nstate=restarting\nprogress=0\n"
+            "detail=health-confirm-failed:web-status\n",
+        )
+        self.write_update(
+            "check-status",
+            "schema=1\nsource=github-releases\nchannel=dev\n"
+            "status=reboot-pending\nsource_reachable=true\n"
+            f"latest_version={latest_version}\nlast_check_epoch=1\n",
+        )
+
     def seed_finalized_rollback(self, terminal_state: str = "rolled-back") -> None:
         """The device as the rollback left it: history record, frozen check
         record, and either the failed candidate's restart record or the
@@ -581,7 +675,8 @@ class _BootWorkerFixture:
         ``interrupt_at`` places the power loss inside the recovery helper:
         "pending-unlink" between the two unlinks of its live-record cleanup,
         "staging" after that cleanup but before its staging tree is removed,
-        "cleanup" once both are done, and ``None`` for a boot that completes.
+        "cleanup" once both are done, "state" between the two renames of the
+        terminal publication, and ``None`` for a boot that completes.
         """
         return subprocess.run(
             [BUSYBOX, "sh", str(self.harness)],
@@ -595,6 +690,7 @@ class _BootWorkerFixture:
                     "1" if interrupt_at == "staging" else "0"
                 ),
                 "INTERRUPT_AFTER_CLEANUP": "1" if interrupt_at == "cleanup" else "0",
+                "INTERRUPT_AFTER_STATE_RENAME": "1" if interrupt_at == "state" else "0",
             },
             text=True,
             capture_output=True,
@@ -631,7 +727,7 @@ class RollbackFinalizationResumesAfterInterruption(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.fx = _BootWorkerFixture(self.tmp)
 
-    def assert_terminal_publication(self, markers: str) -> None:
+    def assert_terminal_publication(self, markers: str, resumed: bool = True) -> None:
         state = self.fx.read_update("state")
         self.assertEqual(state["schema"], "1")
         self.assertEqual(state["state"], "rolled-back")
@@ -645,9 +741,14 @@ class RollbackFinalizationResumesAfterInterruption(unittest.TestCase):
         self.assertEqual(check["channel"], "dev")
         self.assertFalse((self.fx.update / "state.tmp").exists())
         self.assertFalse((self.fx.update / "check-status.tmp").exists())
-        self.assertIn(
-            f"ota-rollback-terminal-publication-resumed:{ROLLBACK_SLOT}", markers
-        )
+        if resumed:
+            self.assertIn(
+                f"ota-rollback-terminal-publication-resumed:{ROLLBACK_SLOT}", markers
+            )
+        else:
+            # The rollback branch itself published: the recovery path must not
+            # have pre-empted or duplicated it.
+            self.assertNotIn("ota-rollback-terminal-publication-resumed", markers)
 
     def assert_untouched_failed_candidate(self) -> None:
         state = self.fx.read_update("state")
@@ -659,6 +760,36 @@ class RollbackFinalizationResumesAfterInterruption(unittest.TestCase):
         self.assertNotIn(
             "ota-rollback-terminal-publication-resumed", self.fx.markers()
         )
+
+    def assert_legacy_rollback_evidence(self) -> None:
+        """The schema-1 rollback record is the retired pending record itself."""
+        record = self.fx.read_update("rolled-back")
+        self.assertEqual(record["schema"], "1")
+        self.assertNotIn("transaction_id", record)
+        self.assertEqual(record["version"], ROLLBACK_VERSION)
+        self.assertEqual(record["slot"], ROLLBACK_SLOT)
+
+    def assert_no_v2_cleanup(self) -> None:
+        markers = self.fx.markers()
+        for v2_marker in (
+            "ota-rollback-resume-live-record-cleaned",
+            "ota-rollback-resume-live-record-foreign",
+            "ota-rollback-resume-live-record-unsafe",
+            "ota-rollback-resume-staging-cleaned",
+            "ota-rollback-resume-staging-unsafe",
+            "ota-rollback-resume-staging-cleanup-failed",
+        ):
+            self.assertNotIn(v2_marker, markers)
+        # The recovery helper itself is never invoked for a legacy record.
+        self.assertFalse(self.fx.fallbacks.exists())
+
+    def plant_legacy_staging(self) -> Path:
+        """The v1 updater's staged tree, which no schema-1 path removes."""
+        staging = self.fx.update / "staging"
+        staging.mkdir()
+        manifest = staging / "manifest"
+        manifest.write_text("format=libreecho-ota-v1\n")
+        return manifest
 
     def test_power_loss_after_cleanup_is_finished_by_the_next_boot(self) -> None:
         self.fx.seed_failed_candidate()
@@ -964,6 +1095,124 @@ class RollbackFinalizationResumesAfterInterruption(unittest.TestCase):
         self.assertNotIn(
             "ota-rollback-terminal-publication-resumed", self.fx.markers()
         )
+
+    def test_legacy_schema_one_rollback_is_finalized_by_the_same_boot(self) -> None:
+        # The un-interrupted boundary this path exists for: a schema-1 rollback
+        # retires its transaction by moving the pending record itself -- there
+        # is no journal to retire and no transaction id in the record a later
+        # boot reads -- and then publishes the same terminal status.
+        self.fx.seed_legacy_failed_candidate()
+        manifest = self.plant_legacy_staging()
+        result = self.fx.boot()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.fx.update / "pending").exists())
+        self.assert_legacy_rollback_evidence()
+        self.assert_terminal_publication(self.fx.markers(), resumed=False)
+        self.assertIn(
+            f"ota-rollback-complete:{ROLLBACK_SLOT}:a", self.fx.markers()
+        )
+        # The v1 updater's staged tree is left as the schema-1 branch leaves it.
+        self.assertEqual(manifest.read_text(), "format=libreecho-ota-v1\n")
+        self.assertFalse(self.fx.reboots.exists())
+
+    def test_interrupted_legacy_check_publication_is_finished_by_the_next_boot(self) -> None:
+        # The boundary the schema-1 record is stranded at: the pending record is
+        # moved, the state half of the publication reaches disk, and the power
+        # is lost before the check record is renamed.  The next boot has no live
+        # transaction to enter the rollback branch with and no transaction id to
+        # match, so the legacy record it finds is the only evidence that the
+        # rollback finished -- without the legacy branch of the resume the check
+        # record would stay `reboot-pending` on every boot.
+        self.fx.seed_legacy_failed_candidate()
+        manifest = self.plant_legacy_staging()
+        interrupted = self.fx.boot(interrupt_at="state")
+        self.assertEqual(interrupted.returncode, -signal.SIGKILL, interrupted.stderr)
+        self.assertFalse((self.fx.update / "pending").exists())
+        self.assert_legacy_rollback_evidence()
+        state = self.fx.read_update("state")
+        self.assertEqual(state["state"], "rolled-back")
+        self.assertEqual(state["detail"], ROLLBACK_SLOT)
+        self.assertEqual(
+            self.fx.read_update("check-status")["status"], "reboot-pending"
+        )
+
+        recovered = self.fx.boot()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assert_terminal_publication(self.fx.markers())
+        self.assertIn("ota-rollback-resume-legacy-publication", self.fx.markers())
+        # The legacy resume publishes and does nothing else: neither v2 cleanup
+        # belongs to a record with no journal and no v2 staged tree, the v1
+        # staged tree is left exactly as found, and no second rollback runs.
+        self.assert_no_v2_cleanup()
+        self.assertEqual(manifest.read_text(), "format=libreecho-ota-v1\n")
+        self.assertEqual(
+            self.fx.markers().count("ota-rollback-terminal-publication-resumed"), 1
+        )
+        self.assertFalse(self.fx.reboots.exists())
+
+        # A later boot is a no-op: the records are already terminal.
+        before_state = (self.fx.update / "state").read_bytes()
+        terminal = (self.fx.update / "check-status").read_bytes()
+        third = self.fx.boot()
+        self.assertEqual(third.returncode, 0, third.stderr)
+        self.assertEqual((self.fx.update / "state").read_bytes(), before_state)
+        self.assertEqual((self.fx.update / "check-status").read_bytes(), terminal)
+        self.assertFalse(self.fx.reboots.exists())
+
+    def test_legacy_publication_that_never_wrote_a_record_is_finished_by_the_next_boot(self) -> None:
+        # The schema-1 branch publishes without checking the writer's status, so
+        # a state write that fails -- or a power loss before it -- leaves the
+        # moved record as the only live evidence.  Both halves are finished by
+        # the next boot.
+        self.fx.seed_legacy_failed_candidate()
+        (self.fx.update / "state.tmp").mkdir()
+        refused = self.fx.boot()
+        self.assertEqual(refused.returncode, 0, refused.stderr)
+        (self.fx.update / "state.tmp").rmdir()
+        self.assertFalse((self.fx.update / "pending").exists())
+        self.assert_legacy_rollback_evidence()
+        self.assert_untouched_failed_candidate()
+
+        recovered = self.fx.boot()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assert_terminal_publication(self.fx.markers())
+        self.assert_no_v2_cleanup()
+        self.assertFalse(self.fx.reboots.exists())
+
+    def test_legacy_resume_never_relabels_an_unrelated_check_record(self) -> None:
+        # A legacy record carries no transaction id, so the version the check
+        # record names is the only thing tying the publication to the failed
+        # candidate: a check record for another candidate is not this
+        # rollback's to rewrite.
+        self.fx.seed_legacy_rollback_record(latest_version="0.15.0")
+        result = self.fx.boot()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.fx.read_update("state")
+        self.assertEqual(state["state"], "rolled-back")
+        self.assertEqual(state["detail"], ROLLBACK_SLOT)
+        check = self.fx.read_update("check-status")
+        self.assertEqual(check["status"], "reboot-pending")
+        self.assertEqual(check["latest_version"], "0.15.0")
+        self.assertFalse((self.fx.update / "check-status.tmp").exists())
+
+    def test_legacy_resume_stands_down_while_a_live_record_exists(self) -> None:
+        # A schema-1 record cannot be matched to a surviving live record -- it
+        # names no transaction -- so a device that still has one keeps that
+        # record for its own recovery path instead of publishing a finalization
+        # on evidence that cannot be attributed to it.
+        self.fx.seed_legacy_rollback_record()
+        self.fx.write_update(
+            "feature-commit", "phase=prepared\ntransaction_id=cafebabe\n"
+        )
+        result = self.fx.boot()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "ota-rollback-resume-live-record-present:feature-commit",
+            self.fx.markers(),
+        )
+        self.assertTrue((self.fx.update / "feature-commit").is_file())
+        self.assert_untouched_failed_candidate()
+        self.assertFalse(self.fx.fallbacks.exists())
 
 
 if __name__ == "__main__":

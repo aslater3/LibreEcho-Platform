@@ -1358,16 +1358,36 @@ ota_health_confirm_worker()
         # Which transaction the finalized history names, so the one-sided live
         # record left by an interrupted retirement can be matched to it.
         resume_transaction=$($BB sed -n 's/^transaction_id=//p' /data/libreecho/update/rolled-back 2>/dev/null)
-        [ -n "$resume_transaction" ] || {
-            log ota-rollback-resume-evidence-invalid
-            return 0
-        }
-        # The retirement and the staging tree are the two helper steps an
-        # interruption can cut short, and the helper will not resume either, so
-        # the terminal records are only published once both are finished -- or
-        # the boot retries.
-        ota_rollback_resume_live_records || return 0
-        ota_rollback_resume_staging_cleanup || return 0
+        resume_schema=$($BB sed -n 's/^schema=//p' /data/libreecho/update/rolled-back 2>/dev/null)
+        if [ -n "$resume_transaction" ]; then
+            # The retirement and the staging tree are the two helper steps an
+            # interruption can cut short, and the helper will not resume
+            # either, so the terminal records are only published once both are
+            # finished -- or the boot retries.
+            ota_rollback_resume_live_records || return 0
+            ota_rollback_resume_staging_cleanup || return 0
+        else
+            # A legacy schema-1 rollback retires its transaction by moving the
+            # pending record itself, so the record that survives an
+            # interruption carries no transaction id and has no durable v2
+            # journal beside it: the moved record is the rollback evidence and
+            # the publication below is the whole of the remaining step, so
+            # neither v2 cleanup is run for it -- the schema-1 branch does not
+            # run them either.  Anything else without a transaction id is not
+            # this worker's rollback record, and a surviving live record is a
+            # transaction whose own recovery path owns those records.
+            [ "$resume_schema" = 1 ] || {
+                log ota-rollback-resume-evidence-invalid
+                return 0
+            }
+            for resume_live in pending feature-commit; do
+                [ ! -e "/data/libreecho/update/$resume_live" ] || {
+                    log "ota-rollback-resume-live-record-present:$resume_live"
+                    return 0
+                }
+            done
+            log ota-rollback-resume-legacy-publication
+        fi
         if ota_rollback_publish_terminal "$resume_slot"; then
             log "ota-rollback-terminal-publication-resumed:$resume_slot"
         else
