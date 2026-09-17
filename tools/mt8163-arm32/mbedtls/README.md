@@ -50,6 +50,11 @@ builder, which fails closed if either is missing or different:
 | jinja2 | 3.1.6 | PSA driver wrapper templates |
 | jsonschema | 4.25.1 | PSA driver JSON specification validation |
 
+`SOURCE.lock` also records the interpreter floor for those pins: the jsonschema
+release declares `Requires-Python >=3.9`, and the builder rejects an older
+interpreter before doing any work rather than failing later on a pin that cannot
+be installed.
+
 Install them for the interpreter that runs the build, for example:
 
 ```sh

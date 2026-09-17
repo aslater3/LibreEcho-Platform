@@ -4119,6 +4119,14 @@ class UiTlsPackagingTests(unittest.TestCase):
         requirements = lock["build_requirements"]
         for package in ("jinja2", "jsonschema"):
             self.assertRegex(requirements[package], r"^\d+\.\d+\.\d+$")
+        # The pinned jsonschema release declares Requires-Python >=3.9 (jinja2
+        # 3.1.6 allows 3.7), so a lower advertised floor would name a build host
+        # that cannot install the pin the builder then requires.
+        floor = requirements["python3"]
+        self.assertRegex(floor, r"^>=\d+\.\d+$")
+        self.assertGreaterEqual(
+            tuple(int(part) for part in floor[2:].split(".")), (3, 9)
+        )
 
         builder = (TOOLS_DIR / "mbedtls/build_mbedtls.sh").read_text()
         self.assertIn("SOURCE.lock", builder)
@@ -4719,6 +4727,13 @@ class UiTlsPackagingTests(unittest.TestCase):
         interpreter.write_text(
             "#!/bin/sh\n"
             'if [ "${1:-}" = "-c" ] || [ "${2:-}" = "-c" ]; then\n'
+            "  # The builder reads the interpreter version to check the locked\n"
+            "  # floor and to record the build, so a host older than that floor can\n"
+            "  # be exercised from a fixture.\n"
+            '  if [ -n "${LE_TEST_PYTHON_VERSION:-}" ]; then\n'
+            "    printf '%s\\n' \"$LE_TEST_PYTHON_VERSION\"\n"
+            "    exit 0\n"
+            "  fi\n"
             f'  exec "{sys.executable}" "$@"\n'
             "fi\n"
             "captured=$(mktemp)\n"
@@ -4760,6 +4775,7 @@ class UiTlsPackagingTests(unittest.TestCase):
         name: str,
         output: Path | None = None,
         race_output: Path | None = None,
+        python_version: str | None = None,
     ) -> tuple[subprocess.CompletedProcess, Path]:
         lock = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())
         environment = os.environ.copy()
@@ -4771,6 +4787,12 @@ class UiTlsPackagingTests(unittest.TestCase):
         # inject the race into a build that is not asking for it.
         environment["LE_TEST_RACE_OUTPUT"] = (
             str(race_output) if race_output is not None else ""
+        )
+        # Empty means "report the real interpreter version"; the fixture shim
+        # answers only the version query, so a host below the locked floor can
+        # be exercised without changing the interpreter that runs the build.
+        environment["LE_TEST_PYTHON_VERSION"] = (
+            python_version if python_version is not None else ""
         )
         environment["LE_TEST_FILE_DESCRIPTION"] = (
             "ELF 32-bit LSB relocatable, ARM, EABI5 version 1 (SYSV)"
@@ -4951,6 +4973,43 @@ class UiTlsPackagingTests(unittest.TestCase):
             self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
             self.assertIn("atomic no-replace publication", refused.stderr)
             self.assertFalse(output.exists(), refused.stdout + refused.stderr)
+
+    def test_mbedtls_builder_enforces_the_locked_python_floor(self) -> None:
+        """Codex review: the advertised interpreter floor must be enforced.
+
+        `SOURCE.lock` advertised a floor its own pinned requirement cannot
+        support: jsonschema 4.25.1 declares `Requires-Python >=3.9`, so a host the
+        lock claimed was supported failed later with an uninstallable pinned
+        package instead of a clear refusal.  The floor is raised to the pin's own
+        requirement and read from the lock, so the builder refuses an older
+        interpreter before it does any work.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+            floor = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())[
+                "build_requirements"
+            ]["python3"]
+
+            older, older_output = self.run_mbedtls_builder(
+                fixture,
+                leaked_path=False,
+                name="older-python",
+                python_version="3.8.10",
+            )
+            self.assertEqual(older.returncode, 1, older.stdout + older.stderr)
+            self.assertIn("older than the pinned floor", older.stderr)
+            self.assertIn(floor, older.stderr)
+            self.assertFalse(older_output.exists(), older.stdout + older.stderr)
+
+            # The supported interpreter the fixture reports by default still
+            # builds and publishes, so the floor is not enforced over-eagerly.
+            supported, supported_output = self.run_mbedtls_builder(
+                fixture, leaked_path=False, name="supported-python"
+            )
+            self.assertEqual(
+                supported.returncode, 0, supported.stdout + supported.stderr
+            )
+            self.assertTrue((supported_output / "mbedtls-source.json").is_file())
 
     def test_ui_tls_verifier_rejects_a_prefix_with_headers_off_the_pin(self) -> None:
         """Codex review: the consumed headers must be bound to the pin.

@@ -77,6 +77,43 @@ actual_archive_sha=$(sha256sum "$ARCHIVE" | awk '{print $1}')
   exit 1
 }
 
+# The lock's interpreter floor is enforced here, before any work.  The pinned
+# build requirements carry their own Requires-Python metadata (jsonschema 4.25.1
+# requires 3.9), so an interpreter below the floor cannot install them at all and
+# would otherwise fail much later with an unresolvable pinned package instead of
+# a clear refusal.
+python_floor=$("$PYTHON" - "$SOURCE_LOCK" <<'PY'
+import json
+import sys
+
+lock = json.load(open(sys.argv[1], encoding="utf-8"))
+floor = (lock.get("build_requirements") or {}).get("python3")
+if not isinstance(floor, str) or not floor:
+    sys.exit("ERROR: SOURCE.lock does not pin the python3 build requirement floor")
+print(floor)
+PY
+) || exit 1
+python_version=$("$PYTHON" -c 'import platform;print(platform.python_version())')
+[[ "$python_floor" =~ ^\>=([0-9]+)\.([0-9]+)$ ]] || {
+  printf 'ERROR: unsupported python3 floor in SOURCE.lock: %s\n' "$python_floor" >&2
+  exit 1
+}
+floor_major=${BASH_REMATCH[1]}
+floor_minor=${BASH_REMATCH[2]}
+[[ "$python_version" =~ ^([0-9]+)\.([0-9]+) ]] || {
+  printf 'ERROR: cannot read the interpreter version: %s\n' "$PYTHON" >&2
+  exit 1
+}
+python_major=${BASH_REMATCH[1]}
+python_minor=${BASH_REMATCH[2]}
+if ((10#$python_major < 10#$floor_major)) \
+  || { ((10#$python_major == 10#$floor_major)) \
+    && ((10#$python_minor < 10#$floor_minor)); }; then
+  printf 'ERROR: python %s is older than the pinned floor %s: %s\n' \
+    "$python_version" "$python_floor" "$PYTHON" >&2
+  exit 1
+fi
+
 # The pinned Python packages are build requirements: the release tarball ships
 # generated PSA driver wrappers that the library Makefile regenerates with the
 # bundled Jinja templates.
@@ -238,9 +275,8 @@ if grep -qE "$work|/home/" "$leak_scan"; then
 fi
 
 compiler_version=$("$CC" --version | sed -n '1p')
-python_version=$("$PYTHON" -c 'import platform;print(platform.python_version())')
-# Python 3.8 is the floor this lock permits, so the record uses only
-# 3.8-compatible syntax (str.removesuffix is 3.9+).
+# python_version was read and checked against the lock's interpreter floor above.
+# The record uses only syntax that floor permits.
 "$PYTHON" - "$STAGE" "$SOURCE_LOCK" "$compiler_version" "$python_version" <<'PY'
 import hashlib
 import json
