@@ -122,6 +122,38 @@ STAGE="${OUTPUT}.stage.$$"
   exit 1
 }
 trap 'rm -rf "$work" "$STAGE"' EXIT
+# Publication below is a no-replace rename, and its two options are what make a
+# concurrent build safe: `-T` never treats an existing directory as a container
+# for the stage, and `-n` never replaces what is already there.  Probe the live
+# `mv` once, before any work, because an `mv` that does not provide those
+# semantics would turn a concurrent publication into a contaminated prefix plus
+# a success status - the exact failure this guard exists to prevent.
+probe_mv_no_replace() {
+  local probe="$work/mv-probe" status=0
+  mkdir -p "$probe/source" "$probe/target"
+  printf 'incumbent\n' > "$probe/target/incumbent"
+  mv -T -n -- "$probe/source" "$probe/target" 2>"$work/mv-probe.log" || status=$?
+  # `mv` reports a refused no-replace rename with 0 or 1; 2 or more is its own
+  # usage error, which is what an unsupported -T/-n looks like.
+  (( status <= 1 )) || return 1
+  # The refused rename must leave both sides exactly as they were: the existing
+  # directory is neither replaced nor treated as a container for the stage.
+  [[ -d "$probe/source" && -f "$probe/target/incumbent" \
+    && ! -e "$probe/target/source" ]] || return 1
+  # The same invocation must still publish a staged directory when the target is
+  # absent, so a probe cannot pass on an `mv` that silently ignores both options.
+  status=0
+  mv -T -n -- "$probe/source" "$probe/fresh" 2>>"$work/mv-probe.log" || status=$?
+  [[ $status -eq 0 && -d "$probe/fresh" && ! -e "$probe/source" ]] || return 1
+  rm -rf "$probe"
+  return 0
+}
+probe_mv_no_replace || {
+  printf 'ERROR: mv does not provide atomic no-replace publication (-T -n): %s\n' \
+    "$(command -v mv)" >&2
+  cat "$work/mv-probe.log" >&2
+  exit 1
+}
 tar -xjf "$ARCHIVE" -C "$work"
 src="$work/mbedtls-$mbedtls_version"
 [[ -f "$src/LICENSE" && -f "$src/library/Makefile" && -f "$src/include/mbedtls/ssl.h" ]] || {
@@ -268,6 +300,31 @@ for name, value in sorted(record["archives"].items()):
 print("mbedtls_archives=3")
 PY
 
-# Only a fully checked prefix is moved into place, and the rename is atomic
-# because the staging directory sits beside the requested output path.
-mv "$STAGE" "$OUTPUT"
+# Only a fully checked prefix is published, by a rename that must not replace
+# anything: the staging directory sits beside the requested output path, so the
+# rename is atomic on one filesystem.  The existence check above is a fast
+# refusal, not the race guard - two builders can both see an absent OUTPUT and
+# both finish - so the rename itself carries the contract.  Under `-T` an OUTPUT
+# that appeared meanwhile is a path rather than a container, and under `-n` it is
+# never replaced: the second builder fails closed instead of nesting its stage
+# inside the published prefix.  The stage is asserted to be gone afterwards so
+# that the failure is observed rather than inferred from mv's exit status, and
+# the EXIT trap removes the stage, so an incumbent prefix is never replaced,
+# nested into, or partially overwritten.
+publish_status=0
+mv -T -n -- "$STAGE" "$OUTPUT" 2>"$work/mv-publish.log" || publish_status=$?
+if [[ -e "$STAGE" || -L "$STAGE" ]]; then
+  if [[ -e "$OUTPUT" || -L "$OUTPUT" ]]; then
+    printf 'ERROR: refusing to publish the mbedTLS prefix: %s appeared during the build\n' \
+      "$OUTPUT" >&2
+  else
+    printf 'ERROR: could not publish the mbedTLS prefix: %s\n' "$OUTPUT" >&2
+  fi
+  cat "$work/mv-publish.log" >&2
+  exit 1
+fi
+if ((publish_status != 0)) || [[ ! -f "$OUTPUT/mbedtls-source.json" ]]; then
+  printf 'ERROR: failed to publish the mbedTLS prefix: %s\n' "$OUTPUT" >&2
+  cat "$work/mv-publish.log" >&2
+  exit 1
+fi

@@ -4659,6 +4659,15 @@ class UiTlsPackagingTests(unittest.TestCase):
                   esac
                 done
                 [ -n "$dir" ] || exit 1
+                # A concurrent builder that started with the same absent output
+                # publishes it while this build is still running, so the target
+                # appears after the builder's own existence check has passed.
+                if [ -n "${LE_TEST_RACE_OUTPUT:-}" ] && [ ! -e "$LE_TEST_RACE_OUTPUT" ]; then
+                  mkdir -p "$LE_TEST_RACE_OUTPUT/lib" "$LE_TEST_RACE_OUTPUT/include/mbedtls"
+                  printf '%s\\n' incumbent > "$LE_TEST_RACE_OUTPUT/lib/libmbedtls.a"
+                  printf '%s\\n' incumbent > "$LE_TEST_RACE_OUTPUT/include/mbedtls/build_info.h"
+                  printf '%s\\n' incumbent > "$LE_TEST_RACE_OUTPUT/mbedtls-source.json"
+                fi
                 # The builder's private work directory, exactly as the real
                 # prefix-map flags would record it in the objects.
                 work=$(cd "$dir/../.." && pwd -P)
@@ -4750,6 +4759,7 @@ class UiTlsPackagingTests(unittest.TestCase):
         leaked_path: bool,
         name: str,
         output: Path | None = None,
+        race_output: Path | None = None,
     ) -> tuple[subprocess.CompletedProcess, Path]:
         lock = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())
         environment = os.environ.copy()
@@ -4757,6 +4767,11 @@ class UiTlsPackagingTests(unittest.TestCase):
         environment["LE_TEST_PINNED_ARCHIVE_SHA256"] = lock["source_sha256"]
         environment["LE_TEST_ARCHIVE_LEAK"] = "1" if leaked_path else "0"
         environment["LE_TEST_FIXTURE_DIR"] = str(fixture["workdir"])
+        # Always set, so a value inherited from the host environment cannot
+        # inject the race into a build that is not asking for it.
+        environment["LE_TEST_RACE_OUTPUT"] = (
+            str(race_output) if race_output is not None else ""
+        )
         environment["LE_TEST_FILE_DESCRIPTION"] = (
             "ELF 32-bit LSB relocatable, ARM, EABI5 version 1 (SYSV)"
         )
@@ -4838,6 +4853,104 @@ class UiTlsPackagingTests(unittest.TestCase):
             )
             self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
             self.assertFalse(failed_output.exists(), failed.stdout + failed.stderr)
+
+    @staticmethod
+    def mbedtls_tree_snapshot(root: Path) -> dict[str, bytes | None]:
+        """Map every path below root to its bytes; a directory maps to None.
+
+        The race assertions compare the published prefix against this snapshot,
+        so a nested staging tree, a partially written prefix, or any extra
+        directory is a difference rather than something to remember to check.
+        """
+        return {
+            path.relative_to(root).as_posix(): (
+                path.read_bytes() if path.is_file() else None
+            )
+            for path in sorted(root.rglob("*"))
+        }
+
+    def test_mbedtls_builder_refuses_a_concurrent_publication(self) -> None:
+        """Codex review: publication must not replace a prefix that arrived.
+
+        Two builders can both pass the initial "output is absent" check and then
+        build for minutes.  When the first publishes, a plain `mv STAGE OUTPUT`
+        treats the now-existing directory as a container: the second builder's
+        staging tree is renamed *inside* the published prefix and the command
+        still reports success, so the loser believes it published its validated
+        prefix while the incumbent is contaminated.  The publication rename must
+        be non-replacing and must fail closed instead, leaving the incumbent
+        prefix byte-identical, removing the losing stage, and writing nothing
+        partial over the published prefix.
+
+        The race is injected where it happens: the target appears while the
+        pinned build is running, after the builder's own existence check on the
+        output path has already passed.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+            workdir = fixture["workdir"]
+
+            raced, raced_output = self.run_mbedtls_builder(
+                fixture,
+                leaked_path=False,
+                name="raced-output",
+                race_output=workdir / "raced-output",
+            )
+            self.assertEqual(raced.returncode, 1, raced.stdout + raced.stderr)
+            self.assertIn("appeared during the build", raced.stderr)
+
+            # Exactly what the other builder published, and nothing else.
+            self.assertEqual(
+                self.mbedtls_tree_snapshot(raced_output),
+                {
+                    "include": None,
+                    "include/mbedtls": None,
+                    "include/mbedtls/build_info.h": b"incumbent\n",
+                    "lib": None,
+                    "lib/libmbedtls.a": b"incumbent\n",
+                    "mbedtls-source.json": b"incumbent\n",
+                },
+                raced.stdout + raced.stderr,
+            )
+            # The loser's stage is removed with its private work directory
+            # instead of being left beside the published prefix.
+            self.assertEqual(
+                sorted(path.name for path in workdir.glob("raced-output.stage.*")),
+                [],
+                raced.stdout + raced.stderr,
+            )
+
+    def test_mbedtls_builder_requires_no_replace_rename_semantics(self) -> None:
+        """The publication guard must not rest on an unchecked `mv`.
+
+        `-T` and `-n` are the whole no-replace contract, and an `mv` that accepts
+        those options but ignores them is exactly the implementation that nests a
+        stage inside a published prefix.  The builder probes the live `mv` before
+        doing any work, so such an `mv` fails closed at startup instead of
+        contaminating a prefix later.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+            shim = fixture["shims"] / "mv"
+            shim.write_text(
+                "#!/bin/bash\n"
+                "args=()\n"
+                'for a in "$@"; do\n'
+                '  case "$a" in\n'
+                "    -T|-n) ;;\n"
+                '    *) args+=("$a") ;;\n'
+                "  esac\n"
+                "done\n"
+                'exec /usr/bin/mv "${args[@]}"\n'
+            )
+            shim.chmod(0o755)
+
+            refused, output = self.run_mbedtls_builder(
+                fixture, leaked_path=False, name="unprobeable-output"
+            )
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("atomic no-replace publication", refused.stderr)
+            self.assertFalse(output.exists(), refused.stdout + refused.stderr)
 
     def test_ui_tls_verifier_rejects_a_prefix_with_headers_off_the_pin(self) -> None:
         """Codex review: the consumed headers must be bound to the pin.
