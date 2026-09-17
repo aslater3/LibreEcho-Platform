@@ -4776,6 +4776,7 @@ class UiTlsPackagingTests(unittest.TestCase):
         output: Path | None = None,
         race_output: Path | None = None,
         python_version: str | None = None,
+        tmpdir: Path | None = None,
     ) -> tuple[subprocess.CompletedProcess, Path]:
         lock = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())
         environment = os.environ.copy()
@@ -4794,6 +4795,11 @@ class UiTlsPackagingTests(unittest.TestCase):
         environment["LE_TEST_PYTHON_VERSION"] = (
             python_version if python_version is not None else ""
         )
+        # The builder's private work directory is named after TMPDIR; a caller
+        # that needs a temporary path containing a shell or ERE metacharacter
+        # supplies one instead of relying on the host's TMPDIR.
+        if tmpdir is not None:
+            environment["TMPDIR"] = str(tmpdir)
         environment["LE_TEST_FILE_DESCRIPTION"] = (
             "ELF 32-bit LSB relocatable, ARM, EABI5 version 1 (SYSV)"
         )
@@ -4843,6 +4849,43 @@ class UiTlsPackagingTests(unittest.TestCase):
             )
             self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
             self.assertIn("mbedtls_archives=3", clean.stdout)
+            self.assertTrue((clean_output / "mbedtls-source.json").is_file())
+
+    def test_mbedtls_builder_matches_a_leaked_path_literally(self) -> None:
+        """Codex review: the leak scan must not read the build path as a pattern.
+
+        `$work` was interpolated into a `grep -E` pattern, so an ERE
+        metacharacter in TMPDIR changed it: with a `+` in the temporary directory
+        the private build path no longer matched itself, the nonzero status was
+        read as "no leak", and an archive that carries that path was published.
+        The scan matches both patterns literally and fails closed on a status
+        that means neither "matched" nor "no match".
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+            pattern_tmp = fixture["workdir"] / "build+cache"
+            pattern_tmp.mkdir()
+
+            leaked, leaked_output = self.run_mbedtls_builder(
+                fixture,
+                leaked_path=True,
+                name="output-pattern",
+                tmpdir=pattern_tmp,
+            )
+            embedded = (fixture["workdir"] / "leaked-build-path.txt").read_text()
+            self.assertIn("build+cache", embedded)
+            self.assertEqual(leaked.returncode, 1, leaked.stdout + leaked.stderr)
+            self.assertIn("private build path", leaked.stderr)
+            self.assertFalse(leaked_output.exists(), leaked.stdout + leaked.stderr)
+
+            # A clean build under the same temporary directory still publishes.
+            clean, clean_output = self.run_mbedtls_builder(
+                fixture,
+                leaked_path=False,
+                name="output-pattern-clean",
+                tmpdir=pattern_tmp,
+            )
+            self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
             self.assertTrue((clean_output / "mbedtls-source.json").is_file())
 
     def test_mbedtls_builder_refuses_to_erase_an_existing_output(self) -> None:

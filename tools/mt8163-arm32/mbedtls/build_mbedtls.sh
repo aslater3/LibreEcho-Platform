@@ -270,8 +270,20 @@ packed_version=$(sed -n 's/^#define MBEDTLS_VERSION_STRING  *"\(.*\)"$/\1/p' \
 leak_scan="$work/mbedtls-build-paths.txt"
 strings -a "$STAGE/lib/libmbedtls.a" "$STAGE/lib/libmbedx509.a" \
   "$STAGE/lib/libmbedcrypto.a" > "$leak_scan"
-if grep -qE "$work|/home/" "$leak_scan"; then
+# Both patterns are literal paths, not patterns: `$work` is interpolated into
+# this match, and an ERE metacharacter in TMPDIR (a `+`, `[`, or `*`) would
+# otherwise change the pattern or make it invalid, so the private build path
+# would not match itself and an archive carrying it would be published.  The
+# status is inspected explicitly for the same reason: only 1 means "no match",
+# and a scan that could not be read must not be reported as a clean one.
+leak_status=0
+grep -qF -e "$work" -e '/home/' -- "$leak_scan" || leak_status=$?
+if ((leak_status == 0)); then
   printf 'ERROR: mbedTLS archives contain a private build path\n' >&2; exit 1
+fi
+if ((leak_status != 1)); then
+  printf 'ERROR: could not scan the mbedTLS archives for private build paths\n' >&2
+  exit 1
 fi
 
 compiler_version=$("$CC" --version | sed -n '1p')
