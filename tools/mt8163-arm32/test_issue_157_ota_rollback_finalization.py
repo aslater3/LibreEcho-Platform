@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import unittest
@@ -67,6 +68,32 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
         self.assertIn("s/^latest_version=//p", publish)
         self.assertIn('= "$rollback_version"', publish)
         self.assertIn("/data/libreecho/update/rolled-back", publish)
+
+    def test_boot_worker_retries_an_interrupted_publication_on_every_boot(self) -> None:
+        # The interruption the recovery path exists for: the finalized rollback
+        # record survives, the live transaction does not, and the terminal
+        # records were never written.
+        resume = extract_function(self.init, "ota_rollback_resume_terminal")
+        self.assertIn("/data/libreecho/update/pending", resume)
+        self.assertIn("/data/libreecho/update/feature-commit", resume)
+        self.assertIn("s/^state=//p", resume)
+        self.assertIn("detail=//p", resume)
+        self.assertIn("s/^slot=//p", resume)
+        self.assertIn('ota_rollback_publish_terminal "$resume_slot"', resume)
+        # Fail closed: a refused publication is retried, not forced, and the
+        # slot the history record names is the only one that may be published.
+        self.assertIn("log ota-rollback-resume-evidence-invalid", resume)
+        self.assertIn("ota-rollback-terminal-publication-retry-queued", resume)
+        # The retry must run on every boot of an OTA image, before the boot
+        # decides whether a live transaction exists at all -- reachable only
+        # from one branch is the bug this path fixes.
+        call = self.worker.index("ota_rollback_resume_terminal\n")
+        self.assertLess(call, self.worker.index("if [ -r /data/libreecho/update/pending ]"))
+        self.assertLess(
+            self.worker.index("ota_rollback_resume_terminal()"),
+            self.worker.index("ota_rollback_resume_terminal\n"),
+        )
+        self.assertEqual(self.worker.count("\n    ota_rollback_resume_terminal\n"), 1)
 
     def test_v2_finalization_verifies_postconditions_before_claiming_cleanup(self) -> None:
         confirm = extract_function(self.init, "ota_v2_fallback_confirmed")
@@ -292,6 +319,364 @@ class RollbackFinalizationBehaviour(unittest.TestCase):
         self.assertEqual(state["state"], "rolled-back")
         self.assertEqual(state["detail"], "a")
         self.assertEqual(self.fx.read("check-status")["status"], "update-held-after-rollback")
+
+
+# Absolute roots the shipped boot worker touches.  They are redirected into a
+# sandbox in one pass so the boot decision under test is the shipped one.
+BOOT_WORKER_ROOTS = (
+    "/data/libreecho",
+    "/usr/local/sbin",
+    "/etc/init.d",
+    "/var/run",
+    "/run/libreecho",
+    "/proc/cmdline",
+    "/proc/mounts",
+    "/tmp/",
+)
+
+ROLLBACK_VERSION = "0.14.99"
+ROLLBACK_SLOT = "b"
+FALLBACK_INTERRUPTED = "ota-v2-fallback-preserved-for-recovery"
+
+
+class _BootWorkerFixture:
+    """A disposable root filesystem that runs the real boot worker.
+
+    ``ota_health_confirm_worker`` is lifted verbatim from the shipped PID 1
+    script and every absolute path it uses is redirected into this sandbox, so
+    the branch it takes, the records it writes and the retries it schedules are
+    the shipped ones.  The packaged helpers it shells out to are stubs: this
+    proves the Platform boot contract -- which records survive a boot, and when
+    the worker republishes them -- not the rollback logic inside those helpers.
+    ``reboot`` is stubbed as well, so a host test can never reboot the machine
+    running it.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.update = root / "data/libreecho/update"
+        self.update.mkdir(parents=True)
+        self.boot_log = root / "boot.log"
+        self.reboots = root / "reboots.log"
+        self.fallbacks = root / "fallbacks.log"
+        for directory in (
+            "usr/local/sbin", "etc/init.d", "etc/libreecho", "var/run",
+            "run/libreecho", "proc", "tmp",
+        ):
+            (root / directory).mkdir(parents=True, exist_ok=True)
+        # The slot the bootloader returned to and the per-slot success flags.
+        (root / "proc/cmdline").write_text(
+            "console=ttyMSM0 androidboot.slot_suffix=_a\n"
+        )
+        (root / "proc/mounts").write_text("")
+        # The image's first-install marker is a build-time file, so it is
+        # present and valid on every device that can be running a rollback.
+        (root / "etc/libreecho/first-install-confirm").write_text(
+            "schema=1\nmode=first-install\nboard=radar_puffin\n"
+        )
+        self.shim = self._write(
+            root / "bb",
+            "#!/bin/sh\n"
+            "# BusyBox with the boot-mutating applets neutralised.\n"
+            'case "${1:-}" in\n'
+            f'    reboot) printf \'%s\\n\' "$*" >>"{self.reboots}"; exit 0 ;;\n'
+            "    sleep) exit 0 ;;\n"
+            "    sync) exit 0 ;;\n"
+            "esac\n"
+            f'exec "{BUSYBOX}" "$@"\n',
+        )
+        self._write(
+            root / "usr/local/sbin/libreecho-bootctl",
+            "#!/bin/sh\n"
+            "# The previously confirmed slot is running and stays selected.\n"
+            "printf 'selected_slot=a\\nslot_a_success=1\\nslot_b_success=0\\n'\n",
+        )
+        self._write(
+            root / "usr/local/sbin/libreecho-update",
+            "#!/bin/sh\n"
+            'if [ "${1:-}" = status ]; then printf \'state=rolled-back\\n\'; fi\n'
+            "exit 0\n",
+        )
+        self._write(
+            root / "usr/local/sbin/libreecho-feature-transaction",
+            "#!/bin/sh\n"
+            "# Stub for the packaged recovery helper: it retires the live\n"
+            "# schema-2 transaction exactly as the shipped helper does, and\n"
+            "# then optionally dies mid-boot the way a power loss does.\n"
+            "set -u\n"
+            f'update="{self.update}"\n'
+            f'printf \'%s\\n\' "${{1:-}}" >>"{self.fallbacks}"\n'
+            '[ "${1:-}" = fallback ] || exit 0\n'
+            'rm -f "$update/pending" "$update/feature-commit"\n'
+            'rm -rf "$update/staging"\n'
+            "printf 'schema=2\\ntransaction_id=deadbeef\\nversion=%s\\nslot=%s\\n' \\\n"
+            f"    '{ROLLBACK_VERSION}' '{ROLLBACK_SLOT}' >\"$update/rolled-back\"\n"
+            'if [ "${INTERRUPT_AFTER_CLEANUP:-0}" = 1 ]; then\n'
+            '    kill -KILL "$PPID"\n'
+            "fi\n"
+            "exit 0\n",
+        )
+        self.harness = self._write(
+            root / "worker.sh",
+            "#!/bin/busybox sh\n"
+            "set -u\n"
+            f'BB="{self.shim}"\n'
+            "IMAGE_PROFILE=ota\n"
+            "FEATURE_POLICY=preserve\n"
+            "SERVICE_PROFILE=production\n"
+            f'FIRST_INSTALL_MARKER="{root}/etc/libreecho/first-install-confirm"\n'
+            f'STARTUP_READY="{root}/run/libreecho/startup-ready"\n'
+            "RUNTIME_ROOT=/run/libreecho/features\n"
+            "MDNS_RUNTIME_ROOT=/usr/local/lib/libreecho-mdns/root\n"
+            "NF=3\n"
+            'INIT_TEST_LOG="${BOOT_LOG:?}"\n'
+            'log() { printf \'%s\\n\' "$*" >>"$INIT_TEST_LOG"; }\n'
+            "pmsg_marker() { :; }\n"
+            + self._redirected_worker()
+            + "\nota_health_confirm_worker\nexit $?\n",
+        )
+
+    def _write(self, path: Path, text: str) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        path.chmod(0o755)
+        return path
+
+    def _redirected_worker(self) -> str:
+        body = worker_body(INIT.read_text())
+        # One pass: a replacement must never be rescanned, or the sandbox
+        # prefix itself would be rewritten a second time.
+        return re.sub(
+            "|".join(re.escape(part) for part in BOOT_WORKER_ROOTS),
+            lambda found: f"{self.root}{found.group(0)}",
+            body,
+        )
+
+    def write_update(self, name: str, text: str) -> None:
+        (self.update / name).write_text(text)
+
+    def read_update(self, name: str) -> dict[str, str]:
+        return dict(
+            line.split("=", 1)
+            for line in (self.update / name).read_text().splitlines()
+            if "=" in line
+        )
+
+    def markers(self) -> str:
+        return self.boot_log.read_text() if self.boot_log.exists() else ""
+
+    def seed_failed_candidate(self) -> None:
+        """The failed candidate's live transaction and the records it left."""
+        self.write_update(
+            "pending",
+            f"schema=2\ntransaction_id=deadbeef\nversion={ROLLBACK_VERSION}\n"
+            f"slot={ROLLBACK_SLOT}\n",
+        )
+        self.write_update(
+            "feature-commit", "phase=committed\ntransaction_id=deadbeef\n"
+        )
+        self.write_update(
+            "state",
+            "schema=1\nstate=restarting\nprogress=0\n"
+            "detail=health-confirm-failed:web-status\n",
+        )
+        self.write_update(
+            "check-status",
+            "schema=1\nsource=github-releases\nchannel=dev\n"
+            "status=reboot-pending\nsource_reachable=true\n"
+            f"latest_version={ROLLBACK_VERSION}\nlast_check_epoch=1\n",
+        )
+
+    def seed_finalized_rollback(self, terminal_state: str = "rolled-back") -> None:
+        """The device as the rollback left it: history record, frozen check
+        record, and either the failed candidate's restart record or the
+        terminal state that was published before the interruption."""
+        self.write_update(
+            "rolled-back",
+            f"schema=2\ntransaction_id=deadbeef\nversion={ROLLBACK_VERSION}\n"
+            f"slot={ROLLBACK_SLOT}\n",
+        )
+        self.write_update(
+            "check-status",
+            "schema=1\nsource=github-releases\nchannel=dev\n"
+            "status=reboot-pending\nsource_reachable=true\n"
+            f"latest_version={ROLLBACK_VERSION}\nlast_check_epoch=1\n",
+        )
+        self.write_update(
+            "state",
+            "schema=1\nstate=rolled-back\nprogress=100\ndetail=b\n"
+            if terminal_state == "rolled-back"
+            else "schema=1\nstate=restarting\nprogress=0\n"
+            "detail=health-confirm-failed:web-status\n",
+        )
+
+    def boot(self, interrupted: bool = False) -> subprocess.CompletedProcess[str]:
+        """Run one boot of the shipped worker against the sandbox root."""
+        return subprocess.run(
+            [BUSYBOX, "sh", str(self.harness)],
+            env={
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "BOOT_LOG": str(self.boot_log),
+                "INTERRUPT_AFTER_CLEANUP": "1" if interrupted else "0",
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+
+    def assert_cleanup_happened(self) -> None:
+        for gone in ("pending", "feature-commit", "staging"):
+            if (self.update / gone).exists():
+                raise AssertionError(f"live record survived the rollback: {gone}")
+        if not (self.update / "rolled-back").is_file():
+            raise AssertionError("the finalized rollback record is missing")
+
+
+@unittest.skipUnless(os.path.exists(BUSYBOX), "busybox is required for the host fixture")
+class RollbackFinalizationResumesAfterInterruption(unittest.TestCase):
+    """A finalized rollback must reach its terminal records across a reboot.
+
+    The recovery helper retires the live transaction *before* the worker
+    publishes the terminal status, so a power loss (or a failed write) in
+    between leaves a device that no later boot can finish: the transaction the
+    rollback branch retires is already gone.  These tests run the shipped boot
+    worker itself, on boot after boot, instead of invoking its extracted
+    publisher, so the recovery path -- not just the writer -- is what is proven.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.init = INIT.read_text()
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="libreecho-boot-worker-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.fx = _BootWorkerFixture(self.tmp)
+
+    def assert_terminal_publication(self, markers: str) -> None:
+        state = self.fx.read_update("state")
+        self.assertEqual(state["schema"], "1")
+        self.assertEqual(state["state"], "rolled-back")
+        self.assertEqual(state["progress"], "100")
+        self.assertEqual(state["detail"], ROLLBACK_SLOT)
+        check = self.fx.read_update("check-status")
+        self.assertEqual(check["status"], "update-held-after-rollback")
+        self.assertEqual(check["latest_version"], ROLLBACK_VERSION)
+        # The rewrite keeps the rest of the check record.
+        self.assertEqual(check["last_check_epoch"], "1")
+        self.assertEqual(check["channel"], "dev")
+        self.assertFalse((self.fx.update / "state.tmp").exists())
+        self.assertFalse((self.fx.update / "check-status.tmp").exists())
+        self.assertIn(
+            f"ota-rollback-terminal-publication-resumed:{ROLLBACK_SLOT}", markers
+        )
+
+    def assert_untouched_failed_candidate(self) -> None:
+        state = self.fx.read_update("state")
+        self.assertEqual(state["state"], "restarting")
+        self.assertEqual(state["detail"], "health-confirm-failed:web-status")
+        self.assertEqual(
+            self.fx.read_update("check-status")["status"], "reboot-pending"
+        )
+        self.assertNotIn(
+            "ota-rollback-terminal-publication-resumed", self.fx.markers()
+        )
+
+    def test_power_loss_after_cleanup_is_finished_by_the_next_boot(self) -> None:
+        self.fx.seed_failed_candidate()
+        # Boot 1: the rollback branch retires the transaction and the device
+        # loses power before the terminal status is published.
+        interrupted = self.fx.boot(interrupted=True)
+        self.assertEqual(interrupted.returncode, -signal.SIGKILL, interrupted.stderr)
+        self.fx.assert_cleanup_happened()
+        self.assert_untouched_failed_candidate()
+
+        # Boot 2: no live transaction is left, so only the worker's recovery
+        # path can finish the publication.
+        recovered = self.fx.boot()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assert_terminal_publication(self.fx.markers())
+        # The cleanup ran exactly once: the terminal records were recovered
+        # from the finalized history record, not by another rollback.
+        self.assertEqual(self.fx.fallbacks.read_text().splitlines(), ["fallback"])
+        # Nothing in the recovery path reboots the device.
+        self.assertFalse(self.fx.reboots.exists())
+
+        # Boot 3: the published records are stable, so a later boot is a no-op.
+        before = (self.fx.update / "state").read_bytes()
+        terminal = (self.fx.update / "check-status").read_bytes()
+        third = self.fx.boot()
+        self.assertEqual(third.returncode, 0, third.stderr)
+        self.assertEqual((self.fx.update / "state").read_bytes(), before)
+        self.assertEqual((self.fx.update / "check-status").read_bytes(), terminal)
+        self.assertFalse(self.fx.reboots.exists())
+
+    def test_failed_terminal_publication_is_retried_on_the_next_boot(self) -> None:
+        self.fx.seed_failed_candidate()
+        # Boot 1: the cleanup succeeds but the state publication cannot be
+        # written (the staging file is occupied), so the rollback branch keeps
+        # the transaction retired and reports the refusal.
+        (self.fx.update / "state.tmp").mkdir()
+        refused = self.fx.boot()
+        self.assertEqual(refused.returncode, 0, refused.stderr)
+        self.assertIn(FALLBACK_INTERRUPTED, self.fx.markers())
+        self.fx.assert_cleanup_happened()
+        self.assert_untouched_failed_candidate()
+        (self.fx.update / "state.tmp").rmdir()
+
+        recovered = self.fx.boot()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assert_terminal_publication(self.fx.markers())
+        self.assertEqual(self.fx.fallbacks.read_text().splitlines(), ["fallback"])
+
+    def test_unpublished_check_record_is_recovered_from_a_terminal_state(self) -> None:
+        # The state half was published before the interruption, so the pending
+        # half is the check record the failed candidate left behind.
+        self.fx.seed_finalized_rollback(terminal_state="rolled-back")
+        result = self.fx.boot()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_terminal_publication(self.fx.markers())
+
+    def test_check_record_of_another_candidate_is_never_relabelled(self) -> None:
+        self.fx.seed_finalized_rollback(terminal_state="rolled-back")
+        self.fx.write_update(
+            "check-status", "schema=1\nstatus=reboot-pending\nlatest_version=0.15.0\n"
+        )
+        before_state = (self.fx.update / "state").read_bytes()
+        result = self.fx.boot()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        check = self.fx.read_update("check-status")
+        self.assertEqual(check["status"], "reboot-pending")
+        self.assertEqual(check["latest_version"], "0.15.0")
+        self.assertEqual((self.fx.update / "state").read_bytes(), before_state)
+
+    def test_resume_fails_closed_without_the_rollback_history_record(self) -> None:
+        self.fx.seed_failed_candidate()
+        (self.fx.update / "state.tmp").mkdir()
+        self.assertEqual(self.fx.boot().returncode, 0)
+        (self.fx.update / "state.tmp").rmdir()
+        # The only evidence that the rollback finished is gone, so the worker
+        # must not claim a terminal state for it.
+        (self.fx.update / "rolled-back").unlink()
+        result = self.fx.boot()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_untouched_failed_candidate()
+        self.assertIn("ota-rollback-resume-evidence-invalid", self.fx.markers())
+
+    def test_live_transaction_still_owns_its_publication(self) -> None:
+        self.fx.seed_failed_candidate()
+        # Boot with the transaction intact: the rollback branch publishes, and
+        # the recovery path must not have pre-empted or duplicated it.
+        result = self.fx.boot()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.fx.assert_cleanup_happened()
+        state = self.fx.read_update("state")
+        self.assertEqual(state["state"], "rolled-back")
+        self.assertIn("ota-v2-fallback-cleaned:", self.fx.markers())
+        self.assertNotIn(
+            "ota-rollback-terminal-publication-resumed", self.fx.markers()
+        )
 
 
 if __name__ == "__main__":
