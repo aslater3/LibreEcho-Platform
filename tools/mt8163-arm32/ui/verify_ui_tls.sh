@@ -36,14 +36,20 @@ done
   printf 'ERROR: --prefix and --binary are separate checks\n' >&2; exit 2
 }
 
-# src/tls.c only string literals.  src/tls_stub.c has none of them, so their
-# presence in a packaged binary proves the real implementation was compiled in
-# and LE_TLS_AVAILABLE resolved to 1.
+# src/tls.c only string literals.  src/tls_stub.c has none of them, so any of
+# them in a packaged binary proves the real implementation was compiled in and
+# LE_TLS_AVAILABLE resolved to 1.  The threshold is one, not all three: the
+# release link runs with -Wl,--gc-sections, and libreecho-radiod is a TLS
+# client that never reaches the self-signed certificate path, so its copy of
+# src/tls.c keeps only the layer identity string.  Requiring more would fail a
+# correct libreecho-radiod build; requiring none would accept the stub, which
+# is why the linked mbedTLS evidence below is a separate hard requirement.
 TLS_SOURCE_MARKERS=(
   'libreecho-tls'
   'CN=%s,O=LibreEcho'
   '20200101000000'
 )
+TLS_SOURCE_MARKER_MIN=1
 # Read-only data that only the linked mbedTLS libraries can provide once the
 # artifact has been stripped.
 MBEDTLS_DATA_MARKERS=(
@@ -149,7 +155,7 @@ verify_binary() {
   source_markers=$(count_markers "$text" "${TLS_SOURCE_MARKERS[@]}")
   data_markers=$(count_markers "$text" "${MBEDTLS_DATA_MARKERS[@]}")
   symbols=$(mbedtls_symbol_count "$binary")
-  ((source_markers >= 2)) || {
+  ((source_markers >= TLS_SOURCE_MARKER_MIN)) || {
     printf 'ERROR: %s carries no real TLS implementation (src/tls.c markers: %s/%s): %s\n' \
       "$label" "$source_markers" "${#TLS_SOURCE_MARKERS[@]}" "$binary" >&2
     exit 1

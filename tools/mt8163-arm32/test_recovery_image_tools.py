@@ -4245,6 +4245,81 @@ class UiTlsPackagingTests(unittest.TestCase):
             self.assertEqual(complete.returncode, 1, complete.stdout)
             self.assertIn("prefix is unavailable", complete.stderr)
 
+    def test_ui_tls_verifier_accepts_the_produced_prefix_and_both_consumers(self) -> None:
+        """Issue #250: the positive path must pass for the prefix and both consumers.
+
+        The failure this issue is about is a *false* HTTPS toggle, so the
+        verifier is only useful if it accepts a correct production bundle:
+        a complete pinned prefix, and both packaged consumers carrying the real
+        src/tls.c implementation plus linked mbedTLS.  The stub build must fail
+        for both names.
+        """
+        static_arm32 = (
+            "ELF 32-bit LSB executable, ARM, EABI5 version 1 (GNU/Linux), "
+            "statically linked, for GNU/Linux 3.2.0"
+        )
+        # Both shapes are stripped-equivalent: the mbedTLS static archives are
+        # only evidenced by retained read-only data, not by symbols.
+        consumers = {
+            "web": "libreecho-tls CN=%s,O=LibreEcho 20200101000000 -----BEGIN CERTIFICATE-----",
+            "radiod": "libreecho-tls -----BEGIN CERTIFICATE-----",
+        }
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            if shutil.which("ar") is None:
+                self.skipTest("ar is required to synthesise an mbedTLS prefix")
+            prefix = tmp / "prefix"
+            self.write_mbedtls_prefix(prefix)
+            accepted = subprocess.run(
+                ["bash", str(self.verifier), "--prefix", str(prefix)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertIn("ui_tls_prefix=ok mbedtls_version=3.6.4", accepted.stdout)
+
+            for name, payload in consumers.items():
+                binary = tmp / f"libreecho-{name}"
+                binary.write_text(payload)
+                result = self.run_tls_verifier(tmp, binary, description=static_arm32)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("ui_tls=real", result.stdout)
+
+                stub = tmp / f"libreecho-{name}-stub"
+                stub.write_text("LibreEcho listening on http://0.0.0.0:8080 HTTPS disabled")
+                rejected = self.run_tls_verifier(tmp, stub, description=static_arm32)
+                self.assertEqual(rejected.returncode, 1, rejected.stdout)
+                self.assertIn("real TLS implementation", rejected.stderr)
+
+    def test_ui_tls_verifier_accepts_a_consumer_that_gc_sections_literals(self) -> None:
+        """Issue #250: --gc-sections drops src/tls.c literals a consumer never reaches.
+
+        libreecho-radiod is a TLS client and never enters the self-signed
+        certificate path, so its release binary keeps only the TLS layer
+        identity string.  That is real TLS and must pass; a binary carrying the
+        identity string but no linked mbedTLS evidence must still fail closed.
+        """
+        static_arm32 = (
+            "ELF 32-bit LSB executable, ARM, EABI5 version 1 (GNU/Linux), "
+            "statically linked, for GNU/Linux 3.2.0"
+        )
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            consumer = tmp / "libreecho-radiod"
+            consumer.write_text("libreecho-tls -----BEGIN CERTIFICATE-----")
+            accepted = self.run_tls_verifier(
+                tmp, consumer, description=static_arm32
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertIn("tls_source_markers=1", accepted.stdout)
+
+            identity_only = tmp / "libreecho-web-identity-only"
+            identity_only.write_text("libreecho-tls")
+            rejected = self.run_tls_verifier(
+                tmp, identity_only, description=static_arm32
+            )
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("no linked mbedTLS evidence", rejected.stderr)
+
     @staticmethod
     def write_ar_fixture(path: Path, member: str) -> None:
         """Write a minimal ar archive so the prefix check sees one member."""
