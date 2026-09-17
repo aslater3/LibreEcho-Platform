@@ -71,13 +71,15 @@ tools/mt8163-arm32/mbedtls/build_mbedtls.sh \
 
 ## Consuming the prefix
 
-`LIBREECHO_UI_MBEDTLS_ROOT` must name the produced prefix; `build_ui_bundle.sh`
-requires it, exports `CPPFLAGS=-I<prefix>/include`, adds
-`-L<prefix>/lib` to the UI link flags, and passes
-`WEB_TLS_LIBS`/`RADIOD_TLS_LIBS=-lmbedtls -lmbedx509 -lmbedcrypto` to both
-consumers. `ui/verify_ui_tls.sh` then fails the build unless the compiled and
-the stripped, staged binaries contain the real TLS implementation and remain
-static ARM32.
+`LIBREECHO_UI_MBEDTLS_ROOT` must name the produced prefix. Before compiling,
+`build_ui_bundle.sh` verifies that prefix against `SOURCE.lock` and its
+`mbedtls-source.json`, normalises it to an absolute path, exports
+`CPPFLAGS=-I<prefix>/include`, and passes the three verified archives to
+`WEB_TLS_LIBS` and `RADIOD_TLS_LIBS` by absolute filename. Callers cannot
+substitute a library search path or alternate mbedTLS archives while retaining
+the pinned provenance. `ui/verify_ui_tls.sh` then fails the build unless the
+compiled and stripped, staged binaries contain the real TLS implementation and
+remain static ARM32.
 
 ## Licensing
 
