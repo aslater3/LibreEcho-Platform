@@ -4773,7 +4773,7 @@ class UiTlsPackagingTests(unittest.TestCase):
         *,
         leaked_path: bool,
         name: str,
-        output: Path | None = None,
+        output: Path | str | None = None,
         race_output: Path | None = None,
         python_version: str | None = None,
         tmpdir: Path | None = None,
@@ -4804,12 +4804,16 @@ class UiTlsPackagingTests(unittest.TestCase):
             "ELF 32-bit LSB relocatable, ARM, EABI5 version 1 (SYSV)"
         )
         output = fixture["workdir"] / name if output is None else output
+        # The argument is passed verbatim, so a caller can exercise an output path
+        # as it was typed (for example with a trailing separator) while the
+        # returned path stays the one to assert against.
+        output_argument = str(output)
         completed = subprocess.run(
             [
                 "bash",
                 str(TOOLS_DIR / "mbedtls/build_mbedtls.sh"),
                 "--archive", str(fixture["archive"]),
-                "--output", str(output),
+                "--output", output_argument,
                 "--cc", str(fixture["compiler"]),
                 "--python", str(fixture["interpreter"]),
                 "--jobs", "1",
@@ -4817,7 +4821,7 @@ class UiTlsPackagingTests(unittest.TestCase):
             env=environment, text=True, cwd=fixture["workdir"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
-        return completed, output
+        return completed, Path(output_argument)
 
     def test_mbedtls_builder_rejects_a_leaked_build_path_when_the_scan_short_circuits(
         self,
@@ -5016,6 +5020,35 @@ class UiTlsPackagingTests(unittest.TestCase):
             self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
             self.assertIn("atomic no-replace publication", refused.stderr)
             self.assertFalse(output.exists(), refused.stdout + refused.stderr)
+
+    def test_mbedtls_builder_accepts_an_output_with_a_trailing_separator(self) -> None:
+        """Codex review: a trailing separator must not name the stage as a child.
+
+        `--output /prefix/` derived the staging path `/prefix/.stage.$$`, so
+        creating the stage created `OUTPUT` itself; the no-replace publication then
+        refused an output that only the stage had created, so a valid build failed
+        after the whole compilation and validation had run, and the failed build
+        left that empty directory behind.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+            output = fixture["workdir"] / "trailing-output"
+
+            published, published_output = self.run_mbedtls_builder(
+                fixture,
+                leaked_path=False,
+                name="trailing-output",
+                output=f"{output}{os.sep}",
+            )
+            self.assertEqual(
+                published.returncode, 0, published.stdout + published.stderr
+            )
+            self.assertEqual(published_output, output)
+            self.assertEqual(
+                sorted(path.name for path in output.iterdir()),
+                ["LICENSE", "include", "lib", "mbedtls-source.json"],
+                published.stdout + published.stderr,
+            )
 
     def test_mbedtls_builder_enforces_the_locked_python_floor(self) -> None:
         """Codex review: the advertised interpreter floor must be enforced.

@@ -29,6 +29,21 @@ while (($#)); do
   shift
 done
 [[ -n "$ARCHIVE" && -n "$OUTPUT" && -n "$CC" ]] || { usage >&2; exit 2; }
+# The staging directory is a sibling of OUTPUT, so OUTPUT must name a path rather
+# than a directory with a trailing separator: `--output /prefix/` or `/prefix/.`
+# would make `/prefix/.stage.$$` a child of the output, creating the stage would
+# create OUTPUT itself, and the no-replace publication below would then refuse an
+# output that only the stage had created - after the whole build had already run.
+# Normalise the separator and reject a path that still cannot name a sibling.
+output_argument=$OUTPUT
+while [[ "$OUTPUT" == */ ]]; do OUTPUT=${OUTPUT%/}; done
+while [[ "$OUTPUT" == */. ]]; do OUTPUT=${OUTPUT%/.}; done
+case "$OUTPUT" in
+  ""|.|..|*/..)
+    printf 'ERROR: unsafe mbedTLS prefix output path: %s\n' "$output_argument" >&2
+    exit 1
+    ;;
+esac
 [[ -f "$ARCHIVE" && ! -L "$ARCHIVE" ]] || {
   printf 'ERROR: unsafe mbedTLS source archive: %s\n' "$ARCHIVE" >&2; exit 1
 }
