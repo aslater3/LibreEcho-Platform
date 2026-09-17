@@ -106,7 +106,22 @@ for module, field in (("jinja2", "jinja2"), ("jsonschema", "jsonschema")):
 PY
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/libreecho-mbedtls-build.XXXXXX")
-trap 'rm -rf "$work"' EXIT
+# The prefix is staged beside the target and moved into place only after every
+# check below has passed.  The output path itself is never erased: an accidental
+# shared directory would otherwise lose unrelated artifacts before the build
+# even started, and a failed build would then leave neither the old contents nor
+# a usable prefix.
+STAGE="${OUTPUT}.stage.$$"
+[[ ! -e "$OUTPUT" && ! -L "$OUTPUT" ]] || {
+  printf 'ERROR: refusing to overwrite an existing mbedTLS prefix: %s\n' \
+    "$OUTPUT" >&2
+  exit 1
+}
+[[ ! -e "$STAGE" && ! -L "$STAGE" ]] || {
+  printf 'ERROR: stale mbedTLS prefix staging path: %s\n' "$STAGE" >&2
+  exit 1
+}
+trap 'rm -rf "$work" "$STAGE"' EXIT
 tar -xjf "$ARCHIVE" -C "$work"
 src="$work/mbedtls-$mbedtls_version"
 [[ -f "$src/LICENSE" && -f "$src/library/Makefile" && -f "$src/include/mbedtls/ssl.h" ]] || {
@@ -123,8 +138,7 @@ build_cflags+=" -ffile-prefix-map=$work=/usr/src/mbedtls-$mbedtls_version"
 build_cflags+=" -fdebug-prefix-map=$work=/usr/src/mbedtls-$mbedtls_version"
 build_cflags+=" -fmacro-prefix-map=$work=/usr/src/mbedtls-$mbedtls_version"
 
-rm -rf "$OUTPUT"
-mkdir -p "$OUTPUT/include" "$OUTPUT/lib"
+mkdir -p "$STAGE/include" "$STAGE/lib"
 if ! make -C "$src/library" -j"$JOBS" static \
     CC="$CC" AR="$AR_BIN" PYTHON="$PYTHON" CFLAGS="$build_cflags" \
     >"$work/mbedtls-build.log" 2>&1; then
@@ -142,20 +156,20 @@ if find "$src/library" -maxdepth 1 -name '*.so*' -print -quit | grep -q .; then
   printf 'ERROR: mbedTLS build produced dynamic libraries\n' >&2; exit 1
 fi
 
-cp -R "$src/include/." "$OUTPUT/include/"
-cp "$src/LICENSE" "$OUTPUT/LICENSE"
+cp -R "$src/include/." "$STAGE/include/"
+cp "$src/LICENSE" "$STAGE/LICENSE"
 for archive in libmbedcrypto.a libmbedx509.a libmbedtls.a; do
-  install -m 0644 "$src/library/$archive" "$OUTPUT/lib/$archive"
-  members=$(ar t "$OUTPUT/lib/$archive" | wc -l)
+  install -m 0644 "$src/library/$archive" "$STAGE/lib/$archive"
+  members=$(ar t "$STAGE/lib/$archive" | wc -l)
   ((members > 0)) || {
     printf 'ERROR: empty mbedTLS archive: %s\n' "$archive" >&2; exit 1
   }
-  if ar t "$OUTPUT/lib/$archive" | grep -qE '(^|/)\.\.'; then
+  if ar t "$STAGE/lib/$archive" | grep -qE '(^|/)\.\.'; then
     printf 'ERROR: unsafe member name in mbedTLS archive: %s\n' "$archive" >&2; exit 1
   fi
   member_dir="$work/members-$archive"
   mkdir -p "$member_dir"
-  (cd "$member_dir" && ar x "$OUTPUT/lib/$archive")
+  (cd "$member_dir" && ar x "$STAGE/lib/$archive")
   while IFS= read -r -d '' member; do
     file -b "$member" | grep -Eq '^ELF 32-bit LSB relocatable, ARM' || {
       printf 'ERROR: non-ARM32 object in %s: %s\n' "$archive" "$(basename "$member")" >&2
@@ -167,12 +181,12 @@ done
 
 for header in include/mbedtls/ssl.h include/mbedtls/x509_crt.h include/mbedtls/pk.h \
     include/mbedtls/entropy.h include/mbedtls/build_info.h; do
-  [[ -f "$OUTPUT/$header" && ! -L "$OUTPUT/$header" ]] || {
+  [[ -f "$STAGE/$header" && ! -L "$STAGE/$header" ]] || {
     printf 'ERROR: missing mbedTLS header: %s\n' "$header" >&2; exit 1
   }
 done
 packed_version=$(sed -n 's/^#define MBEDTLS_VERSION_STRING  *"\(.*\)"$/\1/p' \
-  "$OUTPUT/include/mbedtls/build_info.h" | head -n 1)
+  "$STAGE/include/mbedtls/build_info.h" | head -n 1)
 [[ "$packed_version" == "$mbedtls_version" ]] || {
   printf 'ERROR: mbedTLS version mismatch: expected %s, found %s\n' \
     "$mbedtls_version" "${packed_version:-unknown}" >&2
@@ -185,8 +199,8 @@ packed_version=$(sed -n 's/^#define MBEDTLS_VERSION_STRING  *"\(.*\)"$/\1/p' \
 # skipped for exactly the archives that do leak a build path.  Writing the full
 # scan to a file consumes the stream and lets `strings` fail normally instead.
 leak_scan="$work/mbedtls-build-paths.txt"
-strings -a "$OUTPUT/lib/libmbedtls.a" "$OUTPUT/lib/libmbedx509.a" \
-  "$OUTPUT/lib/libmbedcrypto.a" > "$leak_scan"
+strings -a "$STAGE/lib/libmbedtls.a" "$STAGE/lib/libmbedx509.a" \
+  "$STAGE/lib/libmbedcrypto.a" > "$leak_scan"
 if grep -qE "$work|/home/" "$leak_scan"; then
   printf 'ERROR: mbedTLS archives contain a private build path\n' >&2; exit 1
 fi
@@ -195,7 +209,7 @@ compiler_version=$("$CC" --version | sed -n '1p')
 python_version=$("$PYTHON" -c 'import platform;print(platform.python_version())')
 # Python 3.8 is the floor this lock permits, so the record uses only
 # 3.8-compatible syntax (str.removesuffix is 3.9+).
-"$PYTHON" - "$OUTPUT" "$SOURCE_LOCK" "$compiler_version" "$python_version" <<'PY'
+"$PYTHON" - "$STAGE" "$SOURCE_LOCK" "$compiler_version" "$python_version" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -253,3 +267,7 @@ for name, value in sorted(record["archives"].items()):
     print("mbedtls_" + name[:-2] + "_sha256=" + value)
 print("mbedtls_archives=3")
 PY
+
+# Only a fully checked prefix is moved into place, and the rename is atomic
+# because the staging directory sits beside the requested output path.
+mv "$STAGE" "$OUTPUT"

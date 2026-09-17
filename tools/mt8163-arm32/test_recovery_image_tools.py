@@ -4744,7 +4744,12 @@ class UiTlsPackagingTests(unittest.TestCase):
         }
 
     def run_mbedtls_builder(
-        self, fixture: dict[str, Path], *, leaked_path: bool, name: str
+        self,
+        fixture: dict[str, Path],
+        *,
+        leaked_path: bool,
+        name: str,
+        output: Path | None = None,
     ) -> tuple[subprocess.CompletedProcess, Path]:
         lock = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())
         environment = os.environ.copy()
@@ -4755,7 +4760,7 @@ class UiTlsPackagingTests(unittest.TestCase):
         environment["LE_TEST_FILE_DESCRIPTION"] = (
             "ELF 32-bit LSB relocatable, ARM, EABI5 version 1 (SYSV)"
         )
-        output = fixture["workdir"] / name
+        output = fixture["workdir"] / name if output is None else output
         completed = subprocess.run(
             [
                 "bash",
@@ -4802,6 +4807,37 @@ class UiTlsPackagingTests(unittest.TestCase):
             self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
             self.assertIn("mbedtls_archives=3", clean.stdout)
             self.assertTrue((clean_output / "mbedtls-source.json").is_file())
+
+    def test_mbedtls_builder_refuses_to_erase_an_existing_output(self) -> None:
+        """Codex review: an existing output path must never be erased.
+
+        The builder removed the output directory up front, so an accidental
+        shared path was destroyed before the build even started and a later
+        failure left neither the old contents nor a usable prefix.  An existing
+        output path is refused, the prefix is staged next to it, and only a
+        successful build replaces it.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+
+            occupied = fixture["workdir"] / "occupied-output"
+            (occupied / "unrelated-artifacts").mkdir(parents=True)
+            sentinel = occupied / "unrelated-artifacts/keep.txt"
+            sentinel.write_text("must survive\n")
+
+            refused, _ = self.run_mbedtls_builder(
+                fixture, leaked_path=False, name="occupied-output", output=occupied
+            )
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("refusing to overwrite", refused.stderr)
+            self.assertEqual(sentinel.read_text(), "must survive\n")
+
+            # A build that fails must not leave a partial prefix in its place.
+            failed, failed_output = self.run_mbedtls_builder(
+                fixture, leaked_path=True, name="failed-output"
+            )
+            self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+            self.assertFalse(failed_output.exists(), failed.stdout + failed.stderr)
 
     def test_ui_tls_verifier_rejects_a_prefix_with_headers_off_the_pin(self) -> None:
         """Codex review: the consumed headers must be bound to the pin.
