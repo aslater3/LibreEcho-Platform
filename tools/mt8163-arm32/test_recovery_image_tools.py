@@ -4136,6 +4136,8 @@ class UiTlsPackagingTests(unittest.TestCase):
             "statically linked",
             "mbedtls/ssl.h",
             "libmbedtls.a",
+            "SOURCE.lock",
+            "mbedtls-source.json",
         ):
             self.assertIn(required, source)
 
@@ -4290,7 +4292,44 @@ class UiTlsPackagingTests(unittest.TestCase):
                 self.assertEqual(rejected.returncode, 1, rejected.stdout)
                 self.assertIn("real TLS implementation", rejected.stderr)
 
-    def test_ui_tls_verifier_accepts_a_consumer_that_gc_sections_literals(self) -> None:
+    def run_tls_prefix(self, prefix: Path) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", str(self.verifier), "--prefix", str(prefix)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+    def test_ui_tls_verifier_rejects_a_prefix_that_is_not_the_pin(self) -> None:
+        """Issue #250: an API-compatible stale prefix must not be linked.
+
+        A different mbedTLS version, a missing provenance record, or an archive
+        that does not match its recorded digest would ship a dependency other
+        than the one recorded in SOURCE.lock, the license inventory, and the
+        release metadata.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            if shutil.which("ar") is None:
+                self.skipTest("ar is required to synthesise an mbedTLS prefix")
+
+            stale = tmp / "stale"
+            self.write_mbedtls_prefix(stale, version="3.6.3")
+            rejected = self.run_tls_prefix(stale)
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("does not match the pinned", rejected.stderr)
+
+            unprovenanced = tmp / "unprovenanced"
+            self.write_mbedtls_prefix(unprovenanced, provenance=False)
+            rejected = self.run_tls_prefix(unprovenanced)
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("no provenance record", rejected.stderr)
+
+            tampered = tmp / "tampered"
+            self.write_mbedtls_prefix(tampered, tamper_archive_hash="libmbedtls.a")
+            rejected = self.run_tls_prefix(tampered)
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("does not match its provenance record", rejected.stderr)
+
+    def test_ui_tls_verifier_rejects_a_consumer_that_gc_sections_literals(self) -> None:
         """Issue #250: --gc-sections drops src/tls.c literals a consumer never reaches.
 
         libreecho-radiod is a TLS client and never enters the self-signed
@@ -4332,21 +4371,63 @@ class UiTlsPackagingTests(unittest.TestCase):
             archive += b"\n"
         path.write_bytes(archive)
 
-    def write_mbedtls_prefix(self, prefix: Path, *, archives: bool = True) -> None:
-        """Synthesise the mbedTLS prefix shape build_ui_bundle.sh requires."""
+    def write_mbedtls_prefix(
+        self,
+        prefix: Path,
+        *,
+        archives: bool = True,
+        version: str | None = None,
+        provenance: bool = True,
+        tamper_archive_hash: str | None = None,
+    ) -> None:
+        """Synthesise the mbedTLS prefix shape build_ui_bundle.sh requires.
+
+        The version and source hash come from the repository's own SOURCE.lock,
+        so the fixture is pinned to the same identity the verifier enforces.
+        """
+        lock = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())
         (prefix / "include/mbedtls").mkdir(parents=True)
         (prefix / "lib").mkdir()
         for header in ("ssl.h", "x509_crt.h", "pk.h", "entropy.h"):
             (prefix / "include/mbedtls" / header).write_text("/* fixture */\n")
         (prefix / "include/mbedtls/build_info.h").write_text(
-            '#define MBEDTLS_VERSION_STRING         "3.6.4"\n'
+            '#define MBEDTLS_VERSION_STRING         "%s"\n'
+            % (version or lock["version"])
         )
+        digests = {}
         for archive in ("libmbedcrypto.a", "libmbedx509.a", "libmbedtls.a"):
             target = prefix / "lib" / archive
-            if archives:
-                self.write_ar_fixture(target, archive.removesuffix(".a") + ".o")
-            else:
+            if not archives:
                 target.write_text("not an archive\n")
+                continue
+            self.write_ar_fixture(target, archive[:-2] + ".o")
+            digests[archive] = hashlib.sha256(target.read_bytes()).hexdigest()
+        if not (archives and provenance):
+            return
+        if tamper_archive_hash:
+            digests[tamper_archive_hash] = "0" * 64
+        (prefix / "mbedtls-source.json").write_text(
+            json.dumps(
+                {
+                    "name": lock["name"],
+                    "version": lock["version"],
+                    "license": lock["license"],
+                    "source_url": lock["source_url"],
+                    "source_archive_sha256": lock["source_sha256"],
+                    "target": lock["target"],
+                    "build_requirements": lock["build_requirements"],
+                    "python": "3.11.0",
+                    "compiler": "fixture",
+                    "archives": digests,
+                    "include_sha256": hashlib.sha256(
+                        (prefix / "include/mbedtls/build_info.h").read_bytes()
+                    ).hexdigest(),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
 
     def run_ui_bundle(self, tmp: Path, mbedtls_root: str) -> subprocess.CompletedProcess:
         """Run the bundle builder with a stand-in musl and cross toolchain.

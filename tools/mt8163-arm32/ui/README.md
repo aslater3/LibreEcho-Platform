@@ -12,9 +12,13 @@ ARM32 mbedTLS prefix built by `tools/mt8163-arm32/mbedtls` (see that directory's
 `README.md`). The builder passes its include path, library search path, and the
 `WEB_TLS_LIBS`/`RADIOD_TLS_LIBS` archive list to both `libreecho-web` and
 `libreecho-radiod`, then runs `ui/verify_ui_tls.sh` against the compiled and the
-stripped, staged binaries. A bundle that compiled `src/tls_stub.c`
-(`LE_TLS_AVAILABLE=0`), lost the mbedTLS link, or stopped being static ARM32
-fails the build instead of shipping an HTTPS toggle that cannot listen on 8443.
+stripped, staged binaries. The verifier accepts only the pinned identity: the
+prefix version must equal `mbedtls/SOURCE.lock`, and its `mbedtls-source.json`
+provenance record must match the lock and the SHA-256 of each archive that is
+about to be linked. A bundle that compiled `src/tls_stub.c`
+(`LE_TLS_AVAILABLE=0`), lost the mbedTLS link, linked a stale or substituted
+mbedTLS, or stopped being static ARM32 fails the build instead of shipping an
+HTTPS toggle that cannot listen on 8443.
 
 The daemons are packaged as default boot services after the recovery control
 plane has configured loopback. They do not replace the existing kernel or

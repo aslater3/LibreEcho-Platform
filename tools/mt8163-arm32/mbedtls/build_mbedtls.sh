@@ -42,14 +42,13 @@ SOURCE_LOCK="$SCRIPT_DIR/SOURCE.lock"
 [[ -f "$SOURCE_LOCK" && ! -L "$SOURCE_LOCK" ]] || {
   printf 'ERROR: missing mbedTLS source lock: %s\n' "$SOURCE_LOCK" >&2; exit 1
 }
-command -v python3 >/dev/null 2>&1 || {
-  printf 'ERROR: python3 is required to validate the mbedTLS source lock\n' >&2; exit 1
-}
 command -v sha256sum >/dev/null 2>&1 || {
   printf 'ERROR: sha256sum is required to validate the mbedTLS source archive\n' >&2; exit 1
 }
+# One interpreter runs every helper below: the lock parse, the pinned build
+# requirement check, the mbedTLS library Makefile, and the metadata record.
 [[ -n "$PYTHON" ]] || PYTHON=python3
-[[ -x "$(command -v "$PYTHON" 2>/dev/null)" || -x "$PYTHON" ]] || {
+[[ -x "$PYTHON" ]] || command -v "$PYTHON" >/dev/null 2>&1 || {
   printf 'ERROR: python interpreter is unavailable: %s\n' "$PYTHON" >&2; exit 1
 }
 AR_BIN="${CC%gcc}ar"
@@ -58,7 +57,7 @@ AR_BIN="${CC%gcc}ar"
 }
 
 read_lock_field() {
-  python3 - "$SOURCE_LOCK" "$1" <<'PY'
+  "$PYTHON" - "$SOURCE_LOCK" "$1" <<'PY'
 import json
 import sys
 
@@ -186,7 +185,9 @@ fi
 
 compiler_version=$("$CC" --version | sed -n '1p')
 python_version=$("$PYTHON" -c 'import platform;print(platform.python_version())')
-python3 - "$OUTPUT" "$SOURCE_LOCK" "$compiler_version" "$python_version" <<'PY'
+# Python 3.8 is the floor this lock permits, so the record uses only
+# 3.8-compatible syntax (str.removesuffix is 3.9+).
+"$PYTHON" - "$OUTPUT" "$SOURCE_LOCK" "$compiler_version" "$python_version" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -224,6 +225,6 @@ record = {
 )
 print("mbedtls_version=" + record["version"])
 for name, value in sorted(record["archives"].items()):
-    print(f"mbedtls_{name.removesuffix('.a')}_sha256={value}")
+    print("mbedtls_" + name[:-2] + "_sha256=" + value)
 print("mbedtls_archives=3")
 PY
