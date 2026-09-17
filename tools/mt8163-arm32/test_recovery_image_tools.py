@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import textwrap
 import time
 import unittest
 from pathlib import Path
@@ -4067,6 +4068,1204 @@ class UserdataRegressionIntegrationTests(unittest.TestCase):
             text=True, capture_output=True, timeout=900,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class UiTlsPackagingTests(unittest.TestCase):
+    """Issue #250: the production UI bundle must ship real ARM32 TLS."""
+
+    verifier = TOOLS_DIR / "ui/verify_ui_tls.sh"
+
+    def test_ui_bundle_links_pinned_arm32_mbedtls(self) -> None:
+        bundle = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        self.assertIn("LIBREECHO_UI_MBEDTLS_ROOT", bundle)
+        # No default prefix: a bundle without the pinned dependency is not a
+        # production artifact, so the builder must fail closed instead.
+        self.assertIn("MBEDTLS_ROOT=${LIBREECHO_UI_MBEDTLS_ROOT:-}", bundle)
+        self.assertNotIn("LIBREECHO_UI_MBEDTLS_ROOT:-/", bundle)
+        self.assertIn('-I$MBEDTLS_ROOT/include', bundle)
+        self.assertIn('-L$MBEDTLS_ROOT/lib', bundle)
+        self.assertIn('WEB_TLS_LIBS="$TLS_LIBS"', bundle)
+        self.assertIn('RADIOD_TLS_LIBS="$TLS_LIBS"', bundle)
+        # The linkage names the archives inside the prefix the verifier just
+        # checked, by absolute path: a search path or a caller-supplied archive
+        # list could otherwise resolve a different API-compatible mbedTLS.
+        self.assertIn(
+            'TLS_LIBS="$MBEDTLS_ROOT/lib/libmbedtls.a'
+            ' $MBEDTLS_ROOT/lib/libmbedx509.a'
+            ' $MBEDTLS_ROOT/lib/libmbedcrypto.a"',
+            bundle,
+        )
+        self.assertNotIn("LIBREECHO_UI_TLS_LIBS", bundle)
+        self.assertNotIn("-lmbedtls", bundle)
+
+    def test_ui_bundle_verifies_compiled_and_packaged_tls(self) -> None:
+        bundle = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        self.assertIn("verify_ui_tls.sh", bundle)
+        self.assertIn('"$VERIFY_TLS" --prefix "$MBEDTLS_ROOT"', bundle)
+        self.assertIn('--binary "$UI_SOURCE/build/$binary"', bundle)
+        self.assertIn('--binary "$OUTPUT/sbin/$binary"', bundle)
+        self.assertIn("TLS_BINARIES=(libreecho-web libreecho-radiod)", bundle)
+
+    def test_mbedtls_dependency_is_pinned_and_provenanced(self) -> None:
+        lock = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())
+        self.assertEqual(lock["name"], "mbedtls")
+        self.assertEqual(lock["version"], "3.6.4")
+        self.assertEqual(lock["license"], "Apache-2.0")
+        self.assertRegex(lock["source_sha256"], r"^[0-9a-f]{64}$")
+        self.assertTrue(
+            lock["source_url"].endswith(f"mbedtls-{lock['version']}.tar.bz2")
+        )
+        self.assertIn("arm-linux-gnueabihf", lock["target"])
+        requirements = lock["build_requirements"]
+        for package in ("jinja2", "jsonschema"):
+            self.assertRegex(requirements[package], r"^\d+\.\d+\.\d+$")
+        # The pinned jsonschema release declares Requires-Python >=3.9 (jinja2
+        # 3.1.6 allows 3.7), so a lower advertised floor would name a build host
+        # that cannot install the pin the builder then requires.
+        floor = requirements["python3"]
+        self.assertRegex(floor, r"^>=\d+\.\d+$")
+        self.assertGreaterEqual(
+            tuple(int(part) for part in floor[2:].split(".")), (3, 9)
+        )
+
+        builder = (TOOLS_DIR / "mbedtls/build_mbedtls.sh").read_text()
+        self.assertIn("SOURCE.lock", builder)
+        self.assertIn("source_sha256", builder)
+        self.assertIn("libmbedcrypto.a", builder)
+        self.assertIn("libmbedx509.a", builder)
+        self.assertIn("libmbedtls.a", builder)
+        self.assertIn("static", builder)
+        self.assertIn("ELF 32-bit", builder)
+        self.assertIn("build_requirements", builder)
+        self.assertIn("mbedtls-source.json", builder)
+        # Source acquisition stays outside the repository: the builder consumes
+        # a pinned archive and never downloads one.
+        self.assertNotIn("curl", builder)
+        self.assertNotIn("wget", builder)
+
+    def test_ui_tls_verifier_rejects_untrusted_and_stub_artifacts(self) -> None:
+        verifier = self.verifier
+        self.assertTrue(verifier.is_file(), verifier)
+        source = verifier.read_text()
+        for required in (
+            "tls.o",
+            "tls_stub.o",
+            "libreecho-tls",
+            "MBEDTLS_SYMBOL_PREFIX=mbedtls_",
+            "statically linked",
+            "mbedtls/ssl.h",
+            "libmbedtls.a",
+            "SOURCE.lock",
+            "mbedtls-source.json",
+        ):
+            self.assertIn(required, source)
+
+    def run_tls_verifier(
+        self,
+        tmp: Path,
+        binary: Path,
+        *,
+        description: str,
+        objects: Path | None = None,
+    ) -> subprocess.CompletedProcess:
+        shims = tmp / "shims"
+        shims.mkdir(exist_ok=True)
+        (shims / "file").write_text('#!/bin/sh\nprintf "%s\\n" "$LE_TEST_FILE_DESCRIPTION"\n')
+        (shims / "readelf").write_text("#!/bin/sh\nexit 0\n")
+        for shim in ("file", "readelf"):
+            (shims / shim).chmod(0o755)
+        environment = os.environ.copy()
+        environment["PATH"] = f"{shims}:{environment['PATH']}"
+        environment["LE_TEST_FILE_DESCRIPTION"] = description
+        argv = ["bash", str(self.verifier), "--binary", str(binary)]
+        if objects is not None:
+            argv += ["--objects", str(objects)]
+        return subprocess.run(
+            argv, env=environment, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+    def test_ui_tls_verifier_accepts_real_tls_and_rejects_the_stub(self) -> None:
+        static_arm32 = (
+            "ELF 32-bit LSB executable, ARM, EABI5 version 1 (GNU/Linux), "
+            "statically linked, for GNU/Linux 3.2.0"
+        )
+        real_payload = (
+            "libreecho-tls CN=%s,O=LibreEcho 20200101000000 "
+            "-----BEGIN CERTIFICATE-----"
+        )
+        stub_payload = "LibreEcho listening on http://0.0.0.0:8080 HTTPS disabled"
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            objects = tmp / "objects"
+            objects.mkdir()
+            (objects / "tls.o").write_bytes(b"\x7fELF")
+            real = tmp / "libreecho-web"
+            real.write_text(real_payload)
+
+            accepted = self.run_tls_verifier(
+                tmp, real, description=static_arm32, objects=objects
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertIn("ui_tls=real", accepted.stdout)
+
+            stub = tmp / "libreecho-web-stub"
+            stub.write_text(stub_payload)
+            rejected = self.run_tls_verifier(
+                tmp, stub, description=static_arm32, objects=objects
+            )
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("real TLS implementation", rejected.stderr)
+
+            dynamic = tmp / "libreecho-web-dynamic"
+            dynamic.write_text(real_payload)
+            rejected = self.run_tls_verifier(
+                tmp, dynamic,
+                description=(
+                    "ELF 32-bit LSB executable, ARM, EABI5 version 1 "
+                    "(GNU/Linux), dynamically linked, interpreter "
+                    "/lib/ld-linux-armhf.so.3"
+                ),
+            )
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("not static ARM32", rejected.stderr)
+
+            stub_objects = tmp / "stub-objects"
+            stub_objects.mkdir()
+            (stub_objects / "tls.o").write_bytes(b"\x7fELF")
+            (stub_objects / "tls_stub.o").write_bytes(b"\x7fELF")
+            rejected = self.run_tls_verifier(
+                tmp, real, description=static_arm32, objects=stub_objects
+            )
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("tls_stub.c", rejected.stderr)
+
+    def test_ui_tls_verifier_rejects_incomplete_mbedtls_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            prefix = Path(tmp_name) / "mbedtls"
+            (prefix / "include/mbedtls").mkdir(parents=True)
+            (prefix / "lib").mkdir()
+            for header in ("ssl.h", "x509_crt.h", "pk.h", "entropy.h"):
+                (prefix / "include/mbedtls" / header).write_text("/* stub */\n")
+            (prefix / "include/mbedtls/build_info.h").write_text(
+                '#define MBEDTLS_VERSION_STRING         "3.6.4"\n'
+            )
+            for archive in ("libmbedcrypto.a", "libmbedx509.a", "libmbedtls.a"):
+                (prefix / "lib" / archive).write_text("not an archive\n")
+            result = subprocess.run(
+                ["bash", str(self.verifier), "--prefix", str(prefix)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("archive", result.stderr)
+
+            complete = subprocess.run(
+                ["bash", str(self.verifier), "--prefix", str(prefix / "missing")],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(complete.returncode, 1, complete.stdout)
+            self.assertIn("prefix is unavailable", complete.stderr)
+
+    def test_ui_tls_verifier_accepts_the_produced_prefix_and_both_consumers(self) -> None:
+        """Issue #250: the positive path must pass for the prefix and both consumers.
+
+        The failure this issue is about is a *false* HTTPS toggle, so the
+        verifier is only useful if it accepts a correct production bundle:
+        a complete pinned prefix, and both packaged consumers carrying the real
+        src/tls.c implementation plus linked mbedTLS.  The stub build must fail
+        for both names.
+        """
+        static_arm32 = (
+            "ELF 32-bit LSB executable, ARM, EABI5 version 1 (GNU/Linux), "
+            "statically linked, for GNU/Linux 3.2.0"
+        )
+        # Both shapes are stripped-equivalent: the mbedTLS static archives are
+        # only evidenced by retained read-only data, not by symbols.
+        consumers = {
+            "web": "libreecho-tls CN=%s,O=LibreEcho 20200101000000 -----BEGIN CERTIFICATE-----",
+            "radiod": "libreecho-tls -----BEGIN CERTIFICATE-----",
+        }
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            if shutil.which("ar") is None:
+                self.skipTest("ar is required to synthesise an mbedTLS prefix")
+            prefix = tmp / "prefix"
+            self.write_mbedtls_prefix(prefix)
+            accepted = subprocess.run(
+                ["bash", str(self.verifier), "--prefix", str(prefix)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertIn("ui_tls_prefix=ok mbedtls_version=3.6.4", accepted.stdout)
+
+            for name, payload in consumers.items():
+                binary = tmp / f"libreecho-{name}"
+                binary.write_text(payload)
+                result = self.run_tls_verifier(tmp, binary, description=static_arm32)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("ui_tls=real", result.stdout)
+
+                stub = tmp / f"libreecho-{name}-stub"
+                stub.write_text("LibreEcho listening on http://0.0.0.0:8080 HTTPS disabled")
+                rejected = self.run_tls_verifier(tmp, stub, description=static_arm32)
+                self.assertEqual(rejected.returncode, 1, rejected.stdout)
+                self.assertIn("real TLS implementation", rejected.stderr)
+
+    def run_tls_prefix(self, prefix: Path) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", str(self.verifier), "--prefix", str(prefix)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+    def test_ui_tls_verifier_rejects_a_prefix_that_is_not_the_pin(self) -> None:
+        """Issue #250: an API-compatible stale prefix must not be linked.
+
+        A different mbedTLS version, a missing provenance record, or an archive
+        that does not match its recorded digest would ship a dependency other
+        than the one recorded in SOURCE.lock, the license inventory, and the
+        release metadata.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            if shutil.which("ar") is None:
+                self.skipTest("ar is required to synthesise an mbedTLS prefix")
+
+            stale = tmp / "stale"
+            self.write_mbedtls_prefix(stale, version="3.6.3")
+            rejected = self.run_tls_prefix(stale)
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("does not match the pinned", rejected.stderr)
+
+            unprovenanced = tmp / "unprovenanced"
+            self.write_mbedtls_prefix(unprovenanced, provenance=False)
+            rejected = self.run_tls_prefix(unprovenanced)
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("no provenance record", rejected.stderr)
+
+            tampered = tmp / "tampered"
+            self.write_mbedtls_prefix(tampered, tamper_archive_hash="libmbedtls.a")
+            rejected = self.run_tls_prefix(tampered)
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("does not match its provenance record", rejected.stderr)
+
+    def test_ui_tls_verifier_rejects_a_consumer_that_gc_sections_literals(self) -> None:
+        """Issue #250: --gc-sections drops src/tls.c literals a consumer never reaches.
+
+        libreecho-radiod is a TLS client and never enters the self-signed
+        certificate path, so its release binary keeps only the TLS layer
+        identity string.  That is real TLS and must pass; a binary carrying the
+        identity string but no linked mbedTLS evidence must still fail closed.
+        """
+        static_arm32 = (
+            "ELF 32-bit LSB executable, ARM, EABI5 version 1 (GNU/Linux), "
+            "statically linked, for GNU/Linux 3.2.0"
+        )
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            consumer = tmp / "libreecho-radiod"
+            consumer.write_text("libreecho-tls -----BEGIN CERTIFICATE-----")
+            accepted = self.run_tls_verifier(
+                tmp, consumer, description=static_arm32
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertIn("tls_source_markers=1", accepted.stdout)
+
+            identity_only = tmp / "libreecho-web-identity-only"
+            identity_only.write_text("libreecho-tls")
+            rejected = self.run_tls_verifier(
+                tmp, identity_only, description=static_arm32
+            )
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("no linked mbedTLS evidence", rejected.stderr)
+
+    @staticmethod
+    def write_ar_fixture(path: Path, member: str) -> None:
+        """Write a minimal ar archive so the prefix check sees one member."""
+        payload = b"libreecho-mbedtls-prefix-fixture\n"
+        header = (
+            f"{member + '/':<16}{0:<12}{0:<6}{0:<6}{0o644:<8o}{len(payload):<10}`\n"
+        ).encode()
+        archive = b"!<arch>\n" + header + payload
+        if len(payload) % 2:
+            archive += b"\n"
+        path.write_bytes(archive)
+
+    @staticmethod
+    def include_tree_digest(root: Path) -> str:
+        """Digest the include tree exactly as build_mbedtls.sh records it."""
+        value = hashlib.sha256()
+        for path in sorted(root.rglob("*")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            value.update(path.relative_to(root).as_posix().encode("utf-8") + b"\0")
+            value.update(hashlib.sha256(path.read_bytes()).hexdigest().encode("ascii"))
+        return value.hexdigest()
+
+    def write_mbedtls_prefix(
+        self,
+        prefix: Path,
+        *,
+        archives: bool = True,
+        version: str | None = None,
+        provenance: bool = True,
+        tamper_archive_hash: str | None = None,
+    ) -> None:
+        """Synthesise the mbedTLS prefix shape build_ui_bundle.sh requires.
+
+        The version and source hash come from the repository's own SOURCE.lock,
+        so the fixture is pinned to the same identity the verifier enforces.
+        """
+        lock = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())
+        (prefix / "include/mbedtls").mkdir(parents=True)
+        (prefix / "include/psa").mkdir()
+        (prefix / "lib").mkdir()
+        for header in ("ssl.h", "x509_crt.h", "pk.h", "entropy.h"):
+            (prefix / "include/mbedtls" / header).write_text("/* fixture */\n")
+        (prefix / "include/psa/crypto.h").write_text("/* fixture */\n")
+        (prefix / "include/mbedtls/build_info.h").write_text(
+            '#define MBEDTLS_VERSION_STRING         "%s"\n'
+            % (version or lock["version"])
+        )
+        digests = {}
+        for archive in ("libmbedcrypto.a", "libmbedx509.a", "libmbedtls.a"):
+            target = prefix / "lib" / archive
+            if not archives:
+                target.write_text("not an archive\n")
+                continue
+            self.write_ar_fixture(target, archive[:-2] + ".o")
+            digests[archive] = hashlib.sha256(target.read_bytes()).hexdigest()
+        if not (archives and provenance):
+            return
+        if tamper_archive_hash:
+            digests[tamper_archive_hash] = "0" * 64
+        (prefix / "mbedtls-source.json").write_text(
+            json.dumps(
+                {
+                    "name": lock["name"],
+                    "version": lock["version"],
+                    "license": lock["license"],
+                    "source_url": lock["source_url"],
+                    "source_archive_sha256": lock["source_sha256"],
+                    "target": lock["target"],
+                    "build_requirements": lock["build_requirements"],
+                    "python": "3.11.0",
+                    "compiler": "fixture",
+                    "archives": digests,
+                    "include_sha256": hashlib.sha256(
+                        (prefix / "include/mbedtls/build_info.h").read_bytes()
+                    ).hexdigest(),
+                    "include_tree_sha256": self.include_tree_digest(
+                        prefix / "include"
+                    ),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+
+    def run_ui_bundle(
+        self,
+        tmp: Path,
+        mbedtls_root: str,
+        *,
+        env_extra: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess:
+        """Run the bundle builder with a stand-in musl and cross toolchain.
+
+        Every mbedTLS guard runs before the UI checkout is touched, so a
+        stand-in toolchain exercises them without a cross build or a real UI
+        source tree.
+        """
+        musl = tmp / "stand-in-musl"
+        (musl / "usr/bin").mkdir(parents=True, exist_ok=True)
+        (musl / "usr/lib").mkdir(parents=True, exist_ok=True)
+        (musl / "sysroot/usr/include").mkdir(parents=True, exist_ok=True)
+        (musl / "sysroot/usr/include/errno.h").write_text("\n")
+        stand_in_cc = musl / "usr/bin/armv7-alpine-linux-musleabihf-gcc"
+        stand_in_cc.write_text("#!/bin/sh\nexit 0\n")
+        stand_in_cc.chmod(0o755)
+        toolchain = tmp / "stand-in-toolchain"
+        toolchain.mkdir(exist_ok=True)
+        for tool in ("arm-linux-gnueabihf-gcc", "arm-linux-gnueabihf-strip"):
+            (toolchain / tool).write_text("#!/bin/sh\nexit 0\n")
+            (toolchain / tool).chmod(0o755)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "LIBREECHO_UI_MUSL_NATIVE_ROOT": str(musl),
+                "LIBREECHO_UI_MUSL_SYSROOT": str(musl / "sysroot"),
+                "LIBREECHO_UI_MUSL_CC": str(stand_in_cc),
+                "LIBREECHO_UI_MUSL_NATIVE_LIB": str(musl / "usr/lib"),
+                "LIBREECHO_UI_CROSS_COMPILE": str(toolchain / "arm-linux-gnueabihf-"),
+                "LIBREECHO_UI_MBEDTLS_ROOT": mbedtls_root,
+            }
+        )
+        if env_extra:
+            environment.update(env_extra)
+        return subprocess.run(
+            [
+                "bash",
+                str(TOOLS_DIR / "ui/build_ui_bundle.sh"),
+                str(tmp / "ui-source"),
+                str(tmp / "ui-bundle-out"),
+            ],
+            env=environment, text=True, cwd=tmp,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+    def test_ui_bundle_binds_the_link_to_the_verified_prefix(self) -> None:
+        """Codex review: the linked archives must be the verified ones.
+
+        `LIBREECHO_UI_TLS_LIBS` let a caller - or an inherited environment -
+        replace the archive list after `verify_ui_tls.sh` had checked the
+        prefix, so an API-compatible mbedTLS could be linked while the recorded
+        provenance described the pinned one.  The linkage must come from the
+        verified prefix itself, and the override must not reach the link line.
+        """
+        decoy = "/opt/decoy-mbedtls/lib/libmbedtls.a"
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            if shutil.which("ar") is None:
+                self.skipTest("ar is required to synthesise an mbedTLS prefix")
+            if shutil.which("git") is None:
+                self.skipTest("git is required to stage a stand-in UI checkout")
+            prefix = tmp / "prefix"
+            self.write_mbedtls_prefix(prefix)
+
+            # The builder records the UI source identity before it dispatches
+            # the build, so the stand-in checkout has to be a real repository.
+            source = tmp / "ui-source"
+            source.mkdir()
+            (source / "Makefile").write_text("release:\n\t@true\n")
+            for command in (
+                ("init", "--quiet"),
+                ("config", "user.email", "fixture@example.invalid"),
+                ("config", "user.name", "Fixture"),
+                ("add", "Makefile"),
+                ("commit", "--quiet", "-m", "fixture"),
+            ):
+                subprocess.run(
+                    ["git", *command], cwd=source, check=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+
+            record = tmp / "make-record.txt"
+            shim = tmp / "make-shim"
+            shim.write_text(
+                "#!/bin/sh\n"
+                'printf "%s\\n" "$*" >> "$LE_TEST_MAKE_RECORD"\n'
+                "exit 0\n"
+            )
+            shim.chmod(0o755)
+
+            result = self.run_ui_bundle(
+                tmp,
+                str(prefix),
+                env_extra={
+                    "MAKE": str(shim),
+                    "LE_TEST_MAKE_RECORD": str(record),
+                    "LIBREECHO_UI_TLS_LIBS": decoy,
+                },
+            )
+            # The stand-in UI checkout produces no binaries, so the builder
+            # stops on the compiled-artifact check after the link dispatch.
+            self.assertTrue(record.is_file(), result.stdout + result.stderr)
+            invocations = record.read_text().splitlines()
+            self.assertTrue(invocations, result.stdout + result.stderr)
+            for invocation in invocations:
+                self.assertNotIn(decoy, invocation)
+                self.assertNotIn("-lmbedtls", invocation)
+            release = [line for line in invocations if "release" in line]
+            self.assertTrue(release, invocations)
+            for line in release:
+                for archive in ("libmbedtls.a", "libmbedx509.a", "libmbedcrypto.a"):
+                    self.assertIn(f"{prefix}/lib/{archive}", line)
+
+    def test_ui_bundle_fails_closed_without_a_usable_mbedtls_prefix(self) -> None:
+        """Issue #250: the builder must never produce a stub TLS bundle.
+
+        These are the builder's own guards, executed rather than grepped: the
+        builder used to run `make ... release` with no TLS library at all, so
+        the UI Makefile silently selected src/tls_stub.c and the published
+        image kept advertising an HTTPS toggle that could not listen.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            (tmp / "ui-source").mkdir()
+
+            unset = self.run_ui_bundle(tmp, "")
+            self.assertEqual(unset.returncode, 1, unset.stdout + unset.stderr)
+            self.assertIn("mbedTLS prefix", unset.stderr)
+
+            missing = self.run_ui_bundle(tmp, str(tmp / "absent-prefix"))
+            self.assertEqual(missing.returncode, 1, missing.stdout + missing.stderr)
+            self.assertIn("mbedTLS prefix is unavailable", missing.stderr)
+
+            empty = tmp / "empty-prefix"
+            self.write_mbedtls_prefix(empty, archives=False)
+            empty_result = self.run_ui_bundle(tmp, str(empty))
+            self.assertEqual(
+                empty_result.returncode, 1, empty_result.stdout + empty_result.stderr
+            )
+            self.assertIn("mbedTLS archive is empty", empty_result.stderr)
+
+            if shutil.which("ar") is None:
+                self.skipTest("ar is required to synthesise an mbedTLS prefix")
+            valid = tmp / "valid-prefix"
+            self.write_mbedtls_prefix(valid)
+            prefix_ok = subprocess.run(
+                ["bash", str(self.verifier), "--prefix", str(valid)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(prefix_ok.returncode, 0, prefix_ok.stderr)
+            self.assertIn("ui_tls_prefix=ok mbedtls_version=3.6.4", prefix_ok.stdout)
+            # A valid prefix must get past every TLS guard: the build then stops
+            # on the stand-in UI checkout, not on a TLS refusal.
+            reached = self.run_ui_bundle(tmp, str(valid))
+            self.assertNotEqual(reached.returncode, 0, reached.stdout + reached.stderr)
+            output = reached.stdout + reached.stderr
+            self.assertNotIn("mbedTLS prefix is unavailable", output)
+            self.assertNotIn("mbedTLS archive is empty", output)
+            self.assertNotIn("mbedTLS prefix (tools/mt8163-arm32/mbedtls)", output)
+
+    def prepare_mbedtls_builder(self, tmp: Path) -> dict[str, Path]:
+        """Synthesise the pinned archive and a stand-in cross toolchain.
+
+        build_mbedtls.sh owns the whole dependency contract, so that contract is
+        exercised by running the real script.  Only the pinned tar.bz2 (which is
+        not carried in this repository) and the external cross toolchain are
+        stand-ins; every guard the script performs itself runs for real.
+        """
+        for tool in ("ar", "tar", "strings"):
+            if shutil.which(tool) is None:
+                self.skipTest(f"{tool} is required to exercise build_mbedtls.sh")
+        lock = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())
+
+        shims = tmp / "shims"
+        shims.mkdir()
+        # The pinned archive hash cannot be reproduced from a fixture, so the
+        # digest check is answered by a stand-in that reports the locked value.
+        (shims / "sha256sum").write_text(
+            '#!/bin/sh\nprintf "%s  %s\\n" "$LE_TEST_PINNED_ARCHIVE_SHA256" "$1"\n'
+        )
+        (shims / "file").write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$LE_TEST_FILE_DESCRIPTION"\n'
+        )
+        (shims / "make").write_text(
+            textwrap.dedent(
+                """\
+                #!/bin/sh
+                # Stand-in for the mbedTLS library Makefile: emit the three
+                # static archives that the builder then validates.
+                set -eu
+                dir=
+                while [ $# -gt 0 ]; do
+                  case $1 in
+                    -C) dir=$2; shift 2 ;;
+                    *) shift ;;
+                  esac
+                done
+                [ -n "$dir" ] || exit 1
+                # A concurrent builder that started with the same absent output
+                # publishes it while this build is still running, so the target
+                # appears after the builder's own existence check has passed.
+                if [ -n "${LE_TEST_RACE_OUTPUT:-}" ] && [ ! -e "$LE_TEST_RACE_OUTPUT" ]; then
+                  mkdir -p "$LE_TEST_RACE_OUTPUT/lib" "$LE_TEST_RACE_OUTPUT/include/mbedtls"
+                  printf '%s\\n' incumbent > "$LE_TEST_RACE_OUTPUT/lib/libmbedtls.a"
+                  printf '%s\\n' incumbent > "$LE_TEST_RACE_OUTPUT/include/mbedtls/build_info.h"
+                  printf '%s\\n' incumbent > "$LE_TEST_RACE_OUTPUT/mbedtls-source.json"
+                fi
+                # The builder's private work directory, exactly as the real
+                # prefix-map flags would record it in the objects.
+                work=$(cd "$dir/../.." && pwd -P)
+                objs=$(mktemp -d)
+                pad() {
+                  i=0
+                  while [ "$i" -lt "$1" ]; do
+                    printf 'mbedtls_padding_%s_%08d_symbol\\n' "$2" "$i"
+                    i=$((i + 1))
+                  done
+                }
+                : > "$objs/leak.o"
+                if [ "${LE_TEST_ARCHIVE_LEAK:-0}" = 1 ]; then
+                  printf -- '-ffile-prefix-map=%s=/usr/src/mbedtls-3.6.4\\n' "$work" \\
+                    >> "$objs/leak.o"
+                  printf '%s\\n' "$work" > "$LE_TEST_FIXTURE_DIR/leaked-build-path.txt"
+                fi
+                pad 2000 leak >> "$objs/leak.o"
+                pad 6000 x509 > "$objs/x509.o"
+                pad 6000 crypto > "$objs/crypto.o"
+                ar rc "$dir/libmbedtls.a" "$objs/leak.o"
+                ar rc "$dir/libmbedx509.a" "$objs/x509.o"
+                ar rc "$dir/libmbedcrypto.a" "$objs/crypto.o"
+                rm -rf "$objs"
+                """
+            )
+        )
+        # The builder validates the compiler ABI from a probe object's ARM
+        # attributes.  The stand-in reports the hard-float set by default and a
+        # soft-float set on request, so both the accept and reject paths are
+        # exercised without a second cross toolchain on the host.
+        (shims / "readelf").write_text(
+            "#!/bin/sh\n"
+            'case "${LE_TEST_READELF_ABI:-hard}" in\n'
+            "  soft)\n"
+            '    printf "%s\\n" "Attribute Section: aeabi" "Tag_CPU_name: \\"7-A\\""\n'
+            "    ;;\n"
+            "  unreadable) exit 1 ;;\n"
+            "  *)\n"
+            '    printf "%s\\n" "Attribute Section: aeabi" "Tag_CPU_name: \\"7-A\\"" \\\n'
+            '      "Tag_ABI_VFP_args: VFP registers"\n'
+            "    ;;\n"
+            "esac\n"
+            "exit 0\n"
+        )
+        for shim in ("sha256sum", "file", "make", "readelf"):
+            (shims / shim).chmod(0o755)
+
+        toolchain = tmp / "toolchain"
+        toolchain.mkdir()
+        compiler = toolchain / "arm-linux-gnueabihf-gcc"
+        compiler.write_text(
+            "#!/bin/sh\n"
+            'if [ "${1:-}" = "--version" ]; then\n'
+            '  printf "%s\\n" "arm-linux-gnueabihf-gcc (fixture) 13.2.1"\n'
+            "  exit 0\n"
+            "fi\n"
+            "# The builder probes the compiler ABI with a compile; the ABI itself is\n"
+            "# reported by the readelf stand-in, so only the output must exist here.\n"
+            'if [ "${1:-}" = "-c" ]; then\n'
+            "  out=\n"
+            "  while [ $# -gt 0 ]; do\n"
+            '    case $1 in\n'
+            "      -o) out=$2; shift 2 ;;\n"
+            "      *) shift ;;\n"
+            "    esac\n"
+            "  done\n"
+            '  [ -n "$out" ] || exit 1\n'
+            '  printf "fixture object\\n" > "$out"\n'
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n"
+        )
+        compiler.chmod(0o755)
+        (toolchain / "arm-linux-gnueabihf-ar").write_text("#!/bin/sh\nexit 0\n")
+        (toolchain / "arm-linux-gnueabihf-ar").chmod(0o755)
+
+        # The builder's helper steps run with the real interpreter; only the
+        # pinned build requirements (jinja2/jsonschema) are stubbed, because the
+        # host that runs this test does not install them.
+        interpreter = toolchain / "fixture-python"
+        interpreter.write_text(
+            "#!/bin/sh\n"
+            'if [ "${1:-}" = "-c" ] || [ "${2:-}" = "-c" ]; then\n'
+            "  # The builder reads the interpreter version to check the locked\n"
+            "  # floor and to record the build, so a host older than that floor can\n"
+            "  # be exercised from a fixture.\n"
+            '  if [ -n "${LE_TEST_PYTHON_VERSION:-}" ]; then\n'
+            "    printf '%s\\n' \"$LE_TEST_PYTHON_VERSION\"\n"
+            "    exit 0\n"
+            "  fi\n"
+            f'  exec "{sys.executable}" "$@"\n'
+            "fi\n"
+            "captured=$(mktemp)\n"
+            "trap 'rm -f \"$captured\"' EXIT\n"
+            'cat > "$captured"\n'
+            'if grep -q PackageNotFoundError "$captured"; then\n'
+            "  exit 0\n"
+            "fi\n"
+            f'"{sys.executable}" "$@" < "$captured"\n'
+        )
+        interpreter.chmod(0o755)
+
+        source = tmp / "fixture-source" / f"mbedtls-{lock['version']}"
+        (source / "library").mkdir(parents=True)
+        (source / "include/mbedtls").mkdir(parents=True)
+        (source / "LICENSE").write_text("Apache-2.0 fixture\n")
+        (source / "library/Makefile").write_text("static:\n\t@true\n")
+        (source / "include/mbedtls/build_info.h").write_text(
+            '#define MBEDTLS_VERSION_STRING         "%s"\n' % lock["version"]
+        )
+        for header in ("ssl.h", "x509_crt.h", "pk.h", "entropy.h"):
+            (source / "include/mbedtls" / header).write_text("/* fixture */\n")
+        archive = tmp / f"mbedtls-{lock['version']}.tar.bz2"
+        with tarfile.open(archive, "w:bz2") as handle:
+            handle.add(source, arcname=f"mbedtls-{lock['version']}")
+        return {
+            "workdir": tmp,
+            "archive": archive,
+            "shims": shims,
+            "compiler": compiler,
+            "interpreter": interpreter,
+        }
+
+    def run_mbedtls_builder(
+        self,
+        fixture: dict[str, Path],
+        *,
+        leaked_path: bool,
+        name: str,
+        output: Path | str | None = None,
+        race_output: Path | None = None,
+        python_version: str | None = None,
+        tmpdir: Path | None = None,
+        readelf_abi: str | None = None,
+    ) -> tuple[subprocess.CompletedProcess, Path]:
+        lock = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())
+        environment = os.environ.copy()
+        environment["PATH"] = f"{fixture['shims']}:{environment['PATH']}"
+        environment["LE_TEST_PINNED_ARCHIVE_SHA256"] = lock["source_sha256"]
+        environment["LE_TEST_ARCHIVE_LEAK"] = "1" if leaked_path else "0"
+        environment["LE_TEST_FIXTURE_DIR"] = str(fixture["workdir"])
+        # Always set, so a value inherited from the host environment cannot
+        # inject the race into a build that is not asking for it.
+        environment["LE_TEST_RACE_OUTPUT"] = (
+            str(race_output) if race_output is not None else ""
+        )
+        # Empty means "report the real interpreter version"; the fixture shim
+        # answers only the version query, so a host below the locked floor can
+        # be exercised without changing the interpreter that runs the build.
+        environment["LE_TEST_PYTHON_VERSION"] = (
+            python_version if python_version is not None else ""
+        )
+        # The builder's private work directory is named after TMPDIR; a caller
+        # that needs a temporary path containing a shell or ERE metacharacter
+        # supplies one instead of relying on the host's TMPDIR.
+        if tmpdir is not None:
+            environment["TMPDIR"] = str(tmpdir)
+        environment["LE_TEST_FILE_DESCRIPTION"] = (
+            "ELF 32-bit LSB relocatable, ARM, EABI5 version 1 (SYSV)"
+        )
+        # Always set, so the host environment cannot make an ABI-rejection case
+        # look acceptable (or the reverse).
+        environment["LE_TEST_READELF_ABI"] = (
+            readelf_abi if readelf_abi is not None else "hard"
+        )
+        output = fixture["workdir"] / name if output is None else output
+        # The argument is passed verbatim, so a caller can exercise an output path
+        # as it was typed (for example with a trailing separator) while the
+        # returned path stays the one to assert against.
+        output_argument = str(output)
+        completed = subprocess.run(
+            [
+                "bash",
+                str(TOOLS_DIR / "mbedtls/build_mbedtls.sh"),
+                "--archive", str(fixture["archive"]),
+                "--output", output_argument,
+                "--cc", str(fixture["compiler"]),
+                "--python", str(fixture["interpreter"]),
+                "--jobs", "1",
+            ],
+            env=environment, text=True, cwd=fixture["workdir"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        return completed, Path(output_argument)
+
+    def test_mbedtls_builder_rejects_a_leaked_build_path_when_the_scan_short_circuits(
+        self,
+    ) -> None:
+        """Codex review: `strings | grep -q` under `pipefail` hid this rejection.
+
+        `grep -q` leaves as soon as it matches, so `strings` is still writing
+        when the read end closes; `pipefail` then reports the writer's SIGPIPE
+        (141) instead of the match, the `if` body is skipped, and an archive
+        that carries the private build path is accepted.  The guard must consume
+        the whole scan and still reject, without rejecting a clean pinned build.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+
+            leaked, leaked_output = self.run_mbedtls_builder(
+                fixture, leaked_path=True, name="output-leaked"
+            )
+            marker = fixture["workdir"] / "leaked-build-path.txt"
+            self.assertTrue(marker.is_file(), leaked.stdout + leaked.stderr)
+            embedded = marker.read_text().strip()
+            self.assertIn("libreecho-mbedtls-build.", embedded)
+            self.assertEqual(leaked.returncode, 1, leaked.stdout + leaked.stderr)
+            self.assertIn("private build path", leaked.stderr)
+            self.assertFalse((leaked_output / "mbedtls-source.json").exists())
+
+            clean, clean_output = self.run_mbedtls_builder(
+                fixture, leaked_path=False, name="output-clean"
+            )
+            self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+            self.assertIn("mbedtls_archives=3", clean.stdout)
+            self.assertTrue((clean_output / "mbedtls-source.json").is_file())
+
+    def test_mbedtls_builder_matches_a_leaked_path_literally(self) -> None:
+        """Codex review: the leak scan must not read the build path as a pattern.
+
+        `$work` was interpolated into a `grep -E` pattern, so an ERE
+        metacharacter in TMPDIR changed it: with a `+` in the temporary directory
+        the private build path no longer matched itself, the nonzero status was
+        read as "no leak", and an archive that carries that path was published.
+        The scan matches both patterns literally and fails closed on a status
+        that means neither "matched" nor "no match".
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+            pattern_tmp = fixture["workdir"] / "build+cache"
+            pattern_tmp.mkdir()
+
+            leaked, leaked_output = self.run_mbedtls_builder(
+                fixture,
+                leaked_path=True,
+                name="output-pattern",
+                tmpdir=pattern_tmp,
+            )
+            embedded = (fixture["workdir"] / "leaked-build-path.txt").read_text()
+            self.assertIn("build+cache", embedded)
+            self.assertEqual(leaked.returncode, 1, leaked.stdout + leaked.stderr)
+            self.assertIn("private build path", leaked.stderr)
+            self.assertFalse(leaked_output.exists(), leaked.stdout + leaked.stderr)
+
+            # A clean build under the same temporary directory still publishes.
+            clean, clean_output = self.run_mbedtls_builder(
+                fixture,
+                leaked_path=False,
+                name="output-pattern-clean",
+                tmpdir=pattern_tmp,
+            )
+            self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+            self.assertTrue((clean_output / "mbedtls-source.json").is_file())
+
+    def test_mbedtls_builder_refuses_to_erase_an_existing_output(self) -> None:
+        """Codex review: an existing output path must never be erased.
+
+        The builder removed the output directory up front, so an accidental
+        shared path was destroyed before the build even started and a later
+        failure left neither the old contents nor a usable prefix.  An existing
+        output path is refused, the prefix is staged next to it, and only a
+        successful build replaces it.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+
+            occupied = fixture["workdir"] / "occupied-output"
+            (occupied / "unrelated-artifacts").mkdir(parents=True)
+            sentinel = occupied / "unrelated-artifacts/keep.txt"
+            sentinel.write_text("must survive\n")
+
+            refused, _ = self.run_mbedtls_builder(
+                fixture, leaked_path=False, name="occupied-output", output=occupied
+            )
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("refusing to overwrite", refused.stderr)
+            self.assertEqual(sentinel.read_text(), "must survive\n")
+
+            # A build that fails must not leave a partial prefix in its place.
+            failed, failed_output = self.run_mbedtls_builder(
+                fixture, leaked_path=True, name="failed-output"
+            )
+            self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+            self.assertFalse(failed_output.exists(), failed.stdout + failed.stderr)
+
+    @staticmethod
+    def mbedtls_tree_snapshot(root: Path) -> dict[str, bytes | None]:
+        """Map every path below root to its bytes; a directory maps to None.
+
+        The race assertions compare the published prefix against this snapshot,
+        so a nested staging tree, a partially written prefix, or any extra
+        directory is a difference rather than something to remember to check.
+        """
+        return {
+            path.relative_to(root).as_posix(): (
+                path.read_bytes() if path.is_file() else None
+            )
+            for path in sorted(root.rglob("*"))
+        }
+
+    def test_mbedtls_builder_refuses_a_concurrent_publication(self) -> None:
+        """Codex review: publication must not replace a prefix that arrived.
+
+        Two builders can both pass the initial "output is absent" check and then
+        build for minutes.  When the first publishes, a plain `mv STAGE OUTPUT`
+        treats the now-existing directory as a container: the second builder's
+        staging tree is renamed *inside* the published prefix and the command
+        still reports success, so the loser believes it published its validated
+        prefix while the incumbent is contaminated.  The publication rename must
+        be non-replacing and must fail closed instead, leaving the incumbent
+        prefix byte-identical, removing the losing stage, and writing nothing
+        partial over the published prefix.
+
+        The race is injected where it happens: the target appears while the
+        pinned build is running, after the builder's own existence check on the
+        output path has already passed.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+            workdir = fixture["workdir"]
+
+            raced, raced_output = self.run_mbedtls_builder(
+                fixture,
+                leaked_path=False,
+                name="raced-output",
+                race_output=workdir / "raced-output",
+            )
+            self.assertEqual(raced.returncode, 1, raced.stdout + raced.stderr)
+            self.assertIn("appeared during the build", raced.stderr)
+
+            # Exactly what the other builder published, and nothing else.
+            self.assertEqual(
+                self.mbedtls_tree_snapshot(raced_output),
+                {
+                    "include": None,
+                    "include/mbedtls": None,
+                    "include/mbedtls/build_info.h": b"incumbent\n",
+                    "lib": None,
+                    "lib/libmbedtls.a": b"incumbent\n",
+                    "mbedtls-source.json": b"incumbent\n",
+                },
+                raced.stdout + raced.stderr,
+            )
+            # The loser's stage is removed with its private work directory
+            # instead of being left beside the published prefix.
+            self.assertEqual(
+                sorted(path.name for path in workdir.glob("raced-output.stage.*")),
+                [],
+                raced.stdout + raced.stderr,
+            )
+
+    def test_mbedtls_builder_requires_no_replace_rename_semantics(self) -> None:
+        """The publication guard must not rest on an unchecked `mv`.
+
+        `-T` and `-n` are the whole no-replace contract, and an `mv` that accepts
+        those options but ignores them is exactly the implementation that nests a
+        stage inside a published prefix.  The builder probes the live `mv` before
+        doing any work, so such an `mv` fails closed at startup instead of
+        contaminating a prefix later.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+            shim = fixture["shims"] / "mv"
+            shim.write_text(
+                "#!/bin/bash\n"
+                "args=()\n"
+                'for a in "$@"; do\n'
+                '  case "$a" in\n'
+                "    -T|-n) ;;\n"
+                '    *) args+=("$a") ;;\n'
+                "  esac\n"
+                "done\n"
+                'exec /usr/bin/mv "${args[@]}"\n'
+            )
+            shim.chmod(0o755)
+
+            refused, output = self.run_mbedtls_builder(
+                fixture, leaked_path=False, name="unprobeable-output"
+            )
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("atomic no-replace publication", refused.stderr)
+            self.assertFalse(output.exists(), refused.stdout + refused.stderr)
+
+    def test_mbedtls_builder_accepts_an_output_with_a_trailing_separator(self) -> None:
+        """Codex review: a trailing separator must not name the stage as a child.
+
+        `--output /prefix/` derived the staging path `/prefix/.stage.$$`, so
+        creating the stage created `OUTPUT` itself; the no-replace publication then
+        refused an output that only the stage had created, so a valid build failed
+        after the whole compilation and validation had run, and the failed build
+        left that empty directory behind.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+
+            for index, suffix in enumerate((os.sep, os.sep * 2 + ".", os.sep * 3 + ".")):
+                with self.subTest(suffix=suffix):
+                    output = fixture["workdir"] / f"trailing-output-{index}"
+                    published, published_output = self.run_mbedtls_builder(
+                        fixture,
+                        leaked_path=False,
+                        name=f"trailing-output-{index}",
+                        output=f"{output}{suffix}",
+                    )
+                    self.assertEqual(
+                        published.returncode, 0, published.stdout + published.stderr
+                    )
+                    self.assertEqual(published_output, output)
+                    self.assertEqual(
+                        sorted(path.name for path in output.iterdir()),
+                        ["LICENSE", "include", "lib", "mbedtls-source.json"],
+                        published.stdout + published.stderr,
+                    )
+
+    def test_mbedtls_builder_enforces_the_locked_python_floor(self) -> None:
+        """Codex review: the advertised interpreter floor must be enforced.
+
+        `SOURCE.lock` advertised a floor its own pinned requirement cannot
+        support: jsonschema 4.25.1 declares `Requires-Python >=3.9`, so a host the
+        lock claimed was supported failed later with an uninstallable pinned
+        package instead of a clear refusal.  The floor is raised to the pin's own
+        requirement and read from the lock, so the builder refuses an older
+        interpreter before it does any work.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+            floor = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())[
+                "build_requirements"
+            ]["python3"]
+
+            older, older_output = self.run_mbedtls_builder(
+                fixture,
+                leaked_path=False,
+                name="older-python",
+                python_version="3.8.10",
+            )
+            self.assertEqual(older.returncode, 1, older.stdout + older.stderr)
+            self.assertIn("older than the pinned floor", older.stderr)
+            self.assertIn(floor, older.stderr)
+            self.assertFalse(older_output.exists(), older.stdout + older.stderr)
+
+            # The supported interpreter the fixture reports by default still
+            # builds and publishes, so the floor is not enforced over-eagerly.
+            supported, supported_output = self.run_mbedtls_builder(
+                fixture, leaked_path=False, name="supported-python"
+            )
+            self.assertEqual(
+                supported.returncode, 0, supported.stdout + supported.stderr
+            )
+            self.assertTrue((supported_output / "mbedtls-source.json").is_file())
+
+    def test_mbedtls_builder_validates_the_compiler_float_abi(self) -> None:
+        """Codex review: the pinned hard-float ABI must be verified, not assumed.
+
+        A soft-float `arm-linux-gnueabi-gcc` still emits objects that satisfy the
+        generic ARM32 relocatable check, so the prefix could be published while
+        `mbedtls-source.json` recorded the locked `arm-linux-gnueabihf-static`
+        target: the provenance would misstate the artifact, and the production
+        hard-float UI link may reject the cached prefix.  The builder now probes
+        the compiler's own output attributes before doing any work.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+
+            # A compiler whose objects carry VFP argument registers satisfies the
+            # locked hard-float target, and the build still publishes.
+            accepted, accepted_output = self.run_mbedtls_builder(
+                fixture, leaked_path=False, name="hard-float-abi"
+            )
+            self.assertEqual(
+                accepted.returncode, 0, accepted.stdout + accepted.stderr
+            )
+            self.assertTrue((accepted_output / "mbedtls-source.json").is_file())
+
+            # A soft-float compiler is refused before extraction or compilation,
+            # and never publishes a prefix.
+            rejected, rejected_output = self.run_mbedtls_builder(
+                fixture,
+                leaked_path=False,
+                name="soft-float-abi",
+                readelf_abi="soft",
+            )
+            self.assertEqual(
+                rejected.returncode, 1, rejected.stdout + rejected.stderr
+            )
+            self.assertIn("hard-float ABI", rejected.stderr)
+            self.assertFalse(rejected_output.exists(), rejected.stdout + rejected.stderr)
+            self.assertNotIn("mbedtls_archives=", rejected.stdout)
+
+            # An unreadable attribute section is an unverifiable compiler, so it
+            # fails closed rather than being treated as acceptable.
+            unreadable, unreadable_output = self.run_mbedtls_builder(
+                fixture,
+                leaked_path=False,
+                name="unreadable-abi",
+                readelf_abi="unreadable",
+            )
+            self.assertEqual(
+                unreadable.returncode, 1, unreadable.stdout + unreadable.stderr
+            )
+            self.assertIn("cannot read the mbedTLS probe object attributes", unreadable.stderr)
+            self.assertFalse(
+                unreadable_output.exists(), unreadable.stdout + unreadable.stderr
+            )
+
+    def test_mbedtls_builder_cleans_up_on_an_early_refusal(self) -> None:
+        """Codex review: an early refusal must not leak its work directory.
+
+        The output and staging-path guards run before the cleanup trap used to be
+        installed, so every refused retry left a `libreecho-mbedtls-build.*`
+        directory behind in TMPDIR even though no build had started.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            fixture = self.prepare_mbedtls_builder(tmp)
+            tmpdir = tmp / "builder-tmp"
+            tmpdir.mkdir()
+
+            occupied = fixture["workdir"] / "occupied-early-refusal"
+            occupied.mkdir()
+            (occupied / "keep.txt").write_text("must survive\n")
+
+            refused, _ = self.run_mbedtls_builder(
+                fixture,
+                leaked_path=False,
+                name="occupied-early-refusal",
+                output=occupied,
+                tmpdir=tmpdir,
+            )
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("refusing to overwrite", refused.stderr)
+            self.assertEqual((occupied / "keep.txt").read_text(), "must survive\n")
+            leftovers = sorted(path.name for path in tmpdir.iterdir())
+            self.assertEqual(
+                leftovers,
+                [],
+                f"refused build left work directories behind: {leftovers}",
+            )
+
+    def test_ui_tls_verifier_rejects_a_prefix_with_headers_off_the_pin(self) -> None:
+        """Codex review: the consumed headers must be bound to the pin.
+
+        A cached prefix can keep the archives and the provenance record while a
+        header is stale or hand-edited.  Verifying only that the headers exist
+        and that build_info.h still prints the pinned version would link and
+        compile the UI against declarations that do not belong to the recorded
+        archives, so the recorded include-tree digest is enforced for every
+        header in the tree, not only for the version text.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            if shutil.which("ar") is None:
+                self.skipTest("ar is required to synthesise an mbedTLS prefix")
+
+            consumed = tmp / "rewritten-consumed-header"
+            self.write_mbedtls_prefix(consumed)
+            (consumed / "include/mbedtls/ssl.h").write_text("/* rewritten */\n")
+            rejected = self.run_tls_prefix(consumed)
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("headers do not match", rejected.stderr)
+
+            linked = tmp / "rewritten-linked-header"
+            self.write_mbedtls_prefix(linked)
+            (linked / "include/psa/crypto.h").write_text("/* rewritten */\n")
+            rejected = self.run_tls_prefix(linked)
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("headers do not match", rejected.stderr)
+
+            # The pinned version text is preserved, so only the digest can catch
+            # this: the prefix must not be accepted on the version alone.
+            version_text = tmp / "rewritten-build-info"
+            self.write_mbedtls_prefix(version_text)
+            build_info = version_text / "include/mbedtls/build_info.h"
+            build_info.write_text(build_info.read_text() + "\n/* rewritten */\n")
+            rejected = self.run_tls_prefix(version_text)
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("headers do not match", rejected.stderr)
+
+            # A prefix without the recorded include digests fails closed too.
+            unrecorded = tmp / "unrecorded-include-digests"
+            self.write_mbedtls_prefix(unrecorded)
+            record = json.loads((unrecorded / "mbedtls-source.json").read_text())
+            del record["include_tree_sha256"]
+            (unrecorded / "mbedtls-source.json").write_text(
+                json.dumps(record, indent=2, sort_keys=True) + "\n"
+            )
+            rejected = self.run_tls_prefix(unrecorded)
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("include", rejected.stderr)
 
 
 if __name__ == "__main__":
