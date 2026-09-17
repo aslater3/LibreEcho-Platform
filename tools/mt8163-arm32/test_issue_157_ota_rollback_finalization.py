@@ -74,8 +74,10 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
         # record survives, the live transaction does not, and the terminal
         # records were never written.
         resume = extract_function(self.init, "ota_rollback_resume_terminal")
-        self.assertIn("/data/libreecho/update/pending", resume)
-        self.assertIn("/data/libreecho/update/feature-commit", resume)
+        retire_fn = extract_function(self.init, "ota_rollback_resume_live_records")
+        self.assertIn("/data/libreecho/update/pending", retire_fn)
+        self.assertIn("/data/libreecho/update/feature-commit", retire_fn)
+        self.assertIn("ota_rollback_resume_live_records || return 0", resume)
         self.assertIn("s/^state=//p", resume)
         self.assertIn("detail=//p", resume)
         self.assertIn("s/^slot=//p", resume)
@@ -94,6 +96,28 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
         self.assertIn("log ota-rollback-resume-staging-unsafe", cleanup)
         self.assertIn("log ota-rollback-resume-staging-cleanup-failed", cleanup)
         self.assertIn('$BB rm -rf "$resume_staging"', cleanup)
+        # The helper retires the live transaction with one `rm -f` of the
+        # pending record and the feature commit and then exits once either is
+        # gone, so a one-sided retirement is resumed too -- but only for the
+        # transaction the finalized history names, and only while its other
+        # half is already gone: a complete pair is a live transaction whose own
+        # rollback branch owns those records.
+        retire = extract_function(self.init, "ota_rollback_resume_live_records")
+        self.assertIn("/data/libreecho/update/pending", retire)
+        self.assertIn("/data/libreecho/update/feature-commit", retire)
+        self.assertIn("[ ! -e /data/libreecho/update/pending ] ||", retire)
+        self.assertIn("transaction_id=//p", retire)
+        self.assertIn(
+            'log "ota-rollback-resume-live-record-foreign:$resume_live"', retire
+        )
+        self.assertIn(
+            'log "ota-rollback-resume-live-record-unsafe:$resume_live"', retire
+        )
+        self.assertIn("ota-rollback-resume-live-record-cleaned:$resume_live", retire)
+        self.assertLess(
+            resume.index("ota_rollback_resume_live_records || return 0"),
+            resume.index("ota_rollback_resume_staging_cleanup || return 0"),
+        )
         self.assertLess(
             resume.index("ota_rollback_resume_staging_cleanup || return 0"),
             resume.index('ota_rollback_publish_terminal "$resume_slot"'),
@@ -143,6 +167,14 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
         self.assertEqual(self.worker.count('ota_rollback_publish_terminal "$pending_slot"'), 2)
         schema_one = self.worker.index("mv /data/libreecho/update/pending")
         self.assertLess(schema_one, self.worker.index('log "ota-rollback-complete:'))
+        # A schema-2 pending record without its durable journal was never
+        # prepared or activated, so it is not rollback evidence: it must be
+        # preserved for the update flow that rebuilds it instead of being
+        # retired as a rollback whose staged tree is still in place.
+        self.assertLess(
+            self.worker.index("[ -r /data/libreecho/update/feature-commit ]"),
+            self.worker.index('log "ota-v2-fallback-cleaned:'),
+        )
 
 
 class _Fixture:
@@ -429,7 +461,16 @@ class _BootWorkerFixture:
             '[ "${1:-}" = fallback ] || exit 0\n'
             "printf 'schema=2\\ntransaction_id=deadbeef\\nversion=%s\\nslot=%s\\n' \\\n"
             f"    '{ROLLBACK_VERSION}' '{ROLLBACK_SLOT}' >\"$update/rolled-back\"\n"
-            'rm -f "$update/pending" "$update/feature-commit"\n'
+            # The shipped helper retires the pair with one `rm -f` of the
+            # pending record and the feature commit -- in that order -- and
+            # only then removes its staging tree, so a power loss can be placed
+            # on either side of each step.
+            'rm -f "$update/pending"\n'
+            'if [ "${INTERRUPT_AFTER_PENDING_UNLINK:-0}" = 1 ]; then\n'
+            '    kill -KILL "$PPID"\n'
+            "    exit 0\n"
+            "fi\n"
+            'rm -f "$update/feature-commit"\n'
             'if [ "${INTERRUPT_BEFORE_STAGING_CLEANUP:-0}" = 1 ]; then\n'
             '    kill -KILL "$PPID"\n'
             "    exit 0\n"
@@ -538,14 +579,18 @@ class _BootWorkerFixture:
         """Run one boot of the shipped worker against the sandbox root.
 
         ``interrupt_at`` places the power loss inside the recovery helper:
-        "staging" before its staging cleanup, "cleanup" once it is done, and
-        ``None`` for a boot that completes.
+        "pending-unlink" between the two unlinks of its live-record cleanup,
+        "staging" after that cleanup but before its staging tree is removed,
+        "cleanup" once both are done, and ``None`` for a boot that completes.
         """
         return subprocess.run(
             [BUSYBOX, "sh", str(self.harness)],
             env={
                 "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                 "BOOT_LOG": str(self.boot_log),
+                "INTERRUPT_AFTER_PENDING_UNLINK": (
+                    "1" if interrupt_at == "pending-unlink" else "0"
+                ),
                 "INTERRUPT_BEFORE_STAGING_CLEANUP": (
                     "1" if interrupt_at == "staging" else "0"
                 ),
@@ -770,6 +815,107 @@ class RollbackFinalizationResumesAfterInterruption(unittest.TestCase):
                 self.assertIn(
                     "ota-rollback-terminal-publication-resumed:b", fx.markers()
                 )
+
+    def test_one_sided_retirement_is_finished_by_the_next_boot(self) -> None:
+        self.fx.seed_failed_candidate()
+        # Boot 1: the helper records the fallback history and retires the live
+        # transaction, and the device loses power between the two unlinks of
+        # its single `rm -f`, so the durable journal survives without the
+        # pending record.
+        interrupted = self.fx.boot(interrupt_at="pending-unlink")
+        self.assertEqual(interrupted.returncode, -signal.SIGKILL, interrupted.stderr)
+        self.assertFalse((self.fx.update / "pending").exists())
+        self.assertTrue((self.fx.update / "feature-commit").is_file())
+        self.assertTrue((self.fx.update / "staging").is_dir())
+        self.assertTrue((self.fx.update / "rolled-back").is_file())
+        self.assert_untouched_failed_candidate()
+
+        # Boot 2: neither the helper nor `abort-before-activation` will touch a
+        # one-sided pair, so no other production path retires that journal --
+        # and while it exists the update flow refuses to stage any candidate.
+        # The worker retires the record the finalized history names, finishes
+        # the staging cleanup, and only then publishes.
+        recovered = self.fx.boot()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn(
+            "ota-rollback-resume-live-record-cleaned:feature-commit",
+            self.fx.markers(),
+        )
+        self.assertFalse((self.fx.update / "feature-commit").exists())
+        self.assertFalse((self.fx.update / "staging").exists())
+        self.assert_terminal_publication(self.fx.markers())
+        self.assertEqual(self.fx.fallbacks.read_text().splitlines(), ["fallback"])
+        self.assertFalse(self.fx.reboots.exists())
+
+    def test_live_records_of_another_transaction_are_never_retired(self) -> None:
+        self.fx.seed_failed_candidate()
+        self.assertEqual(
+            self.fx.boot(interrupt_at="pending-unlink").returncode, -signal.SIGKILL
+        )
+        # A journal that does not belong to the transaction the finalized
+        # history names is somebody else's live transaction: leave it.
+        self.fx.write_update(
+            "feature-commit", "phase=prepared\ntransaction_id=cafebabe\n"
+        )
+        foreign = self.fx.boot()
+        self.assertEqual(foreign.returncode, 0, foreign.stderr)
+        self.assertIn(
+            "ota-rollback-resume-live-record-foreign:feature-commit",
+            self.fx.markers(),
+        )
+        self.assertTrue((self.fx.update / "feature-commit").is_file())
+        self.assert_untouched_failed_candidate()
+        self.assertNotIn(
+            "ota-rollback-terminal-publication-resumed", self.fx.markers()
+        )
+
+        # A complete pair is a live transaction even when its id matches the
+        # history record, so the resume must not retire it: the rollback branch
+        # owns those records.
+        self.fx.write_update(
+            "pending",
+            f"schema=2\ntransaction_id=deadbeef\nversion={ROLLBACK_VERSION}\n"
+            f"slot={ROLLBACK_SLOT}\n",
+        )
+        self.fx.write_update(
+            "feature-commit", "phase=prepared\ntransaction_id=deadbeef\n"
+        )
+        live = self.fx.boot()
+        self.assertEqual(live.returncode, 0, live.stderr)
+        self.assertNotIn("ota-rollback-resume-live-record-cleaned", self.fx.markers())
+        self.assertNotIn(
+            "ota-rollback-terminal-publication-resumed", self.fx.markers()
+        )
+        self.assertIn(f"ota-v2-fallback-cleaned:{ROLLBACK_SLOT}:a", self.fx.markers())
+
+    def test_schema_two_intent_without_its_journal_is_preserved(self) -> None:
+        # A lone schema-2 pending record is an interrupted intent publish, not
+        # rollback evidence: retiring it as a rollback would publish a
+        # finalization that never happened while its staged tree still holds
+        # the candidate.  It is preserved for the update flow that rebuilds it.
+        self.fx.write_update(
+            "pending",
+            f"schema=2\ntransaction_id=deadbeef\nversion={ROLLBACK_VERSION}\n"
+            f"slot={ROLLBACK_SLOT}\n",
+        )
+        self.fx.write_update(
+            "state",
+            f"schema=1\nstate=downloading\nprogress=10\ndetail={ROLLBACK_VERSION}\n",
+        )
+        self.fx.write_update(
+            "check-status",
+            "schema=1\nsource=github-releases\nchannel=dev\n"
+            "status=reboot-pending\nsource_reachable=true\n"
+            f"latest_version={ROLLBACK_VERSION}\nlast_check_epoch=1\n",
+        )
+        (self.fx.update / "staging").mkdir()
+        refused = self.fx.boot()
+        self.assertEqual(refused.returncode, 0, refused.stderr)
+        self.assertIn("ota-v2-fallback-preserved-for-recovery", self.fx.markers())
+        self.assertTrue((self.fx.update / "pending").is_file())
+        self.assertFalse((self.fx.update / "rolled-back").exists())
+        self.assertEqual(self.fx.read_update("state")["state"], "downloading")
+        self.assertTrue((self.fx.update / "staging").is_dir())
 
     def test_unpublished_check_record_is_recovered_from_a_terminal_state(self) -> None:
         # The state half was published before the interruption, so the pending

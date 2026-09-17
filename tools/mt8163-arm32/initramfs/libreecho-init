@@ -1275,6 +1275,43 @@ ota_health_confirm_worker()
         return 0
     }
 
+    # The helper retires the live transaction with one `rm -f` of the pending
+    # record and the feature commit, and it exits immediately once either is
+    # gone -- `fallback` and `abort-before-activation` both require the pair --
+    # so an interruption between those two unlinks leaves a one-sided record
+    # that no other production path finishes.  The consequence is permanent
+    # rather than cosmetic: the surviving feature commit is the durable v2
+    # journal, so the update flow refuses to stage anything else, and the
+    # resume below would never reach publication.  Only a record that carries
+    # the transaction id of the finalized `rolled-back` history is retired,
+    # and only while its other half is already gone: a complete pair is a live
+    # transaction, whose own rollback branch owns those records.
+    ota_rollback_resume_live_records()
+    {
+        [ ! -e /data/libreecho/update/pending ] ||
+            [ ! -e /data/libreecho/update/feature-commit ] || return 1
+        for resume_live in pending feature-commit; do
+            resume_live_path=/data/libreecho/update/$resume_live
+            [ -e "$resume_live_path" ] || [ -L "$resume_live_path" ] || continue
+            [ -f "$resume_live_path" ] && [ ! -L "$resume_live_path" ] || {
+                log "ota-rollback-resume-live-record-unsafe:$resume_live"
+                return 1
+            }
+            [ "$($BB sed -n 's/^transaction_id=//p' "$resume_live_path" 2>/dev/null)" = \
+                "$resume_transaction" ] || {
+                log "ota-rollback-resume-live-record-foreign:$resume_live"
+                return 1
+            }
+            $BB rm -f "$resume_live_path" || {
+                log "ota-rollback-resume-live-record-cleanup-failed:$resume_live"
+                return 1
+            }
+            $BB sync
+            log "ota-rollback-resume-live-record-cleaned:$resume_live"
+        done
+        return 0
+    }
+
     # A rollback retires the live transaction before its terminal records are
     # published, so a power loss -- or a failed write -- in between leaves a
     # device whose only remaining evidence is the finalized `rolled-back`
@@ -1286,8 +1323,6 @@ ota_health_confirm_worker()
     # unless the history record names the slot that actually rolled back.
     ota_rollback_resume_terminal()
     {
-        [ ! -e /data/libreecho/update/pending ] || return 0
-        [ ! -e /data/libreecho/update/feature-commit ] || return 0
         resume_state=$($BB sed -n 's/^state=//p' /data/libreecho/update/state 2>/dev/null)
         case "$resume_state" in
             restarting)
@@ -1320,9 +1355,18 @@ ota_health_confirm_worker()
                 return 0
                 ;;
         esac
-        # The staging cleanup is the helper step an interruption can cut
-        # short, and the helper will not resume it, so the terminal records are
-        # only published once it is finished -- or the boot retries.
+        # Which transaction the finalized history names, so the one-sided live
+        # record left by an interrupted retirement can be matched to it.
+        resume_transaction=$($BB sed -n 's/^transaction_id=//p' /data/libreecho/update/rolled-back 2>/dev/null)
+        [ -n "$resume_transaction" ] || {
+            log ota-rollback-resume-evidence-invalid
+            return 0
+        }
+        # The retirement and the staging tree are the two helper steps an
+        # interruption can cut short, and the helper will not resume either, so
+        # the terminal records are only published once both are finished -- or
+        # the boot retries.
+        ota_rollback_resume_live_records || return 0
         ota_rollback_resume_staging_cleanup || return 0
         if ota_rollback_publish_terminal "$resume_slot"; then
             log "ota-rollback-terminal-publication-resumed:$resume_slot"
@@ -1420,16 +1464,25 @@ ota_health_confirm_worker()
     case "$pending_slot:$selected_slot" in
         a:a|b:b) ;;
         a:b|b:a)
-            if [ "$($BB sed -n 's/^schema=//p' /data/libreecho/update/pending 2>/dev/null)" = 2 ] &&
-               [ -r /data/libreecho/update/feature-commit ]; then
-                $BB mkdir -p /data/libreecho/update/staging
-                if /usr/local/sbin/libreecho-bootctl status > /data/libreecho/update/staging/bootctl.readback 2>/dev/null &&
-                   /usr/local/sbin/libreecho-feature-transaction fallback &&
-                   ota_v2_fallback_confirmed &&
-                   ota_rollback_publish_terminal "$pending_slot"; then
-                    log "ota-v2-fallback-cleaned:$pending_slot:$selected_slot"
-                    return 0
+            if [ "$($BB sed -n 's/^schema=//p' /data/libreecho/update/pending 2>/dev/null)" = 2 ]; then
+                if [ -r /data/libreecho/update/feature-commit ]; then
+                    $BB mkdir -p /data/libreecho/update/staging
+                    if /usr/local/sbin/libreecho-bootctl status > /data/libreecho/update/staging/bootctl.readback 2>/dev/null &&
+                       /usr/local/sbin/libreecho-feature-transaction fallback &&
+                       ota_v2_fallback_confirmed &&
+                       ota_rollback_publish_terminal "$pending_slot"; then
+                        log "ota-v2-fallback-cleaned:$pending_slot:$selected_slot"
+                        return 0
+                    fi
                 fi
+                # The durable v2 journal is what makes a staged candidate
+                # prepared and activatable evidence.  Without it this record is
+                # the one-sided intent an interrupted intent publish leaves,
+                # which the update flow rebuilds on a retry -- not rollback
+                # evidence.  Retiring it as a rollback below would publish a
+                # finalization that never happened while the staged tree still
+                # holds the candidate, so fail closed and leave both records for
+                # recovery instead.
                 log ota-v2-fallback-preserved-for-recovery
                 return 0
             fi

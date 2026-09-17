@@ -120,6 +120,20 @@ attempt is retried on every subsequent boot and logs
 `ota-rollback-resume-staging-cleaned` before the publication marker
 `ota-rollback-terminal-publication-resumed`.
 
+The retirement of the live records is the helper's other interruptible step: it
+removes the pending record and the feature commit with a single `rm -f` and
+exits as soon as either is gone, while `fallback` and
+`abort-before-activation` both require the pair, so a one-sided retirement has
+no other way out — and for as long as the durable journal survives, the update
+flow refuses to stage anything else. The worker therefore retires a surviving
+record as well, but only when it carries the `transaction_id` recorded in
+`rolled-back` and its other half is already gone (`ota-rollback-resume-live-record-foreign`
+otherwise, and `-unsafe` for a record that is not a regular file); a complete
+pair stays a live transaction for its own rollback branch. A schema-2 `pending`
+record without its durable journal was never prepared or activated, so it is
+preserved for the update flow that rebuilds it instead of being retired as a
+rollback whose staged tree still holds the candidate.
+
 ## Signed bundle v1
 
 The transport is a deterministic POSIX tar with these exact members:
