@@ -5182,6 +5182,40 @@ class UiTlsPackagingTests(unittest.TestCase):
                 unreadable_output.exists(), unreadable.stdout + unreadable.stderr
             )
 
+    def test_mbedtls_builder_cleans_up_on_an_early_refusal(self) -> None:
+        """Codex review: an early refusal must not leak its work directory.
+
+        The output and staging-path guards run before the cleanup trap used to be
+        installed, so every refused retry left a `libreecho-mbedtls-build.*`
+        directory behind in TMPDIR even though no build had started.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            fixture = self.prepare_mbedtls_builder(tmp)
+            tmpdir = tmp / "builder-tmp"
+            tmpdir.mkdir()
+
+            occupied = fixture["workdir"] / "occupied-early-refusal"
+            occupied.mkdir()
+            (occupied / "keep.txt").write_text("must survive\n")
+
+            refused, _ = self.run_mbedtls_builder(
+                fixture,
+                leaked_path=False,
+                name="occupied-early-refusal",
+                output=occupied,
+                tmpdir=tmpdir,
+            )
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("refusing to overwrite", refused.stderr)
+            self.assertEqual((occupied / "keep.txt").read_text(), "must survive\n")
+            leftovers = sorted(path.name for path in tmpdir.iterdir())
+            self.assertEqual(
+                leftovers,
+                [],
+                f"refused build left work directories behind: {leftovers}",
+            )
+
     def test_ui_tls_verifier_rejects_a_prefix_with_headers_off_the_pin(self) -> None:
         """Codex review: the consumed headers must be bound to the pin.
 

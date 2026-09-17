@@ -171,6 +171,9 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/libreecho-mbedtls-build.XXXXXX")
 # even started, and a failed build would then leave neither the old contents nor
 # a usable prefix.
 STAGE="${OUTPUT}.stage.$$"
+# Installed before the refusal guards, which exit early: a rejected retry must
+# not leave its private work directory behind in TMPDIR.
+trap 'rm -rf "$work" "$STAGE"' EXIT
 [[ ! -e "$OUTPUT" && ! -L "$OUTPUT" ]] || {
   printf 'ERROR: refusing to overwrite an existing mbedTLS prefix: %s\n' \
     "$OUTPUT" >&2
@@ -180,7 +183,6 @@ STAGE="${OUTPUT}.stage.$$"
   printf 'ERROR: stale mbedTLS prefix staging path: %s\n' "$STAGE" >&2
   exit 1
 }
-trap 'rm -rf "$work" "$STAGE"' EXIT
 # Publication below is a no-replace rename, and its two options are what make a
 # concurrent build safe: `-T` never treats an existing directory as a container
 # for the stage, and `-n` never replaces what is already there.  Probe the live
