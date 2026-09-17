@@ -1256,6 +1256,76 @@ ota_health_confirm_worker()
         log "first-boot-confirm-pending:$selected_slot"
         pending_slot=$selected_slot
     fi
+    # Publish the terminal status for a rollback that has actually completed.
+    # Automatic finalization must leave a reader-visible record that the
+    # rollback finished, otherwise `libreecho-update status` and the web API
+    # keep reporting the failed candidate's last health check and a phantom
+    # reboot after the previously confirmed slot is already running again.
+    ota_rollback_publish_terminal()
+    {
+        rollback_failed_slot=$1
+        {
+            echo schema=1
+            echo state=rolled-back
+            echo progress=100
+            echo "detail=$rollback_failed_slot"
+        } > /data/libreecho/update/state.tmp &&
+            $BB mv /data/libreecho/update/state.tmp \
+                /data/libreecho/update/state || {
+                log ota-rollback-state-publish-failed
+                $BB rm -f /data/libreecho/update/state.tmp
+                return 1
+            }
+        # The failed candidate's last act is to leave the check record at
+        # `reboot-pending`.  That record is now false: the rollback completed
+        # and the device is running the previously confirmed slot, so without
+        # this the update check status stays frozen until the next scheduled
+        # check.  Rewrite it only when the newest checked version is the one
+        # that rolled back, so a record belonging to a different candidate is
+        # never relabelled.
+        rollback_version=$($BB sed -n 's/^version=//p' \
+            /data/libreecho/update/rolled-back 2>/dev/null)
+        if [ -n "$rollback_version" ] &&
+           [ "$($BB sed -n 's/^status=//p' /data/libreecho/update/check-status 2>/dev/null)" = reboot-pending ] &&
+           [ "$($BB sed -n 's/^latest_version=//p' /data/libreecho/update/check-status 2>/dev/null)" = "$rollback_version" ]; then
+            $BB sed 's/^status=reboot-pending$/status=update-held-after-rollback/' \
+                /data/libreecho/update/check-status \
+                > /data/libreecho/update/check-status.tmp &&
+                $BB mv /data/libreecho/update/check-status.tmp \
+                    /data/libreecho/update/check-status || {
+                    log ota-rollback-check-status-publish-failed
+                    $BB rm -f /data/libreecho/update/check-status.tmp
+                    return 1
+                }
+            log "ota-rollback-check-status-update-held-after-rollback:$rollback_version"
+        fi
+        $BB sync
+    }
+
+    # The recovery helper reports success by removing the transaction it
+    # validated.  Confirm that post-condition on the filesystem before
+    # claiming the rollback is finalized: a helper that exits early, or a
+    # refusal that still returns zero, must never be turned into a terminal
+    # status asserting that the live transaction is gone.
+    ota_v2_fallback_confirmed()
+    {
+        for rollback_live in pending feature-commit; do
+            [ ! -e "/data/libreecho/update/$rollback_live" ] || {
+                log "ota-v2-fallback-live-evidence-remains:$rollback_live"
+                return 1
+            }
+        done
+        [ ! -e /data/libreecho/update/staging ] || {
+            log ota-v2-fallback-staging-remains
+            return 1
+        }
+        [ -r /data/libreecho/update/rolled-back ] || {
+            log ota-v2-fallback-history-missing
+            return 1
+        }
+        return 0
+    }
+
     case "$pending_slot:$selected_slot" in
         a:a|b:b) ;;
         a:b|b:a)
@@ -1263,24 +1333,21 @@ ota_health_confirm_worker()
                [ -r /data/libreecho/update/feature-commit ]; then
                 $BB mkdir -p /data/libreecho/update/staging
                 if /usr/local/sbin/libreecho-bootctl status > /data/libreecho/update/staging/bootctl.readback 2>/dev/null &&
-                   /usr/local/sbin/libreecho-feature-transaction fallback; then
+                   /usr/local/sbin/libreecho-feature-transaction fallback &&
+                   ota_v2_fallback_confirmed &&
+                   ota_rollback_publish_terminal "$pending_slot"; then
                     log "ota-v2-fallback-cleaned:$pending_slot:$selected_slot"
                     return 0
                 fi
                 log ota-v2-fallback-preserved-for-recovery
                 return 0
             fi
+            # A schema-1 transaction has no journal to retire; the pending
+            # record is itself the rollback evidence, so move it and publish
+            # the same terminal status.
             $BB mv /data/libreecho/update/pending \
                 /data/libreecho/update/rolled-back
-            {
-                echo schema=1
-                echo state=rolled-back
-                echo progress=100
-                echo "detail=$pending_slot"
-            } > /data/libreecho/update/state.tmp &&
-                $BB mv /data/libreecho/update/state.tmp \
-                    /data/libreecho/update/state
-            $BB sync
+            ota_rollback_publish_terminal "$pending_slot"
             log "ota-rollback-complete:$pending_slot:$selected_slot"
             return 0
             ;;

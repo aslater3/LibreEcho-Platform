@@ -77,6 +77,35 @@ A full archive refuses a new distinct historical record with
 history pruning: export and any removal require a separate operator decision.
 `rolled-back` remains the latest record consumed by existing status readers.
 
+## Automatic finalization of a confirmed rollback
+
+When the bootloader has already returned to the previously confirmed slot, the
+boot worker finalizes the failed transaction by itself: it runs the
+version-matched recovery implementation from the running (previously confirmed)
+slot, which retires only the matching `pending`/`feature-commit`/staging records
+and preserves the bounded `rolled-back` history described above. No operator
+action and no ADB session are required before the device can accept the next
+candidate.
+
+Finalization is fail-closed and asserted on the filesystem, not on the helper's
+exit status alone. The worker claims the rollback only when `pending`,
+`feature-commit` and staging are gone and `rolled-back` exists; if any of those
+post-conditions does not hold it logs
+`ota-v2-fallback-preserved-for-recovery` and leaves every record, keeping the
+identity, signature, slot, hash, file-type, and generation evidence intact for
+operator recovery. A new download cannot overwrite staging while the
+transaction is still live.
+
+Only after those post-conditions hold does the worker publish the terminal
+`state` record (`state=rolled-back`, `progress=100`) and refresh a check record
+that the failed candidate left at `reboot-pending` to
+`update-held-after-rollback`. The check record is rewritten only when its
+`latest_version` equals the version recorded in `rolled-back`, so a record
+belonging to a different candidate is never relabelled. Publication is atomic
+and idempotent across repeated boots and interruptions, and it leaves
+configuration, installed feature authority, active payloads, and boot
+partitions untouched.
+
 ## Signed bundle v1
 
 The transport is a deterministic POSIX tar with these exact members:

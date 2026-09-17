@@ -55,6 +55,7 @@ jobs:
             test_verify_radar_puffin_dtb.py \
             test_recovery_image_tools.py \
             test_issue_169_ota_health.py \
+            test_issue_157_ota_rollback_finalization.py \
             mdns/test_runtime.py \
             test_qualification.py \
             test_ssh_runtime.py \
