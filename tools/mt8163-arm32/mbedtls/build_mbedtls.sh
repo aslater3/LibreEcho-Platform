@@ -178,8 +178,16 @@ packed_version=$(sed -n 's/^#define MBEDTLS_VERSION_STRING  *"\(.*\)"$/\1/p' \
     "$mbedtls_version" "${packed_version:-unknown}" >&2
   exit 1
 }
-if strings -a "$OUTPUT/lib/libmbedtls.a" "$OUTPUT/lib/libmbedx509.a" \
-    "$OUTPUT/lib/libmbedcrypto.a" | grep -qE "$work|/home/"; then
+# The archives must not record the private build directory.  This cannot be a
+# `strings ... | grep -q` pipeline: `grep -q` leaves on the first match, which
+# leaves `strings` writing into a closed pipe, and `set -o pipefail` then reports
+# its SIGPIPE status (141) instead of the match, so the rejection below would be
+# skipped for exactly the archives that do leak a build path.  Writing the full
+# scan to a file consumes the stream and lets `strings` fail normally instead.
+leak_scan="$work/mbedtls-build-paths.txt"
+strings -a "$OUTPUT/lib/libmbedtls.a" "$OUTPUT/lib/libmbedx509.a" \
+  "$OUTPUT/lib/libmbedcrypto.a" > "$leak_scan"
+if grep -qE "$work|/home/" "$leak_scan"; then
   printf 'ERROR: mbedTLS archives contain a private build path\n' >&2; exit 1
 fi
 

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import textwrap
 import time
 import unittest
 from pathlib import Path
@@ -4517,6 +4518,188 @@ class UiTlsPackagingTests(unittest.TestCase):
             self.assertNotIn("mbedTLS prefix is unavailable", output)
             self.assertNotIn("mbedTLS archive is empty", output)
             self.assertNotIn("mbedTLS prefix (tools/mt8163-arm32/mbedtls)", output)
+
+    def prepare_mbedtls_builder(self, tmp: Path) -> dict[str, Path]:
+        """Synthesise the pinned archive and a stand-in cross toolchain.
+
+        build_mbedtls.sh owns the whole dependency contract, so that contract is
+        exercised by running the real script.  Only the pinned tar.bz2 (which is
+        not carried in this repository) and the external cross toolchain are
+        stand-ins; every guard the script performs itself runs for real.
+        """
+        for tool in ("ar", "tar", "strings"):
+            if shutil.which(tool) is None:
+                self.skipTest(f"{tool} is required to exercise build_mbedtls.sh")
+        lock = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())
+
+        shims = tmp / "shims"
+        shims.mkdir()
+        # The pinned archive hash cannot be reproduced from a fixture, so the
+        # digest check is answered by a stand-in that reports the locked value.
+        (shims / "sha256sum").write_text(
+            '#!/bin/sh\nprintf "%s  %s\\n" "$LE_TEST_PINNED_ARCHIVE_SHA256" "$1"\n'
+        )
+        (shims / "file").write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$LE_TEST_FILE_DESCRIPTION"\n'
+        )
+        (shims / "make").write_text(
+            textwrap.dedent(
+                """\
+                #!/bin/sh
+                # Stand-in for the mbedTLS library Makefile: emit the three
+                # static archives that the builder then validates.
+                set -eu
+                dir=
+                while [ $# -gt 0 ]; do
+                  case $1 in
+                    -C) dir=$2; shift 2 ;;
+                    *) shift ;;
+                  esac
+                done
+                [ -n "$dir" ] || exit 1
+                # The builder's private work directory, exactly as the real
+                # prefix-map flags would record it in the objects.
+                work=$(cd "$dir/../.." && pwd -P)
+                objs=$(mktemp -d)
+                pad() {
+                  i=0
+                  while [ "$i" -lt "$1" ]; do
+                    printf 'mbedtls_padding_%s_%08d_symbol\\n' "$2" "$i"
+                    i=$((i + 1))
+                  done
+                }
+                : > "$objs/leak.o"
+                if [ "${LE_TEST_ARCHIVE_LEAK:-0}" = 1 ]; then
+                  printf -- '-ffile-prefix-map=%s=/usr/src/mbedtls-3.6.4\\n' "$work" \\
+                    >> "$objs/leak.o"
+                  printf '%s\\n' "$work" > "$LE_TEST_FIXTURE_DIR/leaked-build-path.txt"
+                fi
+                pad 2000 leak >> "$objs/leak.o"
+                pad 6000 x509 > "$objs/x509.o"
+                pad 6000 crypto > "$objs/crypto.o"
+                ar rc "$dir/libmbedtls.a" "$objs/leak.o"
+                ar rc "$dir/libmbedx509.a" "$objs/x509.o"
+                ar rc "$dir/libmbedcrypto.a" "$objs/crypto.o"
+                rm -rf "$objs"
+                """
+            )
+        )
+        for shim in ("sha256sum", "file", "make"):
+            (shims / shim).chmod(0o755)
+
+        toolchain = tmp / "toolchain"
+        toolchain.mkdir()
+        compiler = toolchain / "arm-linux-gnueabihf-gcc"
+        compiler.write_text(
+            "#!/bin/sh\n"
+            'if [ "${1:-}" = "--version" ]; then\n'
+            '  printf "%s\\n" "arm-linux-gnueabihf-gcc (fixture) 13.2.1"\n'
+            "fi\n"
+            "exit 0\n"
+        )
+        compiler.chmod(0o755)
+        (toolchain / "arm-linux-gnueabihf-ar").write_text("#!/bin/sh\nexit 0\n")
+        (toolchain / "arm-linux-gnueabihf-ar").chmod(0o755)
+
+        # The builder's helper steps run with the real interpreter; only the
+        # pinned build requirements (jinja2/jsonschema) are stubbed, because the
+        # host that runs this test does not install them.
+        interpreter = toolchain / "fixture-python"
+        interpreter.write_text(
+            "#!/bin/sh\n"
+            'if [ "${1:-}" = "-c" ] || [ "${2:-}" = "-c" ]; then\n'
+            f'  exec "{sys.executable}" "$@"\n'
+            "fi\n"
+            "captured=$(mktemp)\n"
+            "trap 'rm -f \"$captured\"' EXIT\n"
+            'cat > "$captured"\n'
+            'if grep -q PackageNotFoundError "$captured"; then\n'
+            "  exit 0\n"
+            "fi\n"
+            f'"{sys.executable}" "$@" < "$captured"\n'
+        )
+        interpreter.chmod(0o755)
+
+        source = tmp / "fixture-source" / f"mbedtls-{lock['version']}"
+        (source / "library").mkdir(parents=True)
+        (source / "include/mbedtls").mkdir(parents=True)
+        (source / "LICENSE").write_text("Apache-2.0 fixture\n")
+        (source / "library/Makefile").write_text("static:\n\t@true\n")
+        (source / "include/mbedtls/build_info.h").write_text(
+            '#define MBEDTLS_VERSION_STRING         "%s"\n' % lock["version"]
+        )
+        for header in ("ssl.h", "x509_crt.h", "pk.h", "entropy.h"):
+            (source / "include/mbedtls" / header).write_text("/* fixture */\n")
+        archive = tmp / f"mbedtls-{lock['version']}.tar.bz2"
+        with tarfile.open(archive, "w:bz2") as handle:
+            handle.add(source, arcname=f"mbedtls-{lock['version']}")
+        return {
+            "workdir": tmp,
+            "archive": archive,
+            "shims": shims,
+            "compiler": compiler,
+            "interpreter": interpreter,
+        }
+
+    def run_mbedtls_builder(
+        self, fixture: dict[str, Path], *, leaked_path: bool, name: str
+    ) -> tuple[subprocess.CompletedProcess, Path]:
+        lock = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())
+        environment = os.environ.copy()
+        environment["PATH"] = f"{fixture['shims']}:{environment['PATH']}"
+        environment["LE_TEST_PINNED_ARCHIVE_SHA256"] = lock["source_sha256"]
+        environment["LE_TEST_ARCHIVE_LEAK"] = "1" if leaked_path else "0"
+        environment["LE_TEST_FIXTURE_DIR"] = str(fixture["workdir"])
+        environment["LE_TEST_FILE_DESCRIPTION"] = (
+            "ELF 32-bit LSB relocatable, ARM, EABI5 version 1 (SYSV)"
+        )
+        output = fixture["workdir"] / name
+        completed = subprocess.run(
+            [
+                "bash",
+                str(TOOLS_DIR / "mbedtls/build_mbedtls.sh"),
+                "--archive", str(fixture["archive"]),
+                "--output", str(output),
+                "--cc", str(fixture["compiler"]),
+                "--python", str(fixture["interpreter"]),
+                "--jobs", "1",
+            ],
+            env=environment, text=True, cwd=fixture["workdir"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        return completed, output
+
+    def test_mbedtls_builder_rejects_a_leaked_build_path_when_the_scan_short_circuits(
+        self,
+    ) -> None:
+        """Codex review: `strings | grep -q` under `pipefail` hid this rejection.
+
+        `grep -q` leaves as soon as it matches, so `strings` is still writing
+        when the read end closes; `pipefail` then reports the writer's SIGPIPE
+        (141) instead of the match, the `if` body is skipped, and an archive
+        that carries the private build path is accepted.  The guard must consume
+        the whole scan and still reject, without rejecting a clean pinned build.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+
+            leaked, leaked_output = self.run_mbedtls_builder(
+                fixture, leaked_path=True, name="output-leaked"
+            )
+            marker = fixture["workdir"] / "leaked-build-path.txt"
+            self.assertTrue(marker.is_file(), leaked.stdout + leaked.stderr)
+            embedded = marker.read_text().strip()
+            self.assertIn("libreecho-mbedtls-build.", embedded)
+            self.assertEqual(leaked.returncode, 1, leaked.stdout + leaked.stderr)
+            self.assertIn("private build path", leaked.stderr)
+            self.assertFalse((leaked_output / "mbedtls-source.json").exists())
+
+            clean, clean_output = self.run_mbedtls_builder(
+                fixture, leaked_path=False, name="output-clean"
+            )
+            self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+            self.assertIn("mbedtls_archives=3", clean.stdout)
+            self.assertTrue((clean_output / "mbedtls-source.json").is_file())
 
 
 if __name__ == "__main__":
