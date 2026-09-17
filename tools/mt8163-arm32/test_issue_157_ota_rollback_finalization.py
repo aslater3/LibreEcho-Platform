@@ -77,7 +77,7 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
         retire_fn = extract_function(self.init, "ota_rollback_resume_live_records")
         self.assertIn("/data/libreecho/update/pending", retire_fn)
         self.assertIn("/data/libreecho/update/feature-commit", retire_fn)
-        self.assertIn("ota_rollback_resume_live_records || return 0", resume)
+        self.assertIn("ota_rollback_resume_live_records", resume)
         self.assertIn("s/^state=//p", resume)
         self.assertIn("detail=//p", resume)
         self.assertIn("s/^slot=//p", resume)
@@ -115,11 +115,11 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
         )
         self.assertIn("ota-rollback-resume-live-record-cleaned:$resume_live", retire)
         self.assertLess(
-            resume.index("ota_rollback_resume_live_records || return 0"),
-            resume.index("ota_rollback_resume_staging_cleanup || return 0"),
+            resume.index("ota_rollback_resume_live_records"),
+            resume.index("ota_rollback_resume_staging_cleanup"),
         )
         self.assertLess(
-            resume.index("ota_rollback_resume_staging_cleanup || return 0"),
+            resume.index("ota_rollback_resume_staging_cleanup"),
             resume.index('ota_rollback_publish_terminal "$resume_slot"'),
         )
         # Fail closed: a refused publication is retried, not forced, and the
@@ -157,14 +157,14 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
         # transaction reaches, and the single publisher follows both branches.
         self.assertLess(
             resume.index('if [ -n "$resume_transaction" ]; then'),
-            resume.index("ota_rollback_resume_live_records || return 0"),
+            resume.index("ota_rollback_resume_lock || return 0"),
         )
         self.assertLess(
-            resume.index("ota_rollback_resume_live_records || return 0"),
-            resume.index("ota_rollback_resume_staging_cleanup || return 0"),
+            resume.index("ota_rollback_resume_lock || return 0"),
+            resume.index("ota_rollback_resume_live_records"),
         )
         self.assertLess(
-            resume.index("ota_rollback_resume_staging_cleanup || return 0"),
+            resume.index("ota_rollback_resume_staging_cleanup"),
             resume.index("ota-rollback-resume-legacy-publication"),
         )
         self.assertLess(
@@ -192,7 +192,7 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
         )
         self.assertLess(
             resume.index('[ "$resume_slot" != "$selected_slot" ]'),
-            resume.index("ota_rollback_resume_live_records || return 0"),
+            resume.index("ota_rollback_resume_live_records"),
         )
         # The slot the history record is checked against is the running one, so
         # the resume runs after this boot has determined it -- and still before
@@ -201,6 +201,77 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
             self.worker.index('libreecho-bootctl status "$running_slot"'),
             self.worker.index("\n    ota_rollback_resume_terminal\n"),
         )
+
+    def test_resume_validates_the_history_record_before_it_reads_it(self) -> None:
+        # The history record is the only authorization for the resumed removals,
+        # and the helper refuses to read one that is not a bounded regular
+        # non-symlink.  The resume applies the same shape test before it reads a
+        # slot or a transaction id out of the record, and again once it holds
+        # the install lock, so a path that is a symlink -- for example one
+        # pointing at the surviving live record -- never becomes cleanup
+        # authorization.
+        resume = extract_function(self.init, "ota_rollback_resume_terminal")
+        bounded = extract_function(self.init, "ota_rollback_resume_history_bounded")
+        self.assertEqual(resume.count("ota_rollback_resume_history_bounded"), 2)
+        self.assertIn("ota-rollback-resume-history-unsafe", resume)
+        self.assertIn("ota-rollback-resume-evidence-invalid", resume)
+        for probe in (
+            "stat -c %s",
+            "-le 8192",
+            '[ -f "$resume_history" ]',
+            '[ ! -L "$resume_history" ]',
+        ):
+            self.assertIn(probe, bounded)
+        # Nothing is read out of the record before it passed the shape test,
+        # and every read uses the validated path.
+        first_check = resume.index("ota_rollback_resume_history_bounded; then")
+        self.assertLess(first_check, resume.index("s/^slot=//p"))
+        self.assertLess(first_check, resume.index("s/^transaction_id=//p"))
+        self.assertIn("'s/^slot=//p' \"$resume_history\"", resume)
+        self.assertNotIn("'s/^slot=//p' /data/libreecho/update/rolled-back", resume)
+        # The second application is under the install lock, ahead of both
+        # removals, so a record that changed while this boot was deciding is
+        # refused as well.
+        lock_at = resume.index("ota_rollback_resume_lock || return 0")
+        self.assertLess(first_check, lock_at)
+        self.assertLess(lock_at, resume.rindex("ota_rollback_resume_history_bounded; then"))
+        self.assertLess(
+            resume.rindex("ota_rollback_resume_history_bounded; then"),
+            resume.index("ota_rollback_resume_live_records"),
+        )
+
+    def test_resumed_cleanup_is_serialized_with_the_update_flow(self) -> None:
+        # Both resumed removals act inside the update root a concurrent
+        # installation stages into, so they run under the same install lock
+        # `libreecho-update` and `libreecho-update-fetch` take, and the lock is
+        # released again on every path -- including each refusal.
+        resume = extract_function(self.init, "ota_rollback_resume_terminal")
+        lock = extract_function(self.init, "ota_rollback_resume_lock")
+        unlock = extract_function(self.init, "ota_rollback_resume_unlock")
+        self.assertIn("$BB mkdir /data/libreecho/update/install.lock", lock)
+        self.assertIn("ota-rollback-resume-install-locked", lock)
+        self.assertIn("$BB rmdir /data/libreecho/update/install.lock", unlock)
+        self.assertEqual(resume.count("ota_rollback_resume_lock || return 0"), 1)
+        # The two refusals that happen once the lock is held, and the completed
+        # path, each release it.
+        self.assertEqual(resume.count("ota_rollback_resume_unlock"), 3)
+        lock_at = resume.index("ota_rollback_resume_lock || return 0")
+        self.assertLess(lock_at, resume.index("ota_rollback_resume_live_records"))
+        self.assertLess(lock_at, resume.index("ota_rollback_resume_staging_cleanup"))
+        self.assertLess(
+            resume.index("ota_rollback_resume_staging_cleanup"),
+            resume.rindex("ota_rollback_resume_unlock"),
+        )
+        # A boot that cannot take the lock publishes nothing: the records stay
+        # unpublished for the next boot to retry.
+        self.assertLess(
+            lock_at, resume.index('ota_rollback_publish_terminal "$resume_slot"')
+        )
+        # One lock covers both removals; the cleanup must not take a second one
+        # of its own, which the helper's non-reentrant lock protocol forbids.
+        cleanup = extract_function(self.init, "ota_rollback_resume_staging_cleanup")
+        self.assertNotIn("install.lock", cleanup)
+        self.assertNotIn("ota_rollback_resume_unlock", cleanup)
 
     def test_v2_finalization_verifies_postconditions_before_claiming_cleanup(self) -> None:
         confirm = extract_function(self.init, "ota_v2_fallback_confirmed")
@@ -497,6 +568,25 @@ class _BootWorkerFixture:
             f'    reboot) printf \'%s\\n\' "$*" >>"{self.reboots}"; exit 0 ;;\n'
             "    sleep) exit 0 ;;\n"
             "    sync) exit 0 ;;\n"
+            "    # A concurrent installation is free to stage into this update root\n"
+            "    # as soon as the live records are gone, so a boot that resumed the\n"
+            "    # interrupted cleanup can find a different transaction -- or a\n"
+            "    # replaced history record -- under the install lock it takes.  That\n"
+            "    # boundary is modelled by acting at the moment of the lock.\n"
+            "    mkdir)\n"
+            '        if [ "${2##*/}" = install.lock ]; then\n'
+            '            case "${PLANT_UNDER_LOCK:-}" in\n'
+            "                live-transaction)\n"
+            '                    printf \'schema=2\\ntransaction_id=cafebabe\\nversion=9.9.9\\nslot=b\\n\' >"${2%/*}/pending"\n'
+            '                    printf \'format=libreecho-ota-v2\\nversion=9.9.9\\n\' >"${2%/*}/staging/manifest"\n'
+            "                    ;;\n"
+            "                unsafe-history)\n"
+            f'                    "{BUSYBOX}" rm -f "${{2%/*}}/rolled-back"\n'
+            f'                    "{BUSYBOX}" ln -s "${{2%/*}}/feature-commit" "${{2%/*}}/rolled-back"\n'
+            "                    ;;\n"
+            "            esac\n"
+            "        fi\n"
+            "        ;;\n"
             "    mv)\n"
             f'        "{BUSYBOX}" "$@"\n'
             "        rc=$?\n"
@@ -700,7 +790,11 @@ class _BootWorkerFixture:
             "detail=health-confirm-failed:web-status\n",
         )
 
-    def boot(self, interrupt_at: str | None = None) -> subprocess.CompletedProcess[str]:
+    def boot(
+        self,
+        interrupt_at: str | None = None,
+        plant_under_lock: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         """Run one boot of the shipped worker against the sandbox root.
 
         ``interrupt_at`` places the power loss inside the recovery helper:
@@ -708,12 +802,19 @@ class _BootWorkerFixture:
         "staging" after that cleanup but before its staging tree is removed,
         "cleanup" once both are done, "state" between the two renames of the
         terminal publication, and ``None`` for a boot that completes.
+
+        ``plant_under_lock`` models a concurrent installation that acts at the
+        moment the resumed cleanup takes the shared install lock: a complete
+        replacement transaction with its own staged tree
+        (``"live-transaction"``), or a history record replaced by a symlink to
+        the live record (``"unsafe-history"``).
         """
         return subprocess.run(
             [BUSYBOX, "sh", str(self.harness)],
             env={
                 "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                 "BOOT_LOG": str(self.boot_log),
+                "PLANT_UNDER_LOCK": plant_under_lock or "",
                 "INTERRUPT_AFTER_PENDING_UNLINK": (
                     "1" if interrupt_at == "pending-unlink" else "0"
                 ),
@@ -977,6 +1078,202 @@ class RollbackFinalizationResumesAfterInterruption(unittest.TestCase):
                 self.assertIn(
                     "ota-rollback-terminal-publication-resumed:b", fx.markers()
                 )
+
+    def test_symlinked_rollback_history_never_authorizes_the_cleanup(self) -> None:
+        # The history record is the only thing that authorizes the resumed
+        # removals, and the helper refuses to read one that is not a bounded
+        # regular non-symlink.  A symlink to the surviving live record -- which
+        # names both a slot this boot is not running and the transaction id the
+        # resume would match -- must be refused the same way, or a path that is
+        # not rollback evidence at all is used to delete the records it points
+        # at.
+        self.fx.write_update(
+            "feature-commit",
+            f"schema=2\ntransaction_id=deadbeef\nversion={ROLLBACK_VERSION}\n"
+            f"slot={ROLLBACK_SLOT}\n",
+        )
+        self.fx.write_update(
+            "state",
+            "schema=1\nstate=restarting\nprogress=0\n"
+            "detail=health-confirm-failed:web-status\n",
+        )
+        self.fx.write_update(
+            "check-status",
+            "schema=1\nsource=github-releases\nchannel=dev\n"
+            "status=reboot-pending\nsource_reachable=true\n"
+            f"latest_version={ROLLBACK_VERSION}\nlast_check_epoch=1\n",
+        )
+        (self.fx.update / "staging").mkdir()
+        (self.fx.update / "staging" / "manifest").write_text(
+            "format=libreecho-ota-v2\n"
+        )
+        history = self.fx.update / "rolled-back"
+        history.symlink_to(self.fx.update / "feature-commit")
+        before_state = (self.fx.update / "state").read_bytes()
+        before_check = (self.fx.update / "check-status").read_bytes()
+        before_journal = (self.fx.update / "feature-commit").read_bytes()
+
+        refused = self.fx.boot()
+        self.assertEqual(refused.returncode, 0, refused.stderr)
+        self.assertIn("ota-rollback-resume-history-unsafe", self.fx.markers())
+        # Nothing is read through the symlink, and neither the record it points
+        # at nor the staged tree is removed.
+        self.assertNotIn("ota-rollback-resume-live-record-cleaned", self.fx.markers())
+        self.assertNotIn(
+            "ota-rollback-terminal-publication-resumed", self.fx.markers()
+        )
+        self.assertTrue(history.is_symlink())
+        self.assertEqual(
+            (self.fx.update / "feature-commit").read_bytes(), before_journal
+        )
+        self.assertTrue((self.fx.update / "staging").is_dir())
+        self.assertEqual((self.fx.update / "state").read_bytes(), before_state)
+        self.assertEqual((self.fx.update / "check-status").read_bytes(), before_check)
+
+        # Once the record is the regular file the helper itself would accept,
+        # the interruption is finished instead of being stranded by it.
+        history.unlink()
+        self.fx.write_update(
+            "feature-commit", "phase=prepared\ntransaction_id=deadbeef\n"
+        )
+        self.fx.write_update(
+            "rolled-back",
+            f"schema=2\ntransaction_id=deadbeef\nversion={ROLLBACK_VERSION}\n"
+            f"slot={ROLLBACK_SLOT}\n",
+        )
+        recovered = self.fx.boot()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn(
+            "ota-rollback-resume-live-record-cleaned:feature-commit",
+            self.fx.markers(),
+        )
+        self.assertIn("ota-rollback-resume-staging-cleaned", self.fx.markers())
+        self.assert_terminal_publication(self.fx.markers())
+        self.assertFalse(self.fx.reboots.exists())
+
+    def test_installer_holding_the_install_lock_blocks_the_resumed_cleanup(self) -> None:
+        self.fx.seed_failed_candidate()
+        self.assertEqual(
+            self.fx.boot(interrupt_at="staging").returncode, -signal.SIGKILL
+        )
+        self.assertTrue((self.fx.update / "staging").is_dir())
+        before_state = (self.fx.update / "state").read_bytes()
+        before_check = (self.fx.update / "check-status").read_bytes()
+        # The lock is the one `libreecho-update` and `libreecho-update-fetch`
+        # take before they stage into this tree, so a boot that finds it held is
+        # looking at an installation in flight, which owns the tree until it
+        # finishes: leave it and the records alone and let a later boot retry.
+        lock = self.fx.update / "install.lock"
+        lock.mkdir()
+
+        refused = self.fx.boot()
+        self.assertEqual(refused.returncode, 0, refused.stderr)
+        self.assertIn("ota-rollback-resume-install-locked", self.fx.markers())
+        self.assertNotIn("ota-rollback-resume-staging-cleaned", self.fx.markers())
+        self.assertNotIn(
+            "ota-rollback-terminal-publication-resumed", self.fx.markers()
+        )
+        self.assertTrue((self.fx.update / "staging").is_dir())
+        self.assertEqual((self.fx.update / "state").read_bytes(), before_state)
+        self.assertEqual((self.fx.update / "check-status").read_bytes(), before_check)
+        # The in-flight installation still holds the lock: this worker released
+        # nothing it did not take.
+        self.assertTrue(lock.is_dir())
+
+        lock.rmdir()
+        recovered = self.fx.boot()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("ota-rollback-resume-staging-cleaned", self.fx.markers())
+        self.assert_terminal_publication(self.fx.markers())
+        self.assertFalse(lock.exists())
+        self.assertEqual(self.fx.fallbacks.read_text().splitlines(), ["fallback"])
+        self.assertFalse(self.fx.reboots.exists())
+
+    def test_staging_replaced_under_the_lock_is_never_removed(self) -> None:
+        self.fx.seed_failed_candidate()
+        self.assertEqual(
+            self.fx.boot(interrupt_at="staging").returncode, -signal.SIGKILL
+        )
+        self.assertTrue((self.fx.update / "staging").is_dir())
+        before_state = (self.fx.update / "state").read_bytes()
+        before_check = (self.fx.update / "check-status").read_bytes()
+
+        # The replacement lands while this boot is between its decision to
+        # clean up and the install lock it takes to do it: a new candidate's
+        # intent record for the other slot plus its staged tree, which is what
+        # the update flow writes into this same root.  The lock is what makes
+        # that impossible in production; the boot also revalidates under the
+        # lock what it is about to remove and refuses.
+        refused = self.fx.boot(plant_under_lock="live-transaction")
+        self.assertEqual(refused.returncode, 0, refused.stderr)
+        self.assertIn(
+            "ota-rollback-resume-live-record-foreign:pending", self.fx.markers()
+        )
+        self.assertNotIn("ota-rollback-resume-staging-cleaned", self.fx.markers())
+        self.assertNotIn(
+            "ota-rollback-terminal-publication-resumed", self.fx.markers()
+        )
+        # The new candidate's record and staged tree are untouched, and the
+        # rollback history published nothing.
+        self.assertEqual(self.fx.read_update("pending")["transaction_id"], "cafebabe")
+        self.assertEqual(self.fx.read_update("pending")["version"], "9.9.9")
+        self.assertFalse((self.fx.update / "feature-commit").exists())
+        self.assertEqual(
+            (self.fx.update / "staging" / "manifest").read_text(),
+            "format=libreecho-ota-v2\nversion=9.9.9\n",
+        )
+        self.assertEqual((self.fx.update / "state").read_bytes(), before_state)
+        self.assertEqual((self.fx.update / "check-status").read_bytes(), before_check)
+        # The boot released the lock it took, and no second rollback ran.
+        self.assertFalse((self.fx.update / "install.lock").exists())
+        self.assertEqual(self.fx.fallbacks.read_text().splitlines(), ["fallback"])
+
+        # That record is its own recovery path; once it is gone the interrupted
+        # rollback cleanup is finished and published, and the replacement tree
+        # -- no longer owned by any transaction -- goes with it.
+        (self.fx.update / "pending").unlink()
+        recovered = self.fx.boot()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("ota-rollback-resume-staging-cleaned", self.fx.markers())
+        self.assert_terminal_publication(self.fx.markers())
+
+    def test_history_replaced_under_the_lock_is_never_used(self) -> None:
+        self.fx.seed_failed_candidate()
+        self.assertEqual(
+            self.fx.boot(interrupt_at="staging").returncode, -signal.SIGKILL
+        )
+        before_state = (self.fx.update / "state").read_bytes()
+        before_check = (self.fx.update / "check-status").read_bytes()
+
+        # The record is validated again after the lock is taken, so a history
+        # that stopped being a bounded regular non-symlink while this boot was
+        # deciding is not acted on either.
+        refused = self.fx.boot(plant_under_lock="unsafe-history")
+        self.assertEqual(refused.returncode, 0, refused.stderr)
+        self.assertIn("ota-rollback-resume-history-unsafe", self.fx.markers())
+        self.assertNotIn("ota-rollback-resume-staging-cleaned", self.fx.markers())
+        self.assertNotIn("ota-rollback-resume-live-record-cleaned", self.fx.markers())
+        self.assertNotIn(
+            "ota-rollback-terminal-publication-resumed", self.fx.markers()
+        )
+        self.assertTrue((self.fx.update / "rolled-back").is_symlink())
+        self.assertTrue((self.fx.update / "staging").is_dir())
+        self.assertEqual((self.fx.update / "state").read_bytes(), before_state)
+        self.assertEqual((self.fx.update / "check-status").read_bytes(), before_check)
+        # The lock the boot took is released even on that refusal.
+        self.assertFalse((self.fx.update / "install.lock").exists())
+
+        (self.fx.update / "rolled-back").unlink()
+        self.fx.write_update(
+            "rolled-back",
+            f"schema=2\ntransaction_id=deadbeef\nversion={ROLLBACK_VERSION}\n"
+            f"slot={ROLLBACK_SLOT}\n",
+        )
+        recovered = self.fx.boot()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("ota-rollback-resume-staging-cleaned", self.fx.markers())
+        self.assert_terminal_publication(self.fx.markers())
+        self.assertEqual(self.fx.fallbacks.read_text().splitlines(), ["fallback"])
 
     def test_one_sided_retirement_is_finished_by_the_next_boot(self) -> None:
         self.fx.seed_failed_candidate()

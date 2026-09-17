@@ -1247,6 +1247,50 @@ ota_health_confirm_worker()
         return 0
     }
 
+    # The recovery helper validates the rollback history before it acts on it,
+    # and only ever treats a bounded regular non-symlink as evidence, so the
+    # resume that authorizes the same removals from that record applies the
+    # same shape test before it reads a slot or a transaction id out of it.  A
+    # path that is a symlink -- for example one pointing at a surviving live
+    # record -- is never rollback evidence, let alone authorization to remove
+    # the records it names.  The caller decides which refusal to log.
+    ota_rollback_resume_history_bounded()
+    {
+        resume_history=/data/libreecho/update/rolled-back
+        [ -e "$resume_history" ] || [ -L "$resume_history" ] || return 1
+        [ -f "$resume_history" ] || return 1
+        [ ! -L "$resume_history" ] || return 1
+        resume_history_size=$($BB stat -c %s "$resume_history" 2>/dev/null)
+        case "$resume_history_size" in
+            ''|*[!0-9]*) return 1 ;;
+        esac
+        [ "$resume_history_size" -le 8192 ] || return 1
+        return 0
+    }
+
+    # Both resumed removals act inside the update root the installer stages
+    # into, and the installer is free to stage a replacement candidate there as
+    # soon as the live records are gone, so the cleanup is serialized with the
+    # update flow under the flow's own install lock -- the same lock
+    # `libreecho-update` and `libreecho-update-fetch` take, so the two can
+    # never both be inside the tree.  A lock that is already held means an
+    # installation is in flight and owns the tree until it finishes, so this
+    # boot leaves the records unpublished and the next boot retries instead of
+    # racing it.
+    ota_rollback_resume_lock()
+    {
+        $BB mkdir /data/libreecho/update/install.lock 2>/dev/null || {
+            log ota-rollback-resume-install-locked
+            return 1
+        }
+        return 0
+    }
+
+    ota_rollback_resume_unlock()
+    {
+        $BB rmdir /data/libreecho/update/install.lock 2>/dev/null
+    }
+
     # The recovery helper retires the transaction and only then removes its
     # staging tree, and it refuses to run again once the transaction is gone,
     # so an interruption between those two steps leaves a cleanup that no
@@ -1254,8 +1298,10 @@ ota_health_confirm_worker()
     # neither a live transaction nor a finished rollback, on every boot.  A
     # replacement for the legacy single-slot updater and the recovery runner
     # both own the same tree, so the removal is validated the way the helper
-    # validates it -- a staging tree that is a symlink, is not a directory,
-    # contains a symlink, or cannot be removed is left for recovery instead.
+    # validates it -- a staging tree that is a symlink, is not a directory, or
+    # contains a symlink is left for recovery instead -- and it runs under the
+    # install lock its caller took, which is what keeps a tree staged by a
+    # concurrent installation from being removed in this rollback's name.
     ota_rollback_resume_staging_cleanup()
     {
         resume_staging=/data/libreecho/update/staging
@@ -1359,7 +1405,22 @@ ota_health_confirm_worker()
                 return 0
                 ;;
         esac
-        resume_slot=$($BB sed -n 's/^slot=//p' /data/libreecho/update/rolled-back 2>/dev/null)
+        # The helper only ever acts on a history record it validated as a
+        # bounded regular non-symlink, and this resume authorizes the same
+        # removals from that record, so it validates it the same way before it
+        # reads anything out of it: a path that is a symlink -- for example one
+        # pointing at the surviving live record -- or that is not a bounded
+        # regular file is never rollback evidence, let alone authorization to
+        # remove what it names.
+        if ! ota_rollback_resume_history_bounded; then
+            if [ -e "$resume_history" ] || [ -L "$resume_history" ]; then
+                log ota-rollback-resume-history-unsafe
+            else
+                log ota-rollback-resume-evidence-invalid
+            fi
+            return 0
+        fi
+        resume_slot=$($BB sed -n 's/^slot=//p' "$resume_history" 2>/dev/null)
         case "$resume_slot" in
             a|b) ;;
             *)
@@ -1379,15 +1440,32 @@ ota_health_confirm_worker()
         }
         # Which transaction the finalized history names, so the one-sided live
         # record left by an interrupted retirement can be matched to it.
-        resume_transaction=$($BB sed -n 's/^transaction_id=//p' /data/libreecho/update/rolled-back 2>/dev/null)
-        resume_schema=$($BB sed -n 's/^schema=//p' /data/libreecho/update/rolled-back 2>/dev/null)
+        resume_transaction=$($BB sed -n 's/^transaction_id=//p' "$resume_history" 2>/dev/null)
+        resume_schema=$($BB sed -n 's/^schema=//p' "$resume_history" 2>/dev/null)
         if [ -n "$resume_transaction" ]; then
             # The retirement and the staging tree are the two helper steps an
             # interruption can cut short, and the helper will not resume
             # either, so the terminal records are only published once both are
-            # finished -- or the boot retries.
-            ota_rollback_resume_live_records || return 0
-            ota_rollback_resume_staging_cleanup || return 0
+            # finished -- or the boot retries.  Both steps remove something
+            # from the update root a concurrent installation stages into, so
+            # they run under that installation's own install lock, and every
+            # input they act on is validated again under the lock: a lock that
+            # is already held, a history record that stopped being a bounded
+            # regular file, or a live transaction that appeared while this boot
+            # was deciding, all leave the records unpublished for the next boot
+            # instead of removing something this rollback does not own.
+            ota_rollback_resume_lock || return 0
+            if ! ota_rollback_resume_history_bounded; then
+                log ota-rollback-resume-history-unsafe
+                ota_rollback_resume_unlock
+                return 0
+            fi
+            if ! ota_rollback_resume_live_records ||
+               ! ota_rollback_resume_staging_cleanup; then
+                ota_rollback_resume_unlock
+                return 0
+            fi
+            ota_rollback_resume_unlock
         else
             # A legacy schema-1 rollback retires its transaction by moving the
             # pending record itself, so the record that survives an

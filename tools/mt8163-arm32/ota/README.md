@@ -106,6 +106,16 @@ and idempotent across repeated boots and interruptions, and it leaves
 configuration, installed feature authority, active payloads, and boot
 partitions untouched.
 
+The `rolled-back` history record is the only authorization for any of those
+resumed removals, and the recovery helper itself refuses to read one that is not
+a bounded regular non-symlink. The boot worker therefore applies the same shape
+test -- a regular file, not a symlink, at most 8192 bytes -- before it reads a
+slot or a transaction id out of that record, and again once it holds the install
+lock. A record that fails it is refused as `ota-rollback-resume-history-unsafe`
+(or as `ota-rollback-resume-evidence-invalid` when the record is absent), and
+nothing is read through it, removed, or published; a symlink pointing at a
+surviving live record is never cleanup authorization.
+
 The helper retires `pending`/`feature-commit` before it removes its staging
 tree, and it exits immediately once the live transaction is gone, so an
 interruption between those two steps leaves a cleanup that only the boot worker
@@ -119,6 +129,18 @@ with the failed candidate's records still in place. A refused or interrupted
 attempt is retried on every subsequent boot and logs
 `ota-rollback-resume-staging-cleaned` before the publication marker
 `ota-rollback-terminal-publication-resumed`.
+
+Both resumed removals act inside the update root the update flow stages into, so
+they run under the same `update/install.lock` that flow takes before it stages a
+candidate, and their inputs are revalidated once the lock is held. A lock that is
+already held means an installation is in flight and owns the tree until it
+finishes, so the boot logs `ota-rollback-resume-install-locked` and leaves the
+records unpublished for the next boot to retry. A history record that stopped
+being a bounded regular non-symlink, or a live record that appeared while this
+boot was deciding, is refused under the lock as well
+(`ota-rollback-resume-live-record-foreign` for a record naming another
+transaction), so a tree staged for a newer candidate is never removed in the
+rollback's name.
 
 The retirement of the live records is the helper's other interruptible step: it
 removes the pending record and the feature commit with a single `rm -f` and
