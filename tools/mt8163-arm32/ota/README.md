@@ -131,16 +131,29 @@ attempt is retried on every subsequent boot and logs
 `ota-rollback-terminal-publication-resumed`.
 
 Both resumed removals act inside the update root the update flow stages into, so
-they run under the same `update/install.lock` that flow takes before it stages a
-candidate, and their inputs are revalidated once the lock is held. A lock that is
-already held means an installation is in flight and owns the tree until it
-finishes, so the boot logs `ota-rollback-resume-install-locked` and leaves the
-records unpublished for the next boot to retry. A history record that stopped
-being a bounded regular non-symlink, or a live record that appeared while this
-boot was deciding, is refused under the lock as well
+they run under that flow's own locks, in the order it takes them: the boot-local
+fetch lock the fetcher holds while it downloads feature assets straight into this
+staging tree, then the persistent install lock. The fetcher releases the install
+lock before that download and re-takes it for the install, so the fetch lock is
+what protects a tree being written, and a fetch or installation in flight owns
+the tree until it finishes: the boot logs `ota-rollback-resume-fetch-locked` or
+`ota-rollback-resume-install-locked` and leaves the records unpublished for the
+next boot to retry. Their inputs are revalidated once both locks are held: a
+history record that stopped being a bounded regular non-symlink, or a live
+record that appeared while this boot was deciding, is refused there as well
 (`ota-rollback-resume-live-record-foreign` for a record naming another
 transaction), so a tree staged for a newer candidate is never removed in the
 rollback's name.
+
+Because the install lock lives in persistent `/data` and the flow's protocol has
+no answer for a holder that never released it, every lock this worker takes is
+tagged with the boot it was taken in (`owner=rollback-resume`, `boot_id=...`) and
+is released on every path. A lock this worker left behind by a power loss is
+therefore recognised on the next boot and reclaimed with
+`ota-rollback-resume-lock-recovered`, instead of blocking this worker and both
+update tools forever; an untagged lock (an installation) or one taken by the
+current boot is never reclaimed, and a lock that cannot be tagged is given back
+rather than held (`ota-rollback-resume-lock-untagged`).
 
 The retirement of the live records is the helper's other interruptible step: it
 removes the pending record and the feature commit with a single `rm -f` and

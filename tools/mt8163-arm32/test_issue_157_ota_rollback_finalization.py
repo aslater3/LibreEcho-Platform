@@ -42,6 +42,15 @@ def worker_body(text: str) -> str:
     return text[start:end]
 
 
+def extract_top_level_function(text: str, name: str) -> str:
+    """Return the exact ``name()`` function body of a packaged helper script."""
+    pattern = re.compile(rf"^{re.escape(name)}\(\)\n\{{\n.*?^\}}\n", re.M | re.S)
+    match = pattern.search(text)
+    if match is None:
+        raise AssertionError(f"function not found: {name}")
+    return match.group(0)
+
+
 class RollbackFinalizationSourceContracts(unittest.TestCase):
     """Static contracts on the boot worker that performs the finalization."""
 
@@ -241,16 +250,33 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
         )
 
     def test_resumed_cleanup_is_serialized_with_the_update_flow(self) -> None:
-        # Both resumed removals act inside the update root a concurrent
-        # installation stages into, so they run under the same install lock
-        # `libreecho-update` and `libreecho-update-fetch` take, and the lock is
+        # Both resumed removals act inside the update root the update flow
+        # stages into, so they run under the flow's own locks, and every lock is
         # released again on every path -- including each refusal.
         resume = extract_function(self.init, "ota_rollback_resume_terminal")
         lock = extract_function(self.init, "ota_rollback_resume_lock")
+        install = extract_function(self.init, "ota_rollback_resume_install_lock")
         unlock = extract_function(self.init, "ota_rollback_resume_unlock")
-        self.assertIn("$BB mkdir /data/libreecho/update/install.lock", lock)
-        self.assertIn("ota-rollback-resume-install-locked", lock)
+        # The fetcher's boot-local lock first, then the flow's install lock.
+        self.assertIn("$BB mkdir /run/libreecho/fetch.lock", lock)
+        self.assertIn("ota-rollback-resume-fetch-locked", lock)
+        self.assertLess(
+            lock.index("/run/libreecho/fetch.lock"),
+            lock.index("ota_rollback_resume_install_lock"),
+        )
+        # A fetch lock that could not be followed by the install lock is given
+        # back, so a refusal never leaves a lock of this worker's behind.
+        self.assertIn('$BB rmdir /run/libreecho/fetch.lock', lock)
+        self.assertIn("$BB mkdir \"$resume_lock\"", install)
+        self.assertIn("ota-rollback-resume-install-locked", install)
+        self.assertIn("$BB rmdir /run/libreecho/fetch.lock", unlock)
         self.assertIn("$BB rmdir /data/libreecho/update/install.lock", unlock)
+        # The boot id is read before the lock is taken, so the lock this worker
+        # holds can be tagged with the boot it was taken in.
+        self.assertLess(
+            resume.index("/proc/sys/kernel/random/boot_id"),
+            resume.index("ota_rollback_resume_lock || return 0"),
+        )
         self.assertEqual(resume.count("ota_rollback_resume_lock || return 0"), 1)
         # The two refusals that happen once the lock is held, and the completed
         # path, each release it.
@@ -262,16 +288,78 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
             resume.index("ota_rollback_resume_staging_cleanup"),
             resume.rindex("ota_rollback_resume_unlock"),
         )
-        # A boot that cannot take the lock publishes nothing: the records stay
+        # A boot that cannot take the locks publishes nothing: the records stay
         # unpublished for the next boot to retry.
         self.assertLess(
             lock_at, resume.index('ota_rollback_publish_terminal "$resume_slot"')
         )
-        # One lock covers both removals; the cleanup must not take a second one
+        # One acquisition covers both removals; the cleanup must not take a lock
         # of its own, which the helper's non-reentrant lock protocol forbids.
         cleanup = extract_function(self.init, "ota_rollback_resume_staging_cleanup")
         self.assertNotIn("install.lock", cleanup)
+        self.assertNotIn("fetch.lock", cleanup)
         self.assertNotIn("ota_rollback_resume_unlock", cleanup)
+
+    def test_lock_order_matches_the_real_update_flow(self) -> None:
+        # The serialization above is only as good as the flow's own protocol, so
+        # it is asserted against the shipped flow: the fetcher takes its
+        # boot-local fetch lock and then the install lock, releases the install
+        # lock *before* it downloads feature assets straight into the staging
+        # tree, and the worker takes the same two in the same order.
+        fetcher = (HERE / "initramfs/libreecho-update-fetch").read_text()
+        installer = (HERE / "initramfs/libreecho-update").read_text()
+        self.assertIn("FEATURE_STAGE=$ROOT/staging/features", fetcher)
+        self.assertIn("INSTALL_LOCK=$ROOT/install.lock", fetcher)
+        self.assertIn("$RUN_ROOT/libreecho/fetch.lock", fetcher)
+        self.assertIn('$BB mkdir "$INSTALL_LOCK" 2>/dev/null || die update_busy', fetcher)
+        # The installer takes the same path.
+        self.assertIn("LOCK=$UPDATE_ROOT/install.lock", installer)
+        self.assertIn('$BB mkdir "$LOCK" 2>/dev/null', installer)
+        check = extract_top_level_function(fetcher, "check_or_install")
+        self.assertLess(check.index("fetch_lock\n"), check.index("install_lock\n"))
+        self.assertLess(check.index("install_unlock"), check.index("download_feature_assets"))
+        # ... and it writes the staging tree the worker removes.
+        assets = extract_top_level_function(fetcher, "download_feature_assets")
+        self.assertIn("$FEATURE_STAGE", assets)
+        self.assertLess(
+            fetcher.index("$BB mkdir \"$LOCK\" 2>/dev/null"),
+            fetcher.index("$BB mkdir -p \"$FEATURE_STAGE\""),
+        )
+        worker = extract_function(self.init, "ota_rollback_resume_lock")
+        self.assertLess(
+            worker.index("/run/libreecho/fetch.lock"),
+            worker.index("ota_rollback_resume_install_lock"),
+        )
+        self.assertIn(
+            "/data/libreecho/update/install.lock",
+            extract_function(self.init, "ota_rollback_resume_install_lock"),
+        )
+
+    def test_a_lock_this_worker_holds_is_tagged_and_recoverable(self) -> None:
+        # The install lock lives in persistent /data, so a power loss while this
+        # worker holds it would otherwise block this worker and both update
+        # tools forever.  Every lock it takes is therefore tagged with the boot
+        # it was taken in, and only its own tag naming an earlier boot is
+        # reclaimed; a lock that cannot be tagged is given back instead of held.
+        tag = extract_function(self.init, "ota_rollback_resume_tag_lock")
+        install = extract_function(self.init, "ota_rollback_resume_install_lock")
+        unlock = extract_function(self.init, "ota_rollback_resume_unlock")
+        self.assertIn("owner=rollback-resume", tag)
+        self.assertIn("boot_id=%s", tag)
+        self.assertIn("[ -n \"$resume_boot_id\" ] || return 1", tag)
+        self.assertLess(install.index("$BB mkdir \"$resume_lock\""),
+                        install.index("ota_rollback_resume_tag_lock"))
+        self.assertIn("ota-rollback-resume-lock-untagged", install)
+        self.assertIn("ota-rollback-resume-lock-recovered", install)
+        self.assertIn("ota-rollback-resume-install-locked", install)
+        self.assertIn('resume_held_boot=$($BB sed -n \'s/^boot_id=//p\'', install)
+        self.assertIn("'s/^owner=//p'", install)
+        # The tag is removed before the directory, or the release would fail on
+        # it and the lock would never be given back.
+        self.assertIn('$BB rm -f /data/libreecho/update/install.lock/owner', unlock)
+        self.assertLess(
+            unlock.index("install.lock/owner"), unlock.index("rmdir /data/libreecho/update/install.lock")
+        )
 
     def test_v2_finalization_verifies_postconditions_before_claiming_cleanup(self) -> None:
         confirm = extract_function(self.init, "ota_v2_fallback_confirmed")
@@ -517,12 +605,16 @@ BOOT_WORKER_ROOTS = (
     "/run/libreecho",
     "/proc/cmdline",
     "/proc/mounts",
+    "/proc/sys/kernel/random/boot_id",
     "/tmp/",
 )
 
 ROLLBACK_VERSION = "0.14.99"
 ROLLBACK_SLOT = "b"
 FALLBACK_INTERRUPTED = "ota-v2-fallback-preserved-for-recovery"
+# The kernel's per-boot identity, which the worker tags the lock it holds with
+# so that a lock left behind by a power loss is recoverable on the next boot.
+BOOT_ID = "6f3a1e2c-0d5b-4c7a-9f10-000000000001"
 
 
 class _BootWorkerFixture:
@@ -555,6 +647,7 @@ class _BootWorkerFixture:
             "console=ttyMSM0 androidboot.slot_suffix=_a\n"
         )
         (root / "proc/mounts").write_text("")
+        self.reboot()
         # The image's first-install marker is a build-time file, so it is
         # present and valid on every device that can be running a rollback.
         (root / "etc/libreecho/first-install-confirm").write_text(
@@ -585,6 +678,16 @@ class _BootWorkerFixture:
             f'                    "{BUSYBOX}" ln -s "${{2%/*}}/feature-commit" "${{2%/*}}/rolled-back"\n'
             "                    ;;\n"
             "            esac\n"
+            "        fi\n"
+            "        ;;\n"
+            "    rm)\n"
+            "        # A power loss after the resumed cleanup has taken the update\n"
+            "        # flow's locks and before its removal: the tagged install\n"
+            "        # lock survives in persistent /data.\n"
+            '        if [ "${INTERRUPT_WHILE_LOCKED:-0}" = 1 ] &&\n'
+            '           [ "${2:-}" = -rf ] && [ "${3##*/}" = staging ]; then\n'
+            '            kill -KILL "$PPID"\n'
+            "            exit 0\n"
             "        fi\n"
             "        ;;\n"
             "    mv)\n"
@@ -697,6 +800,22 @@ class _BootWorkerFixture:
     def markers(self) -> str:
         return self.boot_log.read_text() if self.boot_log.exists() else ""
 
+    def set_boot_id(self, value: str) -> None:
+        """The kernel boot id this boot reports, which the worker tags its
+        persistent install lock with."""
+        boot_id = self.root / "proc/sys/kernel/random/boot_id"
+        boot_id.parent.mkdir(parents=True, exist_ok=True)
+        boot_id.write_text(f"{value}\n")
+
+    def reboot(self, boot_id: str = BOOT_ID) -> None:
+        """Model a reboot: the boot-local `/run` tree starts empty again and the
+        kernel reports a new boot id, while `/data` survives."""
+        run = self.root / "run"
+        if run.exists():
+            shutil.rmtree(run)
+        (run / "libreecho").mkdir(parents=True, exist_ok=True)
+        self.set_boot_id(boot_id)
+
     def seed_failed_candidate(self, state_record: str | None = None) -> None:
         """The failed candidate's live transaction and the records it left."""
         self.write_update(
@@ -794,6 +913,7 @@ class _BootWorkerFixture:
         self,
         interrupt_at: str | None = None,
         plant_under_lock: str | None = None,
+        interrupt_while_locked: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         """Run one boot of the shipped worker against the sandbox root.
 
@@ -808,6 +928,10 @@ class _BootWorkerFixture:
         replacement transaction with its own staged tree
         (``"live-transaction"``), or a history record replaced by a symlink to
         the live record (``"unsafe-history"``).
+
+        ``interrupt_while_locked`` places the power loss after the resumed
+        cleanup has taken the update flow's locks and before its removal, so
+        the persistent install lock this worker tagged survives the boot.
         """
         return subprocess.run(
             [BUSYBOX, "sh", str(self.harness)],
@@ -815,6 +939,7 @@ class _BootWorkerFixture:
                 "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                 "BOOT_LOG": str(self.boot_log),
                 "PLANT_UNDER_LOCK": plant_under_lock or "",
+                "INTERRUPT_WHILE_LOCKED": "1" if interrupt_while_locked else "0",
                 "INTERRUPT_AFTER_PENDING_UNLINK": (
                     "1" if interrupt_at == "pending-unlink" else "0"
                 ),
@@ -1269,6 +1394,107 @@ class RollbackFinalizationResumesAfterInterruption(unittest.TestCase):
             f"schema=2\ntransaction_id=deadbeef\nversion={ROLLBACK_VERSION}\n"
             f"slot={ROLLBACK_SLOT}\n",
         )
+        recovered = self.fx.boot()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("ota-rollback-resume-staging-cleaned", self.fx.markers())
+        self.assert_terminal_publication(self.fx.markers())
+        self.assertEqual(self.fx.fallbacks.read_text().splitlines(), ["fallback"])
+
+    def test_power_loss_while_holding_the_lock_is_recovered_by_the_next_boot(self) -> None:
+        self.fx.seed_failed_candidate()
+        self.assertEqual(
+            self.fx.boot(interrupt_at="staging").returncode, -signal.SIGKILL
+        )
+
+        # Boot 2 reaches the resumed cleanup, takes the update flow's locks and
+        # loses power before its removal, so this worker's own tagged lock
+        # survives in persistent /data.
+        killed = self.fx.boot(interrupt_while_locked=True)
+        self.assertEqual(killed.returncode, -signal.SIGKILL, killed.stderr)
+        lock = self.fx.update / "install.lock"
+        self.assertTrue(lock.is_dir())
+        self.assertEqual(
+            dict(
+                line.split("=", 1)
+                for line in (lock / "owner").read_text().splitlines()
+            ),
+            {"owner": "rollback-resume", "boot_id": BOOT_ID},
+        )
+        self.assertTrue((self.fx.update / "staging").is_dir())
+
+        # Boot 3 is a later boot -- the tag names the boot before it -- so the
+        # lock is this worker's own leftover rather than an installation in
+        # flight, and it is reclaimed.  Without that, this boot and every later
+        # one, and both update tools, would reject it forever.
+        self.fx.reboot("6f3a1e2c-0d5b-4c7a-9f10-000000000002")
+        recovered = self.fx.boot()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("ota-rollback-resume-lock-recovered", self.fx.markers())
+        self.assertFalse(lock.exists())
+        self.assertFalse((self.fx.update / "staging").exists())
+        self.assert_terminal_publication(self.fx.markers())
+        self.assertEqual(self.fx.fallbacks.read_text().splitlines(), ["fallback"])
+
+    def test_lock_tagged_with_this_boot_is_never_reclaimed(self) -> None:
+        self.fx.seed_failed_candidate()
+        self.assertEqual(
+            self.fx.boot(interrupt_at="staging").returncode, -signal.SIGKILL
+        )
+        # A lock this worker tagged names the boot that is running, so it cannot
+        # be proven stale and is not broken: only an earlier boot's tag is
+        # reclaimed, never a holder that has not finished.
+        lock = self.fx.update / "install.lock"
+        lock.mkdir()
+        (lock / "owner").write_text(
+            f"owner=rollback-resume\nboot_id={BOOT_ID}\n"
+        )
+        before_owner = (lock / "owner").read_bytes()
+        before_state = (self.fx.update / "state").read_bytes()
+
+        refused = self.fx.boot()
+        self.assertEqual(refused.returncode, 0, refused.stderr)
+        self.assertIn("ota-rollback-resume-install-locked", self.fx.markers())
+        self.assertNotIn("ota-rollback-resume-lock-recovered", self.fx.markers())
+        self.assertNotIn(
+            "ota-rollback-terminal-publication-resumed", self.fx.markers()
+        )
+        self.assertEqual((lock / "owner").read_bytes(), before_owner)
+        self.assertTrue((self.fx.update / "staging").is_dir())
+        self.assertEqual((self.fx.update / "state").read_bytes(), before_state)
+        # The fetch lock this boot took before it was refused was given back.
+        self.assertFalse((self.fx.root / "run/libreecho/fetch.lock").exists())
+
+    def test_feature_fetch_in_flight_blocks_the_resumed_cleanup(self) -> None:
+        # `libreecho-update-fetch` releases the install lock before it downloads
+        # feature assets straight into this staging tree, under its boot-local
+        # fetch lock -- so for that window the fetch lock is what makes the
+        # download the owner of the tree, and a boot must not delete it.
+        self.fx.seed_failed_candidate()
+        self.assertEqual(
+            self.fx.boot(interrupt_at="staging").returncode, -signal.SIGKILL
+        )
+        self.assertTrue((self.fx.update / "staging").is_dir())
+        before_state = (self.fx.update / "state").read_bytes()
+        before_check = (self.fx.update / "check-status").read_bytes()
+        fetch_lock = self.fx.root / "run/libreecho/fetch.lock"
+        fetch_lock.mkdir(parents=True)
+
+        refused = self.fx.boot()
+        self.assertEqual(refused.returncode, 0, refused.stderr)
+        self.assertIn("ota-rollback-resume-fetch-locked", self.fx.markers())
+        self.assertNotIn("ota-rollback-resume-staging-cleaned", self.fx.markers())
+        self.assertNotIn(
+            "ota-rollback-terminal-publication-resumed", self.fx.markers()
+        )
+        self.assertTrue((self.fx.update / "staging").is_dir())
+        self.assertEqual((self.fx.update / "state").read_bytes(), before_state)
+        self.assertEqual((self.fx.update / "check-status").read_bytes(), before_check)
+        # The lock the download holds is left exactly as it was, and the install
+        # lock was not taken at all.
+        self.assertTrue(fetch_lock.is_dir())
+        self.assertFalse((self.fx.update / "install.lock").exists())
+
+        fetch_lock.rmdir()
         recovered = self.fx.boot()
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         self.assertIn("ota-rollback-resume-staging-cleaned", self.fx.markers())

@@ -1268,27 +1268,95 @@ ota_health_confirm_worker()
         return 0
     }
 
-    # Both resumed removals act inside the update root the installer stages
-    # into, and the installer is free to stage a replacement candidate there as
-    # soon as the live records are gone, so the cleanup is serialized with the
-    # update flow under the flow's own install lock -- the same lock
-    # `libreecho-update` and `libreecho-update-fetch` take, so the two can
-    # never both be inside the tree.  A lock that is already held means an
-    # installation is in flight and owns the tree until it finishes, so this
-    # boot leaves the records unpublished and the next boot retries instead of
-    # racing it.
-    ota_rollback_resume_lock()
+    # A lock this worker holds is tagged with the boot it was taken in.  The
+    # install lock lives in persistent /data, and the update flow's own protocol
+    # has no answer for a holder that never released it -- and this worker can
+    # be that holder, because it runs on the boot after a power loss, which is
+    # exactly when another loss can land between taking the lock and releasing
+    # it.  An untagged lock (an installation, which never writes this tag) or
+    # one taken by this boot is never reclaimed; only this worker's own tag
+    # naming an earlier boot is.  The tag is required rather than best effort:
+    # a lock that cannot be tagged could not be recovered after a power loss,
+    # so it is given back instead of being held.
+    ota_rollback_resume_tag_lock()
     {
-        $BB mkdir /data/libreecho/update/install.lock 2>/dev/null || {
+        [ -n "$resume_boot_id" ] || return 1
+        printf 'owner=rollback-resume\nboot_id=%s\n' "$resume_boot_id" \
+            > "$resume_lock/owner" 2>/dev/null
+    }
+
+    ota_rollback_resume_install_lock()
+    {
+        resume_lock=/data/libreecho/update/install.lock
+        if $BB mkdir "$resume_lock" 2>/dev/null; then
+            if ota_rollback_resume_tag_lock; then
+                return 0
+            fi
+            $BB rmdir "$resume_lock" 2>/dev/null
+            log ota-rollback-resume-lock-untagged
+            return 1
+        fi
+        # The lock is held.  Only this worker's own tag from an earlier boot is
+        # recoverable; anything else -- the flow's own lock, or one this boot
+        # took -- is an owner that has not finished.
+        [ "$($BB sed -n 's/^owner=//p' "$resume_lock/owner" 2>/dev/null)" = rollback-resume ] || {
             log ota-rollback-resume-install-locked
             return 1
         }
+        resume_held_boot=$($BB sed -n 's/^boot_id=//p' "$resume_lock/owner" 2>/dev/null)
+        case "$resume_held_boot" in
+            ''|"$resume_boot_id")
+                log ota-rollback-resume-install-locked
+                return 1
+                ;;
+        esac
+        $BB rm -f "$resume_lock/owner" 2>/dev/null
+        $BB rmdir "$resume_lock" 2>/dev/null || {
+            log ota-rollback-resume-install-locked
+            return 1
+        }
+        $BB mkdir "$resume_lock" 2>/dev/null || {
+            log ota-rollback-resume-install-locked
+            return 1
+        }
+        if ota_rollback_resume_tag_lock; then
+            log ota-rollback-resume-lock-recovered
+            return 0
+        fi
+        $BB rmdir "$resume_lock" 2>/dev/null
+        log ota-rollback-resume-lock-untagged
+        return 1
+    }
+
+    # Both resumed removals act inside the update root the update flow stages
+    # into, so they are serialized with that flow under its own two locks, taken
+    # in the order the flow takes them: the boot-local fetch lock it holds while
+    # it downloads feature assets straight into the staging tree, then the
+    # persistent install lock it holds while it writes the transaction.  It
+    # releases the install lock before that download and re-takes it for the
+    # install, so the fetch lock is what protects a tree being written, and a
+    # fetch or installation in flight owns the tree until it finishes: this boot
+    # leaves the records unpublished for the next boot to retry instead of
+    # removing what it is writing.
+    ota_rollback_resume_lock()
+    {
+        $BB mkdir -p /run/libreecho 2>/dev/null
+        $BB mkdir /run/libreecho/fetch.lock 2>/dev/null || {
+            log ota-rollback-resume-fetch-locked
+            return 1
+        }
+        if ! ota_rollback_resume_install_lock; then
+            $BB rmdir /run/libreecho/fetch.lock 2>/dev/null
+            return 1
+        fi
         return 0
     }
 
     ota_rollback_resume_unlock()
     {
+        $BB rm -f /data/libreecho/update/install.lock/owner 2>/dev/null
         $BB rmdir /data/libreecho/update/install.lock 2>/dev/null
+        $BB rmdir /run/libreecho/fetch.lock 2>/dev/null
     }
 
     # The recovery helper retires the transaction and only then removes its
@@ -1453,7 +1521,10 @@ ota_health_confirm_worker()
             # is already held, a history record that stopped being a bounded
             # regular file, or a live transaction that appeared while this boot
             # was deciding, all leave the records unpublished for the next boot
-            # instead of removing something this rollback does not own.
+            # instead of removing something this rollback does not own.  The
+            # boot id is what makes a lock this worker left behind by an earlier
+            # power loss recoverable instead of permanent.
+            resume_boot_id=$($BB cat /proc/sys/kernel/random/boot_id 2>/dev/null)
             ota_rollback_resume_lock || return 0
             if ! ota_rollback_resume_history_bounded; then
                 log ota-rollback-resume-history-unsafe
