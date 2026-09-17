@@ -1341,6 +1341,18 @@ ota_health_confirm_worker()
                 [ "$($BB sed -n 's/^status=//p' /data/libreecho/update/check-status 2>/dev/null)" = reboot-pending ] ||
                     return 0
                 ;;
+            reboot-pending|boot-validating)
+                # A candidate that crashes -- or loses power -- on its boots can
+                # exhaust its attempts before this worker reaches its restart
+                # record, so the last progress record the failed candidate left
+                # is either the installer's `reboot-pending` (written before the
+                # reboot into the candidate) or the `boot-validating` record this
+                # worker writes before its health checks.  Both are the failed
+                # candidate's own records, and the evidence that its transaction
+                # was retired is the finalized history record below, not this
+                # progress record -- which is exactly the state a completed
+                # confirmation overwrites (`state=installed`).
+                ;;
             *)
                 # A healthy device, a first install, or a state this worker
                 # never wrote: leave it alone.
@@ -1355,6 +1367,16 @@ ota_health_confirm_worker()
                 return 0
                 ;;
         esac
+        # A rollback leaves the previously confirmed slot running, which is the
+        # pairing the rollback branch itself acts on: it retires the transaction
+        # only while the slot it staged is not the slot that booted.  A history
+        # record naming the slot that is running is therefore retained evidence
+        # of an earlier rollback -- or of a confirmation this device already
+        # finished -- and never a publication for this boot to complete.
+        [ "$resume_slot" != "$selected_slot" ] || {
+            log ota-rollback-resume-history-slot-still-selected
+            return 0
+        }
         # Which transaction the finalized history names, so the one-sided live
         # record left by an interrupted retirement can be matched to it.
         resume_transaction=$($BB sed -n 's/^transaction_id=//p' /data/libreecho/update/rolled-back 2>/dev/null)
@@ -1396,11 +1418,6 @@ ota_health_confirm_worker()
         return 0
     }
 
-    # This boot may be the first one after an interrupted finalization, and
-    # every later boot would skip the rollback branch, so finish it before this
-    # boot decides what it is for.
-    ota_rollback_resume_terminal
-
     running_slot=$($BB sed -n \
         's/.*androidboot.slot_suffix=_\([ab]\).*/\1/p' /proc/cmdline)
     case "$running_slot" in
@@ -1415,6 +1432,13 @@ ota_health_confirm_worker()
                 $BB sed -n 's/^selected_slot=//p')
             ;;
     esac
+
+    # This boot may be the first one after an interrupted finalization, and
+    # every later boot would skip the rollback branch, so finish it before this
+    # boot decides what it is for.  It runs once the running slot is known, so
+    # the finalized history record it finds can be checked against the slot that
+    # actually booted.
+    ota_rollback_resume_terminal
 
     if [ -r /data/libreecho/update/pending ]; then
         CONFIRM_MODE=ota

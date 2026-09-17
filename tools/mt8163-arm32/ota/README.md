@@ -147,6 +147,18 @@ and `feature-commit`. A surviving live record logs
 path, and the check record is rewritten only when its `latest_version` equals the
 version in `rolled-back`, exactly as for a schema-2 rollback.
 
+Which progress record the failed candidate left is not part of that evidence: a
+candidate that crashes -- or loses power -- on its boots exhausts its attempts
+before the worker reaches its own restart record, so the survivor can be the
+installer's `reboot-pending` or the `boot-validating` record the worker writes
+before its health checks. Both are the failed candidate's own records, and the
+evidence that its transaction was retired is the finalized history record, so the
+resume publishes from them as well. The slot that record names is checked against
+the running one first, because a rollback leaves the previously confirmed slot
+running -- a history record naming the slot this boot runs is retained history
+(or a confirmation the device already finished) and is refused with
+`ota-rollback-resume-history-slot-still-selected` instead of being published.
+
 ## Signed bundle v1
 
 The transport is a deterministic POSIX tar with these exact members:

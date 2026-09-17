@@ -172,6 +172,36 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
             resume.index('ota_rollback_publish_terminal "$resume_slot"'),
         )
 
+    def test_resume_recognizes_the_failed_candidates_progress_records(self) -> None:
+        # A candidate can exhaust its boot attempts -- or lose power -- before
+        # the worker reaches its health failure record, so the last progress
+        # record it leaves is the installer's `reboot-pending` or the worker's
+        # own `boot-validating`.  Both have to be recognized, or the stranded
+        # record is simply a different one.
+        resume = extract_function(self.init, "ota_rollback_resume_terminal")
+        self.assertIn("reboot-pending|boot-validating)", resume)
+        self.assertIn("s/^state=//p", resume)
+        # The evidence for a rollback is the finalized history record, and a
+        # rollback leaves the previously confirmed slot running: a record naming
+        # the slot this boot runs is retained history, not a publication.
+        self.assertIn("ota-rollback-resume-history-slot-still-selected", resume)
+        self.assertIn('[ "$resume_slot" != "$selected_slot" ]', resume)
+        self.assertLess(
+            resume.index('case "$resume_slot" in'),
+            resume.index('[ "$resume_slot" != "$selected_slot" ]'),
+        )
+        self.assertLess(
+            resume.index('[ "$resume_slot" != "$selected_slot" ]'),
+            resume.index("ota_rollback_resume_live_records || return 0"),
+        )
+        # The slot the history record is checked against is the running one, so
+        # the resume runs after this boot has determined it -- and still before
+        # the boot decides whether it has a live transaction at all.
+        self.assertLess(
+            self.worker.index('libreecho-bootctl status "$running_slot"'),
+            self.worker.index("\n    ota_rollback_resume_terminal\n"),
+        )
+
     def test_v2_finalization_verifies_postconditions_before_claiming_cleanup(self) -> None:
         confirm = extract_function(self.init, "ota_v2_fallback_confirmed")
         for live_record in ("pending", "feature-commit", "staging", "rolled-back"):
@@ -577,7 +607,7 @@ class _BootWorkerFixture:
     def markers(self) -> str:
         return self.boot_log.read_text() if self.boot_log.exists() else ""
 
-    def seed_failed_candidate(self) -> None:
+    def seed_failed_candidate(self, state_record: str | None = None) -> None:
         """The failed candidate's live transaction and the records it left."""
         self.write_update(
             "pending",
@@ -589,7 +619,8 @@ class _BootWorkerFixture:
         )
         self.write_update(
             "state",
-            "schema=1\nstate=restarting\nprogress=0\n"
+            state_record
+            or "schema=1\nstate=restarting\nprogress=0\n"
             "detail=health-confirm-failed:web-status\n",
         )
         self.write_update(
@@ -1194,6 +1225,93 @@ class RollbackFinalizationResumesAfterInterruption(unittest.TestCase):
         self.assertEqual(check["status"], "reboot-pending")
         self.assertEqual(check["latest_version"], "0.15.0")
         self.assertFalse((self.fx.update / "check-status.tmp").exists())
+
+    def test_interrupted_publication_is_finished_from_the_installer_state(self) -> None:
+        # A candidate that crashes or loses power on its boots can exhaust its
+        # attempts before this worker ever writes its restart record, so the
+        # last progress record it left is the installer's `reboot-pending`.  The
+        # fallback boot then retires the transaction and can lose power before
+        # the publication, and the resume has to recognize that progress record
+        # as the failed candidate's: the finalized history record is what proves
+        # the transaction was retired.
+        self.fx.seed_failed_candidate(
+            state_record="schema=1\nstate=reboot-pending\nprogress=100\ndetail=b\n"
+        )
+        interrupted = self.fx.boot(interrupt_at="cleanup")
+        self.assertEqual(interrupted.returncode, -signal.SIGKILL, interrupted.stderr)
+        self.fx.assert_cleanup_happened()
+        self.assertEqual(self.fx.read_update("state")["state"], "reboot-pending")
+
+        recovered = self.fx.boot()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assert_terminal_publication(self.fx.markers())
+        self.assertEqual(self.fx.fallbacks.read_text().splitlines(), ["fallback"])
+        self.assertFalse(self.fx.reboots.exists())
+
+    def test_interrupted_publication_is_finished_from_the_pre_check_state(self) -> None:
+        # The other progress record the same failure can leave behind: the
+        # `boot-validating` state this worker writes before its health checks, so
+        # the candidate died without ever reaching its restart record.
+        self.fx.seed_failed_candidate(
+            state_record="schema=1\nstate=boot-validating\nprogress=95\n"
+            "detail=health-checks\n"
+        )
+        interrupted = self.fx.boot(interrupt_at="cleanup")
+        self.assertEqual(interrupted.returncode, -signal.SIGKILL, interrupted.stderr)
+        self.fx.assert_cleanup_happened()
+        self.assertEqual(self.fx.read_update("state")["state"], "boot-validating")
+
+        recovered = self.fx.boot()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assert_terminal_publication(self.fx.markers())
+        self.assertEqual(self.fx.fallbacks.read_text().splitlines(), ["fallback"])
+        self.assertFalse(self.fx.reboots.exists())
+
+    def test_interrupted_legacy_publication_is_finished_from_the_installer_state(self) -> None:
+        # The same pre-health-check state on a legacy device: the moved pending
+        # record is the rollback evidence, the installer's progress record
+        # survives, and neither v2 cleanup belongs to it.
+        self.fx.seed_legacy_rollback_record()
+        self.fx.write_update(
+            "state", "schema=1\nstate=reboot-pending\nprogress=100\ndetail=b\n"
+        )
+        manifest = self.plant_legacy_staging()
+        result = self.fx.boot()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_terminal_publication(self.fx.markers())
+        self.assertIn("ota-rollback-resume-legacy-publication", self.fx.markers())
+        self.assert_no_v2_cleanup()
+        self.assertEqual(manifest.read_text(), "format=libreecho-ota-v1\n")
+
+    def test_history_naming_the_running_slot_is_never_published(self) -> None:
+        # A retained history record outlives the rollback it describes: the
+        # device can go on to install and confirm a later candidate on that same
+        # slot, and the record then names the slot the device is running.  That
+        # is not a rollback waiting for a publication -- the rollback branch
+        # itself only retires a transaction staged on a slot other than the one
+        # that booted -- so neither record may be rewritten from it.
+        self.fx.seed_legacy_rollback_record()
+        self.fx.write_update(
+            "rolled-back",
+            f"schema=1\nversion={ROLLBACK_VERSION}\nslot=a\n"
+            f"boot_sha256={'0' * 64}\nupdate_channel=dev\nfeature_policy=preserve\n",
+        )
+        self.fx.write_update(
+            "state", "schema=1\nstate=reboot-pending\nprogress=100\ndetail=a\n"
+        )
+        before_state = (self.fx.update / "state").read_bytes()
+        result = self.fx.boot()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "ota-rollback-resume-history-slot-still-selected", self.fx.markers()
+        )
+        self.assertNotIn(
+            "ota-rollback-terminal-publication-resumed", self.fx.markers()
+        )
+        self.assertEqual((self.fx.update / "state").read_bytes(), before_state)
+        self.assertEqual(
+            self.fx.read_update("check-status")["status"], "reboot-pending"
+        )
 
     def test_legacy_resume_stands_down_while_a_live_record_exists(self) -> None:
         # A schema-1 record cannot be matched to a surviving live record -- it
