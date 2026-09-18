@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -31,6 +32,8 @@
 #include "audio_period_buffer.h"
 #include "audio_visualizer.h"
 #include "playback_status.h"
+#include "playback_drain.h"
+#include "playback_control.h"
 #include "puffin_downmix.h"
 
 #define DEFAULT_ROOT "/run/libreecho-audio"
@@ -80,6 +83,10 @@ struct music_visualizer {
 };
 
 static volatile sig_atomic_t stopping;
+static struct playback_drain playback_cursor;
+static struct pcm *playback_pcm;
+static int playback_control_fd = -1;
+static char playback_control_path[256];
 
 static void on_signal(int signo)
 {
@@ -442,8 +449,28 @@ static void sync_playback_status(const struct source_bus *sources,
 				 struct playback_status *status)
 {
 	unsigned int mask = source_activity_mask(sources);
+	unsigned int drained_mask = 0;
+	uint64_t pending[PLAYBACK_STATUS_BUS_COUNT];
+	long delay = playback_pcm ? pcm_get_delay(playback_pcm) : 0;
+	unsigned int i;
 
-	(void)playback_status_publish(status, mask);
+	if (delay < 0)
+		delay = 0;
+	for (i = 0; i < SOURCE_COUNT; ++i) {
+		int unread = 0;
+		size_t bytes = sources[i].received;
+
+		if (sources[i].fd >= 0 &&
+		    ioctl(sources[i].fd, FIONREAD, &unread) == 0 && unread > 0)
+			bytes += (size_t)unread;
+		pending[i] = playback_drain_pending_frames(
+			&playback_cursor, 1U << i, bytes, delay);
+		if (playback_drain_bus_drained(
+			    &playback_cursor, 1U << i, bytes, delay))
+			drained_mask |= 1U << i;
+	}
+	(void)playback_status_publish_drain(
+		status, mask, drained_mask, pending, playback_cursor.last_frame);
 }
 
 static void clear_source_activity(struct source_bus *sources,
@@ -563,6 +590,75 @@ static int read_media_gain(const char *root)
 	return db_to_q15(db);
 }
 
+static int setup_playback_control(const char *root)
+{
+	struct sockaddr_un address;
+
+	if (snprintf(playback_control_path, sizeof(playback_control_path),
+	             "%s/control.sock", root) >= (int)sizeof(playback_control_path))
+		return -1;
+	playback_control_fd = socket(AF_UNIX,
+	                             SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+	if (playback_control_fd < 0)
+		return -1;
+	memset(&address, 0, sizeof(address));
+	address.sun_family = AF_UNIX;
+	if (strlen(playback_control_path) >= sizeof(address.sun_path))
+		return -1;
+	strcpy(address.sun_path, playback_control_path);
+	(void)unlink(playback_control_path);
+	if (bind(playback_control_fd, (struct sockaddr *)&address,
+	         sizeof(address)) < 0 || chmod(playback_control_path, 0660) < 0)
+		return -1;
+	return 0;
+}
+
+static void close_playback_control(void)
+{
+	if (playback_control_fd >= 0)
+		close(playback_control_fd);
+	playback_control_fd = -1;
+	if (playback_control_path[0])
+		(void)unlink(playback_control_path);
+}
+
+static void drain_playback_control(struct source_bus *sources)
+{
+	char message[64];
+	unsigned int bus;
+
+	if (playback_control_fd < 0)
+		return;
+	for (;;) {
+		ssize_t count = recv(playback_control_fd, message,
+		                     sizeof(message) - 1U, MSG_DONTWAIT);
+		if (count < 0 && errno == EINTR)
+			continue;
+		if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+			break;
+		if (count <= 0)
+			break;
+		message[count] = '\0';
+		if (!playback_control_parse_cancel(message, &bus) ||
+		    bus >= SOURCE_COUNT)
+			continue;
+		sources[bus].received = 0;
+		sources[bus].idle_periods = 0;
+		for (;;) {
+			unsigned char discarded[4096];
+			ssize_t discarded_count = read(sources[bus].fd, discarded,
+			                               sizeof(discarded));
+			if (discarded_count > 0)
+				continue;
+			if (discarded_count < 0 && errno == EINTR)
+				continue;
+			break;
+		}
+		fprintf(stderr, "audio-engine: cancelled %s bus; media preserved\n",
+		        sources[bus].name);
+	}
+}
+
 static int setup_sources(struct source_bus *sources, const char *root)
 {
 	static const char *const names[SOURCE_COUNT] = {
@@ -611,7 +707,8 @@ static void close_sources(struct source_bus *sources)
 
 static int poll_sources(struct source_bus *sources, int timeout_ms)
 {
-	struct pollfd pollfds[SOURCE_COUNT];
+	struct pollfd pollfds[SOURCE_COUNT + 1U];
+	nfds_t count = SOURCE_COUNT;
 	unsigned int i;
 	int result;
 
@@ -620,8 +717,14 @@ static int poll_sources(struct source_bus *sources, int timeout_ms)
 		pollfds[i].events = POLLIN;
 		pollfds[i].revents = 0;
 	}
+	if (playback_control_fd >= 0) {
+		pollfds[count].fd = playback_control_fd;
+		pollfds[count].events = POLLIN;
+		pollfds[count].revents = 0;
+		++count;
+	}
 	do {
-		result = poll(pollfds, SOURCE_COUNT, timeout_ms);
+		result = poll(pollfds, count, timeout_ms);
 	} while (result < 0 && errno == EINTR && !stopping);
 	return result;
 }
@@ -632,6 +735,7 @@ static int read_sources(struct source_bus *sources, const char *root)
 	unsigned int i;
 	int received_any = 0;
 
+	drain_playback_control(sources);
 	for (i = 0; i < SOURCE_COUNT; ++i) {
 		unsigned char *cursor = (unsigned char *)sources[i].samples;
 		size_t new_bytes = 0;
@@ -823,6 +927,7 @@ static int write_period(struct pcm *pcm, const int16_t *samples,
 {
 	if (pcm_writei(pcm, samples, PERIOD_SIZE) != (int)PERIOD_SIZE)
 		return -1;
+	playback_drain_submit(&playback_cursor, activity_mask, PERIOD_SIZE);
 	/*
 	 * Reference delivery is intentionally lossy.  A missing or slow AEC
 	 * consumer must never delay the sole owner of the speaker PCM.
@@ -864,6 +969,8 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	memset(sources, 0, sizeof(sources));
 	memset(&status, 0, sizeof(status));
 	memset(&reference, 0, sizeof(reference));
+	playback_drain_init(&playback_cursor);
+	playback_pcm = NULL;
 	reference.fd = -1;
 	audio_visualizer_init(&visualizer.analyzer);
 	memset(visualizer.levels, 0, sizeof(visualizer.levels));
@@ -875,6 +982,11 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	if (setup_sources(sources, root) < 0) {
 		fprintf(stderr, "audio-engine: source setup failed: %s\n",
 			strerror(errno));
+		goto out;
+	}
+	if (setup_playback_control(root) < 0) {
+		fprintf(stderr, "audio-engine: playback control unavailable: %s\n",
+		        strerror(errno));
 		goto out;
 	}
 	if (playback_status_init(&status, root) < 0) {
@@ -958,6 +1070,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			usleep(250000);
 			continue;
 		}
+		playback_pcm = pcm;
 		/*
 		 * The sender's volume applies to AirPlay media, not to everything
 		 * the device plays.  Applying it unconditionally meant a system
@@ -1016,6 +1129,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				pcm_get_error(pcm));
 			(void)disable_output_controls(card, -1);
 			pcm_close(pcm);
+			playback_pcm = NULL;
 			if (airplay_volume_attempted || airplay_volume_applied)
 				if (saved_volume >= 0)
 					(void)set_pcm_volume(card, saved_volume);
@@ -1025,6 +1139,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		}
 		process_music_visualizer(&visualizer, sources, output);
 		consume_period(sources);
+		sync_playback_status(sources, &status);
 
 		while (!stopping && sources_active(sources)) {
 			/* Same scoping for live volume changes from the sender. */
@@ -1066,11 +1181,19 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			}
 			process_music_visualizer(&visualizer, sources, output);
 			consume_period(sources);
+			sync_playback_status(sources, &status);
 		}
+		/* pcm_writei() only queues frames.  Drain the hardware PCM before
+		 * publishing every bus idle or muting the amplifier, otherwise the
+		 * final queued period is audibly truncated. */
+		if (pcm_drain(pcm) < 0)
+		    fprintf(stderr, "audio-engine: PCM drain failed: %s\n",
+		            pcm_get_error(pcm));
 		clear_source_activity(sources, &announcement_led_active,
-				      &visualizer, &status);
+		                      &visualizer, &status);
 		(void)disable_output_controls(card, -1);
 		pcm_close(pcm);
+		playback_pcm = NULL;
 		/* Only undo a level this engine actually imposed. */
 		if (airplay_session && airplay_volume_applied && saved_volume >= 0)
 			(void)set_pcm_volume(card, saved_volume);
@@ -1086,6 +1209,7 @@ out:
 		sync_playback_status(sources, &status);
 	}
 	le_aec_reference_close(&reference);
+	close_playback_control();
 	free(output);
 	close_sources(sources);
 	if (airplay_volume_applied && saved_volume >= 0)

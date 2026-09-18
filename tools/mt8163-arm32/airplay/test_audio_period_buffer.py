@@ -260,6 +260,8 @@ const char *pcm_get_error(struct pcm *pcm);
 void pcm_close(struct pcm *pcm);
 int pcm_prepare(struct pcm *pcm);
 int pcm_writei(struct pcm *pcm, const void *data, unsigned int frame_count);
+long pcm_get_delay(struct pcm *pcm);
+int pcm_drain(struct pcm *pcm);
 #endif
 """
 
@@ -310,6 +312,7 @@ def main() -> None:
             "-I",
             str(SOURCE_DIR),
             str(engine_source),
+            str(SOURCE_DIR / "playback_control.c"),
             "-Wl,--gc-sections",
             "-lm",
             "-o",
