@@ -53,7 +53,7 @@ WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-INIT_SHA256 = "bd233e781aa3beef851c0aeae48b23f4ae45b966393d782a2a73285826ea3a39"
+INIT_SHA256 = "b71cda59b96bb306ba71ce2510b0dac62915c26da75fd57f2d2a34f01ebaa8e3"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -111,6 +111,7 @@ UI_BINARY_NAMES = {
     "usr/local/sbin/libreecho-btd",
     "usr/local/sbin/libreecho-airplayd",
     "usr/local/sbin/libreecho-wyomingd",
+    "usr/local/sbin/libreecho-lived",
     "usr/local/sbin/libreecho-sttd-wyoming",
     "usr/local/sbin/libreecho-ttsd-wyoming",
 }
@@ -132,6 +133,7 @@ UI_INIT_NAMES = {
     "etc/init.d/libreecho-sttd.init",
     "etc/init.d/libreecho-agentd.init",
     "etc/init.d/libreecho-wyomingd.init",
+    "etc/init.d/libreecho-lived.init",
 }
 UI_FIXED_NAMES = UI_BINARY_NAMES | UI_INIT_NAMES | {
     "etc/libreecho/web-config.json",

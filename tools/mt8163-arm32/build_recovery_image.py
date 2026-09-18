@@ -55,7 +55,7 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "bd233e781aa3beef851c0aeae48b23f4ae45b966393d782a2a73285826ea3a39"
+RECOVERY_INIT_SHA256 = "b71cda59b96bb306ba71ce2510b0dac62915c26da75fd57f2d2a34f01ebaa8e3"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
@@ -798,6 +798,25 @@ def validate_ui_startup_contract(bundle: Path) -> None:
             ),
         ),
         (
+            "etc/init.d/libreecho-lived.init",
+            (
+                # The GPT-Live daemon is launched disarmed and owns no hardware,
+                # so the production graph can start it in every configuration.
+                # The Web/API plane reaches it over exactly this socket, and a
+                # daemon that is packaged without its canonical socket path or
+                # without a status surface would still render a GPT-Live
+                # control that can only answer "service is unavailable".
+                "DAEMON=${DAEMON:-/usr/local/sbin/libreecho-lived}",
+                "PIDFILE=${PIDFILE:-/var/run/libreecho-lived.pid}",
+                "SOCKET=${SOCKET:-/run/libreecho/live.sock}",
+                'mkdir -p "$(dirname "$PIDFILE")" "$(dirname "$LOGFILE")" '
+                '"$(dirname "$SOCKET")"',
+                "is_running()",
+                "start) start_service",
+                'echo "running socket=$SOCKET',
+            ),
+        ),
+        (
             "etc/init.d/libreecho-agentd.init",
             (
                 "AGENT_DEPENDENCY_TIMEOUT_SECONDS=${AGENT_DEPENDENCY_TIMEOUT_SECONDS:-90}",
@@ -946,6 +965,33 @@ def validate_ui_startup_contract(bundle: Path) -> None:
                 raise SystemExit(
                     "ERROR: agentd start case does not wait for dependencies"
                 )
+        if relative.endswith("libreecho-lived.init"):
+            dispatch_start = text.index('case "${1:-}" in')
+            dispatch_body = text[dispatch_start:]
+            if not re.search(r"(?m)^\s*start\)\s*start_service", dispatch_body):
+                raise SystemExit(
+                    "ERROR: lived init script start case does not start the daemon"
+                )
+            if not re.search(r"(?m)^\s*stop\)\s*stop_service", dispatch_body):
+                raise SystemExit(
+                    "ERROR: lived init script has no stop case; a disarmed daemon "
+                    "must still be supervizable"
+                )
+            status_case = re.search(r"(?ms)^\s*status\)(.*?);;", dispatch_body)
+            if status_case is None:
+                raise SystemExit("ERROR: lived init script has no status case")
+            status_body = status_case.group(1)
+            # The socket path is the readiness surface the Web/API plane and the
+            # production health contract read, so status has to name it and has
+            # to fail while the daemon is not listening on it.
+            if "$SOCKET" not in status_body:
+                raise SystemExit(
+                    "ERROR: lived status case does not report the daemon socket"
+                )
+            if "exit 1" not in status_body:
+                raise SystemExit(
+                    "ERROR: lived status case must fail when the daemon is stopped"
+                )
         if relative in payload_contracts:
             start_service_start = text.index("start_service()")
             dispatch_start = text.index('case "${1:-}" in')
@@ -1053,7 +1099,7 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
         "libreecho-timed", "libreecho-timerd",
         "libreecho-audiod", "libreecho-micd",
         "libreecho-ledd", "libreecho-buttond", "libreecho-radiod", "libreecho-btd",
-        "libreecho-airplayd", "libreecho-wyomingd",
+        "libreecho-airplayd", "libreecho-wyomingd", "libreecho-lived",
         "libreecho-sttd-wyoming", "libreecho-ttsd-wyoming",
     ):
         copy_file(f"sbin/{binary}", f"usr/local/sbin/{binary}", 0o755, True)
@@ -1064,6 +1110,7 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
         "libreecho-radiod.init", "libreecho-btd.init",
         "libreecho-airplayd.init", "libreecho-ttsd.init", "libreecho-waked.init",
         "libreecho-sttd.init", "libreecho-agentd.init", "libreecho-wyomingd.init",
+        "libreecho-lived.init",
     ):
         copy_file(f"etc/init.d/{script}", f"etc/init.d/{script}", 0o755)
     copy_file("etc/libreecho/web-config.json", "etc/libreecho/web-config.json", 0o600)

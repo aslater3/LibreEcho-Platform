@@ -2094,6 +2094,25 @@ class PolicyTests(unittest.TestCase):
             "    start) start_service ;;",
             "esac",
         )) + "\n"
+        valid_lived = "\n".join((
+            "DAEMON=${DAEMON:-/usr/local/sbin/libreecho-lived}",
+            "PIDFILE=${PIDFILE:-/var/run/libreecho-lived.pid}",
+            "LOGFILE=${LOGFILE:-/var/log/libreecho-lived.log}",
+            "SOCKET=${SOCKET:-/run/libreecho/live.sock}",
+            "is_running() { return 1; }",
+            "start_service() {",
+            '    mkdir -p "$(dirname "$PIDFILE")" "$(dirname "$LOGFILE")" "$(dirname "$SOCKET")"',
+            "}",
+            "stop_service() { :; }",
+            'case "${1:-}" in',
+            "    start) start_service ;;",
+            "    stop) stop_service ;;",
+            "    status)",
+            '        echo "running socket=$SOCKET"',
+            "        exit 1",
+            "        ;;",
+            "esac",
+        )) + "\n"
 
         with tempfile.TemporaryDirectory() as temporary:
             bundle = Path(temporary)
@@ -2101,11 +2120,13 @@ class PolicyTests(unittest.TestCase):
             buttond = bundle / "etc/init.d/libreecho-buttond.init"
             web = bundle / "etc/init.d/libreecho-web.init"
             agentd = bundle / "etc/init.d/libreecho-agentd.init"
+            lived = bundle / "etc/init.d/libreecho-lived.init"
             led.parent.mkdir(parents=True)
             led.write_text(valid_led)
             buttond.write_text(valid_buttond)
             web.write_text(valid_web)
             agentd.write_text(valid_agentd)
+            lived.write_text(valid_lived)
             feature_script = "\n".join((
                 "PAYLOAD=/data/libreecho/features/feature/payload.squashfs",
                 "RUNTIME_ROOT=/run/libreecho/features/feature/root",
@@ -2672,7 +2693,7 @@ feature_daemon_required tts
             init_script.index("start_ui_services()"):
             init_script.index("start_ui_services &")
         ]
-        self.assertIn('services="$services airplayd radiod ttsd web"', service_start)
+        self.assertIn('services="$services airplayd radiod ttsd lived web"', service_start)
         self.assertNotIn('services="$services airplayd radiod ttsd agentd web"', service_start)
 
     def test_airplay_controller_staging_follows_discovery_and_audio_toggles(self) -> None:
@@ -3084,6 +3105,38 @@ start_feature_service_if_enabled
         self.assertEqual(set(builder_binaries), verified_binaries)
         self.assertEqual(set(shell_for_items(script_blocks[0])), verified_scripts)
         self.assertEqual(set(builder_scripts), verified_scripts)
+
+    def test_gpt_live_daemon_is_packaged_in_every_layer(self) -> None:
+        """Issue #168: a rendered GPT-Live control needs its shipped daemon."""
+        bundle_source = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        binary_blocks = shell_for_blocks(bundle_source, "for binary in \\\n")
+        verify_block = next(
+            block for block in binary_blocks if "statically linked" in block
+        )
+        install_block = next(
+            block for block in binary_blocks if "install -m 0755" in block
+        )
+        script_block = shell_for_blocks(bundle_source, "for script in \\\n")[0]
+        builder_binaries = python_string_list(builder_source, "    for binary in (\n")
+        builder_scripts = python_string_list(builder_source, "    for script in (\n")
+
+        self.assertIn("libreecho-lived", shell_for_items(verify_block))
+        self.assertIn("libreecho-lived", shell_for_items(install_block))
+        self.assertIn("libreecho-lived.init", shell_for_items(script_block))
+        self.assertIn("libreecho-lived", builder_binaries)
+        self.assertIn("libreecho-lived.init", builder_scripts)
+        self.assertIn("usr/local/sbin/libreecho-lived", verifier.UI_BINARY_NAMES)
+        self.assertIn("etc/init.d/libreecho-lived.init", verifier.UI_INIT_NAMES)
+        self.assertIn("libreecho-lived", bundle_source.split("TLS_BINARIES=", 1)[1].split("\n", 1)[0])
+
+    def test_gpt_live_daemon_precedes_web_in_production_graphs(self) -> None:
+        init_source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        graphs = production_service_graphs(init_source)
+        self.assertEqual(len(graphs), 5, graphs)
+        for graph in graphs[1:]:
+            self.assertIn("lived", graph)
+            self.assertLess(graph.index("lived"), graph.index("web"))
 
     def test_timer_daemon_is_in_every_production_service_graph(self) -> None:
         """Issue #162: packaging the daemon is useless unless it is started."""
@@ -4114,7 +4167,10 @@ class UiTlsPackagingTests(unittest.TestCase):
         self.assertIn('"$VERIFY_TLS" --prefix "$MBEDTLS_ROOT"', bundle)
         self.assertIn('--binary "$UI_SOURCE/build/$binary"', bundle)
         self.assertIn('--binary "$OUTPUT/sbin/$binary"', bundle)
-        self.assertIn("TLS_BINARIES=(libreecho-web libreecho-radiod)", bundle)
+        self.assertIn(
+            "TLS_BINARIES=(libreecho-web libreecho-radiod libreecho-lived)",
+            bundle,
+        )
 
     def test_mbedtls_dependency_is_pinned_and_provenanced(self) -> None:
         lock = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())
