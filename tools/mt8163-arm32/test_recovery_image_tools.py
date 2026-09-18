@@ -2960,11 +2960,17 @@ start_feature_service_if_enabled
         self.assertIn("web_listen=0.0.0.0:8080", source)
         self.assertNotIn("if [ -r /data/libreecho/config/users ]; then", source)
         self.assertNotIn("libreecho-update-fetch watch", source)
+        # The health worker is started for every OTA image, not only a
+        # production one: its rollback half must run on the boot after the
+        # bootloader fell back whatever the service profile is, or the failed
+        # candidate's records strand the update flow.  Candidate confirmation
+        # stays production-only, gated inside the worker.
+        self.assertIn('if [ "$IMAGE_PROFILE" = ota ]; then', source)
+        self.assertIn("ota-background-worker-started", source)
+        self.assertIn("ota-background-workers-disabled-for-non-ota-profile", source)
         self.assertIn(
-            'if [ "$IMAGE_PROFILE" = ota ] && [ "$SERVICE_PROFILE" = production ]; then',
-            source,
+            "ota-health-confirmation-skipped-non-production-profile", source
         )
-        self.assertIn("ota-background-workers-disabled-for-diagnostic-profile", source)
         builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
         verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
         self.assertIn('"activation": "manual-single-shot-after-adb"', builder)
@@ -3003,7 +3009,11 @@ start_feature_service_if_enabled
         ):
             self.assertIn(socket_path, source)
         self.assertIn("ota-health-services-not-ready", source)
-        self.assertIn("ota-background-workers-disabled-for-diagnostic-profile", source)
+        # Confirmation is production-only; the worker is not.
+        self.assertIn("ota-background-worker-started", source)
+        self.assertIn(
+            "ota-health-confirmation-skipped-non-production-profile", source
+        )
 
     def test_userdata_mount_is_identity_checked_and_non_destructive(self) -> None:
         source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()

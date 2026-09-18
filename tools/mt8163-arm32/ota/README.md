@@ -87,6 +87,17 @@ and preserves the bounded `rolled-back` history described above. No operator
 action and no ADB session are required before the device can accept the next
 candidate.
 
+The worker runs on every OTA boot, whatever the service profile is, because this
+finalization is not candidate health: `exclude:diagnostic` is a supported OTA
+combination, and a boot that skipped the finalization would leave
+`pending`/`feature-commit`/staging live and the update flow's durable journal
+would then reject every later installation. Candidate confirmation -- the health
+probes, the `confirm` calls and the restart -- stays production-only, gated
+inside the worker (`ota-health-confirmation-skipped-non-production-profile`),
+and the exclusion policy skips exactly that same half
+(`ota-health-feature-validation-skipped-by-exclusion-policy`). A diagnostic slot
+is therefore still left pending and unconfirmed for the operator.
+
 Finalization is fail-closed and asserted on the filesystem, not on the helper's
 exit status alone. The worker claims the rollback only when `pending`,
 `feature-commit` and staging are gone and `rolled-back` exists; if any of those
@@ -153,6 +164,17 @@ record that appeared while this boot was deciding, is refused there as well
 (`ota-rollback-resume-live-record-foreign` for a record naming another
 transaction), so a tree staged for a newer candidate is never removed in the
 rollback's name.
+
+The fallback branch takes the same pair of locks before it touches the update
+root, and holds them through the whole helper sequence: the bootctl readback it
+writes into `staging`, `fallback` itself, the post-condition that validates it,
+and the terminal publication that follows. The helper retires the live pair and
+then removes the staged tree, so running it unlocked would let a download that
+starts the moment the live records disappear have its tree deleted, or leave a
+newly prepared transaction without its staged artifacts. A writer that already
+holds either lock owns the update root until it finishes: the boot logs
+`ota-rollback-resume-fetch-locked` or `ota-rollback-resume-install-locked`,
+leaves every record for the next boot, and releases nothing it did not take.
 
 Because the install lock lives in persistent `/data` and the flow's protocol has
 no answer for a holder that never released it, every lock this worker takes is

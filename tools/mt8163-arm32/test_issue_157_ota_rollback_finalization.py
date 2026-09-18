@@ -42,6 +42,32 @@ def worker_body(text: str) -> str:
     return text[start:end]
 
 
+def launcher_block(text: str) -> str:
+    """The real boot-time launch decision for the health worker.
+
+    The shipped launcher starts the worker in the background; this fixture runs
+    the shipped condition and both branches verbatim and only turns that one
+    start into a foreground call, so the sandbox's exit status is the worker's.
+    The block is located by the start it performs, so a launcher gated on
+    anything else still gets extracted and the tests fail on its behaviour
+    instead of silently bypassing the gate under test.
+    """
+    start_line = text.index("ota_health_confirm_worker &\n")
+    start = text.rindex("\nif [", 0, start_line) + 1
+    end = text.index("\nfi\n", start_line) + len("\nfi\n")
+    block = text[start:end]
+    foreground, replaced = re.subn(
+        r"^    ota_health_confirm_worker &\n",
+        "    ota_health_confirm_worker\n",
+        block,
+        count=1,
+        flags=re.M,
+    )
+    if replaced != 1:
+        raise AssertionError("the launcher no longer starts ota_health_confirm_worker")
+    return foreground
+
+
 def extract_top_level_function(text: str, name: str) -> str:
     """Return the exact ``name()`` function body of a packaged helper script."""
     pattern = re.compile(rf"^{re.escape(name)}\(\)\n\{{\n.*?^\}}\n", re.M | re.S)
@@ -416,9 +442,9 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
     def test_boot_worker_runs_confirmation_and_publication_before_reporting_clean(self) -> None:
         fallback = self.worker.index("libreecho-feature-transaction fallback &&")
         confirm = self.worker.index("ota_v2_fallback_confirmed; then")
-        publish = self.worker.index('ota_rollback_publish_terminal_locked "$pending_slot"')
+        publish = self.worker.index('ota_rollback_publish_terminal "$pending_slot"')
         cleaned = self.worker.index('log "ota-v2-fallback-cleaned:')
-        preserved = self.worker.index("log ota-v2-fallback-preserved-for-recovery")
+        preserved = self.worker.rindex("log ota-v2-fallback-preserved-for-recovery")
         self.assertLess(fallback, confirm)
         self.assertLess(confirm, publish)
         self.assertLess(publish, cleaned)
@@ -433,17 +459,87 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
         self.assertLess(publish, retry)
         self.assertLess(retry, preserved)
 
+    def test_the_launcher_starts_the_worker_for_every_ota_image(self) -> None:
+        # The launcher is the only thing that starts the worker, and rollback
+        # finalization is not candidate health, so its gate may not be the
+        # service profile: a diagnostic OTA boot whose bootloader fell back must
+        # still retire the failed transaction.  The confirmation half is gated
+        # inside the worker instead, and it stays production-only there.
+        block = launcher_block(self.init)
+        self.assertIn('[ "$IMAGE_PROFILE" = ota ]', block)
+        self.assertNotIn("SERVICE_PROFILE", block)
+        self.assertIn("ota-background-worker-started", block)
+        self.assertIn("ota-background-workers-disabled-for-non-ota-profile", block)
+        marker = "ota-health-confirmation-skipped-non-production-profile"
+        self.assertEqual(self.worker.count(marker), 2)
+        confirmation = self.worker.index('if [ "$CONFIRM_MODE" = ota ]; then')
+        for gate in (self.worker.index(marker), self.worker.rindex(marker)):
+            self.assertLess(gate, confirmation)
+            self.assertLess(gate, self.worker.index("log ota-health-waiting-startup-ready"))
+            self.assertLess(gate, self.worker.index("libreecho-update confirm"))
+            self.assertLess(
+                gate, self.worker.index('libreecho-bootctl confirm "$selected_slot"')
+            )
+        # A first install is a candidate confirmation too, so the gate that
+        # keeps the worker from opening one sits ahead of that transaction.
+        self.assertLess(
+            self.worker.index(marker),
+            self.worker.index('if [ ! -r "$FIRST_INSTALL_MARKER" ]'),
+        )
+        # Both gates sit behind the rollback detection and finalization.
+        for earlier in (
+            "ota_rollback_resume_terminal\n",
+            "libreecho-feature-transaction fallback &&",
+            "ota_v2_fallback_confirmed; then",
+        ):
+            self.assertLess(self.worker.index(earlier), confirmation)
+
+    def test_fallback_runs_inside_the_update_flow_locks(self) -> None:
+        # The helper records its fallback history, retires the live pair and
+        # only then removes the staged tree, while `libreecho-update-fetch` can
+        # be downloading a replacement into that same tree holding its
+        # boot-local fetch lock.  The helper's removals therefore run inside the
+        # flow's own two locks, and the terminal publication -- which writes the
+        # same `state.tmp`/`check-status.tmp` pair a concurrent check renames --
+        # is inside the same hold.  Releasing first, or taking the wrapper that
+        # takes them again, would either race that writer or deadlock on the
+        # flow's non-reentrant lock protocol.
+        branch = self.worker[
+            self.worker.index("a:b|b:a)"):
+            self.worker.index("mv /data/libreecho/update/pending")
+        ]
+        acquire = branch.index("ota_rollback_resume_lock")
+        readback = branch.index("staging/bootctl.readback")
+        helper = branch.index("libreecho-feature-transaction fallback &&")
+        postcondition = branch.index("ota_v2_fallback_confirmed; then")
+        publish = branch.index('ota_rollback_publish_terminal "$pending_slot"')
+        release = branch.index("ota_rollback_resume_unlock")
+        self.assertLess(branch.index("/proc/sys/kernel/random/boot_id"), acquire)
+        for step in (readback, helper, postcondition, publish):
+            self.assertLess(acquire, step)
+            self.assertLess(step, release)
+        # One release on each path out of the hold: the completed rollback and
+        # the refusal that leaves the records for recovery.
+        self.assertEqual(branch.count("ota_rollback_resume_unlock"), 2)
+        self.assertNotIn("ota_rollback_publish_terminal_locked", branch)
+
     def test_both_rollback_branches_share_one_terminal_publication(self) -> None:
         publish = extract_function(self.init, "ota_rollback_publish_terminal")
         # The v2 branch must not keep a private copy of the terminal writer:
         # the only state writer in the worker is the shared helper.
         self.assertEqual(self.worker.count("echo state=rolled-back"), 1)
         self.assertIn("echo state=rolled-back", publish)
-        # Both rollback branches reach that one writer, each through the locked
-        # wrapper whose hold covers the write.
+        # Both rollback branches reach that one writer: the schema-1 branch
+        # through the locked wrapper, which takes the holds it does not yet
+        # have, and the v2 branch directly, inside the hold it took before it
+        # ran the recovery helper.
         self.assertEqual(
             self.worker.count('ota_rollback_publish_terminal_locked "$pending_slot"'),
-            2,
+            1,
+        )
+        self.assertEqual(
+            self.worker.count('ota_rollback_publish_terminal "$pending_slot"'),
+            1,
         )
         wrapper = extract_function(self.init, "ota_rollback_publish_terminal_locked")
         self.assertIn("ota_rollback_publish_terminal \"$1\"", wrapper)
@@ -718,10 +814,12 @@ class _BootWorkerFixture:
     """
 
     def __init__(self, root: Path, feature_policy: str = "preserve",
-                 service_profile: str = "production") -> None:
+                 service_profile: str = "production",
+                 image_profile: str = "ota") -> None:
         self.root = root
         self.feature_policy = feature_policy
         self.service_profile = service_profile
+        self.image_profile = image_profile
         self.update = root / "data/libreecho/update"
         self.update.mkdir(parents=True)
         self.boot_log = root / "boot.log"
@@ -729,6 +827,10 @@ class _BootWorkerFixture:
         self.fallbacks = root / "fallbacks.log"
         self.evidence = root / "evidence.log"
         self.publishes = root / "publishes.log"
+        # The kernel boot id the last boot reported, which this fixture rotates
+        # on every boot so a lock a killed boot left behind names an earlier one.
+        self._boot_serial = 0
+        self.boot_id = BOOT_ID
         # Every acquisition and release of the update flow's two locks, in
         # order, so a test can assert the resumed cleanup balances them on
         # every exit instead of trusting its source text.
@@ -914,7 +1016,7 @@ class _BootWorkerFixture:
             "#!/bin/busybox sh\n"
             "set -u\n"
             f'BB="{self.shim}"\n'
-            "IMAGE_PROFILE=ota\n"
+            f"IMAGE_PROFILE={image_profile}\n"
             f"FEATURE_POLICY={feature_policy}\n"
             f"SERVICE_PROFILE={service_profile}\n"
             f'FIRST_INSTALL_MARKER="{root}/etc/libreecho/first-install-confirm"\n'
@@ -926,7 +1028,12 @@ class _BootWorkerFixture:
             'log() { printf \'%s\\n\' "$*" >>"$INIT_TEST_LOG"; }\n'
             "pmsg_marker() { :; }\n"
             + self._redirected_worker()
-            + "\nota_health_confirm_worker\nexit $?\n",
+            # The worker is started by the shipped launcher's own condition and
+            # branches, not by a direct call to it, so the tests exercise the
+            # real boot-time gate.
+            + "\n"
+            + launcher_block(INIT.read_text())
+            + "exit $?\n",
         )
 
     def _write(self, path: Path, text: str) -> Path:
@@ -964,15 +1071,41 @@ class _BootWorkerFixture:
         boot_id = self.root / "proc/sys/kernel/random/boot_id"
         boot_id.parent.mkdir(parents=True, exist_ok=True)
         boot_id.write_text(f"{value}\n")
+        self.boot_id = value
 
-    def reboot(self, boot_id: str = BOOT_ID) -> None:
+    def reboot(self, boot_id: str | None = None) -> None:
         """Model a reboot: the boot-local `/run` tree starts empty again and the
-        kernel reports a new boot id, while `/data` survives."""
+        kernel reports a new boot id, while `/data` survives.
+
+        The wipe is what makes this a reboot rather than a re-run.  The fallback
+        and the resumed cleanup both hold the update flow's boot-local
+        `fetch.lock` while they remove records from the update root, so a worker
+        a power loss killed is still holding that lock when the machine comes
+        back up; only a fresh tmpfs, together with a boot id that makes this
+        worker's own persistent lock name an earlier boot, lets the next boot
+        finish what it left behind.
+        """
         run = self.root / "run"
         if run.exists():
             shutil.rmtree(run)
         (run / "libreecho").mkdir(parents=True, exist_ok=True)
+        if boot_id is None:
+            self._boot_serial += 1
+            boot_id = f"{BOOT_ID[:-12]}{self._boot_serial:012d}"
         self.set_boot_id(boot_id)
+
+    def plant_install_lock(self, owner: str | None = None) -> Path:
+        """Model the update flow's install lock held in the boot that is about
+        to run: by an installation in flight (untagged), or with this worker's
+        own tag.  Whatever a killed boot left in that path is replaced, which is
+        what a holder taking the lock in this boot window would own.
+        """
+        lock = self.update / "install.lock"
+        shutil.rmtree(lock, ignore_errors=True)
+        lock.mkdir()
+        if owner is not None:
+            (lock / "owner").write_text(owner)
+        return lock
 
     def seed_failed_candidate(self, state_record: str | None = None) -> None:
         """The failed candidate's live transaction and the records it left."""
@@ -1069,14 +1202,40 @@ class _BootWorkerFixture:
             "detail=health-confirm-failed:web-status\n",
         )
 
+    def seed_interrupted_cleanup(self) -> None:
+        """The residue a power loss inside the fallback helper leaves behind:
+        the finalized history record, the failed candidate's restart record, the
+        frozen check record, and the staged tree the helper had not yet removed.
+        No lock is held here, which is the state the next boot reads once the
+        boot the power loss killed is over and its own locks are gone.
+        """
+        self.seed_finalized_rollback(terminal_state="restarting")
+        staging = self.update / "staging"
+        staging.mkdir()
+        (staging / "bootctl.readback").write_text(
+            "selected_slot=a\nslot_a_success=1\nslot_b_success=0\n"
+        )
+        (staging / "manifest").write_text(
+            "format=libreecho-ota-v2\ntransaction_id=deadbeef\n"
+            f"slot={ROLLBACK_SLOT}\nversion={ROLLBACK_VERSION}\n"
+        )
+
     def boot(
         self,
         interrupt_at: str | None = None,
         plant_under_lock: str | None = None,
         interrupt_while_locked: bool = False,
         plant_at_release: str | None = None,
+        reboot: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         """Run one boot of the shipped worker against the sandbox root.
+
+        Every call runs a *boot*: the boot-local `/run` tree is fresh and the
+        kernel reports a new boot id, exactly as a real reboot does -- a worker
+        a power loss killed leaves this flow's boot-local fetch lock behind, and
+        no real reboot preserves it.  ``reboot=False`` re-runs the worker inside
+        the current boot window instead, for the tests that model a lock held by
+        a concurrent process rather than one an earlier boot left behind.
 
         ``interrupt_at`` places the power loss inside the recovery helper:
         "pending-unlink" between the two unlinks of its live-record cleanup,
@@ -1099,6 +1258,8 @@ class _BootWorkerFixture:
         which another writer of ``state.tmp``/``check-status.tmp`` can run --
         and writes the check record it owns (``"race-check"``).
         """
+        if reboot:
+            self.reboot()
         return subprocess.run(
             [BUSYBOX, "sh", str(self.harness)],
             env={
@@ -1478,8 +1639,9 @@ class RollbackFinalizationResumesAfterInterruption(unittest.TestCase):
         # take before they stage into this tree, so a boot that finds it held is
         # looking at an installation in flight, which owns the tree until it
         # finishes: leave it and the records alone and let a later boot retry.
-        lock = self.fx.update / "install.lock"
-        lock.mkdir()
+        # The killed fallback boot's own tagged leftover is replaced, which is
+        # what an installation taking the lock in this boot window would own.
+        lock = self.fx.plant_install_lock()
 
         refused = self.fx.boot()
         self.assertEqual(refused.returncode, 0, refused.stderr)
@@ -1634,12 +1796,14 @@ class RollbackFinalizationResumesAfterInterruption(unittest.TestCase):
         self.assertEqual(killed.returncode, -signal.SIGKILL, killed.stderr)
         lock = self.fx.update / "install.lock"
         self.assertTrue(lock.is_dir())
+        # The tag names the boot that took it, so a later boot can prove the
+        # holder never finished.
         self.assertEqual(
             dict(
                 line.split("=", 1)
                 for line in (lock / "owner").read_text().splitlines()
             ),
-            {"owner": "rollback-resume", "boot_id": BOOT_ID},
+            {"owner": "rollback-resume", "boot_id": self.fx.boot_id},
         )
         self.assertTrue((self.fx.update / "staging").is_dir())
 
@@ -1663,16 +1827,17 @@ class RollbackFinalizationResumesAfterInterruption(unittest.TestCase):
         )
         # A lock this worker tagged names the boot that is running, so it cannot
         # be proven stale and is not broken: only an earlier boot's tag is
-        # reclaimed, never a holder that has not finished.
-        lock = self.fx.update / "install.lock"
-        lock.mkdir()
-        (lock / "owner").write_text(
-            f"owner=rollback-resume\nboot_id={BOOT_ID}\n"
+        # reclaimed, never a holder that has not finished.  The boot-local tree
+        # is fresh, but the boot id is not: this is still the boot whose tag the
+        # lock carries, so it is that boot's own lock being tested.
+        self.fx.reboot(self.fx.boot_id)
+        lock = self.fx.plant_install_lock(
+            f"owner=rollback-resume\nboot_id={self.fx.boot_id}\n"
         )
         before_owner = (lock / "owner").read_bytes()
         before_state = (self.fx.update / "state").read_bytes()
 
-        refused = self.fx.boot()
+        refused = self.fx.boot(reboot=False)
         self.assertEqual(refused.returncode, 0, refused.stderr)
         self.assertIn("ota-rollback-resume-install-locked", self.fx.markers())
         self.assertNotIn("ota-rollback-resume-lock-recovered", self.fx.markers())
@@ -1685,22 +1850,62 @@ class RollbackFinalizationResumesAfterInterruption(unittest.TestCase):
         # The fetch lock this boot took before it was refused was given back.
         self.assertFalse((self.fx.root / "run/libreecho/fetch.lock").exists())
 
-    def test_feature_fetch_in_flight_blocks_the_resumed_cleanup(self) -> None:
+    def test_feature_fetch_in_flight_blocks_the_fallback_and_the_cleanup(self) -> None:
         # `libreecho-update-fetch` releases the install lock before it downloads
-        # feature assets straight into this staging tree, under its boot-local
-        # fetch lock -- so for that window the fetch lock is what makes the
-        # download the owner of the tree, and a boot must not delete it.
+        # feature assets straight into this update root's staging tree, under
+        # its boot-local fetch lock -- so for that window the fetch lock is what
+        # makes the download the owner of the tree, and the boot that has fallen
+        # back must neither run the helper's removals nor publish over it.
         self.fx.seed_failed_candidate()
-        self.assertEqual(
-            self.fx.boot(interrupt_at="staging").returncode, -signal.SIGKILL
-        )
-        self.assertTrue((self.fx.update / "staging").is_dir())
-        before_state = (self.fx.update / "state").read_bytes()
-        before_check = (self.fx.update / "check-status").read_bytes()
         fetch_lock = self.fx.root / "run/libreecho/fetch.lock"
         fetch_lock.mkdir(parents=True)
+        before_pending = (self.fx.update / "pending").read_bytes()
+        before_commit = (self.fx.update / "feature-commit").read_bytes()
+        before_state = (self.fx.update / "state").read_bytes()
+        before_check = (self.fx.update / "check-status").read_bytes()
 
-        refused = self.fx.boot()
+        # The download holds the lock while this boot runs, so the boot is the
+        # current boot window rather than a new one.
+        refused = self.fx.boot(reboot=False)
+        self.assertEqual(refused.returncode, 0, refused.stderr)
+        self.assertIn("ota-rollback-resume-fetch-locked", self.fx.markers())
+        self.assertIn(FALLBACK_INTERRUPTED, self.fx.markers())
+        # The helper never ran: the live transaction, the progress records and
+        # the staged tree are exactly as they were found.
+        self.assertFalse(self.fx.fallbacks.exists())
+        self.assertFalse((self.fx.update / "staging").exists())
+        self.assertEqual((self.fx.update / "pending").read_bytes(), before_pending)
+        self.assertEqual((self.fx.update / "feature-commit").read_bytes(), before_commit)
+        self.assertEqual((self.fx.update / "state").read_bytes(), before_state)
+        self.assertEqual((self.fx.update / "check-status").read_bytes(), before_check)
+        # The lock the download holds is left exactly as it was, and the flow's
+        # install lock was not taken at all.
+        self.assertTrue(fetch_lock.is_dir())
+        self.assertFalse((self.fx.update / "install.lock").exists())
+
+        # Once the download releases the fetch lock, the next boot runs the
+        # fallback through its postcondition and publishes the terminal records.
+        fetch_lock.rmdir()
+        recovered = self.fx.boot()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(self.fx.fallbacks.read_text().splitlines(), ["fallback"])
+        self.assertIn(
+            f"ota-v2-fallback-cleaned:{ROLLBACK_SLOT}:a", self.fx.markers()
+        )
+        self.assert_terminal_publication(self.fx.markers(), resumed=False)
+        self.assertFalse((self.fx.update / "install.lock").exists())
+
+    def test_feature_fetch_in_flight_blocks_the_resumed_cleanup(self) -> None:
+        # The same boundary one step later: the helper already retired the live
+        # pair and a power loss cut its staging cleanup short, and a download is
+        # writing into that tree when the next boot resumes.
+        self.fx.seed_interrupted_cleanup()
+        fetch_lock = self.fx.root / "run/libreecho/fetch.lock"
+        fetch_lock.mkdir(parents=True)
+        before_state = (self.fx.update / "state").read_bytes()
+        before_check = (self.fx.update / "check-status").read_bytes()
+
+        refused = self.fx.boot(reboot=False)
         self.assertEqual(refused.returncode, 0, refused.stderr)
         self.assertIn("ota-rollback-resume-fetch-locked", self.fx.markers())
         self.assertNotIn("ota-rollback-resume-staging-cleaned", self.fx.markers())
@@ -1720,7 +1925,6 @@ class RollbackFinalizationResumesAfterInterruption(unittest.TestCase):
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         self.assertIn("ota-rollback-resume-staging-cleaned", self.fx.markers())
         self.assert_terminal_publication(self.fx.markers())
-        self.assertEqual(self.fx.fallbacks.read_text().splitlines(), ["fallback"])
 
     def test_terminal_publication_lands_inside_the_held_locks(self) -> None:
         # The terminal publication writes the same `state.tmp`/`check-status.tmp`
@@ -2272,9 +2476,16 @@ class RollbackFinalizationUnderExclusionPolicy(unittest.TestCase):
         # finalization -- and it must not sit behind the exclusion gate either.
         recovered = self.fx.boot()
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        markers = self.fx.markers()
+        # The shipped launcher, not a direct call into the worker, started it on
+        # a diagnostic OTA image.
+        self.assertIn("ota-background-worker-started", markers)
+        self.assertNotIn(
+            "ota-background-workers-disabled-for-non-ota-profile", markers
+        )
         self.assertIn(
             f"ota-rollback-terminal-publication-resumed:{ROLLBACK_SLOT}",
-            self.fx.markers(),
+            markers,
         )
         state = self.fx.read_update("state")
         self.assertEqual(state["state"], "rolled-back")
@@ -2322,6 +2533,88 @@ class RollbackFinalizationUnderExclusionPolicy(unittest.TestCase):
         )
         self.assertEqual((self.fx.update / "state").read_bytes(), before_state)
         self.assertFalse(self.fx.reboots.exists())
+
+
+@unittest.skipUnless(os.path.exists(BUSYBOX), "busybox is required for the host fixture")
+class RollbackFinalizationLauncherBoundary(unittest.TestCase):
+    """The real launcher starts rollback finalization, and only that half.
+
+    The worker is started by ``libreecho-init``'s own launch decision, so these
+    tests drive that decision rather than calling the worker directly: a
+    diagnostic OTA boot must finalize a rollback, and a non-OTA image must not
+    run the worker at all.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.init = INIT.read_text()
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="libreecho-launcher-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_diagnostic_ota_boot_finalizes_without_the_exclusion_policy(self) -> None:
+        # `preserve:diagnostic` is the other supported diagnostic combination.
+        # The bootloader has fallen back, so the worker -- started by the real
+        # launcher -- retires the transaction, and the confirmation half stays
+        # production-only through its own gate rather than the policy gate.
+        fx = _BootWorkerFixture(
+            self.tmp, feature_policy="preserve", service_profile="diagnostic"
+        )
+        fx.seed_failed_candidate()
+
+        # Boot 1: the fallback branch retires the live pair and the power loss
+        # lands before the terminal publication.
+        interrupted = fx.boot(interrupt_at="cleanup")
+        self.assertEqual(interrupted.returncode, -signal.SIGKILL, interrupted.stderr)
+        fx.assert_cleanup_happened()
+        self.assertEqual(fx.fallbacks.read_text().splitlines(), ["fallback"])
+
+        # Boot 2: the resume publishes the terminal records, and no candidate is
+        # probed, confirmed or rebooted on the way.
+        recovered = fx.boot()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        markers = fx.markers()
+        self.assertIn("ota-background-worker-started", markers)
+        self.assertNotIn("ota-background-workers-disabled-for-non-ota-profile", markers)
+        self.assertIn(
+            f"ota-rollback-terminal-publication-resumed:{ROLLBACK_SLOT}", markers
+        )
+        self.assertIn(
+            "ota-health-confirmation-skipped-non-production-profile", markers
+        )
+        self.assertNotIn(
+            "ota-health-feature-validation-skipped-by-exclusion-policy", markers
+        )
+        self.assertNotIn("ota-health-waiting-startup-ready", markers)
+        self.assertNotIn("ota-probe-passed", markers)
+        self.assertFalse(fx.reboots.exists())
+        state = fx.read_update("state")
+        self.assertEqual(state["state"], "rolled-back")
+        self.assertEqual(state["progress"], "100")
+        self.assertEqual(state["detail"], ROLLBACK_SLOT)
+        self.assertEqual(
+            fx.read_update("check-status")["status"], "update-held-after-rollback"
+        )
+        for finished in ("feature-commit", "pending", "staging", "install.lock"):
+            self.assertFalse((fx.update / finished).exists(), finished)
+
+    def test_a_non_ota_image_never_starts_the_worker(self) -> None:
+        fx = _BootWorkerFixture(
+            self.tmp, feature_policy="exclude", service_profile="diagnostic",
+            image_profile="development",
+        )
+        fx.seed_failed_candidate()
+        result = fx.boot()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        markers = fx.markers()
+        self.assertIn("ota-background-workers-disabled-for-non-ota-profile", markers)
+        self.assertNotIn("ota-background-worker-started", markers)
+        # Nothing was touched: the failed candidate's records are exactly as
+        # the boot found them.
+        self.assertTrue((fx.update / "pending").is_file())
+        self.assertTrue((fx.update / "feature-commit").is_file())
+        self.assertFalse(fx.fallbacks.exists())
 
 
 if __name__ == "__main__":

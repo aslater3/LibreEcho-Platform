@@ -1735,6 +1735,15 @@ ota_health_confirm_worker()
         pmsg_marker ota-health-pending
         pending_slot=$($BB sed -n 's/^slot=//p' /data/libreecho/update/pending)
     else
+        # A first install is a candidate confirmation: only a production boot
+        # opens that transaction and confirms it.  A diagnostic OTA boot runs
+        # the rollback half above -- there is no pending transaction here, so
+        # nothing is skipped -- and must not leave behind a first-install
+        # record it will never confirm.
+        [ "$SERVICE_PROFILE" = production ] || {
+            log ota-health-confirmation-skipped-non-production-profile
+            return 0
+        }
         if [ ! -r "$FIRST_INSTALL_MARKER" ] ||
            [ "$($BB sed -n 's/^schema=//p' "$FIRST_INSTALL_MARKER")" != 1 ] ||
            [ "$($BB sed -n 's/^mode=//p' "$FIRST_INSTALL_MARKER")" != first-install ] ||
@@ -1799,22 +1808,50 @@ ota_health_confirm_worker()
         a:b|b:a)
             if [ "$($BB sed -n 's/^schema=//p' /data/libreecho/update/pending 2>/dev/null)" = 2 ]; then
                 if [ -r /data/libreecho/update/feature-commit ]; then
+                    # The helper acts inside the update root a UI-triggered
+                    # check or install stages into: it records its fallback
+                    # history, retires the live pair, and only then removes the
+                    # staged tree, while `libreecho-update-fetch` may be holding
+                    # the boot-local fetch lock and downloading a replacement
+                    # tree into that same `staging` path.  Its removals would
+                    # therefore delete an active download, or leave a newly
+                    # prepared transaction without its staged artifacts, so the
+                    # whole sequence -- the bootctl readback written into
+                    # staging, `fallback` itself, and the postcondition that
+                    # validates it -- runs under the update flow's own two
+                    # locks, taken in the order it takes them, and they are held
+                    # through the terminal publication that follows, which
+                    # writes the same `state.tmp`/`check-status.tmp` pair a
+                    # concurrent writer renames.  A writer that already holds
+                    # them owns the update root until it finishes, so this boot
+                    # leaves the records to the next boot's resume instead of
+                    # racing it.
+                    resume_boot_id=$($BB cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+                    if ! ota_rollback_resume_lock; then
+                        log ota-v2-fallback-preserved-for-recovery
+                        return 0
+                    fi
                     $BB mkdir -p /data/libreecho/update/staging
                     if /usr/local/sbin/libreecho-bootctl status > /data/libreecho/update/staging/bootctl.readback 2>/dev/null &&
                        /usr/local/sbin/libreecho-feature-transaction fallback &&
                        ota_v2_fallback_confirmed; then
-                        # The terminal publication writes the two staging paths a
-                        # concurrent update check and install write, so it holds
-                        # the flow's locks for the write rather than racing it;
-                        # a writer that already holds them leaves the records to
-                        # the next boot's resume.
-                        if ota_rollback_publish_terminal_locked "$pending_slot"; then
+                        # Both locks are still held across this write: the
+                        # publication is inside the same hold as the helper and
+                        # its postcondition, so no other writer can rename over
+                        # either record between this boot's decision and it.
+                        if ota_rollback_publish_terminal "$pending_slot"; then
                             log "ota-v2-fallback-cleaned:$pending_slot:$selected_slot"
                         else
                             log ota-rollback-terminal-publication-retry-queued
                         fi
+                        # Released exactly once, on every path out of the hold.
+                        ota_rollback_resume_unlock
                         return 0
                     fi
+                    # The helper refused, or its postcondition did not hold:
+                    # nothing was published, the records stay exactly as they
+                    # were found for recovery, and the locks are given back.
+                    ota_rollback_resume_unlock
                 fi
                 # The durable v2 journal is what makes a staged candidate
                 # prepared and activatable evidence.  Without it this record is
@@ -1856,6 +1893,17 @@ ota_health_confirm_worker()
     # forever, and `transaction_pending()` then rejects every later install.
     [ "$FEATURE_POLICY" != exclude ] || {
         log ota-health-feature-validation-skipped-by-exclusion-policy
+        return 0
+    }
+    # Candidate confirmation -- the health-probe progress record, the probes,
+    # the `confirm` call and the restart below -- is production-only.  The
+    # launcher starts this worker on every OTA boot because the rollback
+    # detection and finalization above run for every supported service profile,
+    # and it stops here: a diagnostic slot is deliberately left pending and
+    # unconfirmed for the operator to inspect and recover through the guarded
+    # OTA flow.
+    [ "$SERVICE_PROFILE" = production ] || {
+        log ota-health-confirmation-skipped-non-production-profile
         return 0
     }
     if [ "$CONFIRM_MODE" = ota ]; then
@@ -2213,13 +2261,19 @@ ota_health_confirm_worker()
     $BB sleep 2
     $BB reboot -f
 }
-if [ "$IMAGE_PROFILE" = ota ] && [ "$SERVICE_PROFILE" = production ]; then
+# The worker is launched for every OTA boot, not only a production one.  Its
+# rollback half is not candidate health: retiring a failed candidate's
+# transaction and publishing the rollback's terminal status must run on the
+# boot after the bootloader fell back whatever the service profile is, or
+# `pending`, `feature-commit` and the staged tree stay live and the update
+# flow's `transaction_pending()` then rejects every later installation.  The
+# candidate-confirmation half stays production-only inside the worker, so a
+# diagnostic slot is still left pending and unconfirmed for the operator.
+if [ "$IMAGE_PROFILE" = ota ]; then
     ota_health_confirm_worker &
     log ota-background-worker-started
 else
-    # Keep diagnostic slots pending and unconfirmed.  The operator can inspect
-    # and recover them through the guarded OTA flow after collecting evidence.
-    log ota-background-workers-disabled-for-diagnostic-profile
+    log ota-background-workers-disabled-for-non-ota-profile
 fi
 
 # Audio playback is always user-initiated.  In particular, boot must never
