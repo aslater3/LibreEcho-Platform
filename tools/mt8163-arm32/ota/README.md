@@ -106,15 +106,24 @@ and idempotent across repeated boots and interruptions, and it leaves
 configuration, installed feature authority, active payloads, and boot
 partitions untouched.
 
-The `rolled-back` history record is the only authorization for any of those
-resumed removals, and the recovery helper itself refuses to read one that is not
-a bounded regular non-symlink. The boot worker therefore applies the same shape
-test -- a regular file, not a symlink, at most 8192 bytes -- before it reads a
-slot or a transaction id out of that record, and again once it holds the install
-lock. A record that fails it is refused as `ota-rollback-resume-history-unsafe`
-(or as `ota-rollback-resume-evidence-invalid` when the record is absent), and
-nothing is read through it, removed, or published; a symlink pointing at a
-surviving live record is never cleanup authorization.
+The `rolled-back` history record is correlation and history, not cleanup
+authorization; the record is unsigned, lives in userdata, and any writer can
+replace it. The gate that does authorize a resumed removal is the packaged
+helper's read-only `rollback-evidence` proof -- the signed staged manifest, the
+durable prepared journal, the BCB the bootloader fell back from, and the
+untouched feature state -- which must name the same transaction and slot this
+boot decided with. The record is still shape-checked first: the recovery helper
+refuses to read one that is not a bounded regular non-symlink, and the boot
+worker applies the same test -- a regular file, not a symlink, at most 8192
+bytes -- before it reads a slot or a transaction id out of that record, and
+again once it holds the install lock. A record that fails the shape test is
+refused as `ota-rollback-resume-history-unsafe` (or as
+`ota-rollback-resume-evidence-invalid` when the record is absent), evidence
+that does not name this rollback is refused as
+`ota-rollback-resume-rollback-evidence-unproven` or
+`ota-rollback-resume-rollback-evidence-mismatch`, and nothing is read through a
+refused record, removed, or published; a symlink pointing at a surviving live
+record is never read for cleanup.
 
 The helper retires `pending`/`feature-commit` before it removes its staging
 tree, and it exits immediately once the live transaction is gone, so an
@@ -187,11 +196,11 @@ candidate that crashes -- or loses power -- on its boots exhausts its attempts
 before the worker reaches its own restart record, so the survivor can be the
 installer's `reboot-pending` or the `boot-validating` record the worker writes
 before its health checks. Both are the failed candidate's own records, and the
-evidence that its transaction was retired is the finalized history record, so the
-resume publishes from them as well. The slot that record names is checked against
-the running one first, because a rollback leaves the previously confirmed slot
-running -- a history record naming the slot this boot runs is retained history
-(or a confirmation the device already finished) and is refused with
+finalized history record is what correlates them with the retired transaction, so
+the resume publishes from them as well. The slot that record names is checked
+against the running one first, because a rollback leaves the previously confirmed
+slot running -- a history record naming the slot this boot runs is retained
+history (or a confirmation the device already finished) and is refused with
 `ota-rollback-resume-history-slot-still-selected` instead of being published.
 
 ## Signed bundle v1

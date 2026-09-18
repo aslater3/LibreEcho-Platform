@@ -243,13 +243,13 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
         )
 
     def test_resume_validates_the_history_record_before_it_reads_it(self) -> None:
-        # The history record is the only authorization for the resumed removals,
+        # The history record is correlation and history, not cleanup
+        # authorization -- the helper's signed `rollback-evidence` proof is --
         # and the helper refuses to read one that is not a bounded regular
         # non-symlink.  The resume applies the same shape test before it reads a
         # slot or a transaction id out of the record, and again once it holds
         # the install lock, so a path that is a symlink -- for example one
-        # pointing at the surviving live record -- never becomes cleanup
-        # authorization.
+        # pointing at the surviving live record -- is never read for cleanup.
         resume = extract_function(self.init, "ota_rollback_resume_terminal")
         bounded = extract_function(self.init, "ota_rollback_resume_history_bounded")
         self.assertEqual(resume.count("ota_rollback_resume_history_bounded"), 2)
@@ -465,6 +465,27 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
             self.worker.index("[ -r /data/libreecho/update/feature-commit ]"),
             self.worker.index('log "ota-v2-fallback-cleaned:'),
         )
+
+    def test_exclusion_policy_skips_confirmation_not_rollback_finalization(self) -> None:
+        # `libreecho-update` accepts exactly the `exclude:diagnostic` policy and
+        # profile combination, so the worker's exclusion gate may only skip
+        # candidate feature-health confirmation.  Rollback detection and
+        # finalization are not feature health, and a gate placed ahead of them
+        # strands the failed transaction: the fallback branch never runs, the
+        # resume never completes its cleanup or publication, and the update
+        # flow's `transaction_pending()` (the durable `feature-commit` journal)
+        # then rejects every later installation.
+        marker = "ota-health-feature-validation-skipped-by-exclusion-policy"
+        self.assertEqual(self.worker.count(marker), 1)
+        gate = self.worker.index(marker)
+        self.assertLess(self.worker.index("ota_rollback_resume_terminal\n"), gate)
+        self.assertLess(self.worker.index("ota_v2_fallback_confirmed; then"), gate)
+        self.assertLess(self.worker.index("mv /data/libreecho/update/pending"), gate)
+        # Candidate feature-health confirmation stays behind the gate.
+        self.assertLess(gate, self.worker.index('if [ "$CONFIRM_MODE" = ota ]; then'))
+        self.assertLess(gate, self.worker.index("log ota-health-waiting-startup-ready"))
+        self.assertLess(gate, self.worker.index("libreecho-update confirm"))
+        self.assertLess(gate, self.worker.index("libreecho-bootctl confirm \"$selected_slot\""))
 
 
 class _Fixture:
@@ -696,8 +717,11 @@ class _BootWorkerFixture:
     running it.
     """
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, feature_policy: str = "preserve",
+                 service_profile: str = "production") -> None:
         self.root = root
+        self.feature_policy = feature_policy
+        self.service_profile = service_profile
         self.update = root / "data/libreecho/update"
         self.update.mkdir(parents=True)
         self.boot_log = root / "boot.log"
@@ -891,8 +915,8 @@ class _BootWorkerFixture:
             "set -u\n"
             f'BB="{self.shim}"\n'
             "IMAGE_PROFILE=ota\n"
-            "FEATURE_POLICY=preserve\n"
-            "SERVICE_PROFILE=production\n"
+            f"FEATURE_POLICY={feature_policy}\n"
+            f"SERVICE_PROFILE={service_profile}\n"
             f'FIRST_INSTALL_MARKER="{root}/etc/libreecho/first-install-confirm"\n'
             f'STARTUP_READY="{root}/run/libreecho/startup-ready"\n'
             "RUNTIME_ROOT=/run/libreecho/features\n"
@@ -2196,6 +2220,108 @@ class RollbackFinalizationResumesAfterInterruption(unittest.TestCase):
         self.assertTrue((self.fx.update / "feature-commit").is_file())
         self.assert_untouched_failed_candidate()
         self.assertFalse(self.fx.fallbacks.exists())
+
+
+@unittest.skipUnless(os.path.exists(BUSYBOX), "busybox is required for the host fixture")
+class RollbackFinalizationUnderExclusionPolicy(unittest.TestCase):
+    """The supported ``exclude:diagnostic`` policy must still finalize a rollback.
+
+    ``libreecho-update`` accepts exactly the ``exclude:diagnostic`` policy and
+    profile combination, so the worker's exclusion gate may only skip candidate
+    feature-health confirmation.  Rollback detection and finalization are not
+    feature health: returning on the policy before them left ``pending``,
+    ``feature-commit`` and staging live on every boot, and the update flow's own
+    ``transaction_pending()`` -- the durable ``feature-commit`` journal -- then
+    rejected every later installation.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.init = INIT.read_text()
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="libreecho-exclude-rollback-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.fx = _BootWorkerFixture(
+            self.tmp, feature_policy="exclude", service_profile="diagnostic"
+        )
+
+    def assert_install_unblocked(self) -> None:
+        """The install gate the stranded records used to hold is
+        ``transaction_pending()`` -- the presence of the durable
+        ``feature-commit`` journal -- plus the pending record and the staged tree
+        the installer refuses to replace; the finalization must have retired all
+        three before a later candidate can be accepted."""
+        for finished in ("feature-commit", "pending", "staging"):
+            self.assertFalse((self.fx.update / finished).exists(), finished)
+
+    def test_interrupted_rollback_is_finalized_and_unblocks_the_next_install(self) -> None:
+        self.fx.seed_failed_candidate()
+        # Boot 1: the bootloader has already fallen back.  Under the exclusion
+        # policy the worker must still run the rollback branch -- the fallback
+        # helper retires the transaction -- and the power loss lands on the
+        # helper's staging removal, so neither the cleanup nor the terminal
+        # publication finished.
+        interrupted = self.fx.boot(interrupt_at="cleanup")
+        self.assertEqual(interrupted.returncode, -signal.SIGKILL, interrupted.stderr)
+        self.fx.assert_cleanup_happened()
+        self.assertEqual(self.fx.fallbacks.read_text().splitlines(), ["fallback"])
+        self.assertEqual(self.fx.read_update("state")["state"], "restarting")
+
+        # Boot 2: no live transaction is left, so only the resume can finish the
+        # finalization -- and it must not sit behind the exclusion gate either.
+        recovered = self.fx.boot()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn(
+            f"ota-rollback-terminal-publication-resumed:{ROLLBACK_SLOT}",
+            self.fx.markers(),
+        )
+        state = self.fx.read_update("state")
+        self.assertEqual(state["state"], "rolled-back")
+        self.assertEqual(state["progress"], "100")
+        self.assertEqual(state["detail"], ROLLBACK_SLOT)
+        check = self.fx.read_update("check-status")
+        self.assertEqual(check["status"], "update-held-after-rollback")
+        self.assertEqual(check["latest_version"], ROLLBACK_VERSION)
+        # The rollback ran exactly once, and nothing in the recovery path
+        # reboots the device.
+        self.assertEqual(self.fx.fallbacks.read_text().splitlines(), ["fallback"])
+        self.assertEqual(
+            self.fx.markers().count("ota-rollback-terminal-publication-resumed"), 1
+        )
+        self.assertFalse(self.fx.reboots.exists())
+        # The later installation the stranded journal used to reject is accepted
+        # now that the finalization retired every record it guards on.
+        self.assert_install_unblocked()
+
+        # Boot 3: the finalized records are stable across a later boot.
+        before_state = (self.fx.update / "state").read_bytes()
+        terminal = (self.fx.update / "check-status").read_bytes()
+        third = self.fx.boot()
+        self.assertEqual(third.returncode, 0, third.stderr)
+        self.assertEqual((self.fx.update / "state").read_bytes(), before_state)
+        self.assertEqual((self.fx.update / "check-status").read_bytes(), terminal)
+
+        # Boot 4: the policy still suppresses candidate feature-health
+        # confirmation.  A staged candidate on the running slot is left
+        # unconfirmed instead of being probed and, on failure, rebooted.
+        self.fx.write_update(
+            "pending",
+            "schema=2\ntransaction_id=cafebabe\nversion=0.15.0\nslot=a\n",
+        )
+        skipped = self.fx.boot()
+        self.assertEqual(skipped.returncode, 0, skipped.stderr)
+        markers = self.fx.markers()
+        self.assertIn(
+            "ota-health-feature-validation-skipped-by-exclusion-policy", markers
+        )
+        self.assertNotIn("ota-health-waiting-startup-ready", markers)
+        self.assertNotIn("ota-probe-passed", markers)
+        self.assertEqual(
+            self.fx.markers().count("ota-rollback-terminal-publication-resumed"), 1
+        )
+        self.assertEqual((self.fx.update / "state").read_bytes(), before_state)
+        self.assertFalse(self.fx.reboots.exists())
 
 
 if __name__ == "__main__":

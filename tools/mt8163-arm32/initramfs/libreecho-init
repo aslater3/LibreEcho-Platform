@@ -1172,10 +1172,6 @@ log ui-services-autostart-started
 ota_health_confirm_worker()
 {
     [ "$IMAGE_PROFILE" = ota ] || return 0
-    [ "$FEATURE_POLICY" != exclude ] || {
-        log ota-health-feature-validation-skipped-by-exclusion-policy
-        return 0
-    }
 
     # Publish the terminal status for a rollback that has actually completed.
     # Automatic finalization must leave a reader-visible record that the
@@ -1849,6 +1845,19 @@ ota_health_confirm_worker()
             return 0
             ;;
     esac
+    # The exclusion policy disables candidate feature-health confirmation: an
+    # `exclude` image carries no feature graph to validate.  Rollback detection
+    # and finalization above are not feature health -- they retire a failed
+    # candidate's transaction and publish the rollback's terminal status -- so
+    # they must run for every supported policy.  Returning here instead of at
+    # the top of the worker is what keeps the accepted `exclude:diagnostic`
+    # combination installable: an earlier return skipped the fallback branch
+    # and the resumed cleanup, leaving `pending`/`feature-commit`/staging live
+    # forever, and `transaction_pending()` then rejects every later install.
+    [ "$FEATURE_POLICY" != exclude ] || {
+        log ota-health-feature-validation-skipped-by-exclusion-policy
+        return 0
+    }
     if [ "$CONFIRM_MODE" = ota ]; then
         {
             echo schema=1
