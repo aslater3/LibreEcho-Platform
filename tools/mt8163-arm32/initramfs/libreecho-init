@@ -1368,9 +1368,11 @@ ota_health_confirm_worker()
     # both own the same tree, so the removal is validated the way the helper
     # validates it -- a staging tree that is a symlink, is not a directory, or
     # contains a symlink is left for recovery instead -- and it runs under the
-    # install lock its caller took, which is what keeps a tree staged by a
-    # concurrent installation from being removed in this rollback's name.
-    ota_rollback_resume_staging_cleanup()
+    # locks its caller took, which is what keeps a tree staged by a concurrent
+    # installation from being removed in this rollback's name.  Validation is
+    # separate from the removal so that a tree which cannot be validated is
+    # refused before anything else is read out of the update root.
+    ota_rollback_resume_staging_validate()
     {
         resume_staging=/data/libreecho/update/staging
         [ -e "$resume_staging" ] || [ -L "$resume_staging" ] || return 0
@@ -1380,6 +1382,13 @@ ota_health_confirm_worker()
             log ota-rollback-resume-staging-unsafe
             return 1
         fi
+        return 0
+    }
+
+    ota_rollback_resume_staging_cleanup()
+    {
+        resume_staging=/data/libreecho/update/staging
+        [ -e "$resume_staging" ] || [ -L "$resume_staging" ] || return 0
         $BB rm -rf "$resume_staging" || {
             log ota-rollback-resume-staging-cleanup-failed
             return 1
@@ -1399,9 +1408,14 @@ ota_health_confirm_worker()
     # resume below would never reach publication.  Only a record that carries
     # the transaction id of the finalized `rolled-back` history is retired,
     # and only while its other half is already gone: a complete pair is a live
-    # transaction, whose own rollback branch owns those records.
-    ota_rollback_resume_live_records()
+    # transaction, whose own rollback branch owns those records.  The records
+    # are only *checked* here -- nothing is removed until the rollback evidence
+    # below has proven, from the helper's own contracts, which transaction this
+    # residue is -- so a shaped-but-forged history record can never authorize
+    # the removal of a record whose identity was taken from it.
+    ota_rollback_resume_live_records_check()
     {
+        resume_live_survivors=
         [ ! -e /data/libreecho/update/pending ] ||
             [ ! -e /data/libreecho/update/feature-commit ] || return 1
         for resume_live in pending feature-commit; do
@@ -1416,6 +1430,15 @@ ota_health_confirm_worker()
                 log "ota-rollback-resume-live-record-foreign:$resume_live"
                 return 1
             }
+            resume_live_survivors="$resume_live_survivors $resume_live"
+        done
+        return 0
+    }
+
+    ota_rollback_resume_live_records_remove()
+    {
+        for resume_live in $resume_live_survivors; do
+            resume_live_path=/data/libreecho/update/$resume_live
             $BB rm -f "$resume_live_path" || {
                 log "ota-rollback-resume-live-record-cleanup-failed:$resume_live"
                 return 1
@@ -1424,6 +1447,99 @@ ota_health_confirm_worker()
             log "ota-rollback-resume-live-record-cleaned:$resume_live"
         done
         return 0
+    }
+
+    # True while the update root still holds rollback residue: a one-sided live
+    # record, or a staged tree.  Nothing but residue needs evidence -- requiring
+    # it for a finalization that has nothing left to remove would strand the
+    # publication this path exists to complete.
+    ota_rollback_resume_residue()
+    {
+        for resume_residue in pending feature-commit; do
+            [ -e "/data/libreecho/update/$resume_residue" ] ||
+                [ -L "/data/libreecho/update/$resume_residue" ] || continue
+            return 0
+        done
+        resume_residue=/data/libreecho/update/staging
+        [ -e "$resume_residue" ] || [ -L "$resume_residue" ] || return 1
+        return 0
+    }
+
+    # The only authorization this worker accepts for removing a surviving live
+    # record or the staged tree is the packaged helper's read-only rollback
+    # evidence: the signed staged manifest, the durable prepared journal, the
+    # BCB the bootloader fell back from, and the untouched feature state.  The
+    # `rolled-back` record is inert history -- unsigned, in userdata, and
+    # replaceable by any writer -- so its shape and selected fields are never
+    # treated as authorization, and the evidence must name the same transaction
+    # and slot this boot's decision was taken against.  Anything unproven is
+    # refused and left exactly as it was found, for recovery.
+    ota_rollback_resume_rollback_evidence()
+    {
+        resume_evidence=$(/usr/local/sbin/libreecho-feature-transaction rollback-evidence 2>/dev/null) || {
+            log ota-rollback-resume-rollback-evidence-unproven
+            return 1
+        }
+        resume_evidence_transaction=$(printf '%s\n' "$resume_evidence" |
+            $BB sed -n 's/^rollback-evidence transaction_id=\([^ ]*\) slot=.*/\1/p')
+        resume_evidence_slot=$(printf '%s\n' "$resume_evidence" |
+            $BB sed -n 's/^rollback-evidence transaction_id=[^ ]* slot=\([^ ]*\)$/\1/p')
+        case "$resume_evidence_transaction:$resume_evidence_slot" in
+            *:|:*) log ota-rollback-resume-rollback-evidence-unproven; return 1 ;;
+        esac
+        [ "$resume_evidence_transaction" = "$resume_transaction" ] &&
+            [ "$resume_evidence_slot" = "$resume_slot" ] || {
+            log "ota-rollback-resume-rollback-evidence-mismatch:$resume_evidence_transaction:$resume_evidence_slot"
+            return 1
+        }
+        log "ota-rollback-resume-rollback-evidence-proven:$resume_transaction:$resume_slot"
+        return 0
+    }
+
+    # Every input the locked removals and the publication act on is read once
+    # more after the locks are taken, against the values this boot decided with:
+    # a history or progress record that was replaced while the boot was deciding
+    # must not be removed, published over, or used to authorize a removal.
+    ota_rollback_resume_records_unchanged()
+    {
+        [ "$($BB sed -n 's/^slot=//p' "$resume_history" 2>/dev/null)" = \
+            "$resume_slot" ] || {
+            log ota-rollback-resume-history-changed
+            return 1
+        }
+        [ "$($BB sed -n 's/^transaction_id=//p' "$resume_history" 2>/dev/null)" = \
+            "$resume_transaction" ] || {
+            log ota-rollback-resume-history-changed
+            return 1
+        }
+        [ "$($BB sed -n 's/^schema=//p' "$resume_history" 2>/dev/null)" = \
+            "$resume_schema" ] || {
+            log ota-rollback-resume-history-changed
+            return 1
+        }
+        [ "$($BB sed -n 's/^state=//p' /data/libreecho/update/state 2>/dev/null)" = \
+            "$resume_state" ] || {
+            log ota-rollback-resume-state-changed
+            return 1
+        }
+        return 0
+    }
+
+    # The terminal publication writes `state.tmp` and `check-status.tmp`, the
+    # same two staging paths a concurrent update check and install write, so a
+    # publication that is not already inside the flow's locks takes them for the
+    # same reason the cleanup does, in the flow's own order.  Whichever writer
+    # starts first finishes before the other can begin; a lock that is already
+    # held means a writer owns the update root until it finishes, so this boot
+    # leaves the records to the next one instead of racing it.
+    ota_rollback_publish_terminal_locked()
+    {
+        resume_boot_id=$($BB cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+        ota_rollback_resume_lock || return 1
+        ota_rollback_publish_terminal "$1"
+        resume_publish_rc=$?
+        ota_rollback_resume_unlock
+        return "$resume_publish_rc"
     }
 
     # A rollback retires the live transaction before its terminal records are
@@ -1516,11 +1632,12 @@ ota_health_confirm_worker()
             # either, so the terminal records are only published once both are
             # finished -- or the boot retries.  Both steps remove something
             # from the update root a concurrent installation stages into, so
-            # they run under that installation's own install lock, and every
-            # input they act on is validated again under the lock: a lock that
-            # is already held, a history record that stopped being a bounded
-            # regular file, or a live transaction that appeared while this boot
-            # was deciding, all leave the records unpublished for the next boot
+            # they run under that installation's own locks, and every input
+            # they act on is validated again under the lock: a lock that is
+            # already held, a history or progress record that was replaced
+            # while this boot was deciding, a staged shape the helper would
+            # refuse, or residue the packaged helper cannot prove is this
+            # rollback, all leave the records unpublished for the next boot
             # instead of removing something this rollback does not own.  The
             # boot id is what makes a lock this worker left behind by an earlier
             # power loss recoverable instead of permanent.
@@ -1531,12 +1648,36 @@ ota_health_confirm_worker()
                 ota_rollback_resume_unlock
                 return 0
             fi
-            if ! ota_rollback_resume_live_records ||
-               ! ota_rollback_resume_staging_cleanup; then
+            if ! ota_rollback_resume_records_unchanged; then
                 ota_rollback_resume_unlock
                 return 0
             fi
+            if ota_rollback_resume_residue; then
+                if ! ota_rollback_resume_live_records_check ||
+                   ! ota_rollback_resume_staging_validate ||
+                   ! ota_rollback_resume_rollback_evidence; then
+                    ota_rollback_resume_unlock
+                    return 0
+                fi
+                if ! ota_rollback_resume_live_records_remove ||
+                   ! ota_rollback_resume_staging_cleanup; then
+                    ota_rollback_resume_unlock
+                    return 0
+                fi
+            fi
+            # Both locks are still held through the publication above: it writes
+            # the same `state.tmp`/`check-status.tmp` pair a concurrent check
+            # and install write, and the records it reads were revalidated under
+            # this same hold, so no other writer can rename over them between
+            # this boot's decision and the write.  Releasing here -- before the
+            # write -- is the race this hold exists to close.
+            if ota_rollback_publish_terminal "$resume_slot"; then
+                log "ota-rollback-terminal-publication-resumed:$resume_slot"
+            else
+                log ota-rollback-terminal-publication-retry-queued
+            fi
             ota_rollback_resume_unlock
+            return 0
         else
             # A legacy schema-1 rollback retires its transaction by moving the
             # pending record itself, so the record that survives an
@@ -1559,7 +1700,10 @@ ota_health_confirm_worker()
             done
             log ota-rollback-resume-legacy-publication
         fi
-        if ota_rollback_publish_terminal "$resume_slot"; then
+        # The legacy record removes nothing, so it has no cleanup to serialize,
+        # but the publication itself is the same pair of staging paths and takes
+        # the flow's locks for the write.
+        if ota_rollback_publish_terminal_locked "$resume_slot"; then
             log "ota-rollback-terminal-publication-resumed:$resume_slot"
         else
             log ota-rollback-terminal-publication-retry-queued
@@ -1662,9 +1806,17 @@ ota_health_confirm_worker()
                     $BB mkdir -p /data/libreecho/update/staging
                     if /usr/local/sbin/libreecho-bootctl status > /data/libreecho/update/staging/bootctl.readback 2>/dev/null &&
                        /usr/local/sbin/libreecho-feature-transaction fallback &&
-                       ota_v2_fallback_confirmed &&
-                       ota_rollback_publish_terminal "$pending_slot"; then
-                        log "ota-v2-fallback-cleaned:$pending_slot:$selected_slot"
+                       ota_v2_fallback_confirmed; then
+                        # The terminal publication writes the two staging paths a
+                        # concurrent update check and install write, so it holds
+                        # the flow's locks for the write rather than racing it;
+                        # a writer that already holds them leaves the records to
+                        # the next boot's resume.
+                        if ota_rollback_publish_terminal_locked "$pending_slot"; then
+                            log "ota-v2-fallback-cleaned:$pending_slot:$selected_slot"
+                        else
+                            log ota-rollback-terminal-publication-retry-queued
+                        fi
                         return 0
                     fi
                 fi
@@ -1681,11 +1833,15 @@ ota_health_confirm_worker()
             fi
             # A schema-1 transaction has no journal to retire; the pending
             # record is itself the rollback evidence, so move it and publish
-            # the same terminal status.
+            # the same terminal status -- under the same locks, for the same
+            # staged-path race.
             $BB mv /data/libreecho/update/pending \
                 /data/libreecho/update/rolled-back
-            ota_rollback_publish_terminal "$pending_slot"
-            log "ota-rollback-complete:$pending_slot:$selected_slot"
+            if ota_rollback_publish_terminal_locked "$pending_slot"; then
+                log "ota-rollback-complete:$pending_slot:$selected_slot"
+            else
+                log ota-rollback-terminal-publication-retry-queued
+            fi
             return 0
             ;;
         *)

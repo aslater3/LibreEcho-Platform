@@ -1366,6 +1366,26 @@ bcb_fallback_safe() {
     [ "$(value slot_${selected}_success "$BCB_FILE")" = 1 ] || return 1
 }
 
+# Read-only: the slot the bootloader fell back from, proven by the BCB alone --
+# the selected slot is the successful one and the other slot is neither
+# selected nor successful.  The BCB lives outside userdata, so this is evidence
+# no flat update record can supply or replace, and it is what tells the boot
+# worker which slot a rolled-back candidate occupied without trusting the
+# opaque `rolled-back` history for it.
+bcb_fallback_slot() {
+    local selected other
+    regular "$BCB_FILE" bcb-readback
+    selected=$(value selected_slot "$BCB_FILE")
+    case "$selected" in a|b) ;; *) return 1 ;; esac
+    [ "$(value "slot_${selected}_success" "$BCB_FILE")" = 1 ] || return 1
+    case "$selected" in
+        a) other=b ;;
+        b) other=a ;;
+    esac
+    [ "$(value "slot_${other}_success" "$BCB_FILE")" = 0 ] || return 1
+    printf '%s\n' "$other"
+}
+
 verify_prior_v1_install() {
     local selected expected actual
     [ -e "$INSTALLED" ] || return 0
@@ -1483,6 +1503,67 @@ fallback() {
     [ ! -e "$STAGING" ] || $BB rm -rf "$STAGING" || fail fallback-cleanup
     sync_file
     printf 'fallback-cleaned transaction_id=%s\n' "$tx"
+}
+
+# Read-only proof for the boot worker's resumed cleanup.  The flat
+# `rolled-back` record is inert evidence: it is unsigned, it lives in userdata,
+# and any writer can replace it, so it can never be what authorizes removing a
+# surviving live record or the staged tree.  What can is the set of contracts
+# this helper already acts on before it removes anything -- the signed staged
+# manifest, the durable prepared journal, the BCB the bootloader fell back from,
+# and the canonical feature state the rollback never touched.  Prove them, print
+# the transaction and slot they identify, and refuse anything unproven: a
+# shaped-but-forged record then buys no removal, and an interruption that cannot
+# be proven is left exactly as it was found.
+rollback_evidence() {
+    local survivor= path tx slot ids feature action observed
+    safe_path "$ROOT"; safe_path "$STAGING"; safe_path "$JOURNAL"; safe_path "$PENDING"
+    [ -d "$ROOT" ] || fail rollback-evidence-root
+    for path in "$JOURNAL" "$PENDING"; do
+        [ -e "$path" ] || [ -L "$path" ] || continue
+        regular "$path" rollback-evidence-record
+        [ -z "$survivor" ] || fail rollback-evidence-live-transaction
+        survivor=$path
+    done
+    # The staged tree must still be the artifact the embedded key signed: the
+    # signature binds its transaction id, version, boot digest, and feature
+    # identities, so a substituted or half-staged tree cannot pass as this
+    # transaction's own staging.
+    check_manifest "$STAGING/manifest"
+    [ "$(value image_profile "$STAGING/manifest")" = ota ] || fail rollback-evidence-profile
+    tx=$(value transaction_id "$STAGING/manifest")
+    slot=$(bcb_fallback_slot) || fail rollback-evidence-bcb
+    if [ -n "$survivor" ]; then
+        # Only the durable journal proves the transaction was prepared.  A lone
+        # pending record is the one-sided intent an interrupted intent publish
+        # leaves, which the update flow rebuilds, and a pair is a live
+        # transaction whose own rollback branch owns it.
+        [ "$survivor" = "$JOURNAL" ] || fail rollback-evidence-unprepared
+        [ "$(value schema "$JOURNAL")" = 2 ] || fail rollback-evidence-schema
+        [ "$(value phase "$JOURNAL")" = prepared ] || fail rollback-evidence-phase
+        [ "$(value transaction_id "$JOURNAL")" = "$tx" ] || fail rollback-evidence-identity
+        [ "$(value slot "$JOURNAL")" = "$slot" ] || fail rollback-evidence-slot
+        [ "$(value version "$JOURNAL")" = "$(value version "$STAGING/manifest")" ] || fail rollback-evidence-version
+        [ "$(value boot_sha256 "$JOURNAL")" = "$(value boot_sha256 "$STAGING/manifest")" ] || fail rollback-evidence-boot
+        observed=$(hash_state "$STAGING/manifest")
+        [ "$(value manifest_sha256 "$JOURNAL")" = "$observed" ] || fail rollback-evidence-manifest
+        observed=$(hash_state "$STAGING/manifest.sig")
+        [ "$(value manifest_sig_sha256 "$JOURNAL")" = "$observed" ] || fail rollback-evidence-manifest-signature
+        ids=$(value feature_ids "$JOURNAL")
+        [ "$ids" = "$(value feature_ids "$STAGING/manifest")" ] || fail rollback-evidence-features
+        for feature in $(printf '%s' "$ids" | $BB tr ',' ' '); do
+            action=$(value "feature_${feature}_action" "$JOURNAL")
+            [ "$action" = "$(value "feature_${feature}_action" "$STAGING/manifest")" ] || fail rollback-evidence-features
+            # The rollback never reached the canonical feature files, so the
+            # operations the intent planned must still be untouched.
+            abort_operation_untouched "$feature"
+        done
+        # The previously confirmed slot is the one running, with its recorded
+        # boot image digest, exactly as the fallback path requires.
+        verify_prior_v1_install
+    fi
+    no_symlinks_tree
+    printf 'rollback-evidence transaction_id=%s slot=%s\n' "$tx" "$slot"
 }
 
 status() {
@@ -1691,5 +1772,6 @@ case "${1:-}" in
  provenance) [ "$#" -eq 1 ] || fail usage; provenance;;
  abort-before-activation) [ "$#" -eq 1 ] || fail usage; abort;;
  fallback) [ "$#" -eq 1 ] || fail usage; fallback;;
+ rollback-evidence) [ "$#" -eq 1 ] || fail usage; rollback_evidence;;
  *) fail usage;;
 esac
