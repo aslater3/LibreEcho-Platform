@@ -1383,8 +1383,14 @@ class SourceTests(unittest.TestCase):
         )
         power_amp = source.index("power_output_controls(card)")
         unmute = source.index("unmute_output_controls(card)")
-        self.assertLess(power_amp, first_write)
-        self.assertLess(first_write, unmute)
+        prime = source.index("write_period(pcm, prime_silence, &reference, 0)")
+        self.assertIn(
+            "static const int16_t prime_silence[PERIOD_SIZE * OUTPUT_CHANNELS] = {0};",
+            source,
+        )
+        self.assertLess(power_amp, prime)
+        self.assertLess(prime, unmute)
+        self.assertLess(unmute, first_write)
         self.assertIn(
             "ready = prepare_initial_period(sources, root, output, &dynamics,",
             source,
