@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""0.13.15 verifier overlay for MT8163 vendor-import compatibility.
+"""0.13.18 verifier overlay for MT8163 vendor-import compatibility.
 
 The 0.13.14 verifier remains byte-for-byte available in the adjacent legacy
 module. This release overlay changes only the importer identity and the
@@ -13,7 +13,7 @@ import verify_recovery_image_0_13_14 as _impl
 
 
 CONNECTIVITY_IMPORTER_SHA256 = (
-    "e9d98d059d7f0082d28bad134bf72fa6b6c4318a104d7de4001d9984df0e0854"
+    "8afc963c2fadbd58573540938d6012ee12b9a2e234d5ad0eb53c523be332550d"
 )
 V2_MANIFEST = "vendor-assets/mt8163-v181-stock-v2.tsv"
 V2_TARGET = "etc/libreecho/vendor-assets/mt8163-v181-stock-v2.tsv"
