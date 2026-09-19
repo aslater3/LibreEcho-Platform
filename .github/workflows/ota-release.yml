@@ -30,6 +30,25 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Retain exact tracked audio verification inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD > "$RUNNER_TEMP/audio-source-commit.txt"
+          git archive --format=tar.gz HEAD -- \
+            AGENTS.md README.md .github/workflows/ota-release.yml \
+            tools/mt8163-arm32/airplay > "$RUNNER_TEMP/audio-source.tar.gz"
+
+      - name: Upload short-lived audio verification inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: audio-verification-inputs
+          path: |
+            ${{ runner.temp }}/audio-source-commit.txt
+            ${{ runner.temp }}/audio-source.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
