@@ -80,3 +80,19 @@ The normal build prefers `/usr/bin/arm-linux-gnueabihf-g++` and falls back to
 the ARMHF C driver when the host has no separate C++ driver; the pinned
 AirPlay sources are C. CI or a release builder can override this explicitly
 with `LIBREECHO_AIRPLAY_CXX`.
+
+
+## Managed PCM producers
+
+The engine also serves `streams.sock` using `pcm_stream_protocol.h`. Each bounded
+SEQPACKET connection is an independent producer generation. FINISH pads/render
+accounts the final valid samples; DRAINED is based on hardware progress, not EOF
+or a producer exit. Early disconnect cancels only that stream. The legacy FIFOs
+remain for migration, with complete short tails rendered after a bounded gap.
+Live uses a separate focus connection so music stays ducked during the whole
+conversation. Cold start primes silence before programme playback; the existing
+codec/amp safety sequence is retained. This requires the matching UI client.
+
+`test_audio_period_buffer.py` runs the managed-stream runtime regressions as well
+as the legacy FIFO tests and startup source contract. Hardware qualification of
+acoustic onset/tail preservation and AEC alignment remains separate.

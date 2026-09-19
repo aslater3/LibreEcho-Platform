@@ -35,6 +35,8 @@ int main(void)
 	struct stat first;
 	struct stat unchanged;
 	struct stat announcing;
+	uint64_t pending[PLAYBACK_STATUS_BUS_COUNT] = {0, 85, 0, 0};
+	uint64_t last_frame[PLAYBACK_STATUS_BUS_COUNT] = {4096, 2048, 0, 0};
 	int result = 1;
 
 	if (!mkdtemp(root)) {
@@ -75,6 +77,18 @@ int main(void)
 	    !strstr(document, "\"system\":false") ||
 	    !strstr(document, "\"alarm\":false")) {
 		fprintf(stderr, "invalid announcing status: %s", document);
+		goto out;
+	}
+	if (playback_status_publish_drain(
+		    &status, PLAYBACK_BUS_MEDIA | PLAYBACK_BUS_SYSTEM,
+		    PLAYBACK_BUS_MEDIA | PLAYBACK_BUS_ANNOUNCEMENT |
+		        PLAYBACK_BUS_ALARM,
+		    pending, last_frame) < 0 ||
+	    read_status(status.path, document, sizeof(document), &announcing) < 0 ||
+	    !strstr(document, "\"system\":{\"drained\":false") ||
+	    !strstr(document, "\"pending_frames\":85") ||
+	    !strstr(document, "\"last_frame\":2048")) {
+		fprintf(stderr, "invalid per-bus drain status: %s", document);
 		goto out;
 	}
 	puts("atomic playback status: ok");

@@ -27,7 +27,7 @@ MUSL_CC=${LIBREECHO_UI_MUSL_CC:-$MUSL_NATIVE_ROOT/usr/bin/armv7-alpine-linux-mus
 MUSL_NATIVE_LIB=${LIBREECHO_UI_MUSL_NATIVE_LIB:-$MUSL_NATIVE_ROOT/usr/lib}
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd -P)
 VERIFY_TLS=$SCRIPT_DIR/verify_ui_tls.sh
-TLS_BINARIES=(libreecho-web libreecho-radiod)
+TLS_BINARIES=(libreecho-web libreecho-radiod libreecho-lived)
 
 [[ -n "$UI_SOURCE" && -d "$UI_SOURCE" ]] || {
     echo "ERROR: LibreEcho-UI source checkout is required" >&2
@@ -116,7 +116,10 @@ export CPPFLAGS="-I$MBEDTLS_ROOT/include${CPPFLAGS:+ $CPPFLAGS}"
     release
 
 # A build that selected src/tls_stub.c (LE_TLS_AVAILABLE=0) or that failed to
-# link mbedTLS must fail here, before anything is staged for the image.
+# link mbedTLS must fail here, before anything is staged for the image.  This
+# covers every shipped TLS client, including libreecho-lived: the GPT-Live
+# realtime transport is TLS-only, so a stub build of it could never connect and
+# must not reach the image.
 for binary in "${TLS_BINARIES[@]}"; do
     "$VERIFY_TLS" --binary "$UI_SOURCE/build/$binary" \
         --objects "$UI_SOURCE/build" --label "$binary"
@@ -137,7 +140,7 @@ for binary in \
     libreecho-timerd \
     libreecho-audiod libreecho-micd libreecho-ledd libreecho-buttond \
     libreecho-radiod libreecho-btd \
-    libreecho-airplayd libreecho-wyomingd
+    libreecho-airplayd libreecho-wyomingd libreecho-lived
 do
     path="$UI_SOURCE/build/$binary"
     [[ -f "$path" && ! -L "$path" ]] || {
@@ -189,7 +192,7 @@ for binary in \
     libreecho-timerd \
     libreecho-audiod libreecho-micd libreecho-ledd libreecho-buttond \
     libreecho-radiod libreecho-btd \
-    libreecho-airplayd libreecho-wyomingd \
+    libreecho-airplayd libreecho-wyomingd libreecho-lived \
     libreecho-sttd-wyoming libreecho-ttsd-wyoming
 do
     install -m 0755 "$UI_SOURCE/build/$binary" "$OUTPUT/sbin/$binary"
@@ -209,7 +212,7 @@ for script in \
     libreecho-buttond.init libreecho-radiod.init libreecho-btd.init \
     libreecho-airplayd.init libreecho-ttsd.init \
     libreecho-waked.init libreecho-sttd.init libreecho-agentd.init \
-    libreecho-wyomingd.init
+    libreecho-wyomingd.init libreecho-lived.init
 do
     install -m 0755 "$UI_SOURCE/init/$script" "$OUTPUT/etc/init.d/$script"
 done

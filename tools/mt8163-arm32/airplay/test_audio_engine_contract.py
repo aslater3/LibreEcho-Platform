@@ -27,6 +27,7 @@ def main() -> None:
         "int poll_timeout = period_ready(sources) ? 20 : -1;",
         "power_output_controls(card)",
         "unmute_output_controls(card)",
+        "pcm_drain(pcm)",
     )
     missing = [fragment for fragment in required if fragment not in text]
     if missing:
@@ -37,6 +38,21 @@ def main() -> None:
         raise SystemExit("one-channel MonoRight PCM regresses the left DAC to noise")
     if "output=S16_LE/48000/mono MonoRight" in text:
         raise SystemExit("MonoRight output banner must not remain")
+    drain = text.rfind("pcm_drain(pcm)")
+    idle = text.rfind("clear_source_activity(sources")
+    mute = text.rfind("disable_output_controls(card")
+    if not (drain < idle < mute):
+        raise SystemExit(
+            "hardware PCM must drain before idle publication and amplifier mute"
+        )
+    run = text[text.index("static int run_engine"):]
+    prime = run.index("write_period(pcm, prime_silence")
+    unmute = run.index("unmute_output_controls(card)", prime)
+    programme = run.index("write_period(pcm, output", prime)
+    if not prime < unmute < programme:
+        raise SystemExit("cold output must prime silence and unmute before programme audio")
+    if "le_pcm_server_submit" not in text or "le_pcm_server_progress" not in text:
+        raise SystemExit("managed streams must retain hardware playback accounting")
     print("audio_engine_contract: mono programme duplicated into stereo PCM 23 PASS")
 
 

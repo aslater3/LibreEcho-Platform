@@ -243,10 +243,17 @@ build_audio_components() {
         -o "$objects/audio_visualizer.o"
     "$CC" $bridge_cflags -c "$PLAYBACK_STATUS_SOURCE" \
         -o "$objects/playback_status.o"
+    "$CC" $bridge_cflags -c "$SCRIPT_DIR/playback_drain.c" \
+        -o "$objects/playback_drain.o"
+    "$CC" $bridge_cflags -c "$SCRIPT_DIR/playback_control.c" \
+        -o "$objects/playback_control.o"
+    "$CC" $bridge_cflags -c "$SCRIPT_DIR/pcm_stream_server.c" \
+        -o "$objects/pcm_stream_server.o"
     "$CC" $bridge_cflags -c "$AEC_REFERENCE_SOURCE" \
         -o "$objects/aec_reference.o"
     "$CC" $bridge_cflags "$objects/audio_engine.o" \
         "$objects/audio_visualizer.o" "$objects/playback_status.o" \
+        "$objects/playback_drain.o" "$objects/playback_control.o" "$objects/pcm_stream_server.o" \
         "$objects/aec_reference.o" "$tinyalsa_source/src/libtinyalsa.a" \
         -ldl -lm -o "$OUTPUT/libreecho-audio-engine"
 }
