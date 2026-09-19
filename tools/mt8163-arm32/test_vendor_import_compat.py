@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import stat
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 TOOLS_DIR = Path(__file__).resolve().parent
@@ -93,6 +95,7 @@ class VendorImporterCompatTests(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            timeout=15,
         )
         return result, config / "vendor-assets.tsv", Path(environment["LIBREECHO_VENDOR_STATUS_PATH"])
 
@@ -125,10 +128,21 @@ class VendorImporterCompatTests(unittest.TestCase):
             self.assertEqual(enrolled.read_text(), manifest_lines(payloads))
             self.assertNotIn(b"unknown-owner-local-wifi-code", enrolled.read_bytes())
 
+            # A cold boot discards all runtime bytes and status. Only the
+            # persisted hash/size contract may authorise the second import.
+            self.assertFalse(enrolled.with_name("vendor-import-force-next-boot").exists())
+            self.assertEqual(sorted(p.name for p in enrolled.parent.iterdir()), ["vendor-assets.tsv"])
+            self.assertFalse((root / "vendor-stage").exists())
+            shutil.rmtree(root / "runtime-firmware")
+            shutil.rmtree(root / "run")
             second, enrolled_again, status_again = self.run_importer(root, source)
             self.assertEqual(second.returncode, 0, second.stderr)
             self.assertEqual(enrolled_again.read_text(), manifest_lines(payloads))
             self.assertIn("verification=owner-local-enrolled\n", status_again.read_text())
+            self.assertFalse(enrolled.with_name("vendor-import-force-next-boot").exists())
+            for name, payload in payloads.items():
+                self.assertEqual((root / "runtime-firmware" / name).read_bytes(), payload)
+            self.assertEqual((root / "runtime-firmware/WIFI_RAM_CODE").read_bytes(), payloads["WIFI_RAM_CODE_8163"])
 
     def test_changed_enrolled_set_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -205,6 +219,44 @@ class VendorImporterCompatTests(unittest.TestCase):
             self.assertNotIn("VENDOR_IMPORT_UNKNOWN_COMPATIBLE_SET", result.stderr)
             self.assertIn("VENDOR_IMPORT_NO_HASH_PINNED_SET", result.stderr)
             self.assertIn("error=VENDOR_IMPORT_NO_HASH_PINNED_SET\n", status.read_text())
+
+
+    def test_damaged_enrolment_copy_is_rejected_before_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "system-a"
+            write_payloads(source, unknown_payloads())
+            bindir = root / "bin"
+            bindir.mkdir()
+            # Corrupt only the enrolled manifest copy, preserving its schema.
+            # Schema validation alone must not bless different trust records.
+            copier = bindir / "cp"
+            copier.write_text(
+                "#!/bin/sh\n"
+                "/bin/cp \"$@\" || exit $?\n"
+                "case \"$2\" in\n"
+                "  */.vendor-assets.tsv.enrol.*)\n"
+                "    sed '1s/^[^|]*/" + "0" * 64 + "/' \"$2\" > \"$2.damage\"\n"
+                "    mv \"$2.damage\" \"$2\"\n"
+                "    chmod 0600 \"$2\"\n"
+                "    ;;\n"
+                "esac\n"
+            )
+            copier.chmod(0o755)
+            with mock.patch.dict(os.environ, {"PATH": f"{bindir}:{os.environ['PATH']}"}):
+                result, enrolled, status = self.run_importer(root, source, force=True)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("VENDOR_IMPORT_ENROLLED_SPEC_COPY_MISMATCH", result.stderr)
+            self.assertFalse(enrolled.exists())
+            self.assertIn("state=failed\n", status.read_text())
+            self.assertEqual(list(enrolled.parent.iterdir()), [])
+
+    def test_image_builder_pins_the_current_importer(self) -> None:
+        expected = hashlib.sha256(IMPORTER.read_bytes()).hexdigest()
+        self.assertIn(
+            f'CONNECTIVITY_IMPORTER_SHA256 = "{expected}"',
+            (TOOLS_DIR / "build_recovery_image.py").read_text(),
+        )
 
 
 if __name__ == "__main__":

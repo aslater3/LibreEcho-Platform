@@ -422,7 +422,17 @@ enrol_for_future_boots()
     cp "$STAGE/ASSETS.tsv" "$enrolled_temp"
     chmod 0600 "$enrolled_temp"
     validate_spec_file "$enrolled_temp"
-    mv "$enrolled_temp" "$ENROLLED_SPEC"
+    # A valid schema is not proof that the stored trust record is the one
+    # the owner accepted. Verify the exact copy before atomic publication.
+    if ! cmp -s "$STAGE/ASSETS.tsv" "$enrolled_temp"; then
+        rm -f "$enrolled_temp"
+        fail VENDOR_IMPORT_ENROLLED_SPEC_COPY_MISMATCH
+    fi
+    sync || fail VENDOR_IMPORT_ENROLLED_SPEC_SYNC_FAILED
+    mv "$enrolled_temp" "$ENROLLED_SPEC" || fail VENDOR_IMPORT_ENROLLED_SPEC_COMMIT_FAILED
+    validate_enrolled_spec || fail VENDOR_IMPORT_ENROLLED_SPEC_INVALID
+    cmp -s "$STAGE/ASSETS.tsv" "$ENROLLED_SPEC" || fail VENDOR_IMPORT_ENROLLED_SPEC_READBACK_MISMATCH
+    sync || fail VENDOR_IMPORT_ENROLLED_SPEC_SYNC_FAILED
 }
 
 prepare_status_path || fail VENDOR_IMPORT_STATUS_PATH_UNSAFE
