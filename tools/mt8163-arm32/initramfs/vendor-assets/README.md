@@ -77,3 +77,17 @@ For the MT8163 WLAN driver, the importer creates the runtime regular-file alias
 `WIFI_RAM_CODE_8163`. The initramfs provides `/etc/firmware` as a relative link
 to `../lib/firmware`, matching the driver's literal firmware path without
 embedding or redistributing vendor bytes.
+
+## Enrolment durability and reboot regression (0.13.18)
+
+Before publishing a new owner-local contract, the importer compares the temporary
+manifest byte-for-byte with the verified staged contract and syncs it. It then
+atomically renames the file, checks its type/mode/schema and exact contents again,
+and syncs before reporting readiness. A failed copy, commit, readback or sync is
+reported as an enrolment error rather than successful acceptance.
+
+The regression test discards runtime firmware, transient staging and status
+between two imports. With the force marker consumed, the second import must
+recreate every runtime firmware file using only the unchanged mode-0600 enrolment
+contract. A damaged-but-schema-valid manifest copy is rejected before commit.
+These are synthetic host checks, not physical-device reboot acceptance.
