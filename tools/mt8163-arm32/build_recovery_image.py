@@ -236,7 +236,7 @@ def pinned_source(root: Path, relative: str, label: str) -> Path:
 
 
 def copy_adbd(adbd: Path, metadata_path: Path, stage: Path,
-              manifest: dict[str, object]) -> None:
+              manifest: dict[str, object], network_adb: str) -> None:
     if adbd.is_symlink() or not adbd.is_file():
         raise SystemExit(f"ERROR: adbd is not a regular file: {adbd}")
     if metadata_path.is_symlink() or not metadata_path.is_file():
@@ -247,7 +247,8 @@ def copy_adbd(adbd: Path, metadata_path: Path, stage: Path,
         raise SystemExit(f"ERROR: invalid adbd source metadata: {exc}") from exc
     required_metadata = {
         "source", "source_url", "source_commit", "source_license", "patch_sha256",
-        "compiler", "kernel_headers", "binary_sha256", "binary_size", "transport", "tcp_listener",
+        "compiler", "kernel_headers", "binary_sha256", "binary_size", "transport",
+        "tcp_listener", "authentication", "tcp_port",
     }
     if set(metadata) != required_metadata:
         raise SystemExit("ERROR: adbd source metadata schema mismatch")
@@ -261,8 +262,17 @@ def copy_adbd(adbd: Path, metadata_path: Path, stage: Path,
         raise SystemExit("ERROR: adbd source license is not Apache-2.0")
     if not isinstance(metadata["kernel_headers"], str) or not metadata["kernel_headers"]:
         raise SystemExit("ERROR: adbd kernel-header provenance is missing")
-    if metadata["transport"] != "usb-functionfs-only" or metadata["tcp_listener"] is not False:
-        raise SystemExit("ERROR: adbd transport policy is not USB FunctionFS-only")
+    expected_policy = (
+        ("usb-functionfs+tcp-open-dev", True, "none", 5555)
+        if network_adb == "open-dev"
+        else ("usb-functionfs-only", False, "physical-scope", 0)
+    )
+    actual_policy = (
+        metadata["transport"], metadata["tcp_listener"],
+        metadata["authentication"], metadata["tcp_port"],
+    )
+    if actual_policy != expected_policy:
+        raise SystemExit("ERROR: adbd transport policy does not match --network-adb")
     target = stage / "sbin/adbd"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(data)
@@ -273,6 +283,13 @@ def copy_adbd(adbd: Path, metadata_path: Path, stage: Path,
         "size": len(data),
         "mode": "0750",
         "source": metadata,
+    }
+    manifest["network_adb"] = {
+        "mode": network_adb,
+        "port": 5555 if network_adb == "open-dev" else 0,
+        "authentication": "unauthenticated-root" if network_adb == "open-dev" else "disabled",
+        "bind_scope": "all-interfaces" if network_adb == "open-dev" else "none",
+        "development_only": True if network_adb == "open-dev" else False,
     }
 
 
@@ -2256,6 +2273,8 @@ def main() -> None:
                         default="preserve")
     parser.add_argument("--update-channel", choices=("dev", "stable"),
                         required=True)
+    parser.add_argument("--network-adb", choices=("disabled", "open-dev"),
+                        default="disabled")
     parser.add_argument("--bootctl", type=Path, required=True)
     parser.add_argument("--update-verifier", type=Path, required=True)
     parser.add_argument("--ota-public-key", type=Path, required=True)
@@ -2351,6 +2370,9 @@ def main() -> None:
     parser.add_argument("--ramdisk-output", type=Path)
     parser.add_argument("--manifest", type=Path)
     args = parser.parse_args()
+
+    if args.network_adb == "open-dev" and args.update_channel != "dev":
+        raise SystemExit("ERROR: open network ADB is restricted to the dev channel")
 
     connectivity_options = {
         "wmt_config_helper": args.wmt_config_helper,
@@ -2688,7 +2710,10 @@ def main() -> None:
     overlay = Path(__file__).resolve().parent / "initramfs"
     with tempfile.TemporaryDirectory(prefix="libreecho-arm32-initramfs-") as temporary:
         stage = Path(temporary)
-        copy_adbd(args.adbd.resolve(), args.adbd_source_metadata.resolve(), stage, manifest)
+        copy_adbd(
+            args.adbd.resolve(), args.adbd_source_metadata.resolve(), stage, manifest,
+            args.network_adb,
+        )
         add_overlay(
             stage, overlay, args.busybox.resolve(), args.musl_loader.resolve(),
             args.expected_busybox_sha256, args.expected_musl_loader_sha256,

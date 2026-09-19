@@ -8,7 +8,13 @@ int property_get(const char *name, char *value, const char *default_value)
     else if (!strcmp(name, "ro.adb.secure")) result = "0";
     else if (!strcmp(name, "ro.kernel.qemu")) result = "0";
     else if (!strcmp(name, "service.adb.root")) result = "";
-    else if (!strcmp(name, "service.adb.tcp.port")) result = "0";
+    else if (!strcmp(name, "service.adb.tcp.port")) {
+#ifdef LIBREECHO_OPEN_NETWORK_ADB
+        result = "5555";
+#else
+        result = "0";
+#endif
+    }
     if (value) {
         strncpy(value, result, 91);
         value[91] = '\0';

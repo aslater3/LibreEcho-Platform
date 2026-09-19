@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  printf '%s\n' 'usage: build_adbd.sh --source DIR --output DIR --cc COMPILER --kernel-headers DIR [--sysroot DIR] [--test-ffs-root DIR]'
+  printf '%s\n' 'usage: build_adbd.sh --source DIR --output DIR --cc COMPILER --kernel-headers DIR [--sysroot DIR] [--test-ffs-root DIR] [--network-adb disabled|open-dev]'
 }
 
 SOURCE=
@@ -11,6 +11,7 @@ CC=
 sysroot=
 kernel_headers=
 test_ffs_root=
+network_adb=disabled
 while (($#)); do
   case "$1" in
     --source) shift; (($#)) || { usage >&2; exit 2; }; SOURCE=$1 ;;
@@ -19,12 +20,17 @@ while (($#)); do
     --sysroot) shift; (($#)) || { usage >&2; exit 2; }; sysroot=$1 ;;
     --kernel-headers) shift; (($#)) || { usage >&2; exit 2; }; kernel_headers=$1 ;;
     --test-ffs-root) shift; (($#)) || { usage >&2; exit 2; }; test_ffs_root=$1 ;;
+    --network-adb) shift; (($#)) || { usage >&2; exit 2; }; network_adb=$1 ;;
     -h|--help) usage; exit 0 ;;
     *) printf 'ERROR: unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
   shift
 done
 [[ -n "$SOURCE" && -n "$OUTPUT" && -n "$CC" && -n "$kernel_headers" ]] || { usage >&2; exit 2; }
+case "$network_adb" in
+  disabled|open-dev) ;;
+  *) printf 'ERROR: invalid network ADB mode: %s\n' "$network_adb" >&2; exit 2 ;;
+esac
 ADBD_SOURCE=$SOURCE
 ADBD_SOURCE_COMMIT=
 [[ -d "$SOURCE/.git" ]] || { printf 'ERROR: adbd source is not a Git checkout: %s\n' "$SOURCE" >&2; exit 1; }
@@ -77,6 +83,7 @@ patch --batch --forward --fuzz=0 -p1 -d "$work" < "$SCRIPT_DIR/libreecho-adbd.pa
 
 CFLAGS=(
   -march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard -O2
+  -fpermissive
   -ffunction-sections -fdata-sections -fno-omit-frame-pointer
   "-ffile-prefix-map=$work=/usr/src/libreecho-adbd"
   "-fdebug-prefix-map=$work=/usr/src/libreecho-adbd"
@@ -97,6 +104,9 @@ if [[ -n "$test_ffs_root" ]]; then
 fi
 if [[ -n "$sysroot" ]]; then
   CFLAGS+=("--sysroot=$sysroot")
+fi
+if [[ "$network_adb" == open-dev ]]; then
+  CFLAGS+=("-DLIBREECHO_OPEN_NETWORK_ADB=1")
 fi
 
 sources=(
@@ -128,8 +138,19 @@ binary_sha=$(sha256sum "$OUTPUT/adbd" | awk '{print $1}')
 binary_size=$(stat -c %s "$OUTPUT/adbd")
 patch_sha=$(sha256sum "$SCRIPT_DIR/libreecho-adbd.patch" | awk '{print $1}')
 compiler_version=$("$CC" --version | python3 -c 'import sys; print(sys.stdin.readline().strip())')
+if [[ "$network_adb" == open-dev ]]; then
+  transport=usb-functionfs+tcp-open-dev
+  tcp_listener=true
+  authentication=none
+  tcp_port=5555
+else
+  transport=usb-functionfs-only
+  tcp_listener=false
+  authentication=physical-scope
+  tcp_port=0
+fi
 python3 -c 'import json, pathlib, sys
-out, commit, patch_sha, compiler, kernel_headers, size, binary_sha = sys.argv[1:]
+out, commit, patch_sha, compiler, kernel_headers, size, binary_sha, transport, tcp_listener, authentication, tcp_port = sys.argv[1:]
 pathlib.Path(out).write_text(json.dumps({
   "source": "AOSP platform/system/core",
   "source_url": "https://android.googlesource.com/platform/system/core",
@@ -140,9 +161,12 @@ pathlib.Path(out).write_text(json.dumps({
   "kernel_headers": "exported-linux-uapi",
   "binary_sha256": binary_sha,
   "binary_size": int(size),
-  "transport": "usb-functionfs-only",
-  "tcp_listener": False,
+  "transport": transport,
+  "tcp_listener": tcp_listener == "true",
+  "authentication": authentication,
+  "tcp_port": int(tcp_port),
 }, sort_keys=True, indent=2) + "\n")' \
-  "$OUTPUT/adbd-source.json" "$source_commit" "$patch_sha" "$compiler_version" "$kernel_headers" "$binary_size" "$binary_sha"
+  "$OUTPUT/adbd-source.json" "$source_commit" "$patch_sha" "$compiler_version" "$kernel_headers" "$binary_size" "$binary_sha" \
+  "$transport" "$tcp_listener" "$authentication" "$tcp_port"
 printf 'adbd_source_commit=%s\nadbd_patch_sha256=%s\nadbd_sha256=%s\nadbd_size=%s\n' \
   "$source_commit" "$patch_sha" "$binary_sha" "$binary_size"

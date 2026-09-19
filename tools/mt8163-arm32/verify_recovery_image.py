@@ -1125,6 +1125,7 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                        expected_service_profile: str,
                        expected_feature_policy: str,
                        expected_update_channel: str,
+                       expected_network_adb: str,
                        expected_busybox_sha256: str,
                        expected_loader_sha256: str,
                        expected_bootctl_sha256: str,
@@ -1782,17 +1783,35 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     }:
         fail("adbd manifest record mismatch")
     source_record = adbd_record["source"]
+    expected_adbd_policy = (
+        ("usb-functionfs+tcp-open-dev", True, "none", 5555)
+        if expected_network_adb == "open-dev"
+        else ("usb-functionfs-only", False, "physical-scope", 0)
+    )
     if (
         not isinstance(source_record, dict)
         or source_record.get("source_license") != "Apache-2.0"
-        or source_record.get("transport") != "usb-functionfs-only"
-        or source_record.get("tcp_listener") is not False
+        or (
+            source_record.get("transport"), source_record.get("tcp_listener"),
+            source_record.get("authentication"), source_record.get("tcp_port"),
+        ) != expected_adbd_policy
         or not isinstance(source_record.get("kernel_headers"), str)
         or not source_record.get("kernel_headers")
         or not re.fullmatch(r"[0-9a-f]{40}", str(source_record.get("source_commit", "")))
         or not re.fullmatch(r"[0-9a-f]{64}", str(source_record.get("patch_sha256", "")))
     ):
         fail("adbd source provenance or transport policy is invalid")
+    expected_network_record = {
+        "mode": expected_network_adb,
+        "port": 5555 if expected_network_adb == "open-dev" else 0,
+        "authentication": (
+            "unauthenticated-root" if expected_network_adb == "open-dev" else "disabled"
+        ),
+        "bind_scope": "all-interfaces" if expected_network_adb == "open-dev" else "none",
+        "development_only": expected_network_adb == "open-dev",
+    }
+    if manifest.get("network_adb") != expected_network_record:
+        fail("network ADB manifest policy mismatch")
     if "stock_userspace" in manifest:
         fail("stock userspace manifest entry is forbidden")
     busybox = require_member(entries, "bin/busybox", expected_busybox_sha256, 0o755)
@@ -2050,6 +2069,8 @@ def main() -> None:
     )
     parser.add_argument("--expected-update-channel", choices=("dev", "stable"),
                         required=True)
+    parser.add_argument("--expected-network-adb", choices=("disabled", "open-dev"),
+                        default="disabled")
     parser.add_argument("--expected-busybox-sha256", required=True)
     parser.add_argument("--expected-musl-loader-sha256", required=True)
     parser.add_argument("--expected-bootctl-sha256", required=True)
@@ -2104,6 +2125,9 @@ def main() -> None:
         help="require the initramfs to contain exactly this opt-in connectivity bundle",
     )
     args = parser.parse_args()
+
+    if args.expected_network_adb == "open-dev" and args.expected_update_channel != "dev":
+        fail("open network ADB is restricted to the dev channel")
 
     envelope, zimage, system_map, ramdisk, boot = map(
         read, (args.boot_envelope, args.zimage, args.system_map, args.ramdisk, args.boot_image)
@@ -2208,7 +2232,8 @@ def main() -> None:
     connectivity_enabled = validate_initramfs(
         ramdisk, manifest, schema_version, args.expected_image_profile,
         args.expected_service_profile, args.expected_feature_policy,
-        args.expected_update_channel, args.expected_busybox_sha256, args.expected_musl_loader_sha256,
+        args.expected_update_channel, args.expected_network_adb,
+        args.expected_busybox_sha256, args.expected_musl_loader_sha256,
         args.expected_bootctl_sha256, args.expected_update_verifier_sha256,
         args.expected_ota_public_key_sha256, args.expected_adbd_sha256,
         args.expected_audio_probe_sha256,

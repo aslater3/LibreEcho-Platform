@@ -3489,7 +3489,11 @@ start_feature_service_if_enabled
         self.assertNotIn("pending_channel_race", fetcher)
         self.assertNotIn("migrate_pending_channel", fetcher)
         verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
-        self.assertIn("args.expected_update_channel, args.expected_busybox_sha256", verifier)
+        self.assertIn(
+            "args.expected_update_channel, args.expected_network_adb,",
+            verifier,
+        )
+        self.assertIn("args.expected_busybox_sha256", verifier)
         self.assertIn("pending_channel_preserve", updater)
         self.assertIn("printf '%s\\n' \"channel=$selected_channel\"", updater)
         self.assertIn("die manifest_service_profile", updater)

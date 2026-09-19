@@ -4,5 +4,5 @@ source_commit=4f247d753a8865cd16292ff0b720b72c28049786
 source_license=Apache-2.0
 source_subtree=adb,libcutils,libmincrypt,include
 build_target=adbd
-transport=USB FunctionFS only; target TCP listener disabled
-root_policy=LibreEcho property compatibility pins ro.secure=0 and refuses TCP ADB
+transport=USB FunctionFS by default; open-dev additionally enables unauthenticated TCP 5555
+root_policy=LibreEcho property compatibility pins ro.secure=0; TCP is compile-time dev-only opt-in
