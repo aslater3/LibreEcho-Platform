@@ -1,0 +1,49 @@
+name: Exact audio source import
+# Temporary transport for reviewed host-tested source. This job creates only
+# immutable Git objects; the connected authoring tool updates the feature ref.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  import:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'fix/issue-168-lived-packaging'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify and apply exact reviewed source
+        env:
+          MANIFEST_SHA256: cd7682721b9a439749aac5e78aa714193251facc5afb65be63bc3c037ff38310
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '77db669f51add4e5c2d1689ae788156db5ff74b2bdf365989ec76963ff73709c  .github/audio-import/import.py' | sha256sum -c -
+          cp .github/audio-import/import.py "$RUNNER_TEMP/audio-import.py"
+          python3 "$RUNNER_TEMP/audio-import.py" prepare
+      - name: Run bounded audio regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout -k 2 30 python3 tools/mt8163-arm32/airplay/test_audio_period_buffer.py
+          cc -std=c99 -Wall -Wextra -Werror tools/mt8163-arm32/airplay/test_playback_drain.c tools/mt8163-arm32/airplay/playback_drain.c -o "$RUNNER_TEMP/test-playback-drain"
+          timeout 10 "$RUNNER_TEMP/test-playback-drain"
+          bash -n tools/mt8163-arm32/airplay/build_airplay.sh
+          git diff --cached --check
+      - name: Upload verified immutable source objects
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 "$RUNNER_TEMP/audio-import.py" upload
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: audio-verified-tree
+          path: ${{ runner.temp }}/audio-verified-tree.json
+          retention-days: 1
+          if-no-files-found: error
