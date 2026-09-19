@@ -45,6 +45,14 @@ def main() -> None:
         raise SystemExit(
             "hardware PCM must drain before idle publication and amplifier mute"
         )
+    run = text[text.index("static int run_engine"):]
+    prime = run.index("write_period(pcm, prime_silence")
+    unmute = run.index("unmute_output_controls(card)", prime)
+    programme = run.index("write_period(pcm, output", prime)
+    if not prime < unmute < programme:
+        raise SystemExit("cold output must prime silence and unmute before programme audio")
+    if "le_pcm_server_submit" not in text or "le_pcm_server_progress" not in text:
+        raise SystemExit("managed streams must retain hardware playback accounting")
     print("audio_engine_contract: mono programme duplicated into stereo PCM 23 PASS")
 
 

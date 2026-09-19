@@ -313,6 +313,7 @@ def main() -> None:
             str(SOURCE_DIR),
             str(engine_source),
             str(SOURCE_DIR / "playback_control.c"),
+            str(SOURCE_DIR / "pcm_stream_server.c"),
             "-Wl,--gc-sections",
             "-lm",
             "-o",
@@ -320,6 +321,14 @@ def main() -> None:
         ]
         subprocess.run(command, check=True, timeout=60)
         subprocess.run([str(engine_binary)], check=True, timeout=60)
+
+    with tempfile.TemporaryDirectory(prefix="le-pcm-stream-") as temporary:
+        binary = Path(temporary) / "test-pcm-stream"
+        subprocess.run(["cc", "-std=c99", "-Wall", "-Wextra", "-Werror",
+                        str(SOURCE_DIR / "test_pcm_stream.c"),
+                        str(SOURCE_DIR / "pcm_stream_server.c"), "-o", str(binary)],
+                       check=True, timeout=30)
+        subprocess.run([str(binary)], check=True, timeout=10)
 
     engine = ENGINE_SOURCE.read_text(encoding="utf-8")
     required = (
@@ -347,6 +356,8 @@ def main() -> None:
         raise SystemExit("retained periods need a timed state recheck")
     if "if (read_or_retain_sources(sources, root) <= 0)" not in run_engine:
         raise SystemExit("retained periods must advance without a new FIFO read")
+    subprocess.run(["python3", str(SOURCE_DIR / "test_audio_engine_contract.py")],
+                   check=True, timeout=10)
     print("audio_period_buffer: short-read accumulation and engine continuity PASS")
 
 

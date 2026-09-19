@@ -40,7 +40,7 @@ uint64_t playback_drain_played_frames(const struct playback_drain *drain,
 {
     uint64_t delay;
 
-    if (!drain)
+    if (!drain || hardware_delay_frames < 0)
         return 0;
     delay = hardware_delay_frames > 0 ? (uint64_t)hardware_delay_frames : 0U;
     return delay >= drain->submitted_frames

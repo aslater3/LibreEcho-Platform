@@ -33,6 +33,8 @@ int main(void)
     CHECK(!playback_drain_bus_drained(&drain, PLAYBACK_DRAIN_SYSTEM, 4096, 0));
     CHECK(playback_drain_bus_drained(&drain, PLAYBACK_DRAIN_SYSTEM, 0, 0));
 
+    CHECK(playback_drain_played_frames(&drain, -1) == 0);
+    CHECK(!playback_drain_bus_drained(&drain, PLAYBACK_DRAIN_SYSTEM, 0, -1));
     printf("playback_drain: per-bus cursor PASS\n");
     return 0;
 }
