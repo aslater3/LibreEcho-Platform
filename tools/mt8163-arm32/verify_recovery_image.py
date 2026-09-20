@@ -29,7 +29,7 @@ _impl.OVERLAY_TARGETS[V2_MANIFEST] = V2_TARGET
 # mirror them here because this release entry point delegates to the retained
 # verifier module rather than duplicating its 2,000+ lines of implementation.
 _SOURCE_CONTRACT_MARKERS = (
-    'INIT_SHA256 = "743058cb7a45530efe5b16df6d2960fd781f67410dbb189317f3f8647c8e6bc5"',
+    'INIT_SHA256 = "971be2378caa987cdf20f9013ffbdde762ad5b8b6c68900e61da8c52b6a17dce"',
     "stock_userspace",
     "stock Android connectivity userspace remains embedded",
     "wireless-tools-COPYING",

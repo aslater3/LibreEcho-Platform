@@ -2483,7 +2483,11 @@ feature_daemon_required tts
             decision.index("start_feature_service", decision.index("airplay_explicitly_disabled")),
         )
 
-    def test_first_install_confirmation_requires_startup_ready_and_led_handoff(self) -> None:
+    def test_first_install_confirmation_does_not_require_optional_services(self) -> None:
+        # Platform #60: a fresh install has no previously confirmed slot to fall
+        # back to, so a failed optional application service must not be able to
+        # expire the only recoverable slot.  The boot/recovery plane gates the
+        # first-boot confirmation; the complete service graph stays the OTA gate.
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
         self.assertIn(
             'STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}',
@@ -2493,10 +2497,19 @@ feature_daemon_required tts
         self.assertIn("startup-ready-marker-missing", init_script)
         self.assertIn("led-handoff-not-ready", init_script)
         self.assertIn("startup_ready_marker_valid || {", init_script)
-        self.assertLess(
-            init_script.index("startup_ready_marker_valid || {"),
-            init_script.index("libreecho-bootctl confirm \"$selected_slot\""),
-        )
+        gated = init_script.index('elif [ "$CONFIRM_MODE" = first-boot ]; then')
+        first_boot_branch = init_script[gated:]
+        first_boot_branch = first_boot_branch[: first_boot_branch.index("        else")]
+        self.assertIn("services-degraded", first_boot_branch)
+        self.assertNotIn("probe_ok=0", first_boot_branch)
+        ota_branch = init_script[gated:]
+        ota_branch = ota_branch[ota_branch.index("        else") :]
+        ota_branch = ota_branch[: ota_branch.index("        fi")]
+        self.assertIn("last_check=services-ready", ota_branch)
+        self.assertIn("probe_ok=0", ota_branch)
+        # The degraded service graph is still recorded for the OTA gate.
+        self.assertIn("strict_graph=1", init_script)
+        self.assertIn("first-boot-probe-passed-degraded", init_script)
 
     def test_ui_startup_contract_covers_payload_services_and_airplay_default(self) -> None:
         builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
@@ -2797,11 +2810,16 @@ feature_daemon_required tts
         )
         self.assertIn("first-boot-slot-confirmed", init)
         self.assertIn("first-boot-slot-already-confirmed", init)
-        # The confirmation must sit behind the same health gate the OTA path
-        # uses, never in front of it.
+        # The confirmation must sit behind its own health gate, never in front of
+        # it: the pending record is created before the probes run, and the confirm
+        # call follows them.
         self.assertLess(
             init.index('log "first-boot-confirm-pending:$selected_slot"'),
-            init.index('[ "$passed" -eq 3 ]'),
+            init.index('libreecho-bootctl confirm "$selected_slot"'),
+        )
+        self.assertLess(
+            init.index('libreecho-bootctl confirm "$selected_slot"'),
+            init.index('log "first-boot-slot-confirmed:$selected_slot"'),
         )
         # A first boot must never reboot: there is no previously confirmed
         # slot to fall back to.
@@ -2835,6 +2853,68 @@ feature_daemon_required tts
         self.assertIn("$BB rm -f \"$first_install_confirmed\"", finalization)
         self.assertIn("first-install-confirmation-record-finalization-failed", finalization)
         self.assertLess(finalization.index("$BB mv"), finalization.index("$BB rm -f /data/libreecho/update/first-install.pending"))
+
+    def test_boot_slot_diagnostics_are_recorded_on_persistent_userdata(self) -> None:
+        # A device that stops booting can report nothing about itself, so the
+        # retry countdown the preloader enforces, the confirmation verdict, and
+        # the reason no confirmation happened are recorded on userdata while the
+        # device still boots.
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        cleanup = (TOOLS_DIR / "initramfs/libreecho-data-cleanup").read_text()
+        for marker in (
+            "BOOT_HEALTH=/data/libreecho/update/boot-health",
+            "BOOT_COUNT=/data/libreecho/update/boot-count",
+            "BOOT_HISTORY=/data/libreecho/update/boot-history",
+            "bh_write()",
+            "bh_history()",
+            "bh_bump_count()",
+            "bh_skipped()",
+            "slot_a_priority=%s",
+            "slot_a_tries=%s",
+            "slot_a_success=%s",
+            "slot_b_tries=%s",
+            "slot_b_success=%s",
+            "last_check=%s",
+            "strict_graph=%s",
+        ):
+            self.assertIn(marker, init)
+        # Every boot is counted and recorded before the worker is launched, so a
+        # device that stops booting mid-worker still carries a record.
+        self.assertLess(
+            init.index("bh_boot_count=$(bh_bump_count)"),
+            init.index("ota_health_confirm_worker &"),
+        )
+        self.assertLess(
+            init.index("boot-diagnostics-unavailable"),
+            init.index("ota_health_confirm_worker &"),
+        )
+        # The record is written atomically and synced; the history is bounded.
+        write_body = init[init.index("\nbh_write()\n{") :]
+        write_body = write_body[: write_body.index("\n}\n")]
+        self.assertIn("$BB sync", write_body)
+        self.assertIn('$BB mv "$bh_tmp" "$BOOT_HEALTH"', write_body)
+        self.assertIn("2>/dev/null || {", write_body)
+        self.assertIn("BOOT_HISTORY_MAX=8", init)
+        self.assertIn("tail -n $((BOOT_HISTORY_MAX - 1))", init)
+        # Each decision path leaves its own evidence.
+        for marker in (
+            "bh_skipped feature-policy-exclude",
+            "bh_skipped first-install-marker-absent-or-invalid",
+            "bh_skipped first-boot-slot-unknown",
+            "bh_skipped first-install-payload-hash-unavailable",
+            "bh_skipped first-install-transaction-invalid",
+            "bh_skipped first-install-transaction-write-failed",
+            "bh_state=confirmed",
+            "bh_state=failed",
+            "bh_state=restarting",
+        ):
+            self.assertIn(marker, init)
+        self.assertLess(
+            init.index('log "first-boot-confirm-failed:$last_check"'),
+            init.index("bh_state=failed"),
+        )
+        # The cleanup contract must allow the new records on userdata.
+        self.assertIn("boot-health boot-count boot-history", cleanup)
 
     def test_ota_vm_asserts_each_phase_and_resets_bcb(self) -> None:
         vm = TOOLS_DIR / "ota-test-vm"
