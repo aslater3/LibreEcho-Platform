@@ -32,6 +32,54 @@ has tries. Before activating an update, the running slot is recorded as
 `priority=15, tries=0, successful=1`. If all target attempts fail, the
 preloader falls back to the successful priority-14 slot.
 
+## First-boot confirmation and recorded boot diagnostics
+
+The countdown above is enforced by the preloader and cleared only by
+`libreecho-bootctl confirm`, so confirmation is the single event that makes an
+installed slot permanently bootable. A fresh install has no previously confirmed
+slot to fall back to, and the public installer writes no BCB of its own: Amonet
+resets it to `slot0 = priority 15, tries 7, success 0` and `slot1 = priority 14,
+tries 7, success 0`. Everything therefore depends on the running image confirming
+itself before the countdown reaches zero.
+
+Two health gates apply, by design:
+
+| mode | gate | fallback available |
+| --- | --- | --- |
+| `first-boot` (fresh install, no `update/pending` record) | boot/recovery plane only — `/data` mounted, ADB FunctionFS ready, web service running, held across three probes | none |
+| `ota` (an `update/pending` record exists) | the complete selected service graph, including the optional integration daemons | the previously confirmed priority-14 slot |
+
+A failed *optional* application service must never be able to expire the only
+recoverable slot (platform #60), so on a first boot the strict graph is recorded
+rather than required (`last_check=services-degraded`); it stays required for OTA,
+where a rollback target exists.
+
+Because a device that stops booting can report nothing about itself, init records
+the countdown and its verdict on userdata on every boot:
+
+```text
+/data/libreecho/update/boot-count    monotonic boot counter
+/data/libreecho/update/boot-health   latest boot: state, mode, running/selected/
+                                     pending slot, per-slot priority/tries/success,
+                                     boot counter, probe attempts, last_check,
+                                     strict_graph, epoch
+/data/libreecho/update/boot-history  bounded (8) one line per boot, carrying the
+                                     countdown and the previous boot's verdict
+```
+
+`boot-health` states are `booting` (record written before any service starts),
+`pending` (probing), `confirmed`, `failed`, `restarting` (OTA health failure) and
+`skipped`, whose `last_check` names the reason no confirmation was attempted:
+`feature-policy-exclude`, `first-install-marker-absent-or-invalid`,
+`first-boot-slot-unknown`, `first-install-payload-hash-unavailable`,
+`first-install-transaction-invalid`, `first-install-transaction-write-failed`.
+
+These records live on `userdata`, so a reinstall that formats it destroys them —
+and once the countdown expires the device is unreachable. Collect
+`libreecho-bootctl status` together with `update/boot-health` and
+`update/boot-history` (all carried by the diagnostic bundle) while the device
+still boots.
+
 ## Write allowlist
 
 An ordinary OTA transaction may write only:

@@ -256,7 +256,7 @@ TOLERATE_UNKNOWN_FILES=1
 check_children "$DATA_ROOT/libreecho/update" \
     channel incoming staging state pending installed rolled-back check-status \
     automatic-updates install.lock bootctl.confirm bootctl.confirmed feature-commit committed-manifest committed-manifest.sig restart-record first-install.pending \
-    first-install.confirmed
+    first-install.confirmed boot-health boot-count boot-history
 TOLERATE_UNKNOWN_FILES=0
 
 if [ -d "$DATA_ROOT/libreecho/features" ]; then

@@ -42,6 +42,15 @@ FEATURE_POLICY_VALUE=$($BB cat /etc/libreecho/feature-policy 2>/dev/null)
 FEATURE_POLICY=exclude
 FIRST_INSTALL_MARKER=/etc/libreecho/first-install-confirm
 STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}
+# Boot-control diagnostics.  A device that stops booting can report nothing
+# about itself, so the retry countdown the preloader enforces is recorded on the
+# persistent filesystem while the device still boots.  These records live on
+# userdata and do not survive a reinstall that formats it: collect the
+# diagnostic bundle before reinstalling.
+BOOT_HEALTH=/data/libreecho/update/boot-health
+BOOT_COUNT=/data/libreecho/update/boot-count
+BOOT_HISTORY=/data/libreecho/update/boot-history
+BOOT_HISTORY_MAX=8
 case "$FEATURE_POLICY_VALUE" in
     preserve|redistributable|community-noncommercial|exclude)
         FEATURE_POLICY=$FEATURE_POLICY_VALUE
@@ -91,6 +100,175 @@ log()
 	# the old /dev/kmsg writer does not default to INFO.
 	printf '<6>%s\n' "$msg" > /dev/kmsg 2>/dev/null
 	printf '%s\n' "$msg" > /dev/console 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Boot-control diagnostics.
+#
+# The preloader selects the highest-priority slot that is successful or still
+# has tries, and refuses a slot whose tries reach zero while success is 0.  Only
+# `libreecho-bootctl confirm` clears that countdown, so every boot records the
+# state the countdown was in and why confirmation did or did not happen.  These
+# records are the only boot-slot evidence left once a device stops booting.
+#
+# Globals consumed by bh_write(): bh_state, bh_mode_value, bh_running,
+# bh_selected, bh_pending, bh_boot_count, bh_attempt, bh_passed, bh_last_check,
+# bh_strict.
+bh_status=
+bh_state=booting
+bh_mode_value=none
+bh_running=-
+bh_selected=-
+bh_pending=-
+bh_boot_count=0
+bh_attempt=0
+bh_passed=0
+bh_last_check=none
+bh_strict=0
+
+bh_bootctl()
+{
+	bh_status=$(/usr/local/sbin/libreecho-bootctl status 2>/dev/null)
+}
+
+bh_value()
+{
+	bh_field=$(printf '%s\n' "$bh_status" | $BB sed -n "s/^$1=//p" |
+		$BB head -n 1)
+	if [ -z "$bh_field" ]; then
+		printf '%s\n' -
+	else
+		printf '%s\n' "$bh_field"
+	fi
+}
+
+bh_classify_mode()
+{
+	if [ -r /data/libreecho/update/pending ]; then
+		printf '%s\n' ota
+	elif [ -r "$FIRST_INSTALL_MARKER" ]; then
+		printf '%s\n' first-boot
+	else
+		printf '%s\n' none
+	fi
+}
+
+bh_running_slot()
+{
+	bh_slot=$($BB sed -n \
+		's/.*androidboot.slot_suffix=_\([ab]\).*/\1/p' /proc/cmdline)
+	if [ -z "$bh_slot" ]; then
+		printf '%s\n' -
+	else
+		printf '%s\n' "$bh_slot"
+	fi
+}
+
+bh_pending_slot()
+{
+	bh_rec=$($BB sed -n 's/^slot=//p' /data/libreecho/update/pending 2>/dev/null |
+		$BB head -n 1)
+	if [ -z "$bh_rec" ]; then
+		printf '%s\n' -
+	else
+		printf '%s\n' "$bh_rec"
+	fi
+}
+
+bh_bump_count()
+{
+	bh_seen=$($BB sed -n '1p' "$BOOT_COUNT" 2>/dev/null)
+	case "$bh_seen" in
+		''|*[!0-9]*) bh_seen=0 ;;
+	esac
+	bh_seen=$((bh_seen + 1))
+	if printf '%s\n' "$bh_seen" > "$BOOT_COUNT.tmp" 2>/dev/null; then
+		$BB sync
+		if $BB mv "$BOOT_COUNT.tmp" "$BOOT_COUNT" 2>/dev/null; then
+			printf '%s\n' "$bh_seen"
+			return 0
+		fi
+		$BB rm -f "$BOOT_COUNT.tmp"
+	fi
+	printf '%s\n' 0
+}
+
+# One bounded line per boot.  The verdict the previous boot recorded is carried
+# into the new line before this boot overwrites boot-health, so a device that has
+# already stopped booting still shows how the countdown reached zero.
+bh_history()
+{
+	bh_prev=$($BB sed -n 's/^state=//p' "$BOOT_HEALTH" 2>/dev/null | $BB head -n 1)
+	bh_prev_check=$($BB sed -n 's/^last_check=//p' "$BOOT_HEALTH" 2>/dev/null |
+		$BB head -n 1)
+	bh_prev_slot=$($BB sed -n 's/^selected_slot=//p' "$BOOT_HEALTH" 2>/dev/null |
+		$BB head -n 1)
+	[ -n "$bh_prev" ] || bh_prev=none
+	[ -n "$bh_prev_check" ] || bh_prev_check=none
+	[ -n "$bh_prev_slot" ] || bh_prev_slot=-
+	bh_bootctl
+	bh_line="epoch=$(date -u +%s 2>/dev/null) boot=$bh_boot_count"
+	bh_line="$bh_line mode=$bh_mode_value running=$bh_running"
+	bh_line="$bh_line selected=$bh_selected pending=$bh_pending"
+	bh_line="$bh_line a=$(bh_value slot_a_priority)/$(bh_value slot_a_tries)/$(bh_value slot_a_success)"
+	bh_line="$bh_line b=$(bh_value slot_b_priority)/$(bh_value slot_b_tries)/$(bh_value slot_b_success)"
+	bh_line="$bh_line prev=$bh_prev:$bh_prev_check prev_slot=$bh_prev_slot"
+	bh_tmp=$BOOT_HISTORY.tmp
+	if [ -s "$BOOT_HISTORY" ]; then
+		$BB tail -n $((BOOT_HISTORY_MAX - 1)) "$BOOT_HISTORY" > "$bh_tmp" \
+			2>/dev/null || : > "$bh_tmp"
+	else
+		: > "$bh_tmp"
+	fi
+	printf '%s\n' "$bh_line" >> "$bh_tmp" 2>/dev/null &&
+		$BB mv "$bh_tmp" "$BOOT_HISTORY" 2>/dev/null
+	$BB rm -f "$bh_tmp"
+}
+
+# Atomic record of the current boot's slot state and confirmation verdict.
+bh_write()
+{
+	bh_bootctl
+	bh_tmp=$BOOT_HEALTH.tmp
+	{
+		printf 'schema=1\n'
+		printf 'state=%s\n' "$bh_state"
+		printf 'mode=%s\n' "$bh_mode_value"
+		printf 'running_slot=%s\n' "$bh_running"
+		printf 'selected_slot=%s\n' "$bh_selected"
+		printf 'pending_slot=%s\n' "$bh_pending"
+		printf 'slot_a_priority=%s\n' "$(bh_value slot_a_priority)"
+		printf 'slot_a_tries=%s\n' "$(bh_value slot_a_tries)"
+		printf 'slot_a_success=%s\n' "$(bh_value slot_a_success)"
+		printf 'slot_b_priority=%s\n' "$(bh_value slot_b_priority)"
+		printf 'slot_b_tries=%s\n' "$(bh_value slot_b_tries)"
+		printf 'slot_b_success=%s\n' "$(bh_value slot_b_success)"
+		printf 'boot_count=%s\n' "$bh_boot_count"
+		printf 'attempt=%s\n' "$bh_attempt"
+		printf 'passed=%s\n' "$bh_passed"
+		printf 'last_check=%s\n' "$bh_last_check"
+		printf 'strict_graph=%s\n' "$bh_strict"
+		printf 'epoch=%s\n' "$(date -u +%s 2>/dev/null)"
+	} > "$bh_tmp" 2>/dev/null || {
+		$BB rm -f "$bh_tmp"
+		return 1
+	}
+	$BB sync
+	if $BB mv "$bh_tmp" "$BOOT_HEALTH" 2>/dev/null; then
+		return 0
+	fi
+	$BB rm -f "$bh_tmp"
+	return 1
+}
+
+# Record why this boot did not attempt a confirmation.  Answering that question
+# after the fact is the whole point of the record: "no confirmation happened" and
+# "the health gate failed" have different fixes.
+bh_skipped()
+{
+	bh_state=skipped
+	bh_last_check=$1
+	bh_write
 }
 
 if [ "$SERVICE_PROFILE_INVALID" -eq 1 ]; then
@@ -336,6 +514,26 @@ if userdata_mount; then
 else
     DATA_CLEANUP_OK=0
     log userdata-unavailable
+fi
+
+# Record this boot's slot state before any service starts.  Later writes refine
+# bh_state; this one guarantees a record exists even when the health worker never
+# runs, and it is the line that makes the retry countdown visible across boots.
+if [ "${DATA_CLEANUP_OK:-0}" -eq 1 ]; then
+    bh_boot_count=$(bh_bump_count)
+    bh_mode_value=$(bh_classify_mode)
+    bh_running=$(bh_running_slot)
+    bh_pending=$(bh_pending_slot)
+    bh_bootctl
+    bh_selected=$(bh_value selected_slot)
+    bh_state=booting
+    bh_last_check=none
+    bh_history
+    bh_write
+    log "boot-count:$bh_boot_count"
+    log "boot-slot:$bh_running:$bh_selected"
+else
+    log boot-diagnostics-unavailable
 fi
 VENDOR_ASSETS_OK=0
 if [ "${DATA_CLEANUP_OK:-0}" -eq 1 ] &&
@@ -974,6 +1172,7 @@ ota_health_confirm_worker()
     [ "$IMAGE_PROFILE" = ota ] || return 0
     [ "$FEATURE_POLICY" != exclude ] || {
         log ota-health-feature-validation-skipped-by-exclusion-policy
+        bh_skipped feature-policy-exclude
         return 0
     }
     running_slot=$($BB sed -n \
@@ -990,30 +1189,44 @@ ota_health_confirm_worker()
                 $BB sed -n 's/^selected_slot=//p')
             ;;
     esac
+    bh_running=$running_slot
+    [ -n "$bh_running" ] || bh_running=-
+    bh_selected=$selected_slot
+    [ -n "$bh_selected" ] || bh_selected=-
 
     if [ -r /data/libreecho/update/pending ]; then
         CONFIRM_MODE=ota
         log ota-health-confirm-pending
         pending_slot=$($BB sed -n 's/^slot=//p' /data/libreecho/update/pending)
+        bh_mode_value=ota
+        bh_pending=$pending_slot
+        [ -n "$bh_pending" ] || bh_pending=-
     else
         if [ ! -r "$FIRST_INSTALL_MARKER" ] ||
            [ "$($BB sed -n 's/^schema=//p' "$FIRST_INSTALL_MARKER")" != 1 ] ||
            [ "$($BB sed -n 's/^mode=//p' "$FIRST_INSTALL_MARKER")" != first-install ] ||
            [ "$($BB sed -n 's/^board=//p' "$FIRST_INSTALL_MARKER")" != radar_puffin ]; then
             log first-install-marker-absent-or-invalid
+            bh_mode_value=first-boot
+            bh_skipped first-install-marker-absent-or-invalid
             return 0
         fi
         CONFIRM_MODE=first-boot
+        bh_mode_value=first-boot
         case "$selected_slot" in
             a|b) ;;
             *)
                 log "first-boot-slot-unknown:$selected_slot"
+                bh_skipped first-boot-slot-unknown
                 return 0
                 ;;
         esac
         if [ "$(/usr/local/sbin/libreecho-bootctl status 2>/dev/null |
             $BB sed -n "s/^slot_${selected_slot}_success=//p")" = 1 ]; then
             log "first-boot-slot-already-confirmed:$selected_slot"
+            bh_state=confirmed
+            bh_last_check=none
+            bh_write
             return 0
         fi
         if [ "$selected_slot" = a ]; then
@@ -1026,6 +1239,7 @@ ota_health_confirm_worker()
         case "$payload_hash" in
             ''|*[!0-9a-f]*)
                 log first-install-payload-hash-unavailable
+                bh_skipped first-install-payload-hash-unavailable
                 return 0
                 ;;
         esac
@@ -1035,6 +1249,7 @@ ota_health_confirm_worker()
             recorded_hash=$($BB sed -n 's/^boot_sha256=//p' "$first_install_pending")
             if [ "$recorded_slot" != "$selected_slot" ] || [ "$recorded_hash" != "$payload_hash" ]; then
                 log first-install-transaction-invalid
+                bh_skipped first-install-transaction-invalid
                 return 0
             fi
         else
@@ -1047,6 +1262,7 @@ ota_health_confirm_worker()
             } > "$first_install_pending.tmp" &&
                 $BB mv "$first_install_pending.tmp" "$first_install_pending" || {
                     log first-install-transaction-write-failed
+                    bh_skipped first-install-transaction-write-failed
                     return 0
                 }
             $BB sync
@@ -1054,7 +1270,11 @@ ota_health_confirm_worker()
         fi
         log "first-boot-confirm-pending:$selected_slot"
         pending_slot=$selected_slot
+        bh_pending=-
     fi
+    bh_state=pending
+    bh_last_check=none
+    bh_write
     case "$pending_slot:$selected_slot" in
         a:a|b:b) ;;
         a:b|b:a)
@@ -1272,31 +1492,54 @@ ota_health_confirm_worker()
         return 1
     }
 
-    # Require the persistent filesystem, ADB control plane, web service, and
-    # complete selected service graph to remain healthy across three probes
-    # before making the slot permanent.
+    # Require the health a slot confirmation is entitled to, held stable across
+    # three probes, before making the slot permanent.
+    #
+    # A fresh install is gated on the boot/recovery plane only: it has no
+    # previously confirmed slot to fall back to, so a failed *optional*
+    # application service must not be able to expire the only recoverable slot
+    # (platform #60).  The complete selected service graph stays the stricter
+    # OTA acceptance gate, where a rollback target does exist.
     $BB sleep 45
     attempt=0
     passed=0
     last_check=unknown
+    strict_graph=0
     while [ "$attempt" -lt 6 ] && [ "$passed" -lt 3 ]; do
         attempt=$((attempt + 1))
+        probe_ok=1
         if ! $BB grep -q ' /data ' /proc/mounts 2>/dev/null; then
             last_check=data-mount
+            probe_ok=0
         elif [ "${ffs_ready:-0}" -ne 1 ]; then
             last_check=ffs-ready
+            probe_ok=0
         elif ! /etc/init.d/libreecho-web.init status >/dev/null 2>&1; then
             last_check=web-status
-        elif ! ota_health_services_ready; then
-            last_check=services-ready
-        else
+            probe_ok=0
+        elif ota_health_services_ready; then
             last_check=none
+            strict_graph=1
+        elif [ "$CONFIRM_MODE" = first-boot ]; then
+            last_check=services-degraded
+        else
+            last_check=services-ready
+            probe_ok=0
         fi
-        if [ "$last_check" != none ]; then
+        bh_attempt=$attempt
+        bh_passed=$passed
+        bh_last_check=$last_check
+        bh_strict=$strict_graph
+        bh_state=pending
+        bh_write
+        if [ "$probe_ok" -ne 1 ]; then
             passed=0
             log "ota-health-probe-failed:$attempt:$last_check"
             $BB sleep 30
             continue
+        fi
+        if [ "$last_check" = services-degraded ]; then
+            log "first-boot-probe-passed-degraded:$attempt"
         fi
         passed=$((passed + 1))
         log "ota-health-probe-passed:$passed"
@@ -1315,25 +1558,40 @@ ota_health_confirm_worker()
                 $BB rm -f /data/libreecho/update/first-install.pending
                 $BB sync
                 log "first-boot-slot-confirmed:$selected_slot"
+                bh_state=confirmed
+                bh_last_check=none
+                bh_write
                 return 0
             fi
             $BB rm -f "$first_install_confirmed"
             log first-install-confirmation-record-finalization-failed
+            bh_state=confirmed
+            bh_last_check=confirmation-record-finalization-failed
+            bh_write
             return 0
         fi
         # Never restart after a failed first boot: there is no previously
         # confirmed slot to fall back to, so a reboot could only repeat this
         # outcome and would burn the remaining try counter.
         log "first-boot-confirm-failed:$last_check"
+        bh_state=failed
+        bh_last_check=$last_check
+        bh_write
         return 0
     fi
 
     if [ "$passed" -eq 3 ] &&
        /usr/local/sbin/libreecho-update confirm >/tmp/ota-confirm.log 2>&1; then
         log ota-slot-confirmed
+        bh_state=confirmed
+        bh_last_check=none
+        bh_write
         return 0
     fi
     log ota-health-confirm-failed-rebooting
+    bh_state=restarting
+    bh_last_check=$last_check
+    bh_write
     # Issue #41: leave persistent evidence for why this worker restarted the
     # device.  The record lives on the persistent userdata filesystem (not
     # tmpfs), is written atomically and synced before the reboot, and is
