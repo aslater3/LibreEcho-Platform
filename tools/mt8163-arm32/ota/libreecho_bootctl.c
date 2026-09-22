@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Amazon/MediaTek BCB control for the Amonet Biscuit partition layout.
+ * Amazon/MediaTek BCB control for the supported Biscuit boot layouts.
  * This tool never writes a boot image. It can write only the BCB sector in misc.
  */
 #define _FILE_OFFSET_BITS 64
@@ -26,7 +26,17 @@ struct partition_contract {
     unsigned long sectors;
 };
 
-static const struct partition_contract partitions[] = {
+/* Two boot layouts are supported and a unit matches exactly one of them.
+ *
+ * The legacy Amonet layout redirects LK's boot_a/boot_b reads to the _x stores
+ * and keeps the Amonet header and tail payload in the large wrapper partitions,
+ * so the OS image belongs in boot_a_x/boot_b_x. The pinned upstream chain has no
+ * redirect: boot_a and boot_b are the stores themselves.
+ *
+ * Both name the same device node and the same reviewed sector count, and the BCB
+ * this tool manipulates lives in misc either way. Only the names differ.
+ */
+static const struct partition_contract partitions_amonet[] = {
     {"/dev/mmcblk0p8", "/sys/class/block/mmcblk0p8", "misc", 1025},
     {"/dev/mmcblk0p9", "/sys/class/block/mmcblk0p9", "persist", 32768},
     {"/dev/mmcblk0p10", "/sys/class/block/mmcblk0p10", "boot_a_x", 32768},
@@ -35,6 +45,18 @@ static const struct partition_contract partitions[] = {
     {"/dev/mmcblk0p17", "/sys/class/block/mmcblk0p17", "boot_a", 225280},
     {"/dev/mmcblk0p18", "/sys/class/block/mmcblk0p18", "boot_b", 225280},
 };
+
+static const struct partition_contract partitions_pinned[] = {
+    {"/dev/mmcblk0p8", "/sys/class/block/mmcblk0p8", "misc", 1025},
+    {"/dev/mmcblk0p9", "/sys/class/block/mmcblk0p9", "persist", 32768},
+    {"/dev/mmcblk0p10", "/sys/class/block/mmcblk0p10", "boot_a", 32768},
+    {"/dev/mmcblk0p11", "/sys/class/block/mmcblk0p11", "boot_b", 32768},
+    {"/dev/mmcblk0p16", "/sys/class/block/mmcblk0p16", "userdata", 2137088},
+};
+
+#define CONTRACT_COUNT(set) (sizeof(set) / sizeof((set)[0]))
+
+static const char *boot_layout = "unknown";
 
 static int read_text(const char *path, char *output, size_t size)
 {
@@ -70,41 +92,69 @@ static int partition_sectors_match(const struct partition_contract *contract,
            contract->sectors == 2137088UL && strcmp(text, "2153472") == 0;
 }
 
+/* Probing a layout the unit does not use must stay quiet: printing its contract
+ * errors would look like a failure on a supported device. Diagnostics are
+ * emitted only for the set that finally fails. */
+static int contract_reporting = 1;
+
 static int validate_partition(const struct partition_contract *contract)
 {
     char path[160], text[1024], expected[80];
     struct stat st;
 
     if (stat(contract->device, &st) || !S_ISBLK(st.st_mode)) {
-        fprintf(stderr, "ERROR: %s is not a block device\n", contract->device);
+        if (contract_reporting)
+            fprintf(stderr, "ERROR: %s is not a block device\n", contract->device);
         return -1;
     }
     snprintf(path, sizeof(path), "%s/size", contract->sysfs);
     if (read_text(path, text, sizeof(text)) ||
         !partition_sectors_match(contract, text)) {
-        fprintf(stderr, "ERROR: %s sector contract failed\n", contract->name);
+        if (contract_reporting)
+            fprintf(stderr, "ERROR: %s sector contract failed\n", contract->name);
         return -1;
     }
     snprintf(path, sizeof(path), "%s/uevent", contract->sysfs);
     if (read_text(path, text, sizeof(text))) {
-        fprintf(stderr, "ERROR: cannot read %s identity\n", contract->name);
+        if (contract_reporting)
+            fprintf(stderr, "ERROR: cannot read %s identity\n", contract->name);
         return -1;
     }
     snprintf(expected, sizeof(expected), "PARTNAME=%s", contract->name);
     if (!strstr(text, expected)) {
-        fprintf(stderr, "ERROR: %s PARTNAME contract failed\n", contract->name);
+        if (contract_reporting)
+            fprintf(stderr, "ERROR: %s PARTNAME contract failed\n", contract->name);
         return -1;
     }
     return 0;
 }
 
-static int validate_layout(void)
+static int validate_set(const struct partition_contract *set, size_t count)
 {
     size_t i;
-    for (i = 0; i < sizeof(partitions) / sizeof(partitions[0]); ++i)
-        if (validate_partition(&partitions[i]))
+    for (i = 0; i < count; ++i)
+        if (validate_partition(&set[i]))
             return -1;
     return 0;
+}
+
+/* The legacy Amonet layout is validated first and unchanged, so a unit that has
+ * always taken that path still does. Only a unit matching neither set fails, and
+ * it fails exactly as before: with the legacy contract diagnostics. */
+static int validate_layout(void)
+{
+    contract_reporting = 0;
+    if (validate_set(partitions_amonet, CONTRACT_COUNT(partitions_amonet)) == 0) {
+        boot_layout = "amonet";
+        return 0;
+    }
+    if (validate_set(partitions_pinned, CONTRACT_COUNT(partitions_pinned)) == 0) {
+        boot_layout = "pinned";
+        return 0;
+    }
+    contract_reporting = 1;
+    (void)validate_set(partitions_amonet, CONTRACT_COUNT(partitions_amonet));
+    return -1;
 }
 
 static int bcb_valid(const uint8_t *bcb)
@@ -192,7 +242,12 @@ static void print_status(const uint8_t *bcb, int running_slot)
            slot_priority(bcb, 1), slot_tries(bcb, 1), slot_success(bcb, 1));
     printf("slot_a_image=/dev/mmcblk0p10\n");
     printf("slot_b_image=/dev/mmcblk0p11\n");
-    printf("wrapper_a=/dev/mmcblk0p17\nwrapper_b=/dev/mmcblk0p18\n");
+    printf("boot_layout=%s\n", boot_layout);
+    if (!strcmp(boot_layout, "pinned"))
+        /* The pinned chain has no Amonet wrapper partitions. */
+        printf("wrapper_a=-\nwrapper_b=-\n");
+    else
+        printf("wrapper_a=/dev/mmcblk0p17\nwrapper_b=/dev/mmcblk0p18\n");
 }
 
 static int parse_slot(const char *value)

@@ -134,17 +134,27 @@ target_device_for_slot()
             target_device=$BOOT_DEVICE_ROOT/mmcblk0p10
             target_sys=$BOOT_SYS_ROOT/mmcblk0p10
             target_partname=boot_a_x
+            target_partname_pinned=boot_a
             ;;
         b)
             target_device=$BOOT_DEVICE_ROOT/mmcblk0p11
             target_sys=$BOOT_SYS_ROOT/mmcblk0p11
             target_partname=boot_b_x
+            target_partname_pinned=boot_b
             ;;
         *) die boot_control_target ;;
     esac
 
+    # The slot store is the same reviewed 32768-sector partition at the same
+    # device node on both supported layouts; only its PARTNAME differs. The
+    # legacy Amonet layout redirects LK's boot_a/boot_b reads to these _x stores,
+    # while the pinned upstream chain names the stores boot_a/boot_b directly.
+    # Accepting either name for this node changes nothing else, and the exact
+    # sector check still rejects the 225280-sector Amonet wrapper partitions, so
+    # a boot image can never be written to a wrapper.
     [ -b "$target_device" ] &&
-        $BB grep -qx "PARTNAME=$target_partname" "$target_sys/uevent" 2>/dev/null &&
+        { $BB grep -qx "PARTNAME=$target_partname" "$target_sys/uevent" 2>/dev/null ||
+          $BB grep -qx "PARTNAME=$target_partname_pinned" "$target_sys/uevent" 2>/dev/null; } &&
         [ "$($BB cat "$target_sys/size" 2>/dev/null)" = "$BOOT_SECTORS" ] ||
         die boot_target_identity
 }

@@ -3652,6 +3652,51 @@ start_feature_service_if_enabled
             confirm.index('"$BOOTCTL" confirm'),
         )
 
+    def test_boot_control_accepts_both_supported_boot_layouts(self) -> None:
+        """The pinned upstream chain names the slot stores boot_a/boot_b, while the
+        legacy Amonet layout exposes the same device nodes as boot_a_x/boot_b_x with
+        separate wrapper partitions. Both must validate, the Amonet set must be tried
+        first so a unit already on that layout keeps its existing path, and a unit
+        matching neither must still fail closed rather than accept either set loosely.
+        """
+        source = (TOOLS_DIR / "ota/libreecho_bootctl.c").read_text()
+        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
+        inspector = (TOOLS_DIR / "inspect_boot_control_root.sh").read_text()
+
+        # Both contract sets exist, and the legacy set is selected first.
+        self.assertIn("partitions_amonet[]", source)
+        self.assertIn("partitions_pinned[]", source)
+        self.assertLess(
+            source.index('boot_layout = "amonet"'),
+            source.index('boot_layout = "pinned"'),
+        )
+
+        # The pinned set pins the same nodes and sizes and has no wrappers.
+        pinned = source[
+            source.index("partitions_pinned[]") : source.index("#define CONTRACT_COUNT")
+        ]
+        for expected in ("mmcblk0p8", "mmcblk0p9", "mmcblk0p10", "mmcblk0p11", "mmcblk0p16"):
+            self.assertIn(expected, pinned)
+        self.assertIn('"boot_a", 32768', pinned)
+        self.assertIn('"boot_b", 32768', pinned)
+        self.assertNotIn("mmcblk0p17", pinned)
+        self.assertNotIn("mmcblk0p18", pinned)
+
+        # Probing the unused layout stays quiet; the failing set still reports, and
+        # the selected layout is reported so an operator can see which one matched.
+        self.assertIn("contract_reporting", source)
+        self.assertIn('printf("boot_layout=%s\\n", boot_layout)', source)
+
+        # The updater accepts either store name for the slot's device node and keeps
+        # the sector pin that rejects a 225280-sector Amonet wrapper partition.
+        for slot in ("a", "b"):
+            self.assertIn(f"target_partname=boot_{slot}_x", updater)
+            self.assertIn(f"target_partname_pinned=boot_{slot}", updater)
+        self.assertIn('= "$BOOT_SECTORS"', updater)
+
+        # The inspector reports the layout the unit has instead of demanding one.
+        self.assertIn("require_partition_any", inspector)
+
     def test_host_ota_path_is_explicit_and_uses_guarded_updater(self) -> None:
         host = pipeline_file("ota.sh").read_text()
         preflight = pipeline_file("ota-preflight-root.sh").read_text()

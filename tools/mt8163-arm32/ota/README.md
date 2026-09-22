@@ -2,7 +2,13 @@
 
 ## Platform mapping
 
-The Biscuit Amonet layout has two layers of boot storage:
+Two boot layouts are supported. A unit matches exactly one of them, and a slot's
+boot store is the same device node at the same reviewed size in both, so nothing
+outside partition identity differs between them.
+
+### Legacy Amonet layout
+
+Two layers of boot storage:
 
 | BCB slot | Amonet entry/wrapper | Redirected OS image |
 | --- | --- | --- |
@@ -15,6 +21,18 @@ fastboot `flash boot_a`/`flash boot_b` commands to `_x`. Linux does not pass
 through that fastboot hook, so the on-device updater must write `_x` directly.
 The large `boot_a` and `boot_b` partitions contain the Amonet header and tail
 payload and are read-only invariants for OTA.
+
+### Pinned upstream chain layout
+
+No redirect and no wrapper partitions: `boot_a` (`/dev/mmcblk0p10`, 32768
+sectors) and `boot_b` (`/dev/mmcblk0p11`, 32768 sectors) are the stores LK reads,
+and `/dev/mmcblk0p17` and `/dev/mmcblk0p18` do not exist. The updater writes the
+inactive store directly, exactly as it writes `_x` on the Amonet layout.
+
+`libreecho-bootctl` validates the Amonet contract set first and unchanged, then
+the pinned set, and reports which one matched as `boot_layout=`. Probing the
+layout a unit does not use stays quiet, and a unit matching neither fails closed
+with the Amonet contract diagnostics.
 
 The Amazon BCB is 7 bytes at offset `0x360` in `misc`
 (`/dev/mmcblk0p8`, 1025 sectors):
@@ -36,7 +54,8 @@ preloader falls back to the successful priority-14 slot.
 
 An ordinary OTA transaction may write only:
 
-1. the inactive redirected image store, `boot_a_x` or `boot_b_x`;
+1. the inactive image store — `boot_a_x` or `boot_b_x` on the Amonet layout, or
+   `boot_a`/`boot_b` on the pinned layout;
 2. the single 512-byte `misc` sector containing the BCB; and
 3. `/data/libreecho/update`, which holds downloaded packages and transaction
    state on the existing `userdata` filesystem.
