@@ -67,6 +67,7 @@ OVERLAY_FILES = {
     "libreecho-vendor-import": 0o755,
     "vendor-assets/mt8163-v181-stock-v1.tsv": 0o644,
     "vendor-assets/mt8163-v181-stock-v2.tsv": 0o644,
+    "vendor-assets/mt8163-v181-stock-v3.tsv": 0o644,
     "libreecho-update": 0o755,
     "libreecho-update-fetch": 0o755,
     "libreecho-feature-transaction": 0o755,
@@ -85,6 +86,9 @@ OVERLAY_TARGETS = {
     ),
     "vendor-assets/mt8163-v181-stock-v2.tsv": (
         "etc/libreecho/vendor-assets/mt8163-v181-stock-v2.tsv"
+    ),
+    "vendor-assets/mt8163-v181-stock-v3.tsv": (
+        "etc/libreecho/vendor-assets/mt8163-v181-stock-v3.tsv"
     ),
     "libreecho-update": "usr/local/sbin/libreecho-update",
     "libreecho-update-fetch": "usr/local/sbin/libreecho-update-fetch",

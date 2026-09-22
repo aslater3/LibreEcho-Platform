@@ -1761,6 +1761,41 @@ class VendorAssetContractTests(unittest.TestCase):
         self.assertEqual(builder.CONNECTIVITY_IMPORTER_SHA256, actual)
         self.assertEqual(verifier.CONNECTIVITY_IMPORTER_SHA256, actual)
 
+    def test_every_shipped_vendor_spec_is_wired_into_every_owner(self) -> None:
+        """A spec present in the repository but absent from an owner's inventory
+        never reaches a device: the builder stages only what its map lists, and
+        the verifier rejects a member it does not expect. v3 shipped that way,
+        and a device carrying that stock revision kept failing the import with
+        UNKNOWN_COMPATIBLE_SET even though the fix was merged.
+
+        The builder's staging map is function-local, so its source is checked
+        textually; the verifier's two maps are module-level and checked directly.
+        """
+        shipped = sorted(
+            path.name
+            for path in (TOOLS_DIR / "initramfs/vendor-assets").glob(
+                "mt8163-v181-stock-v*.tsv"
+            )
+        )
+        self.assertTrue(shipped, "no shipped vendor specifications found")
+        builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        for name in shipped:
+            member = f"vendor-assets/{name}"
+            self.assertIn(
+                member, builder_source, f"{member} is not staged by the image builder"
+            )
+            self.assertIn(
+                member, verifier.OVERLAY_FILES, f"{member} missing from OVERLAY_FILES"
+            )
+            self.assertIn(
+                member, verifier.OVERLAY_TARGETS, f"{member} missing from OVERLAY_TARGETS"
+            )
+            self.assertEqual(
+                verifier.OVERLAY_TARGETS[member],
+                f"etc/libreecho/vendor-assets/{name}",
+                f"{member} overlay target disagrees with its member path",
+            )
+
     def test_vendor_firmware_policy_documents_no_redistribution(self) -> None:
         policy = TOOLS_DIR / "initramfs/vendor-assets/README.md"
         text = policy.read_text()

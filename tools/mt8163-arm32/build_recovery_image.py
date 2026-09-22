@@ -424,6 +424,9 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         "vendor-assets/mt8163-v181-stock-v2.tsv": (
             "etc/libreecho/vendor-assets/mt8163-v181-stock-v2.tsv", 0o644,
         ),
+        "vendor-assets/mt8163-v181-stock-v3.tsv": (
+            "etc/libreecho/vendor-assets/mt8163-v181-stock-v3.tsv", 0o644,
+        ),
         "libreecho-update": ("usr/local/sbin/libreecho-update", 0o755),
         "libreecho-update-fetch": ("usr/local/sbin/libreecho-update-fetch", 0o755),
         "libreecho-feature-transaction": (
