@@ -156,6 +156,23 @@ remove_children() {
         remove_path "$child"
     done
 }
+# A staged, SIGNED update is not residue.  It is prepared work that the
+# boot-bound feature transaction consumes later in this same boot
+# (commit_policy=after-slot-confirm).  Clearing it here destroys a prepared
+# transaction before the thing that would commit it ever runs -- which is
+# precisely what a recovery-staged single-pass install leaves behind, and why
+# such an install cannot otherwise work in one pass.  A recovery install has
+# no journal marker yet, so this is checked alongside the marker rules below:
+# preserve only a signed set, and clear unsigned leftovers at the steady-state
+# boundary.
+staged_manifest=$DATA_ROOT/libreecho/update/staging/manifest
+staged_signature=$DATA_ROOT/libreecho/update/staging/manifest.sig
+PRESERVE_SIGNED_STAGED=0
+if [ -f "$staged_manifest" ] && [ -f "$staged_signature" ] &&
+        [ ! -L "$staged_manifest" ] && [ ! -L "$staged_signature" ]; then
+    PRESERVE_SIGNED_STAGED=1
+fi
+
 # A reboot-bound v2 transaction owns its referenced staging until either the
 # old slot is selected or the confirmed slot has completed its journal.  Older
 # images must recognize the marker and not delete candidate artifacts blindly.
@@ -174,11 +191,19 @@ for marker in "$DATA_ROOT/libreecho/update/pending" "$DATA_ROOT/libreecho/update
         *) PRESERVE_AMBIGUOUS_TRANSACTION=1 ;;
     esac
 done
-if [ "$PRESERVE_V2_TRANSACTION" -eq 0 ] && [ "$PRESERVE_AMBIGUOUS_TRANSACTION" -eq 0 ]; then
+if [ "$PRESERVE_V2_TRANSACTION" -eq 0 ] &&
+        [ "$PRESERVE_AMBIGUOUS_TRANSACTION" -eq 0 ] &&
+        [ "$PRESERVE_SIGNED_STAGED" -eq 0 ]; then
     remove_children "$DATA_ROOT/libreecho/update/incoming"
     remove_children "$DATA_ROOT/libreecho/update/staging"
 else
-    printf '%s\n' DATA_CLEANUP_V2_TRANSACTION_PRESERVED
+    if [ "$PRESERVE_SIGNED_STAGED" -eq 1 ]; then
+        printf 'DATA_CLEANUP_STAGED_SIGNED_PRESERVED=%s\n' \
+            "${staged_manifest#"$DATA_ROOT"/}" >&2
+    fi
+    if [ "$PRESERVE_V2_TRANSACTION" -eq 1 ] || [ "$PRESERVE_AMBIGUOUS_TRANSACTION" -eq 1 ]; then
+        printf '%s\n' DATA_CLEANUP_V2_TRANSACTION_PRESERVED
+    fi
 fi
 
 unknown=0

@@ -1,0 +1,6 @@
+# LibreEcho initial-install
+#
+# The install logic lives in META-INF/com/google/android/update-binary and
+# lib/install.sh, which this zip also carries. This file exists because the
+# recovery zip format requires it; TWRP never parses it for installer zips that
+# ship their own update-binary.

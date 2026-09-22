@@ -7,6 +7,13 @@ set -eu
 
 DATA_ROOT=${DATA_ROOT:-/data}
 TEST_MODE=${LIBREECHO_VENDOR_TEST_MODE:-0}
+# The default spec stays on v1 so existing units see no behaviour change: v1
+# and v2 are the revisions that have always shipped as the default, and flipping
+# the default to v3 would regress any unit whose stock ROM patches hash to those.
+# v3 is shipped alongside and is selectable through SPEC_OVERRIDE /
+# ENROLLED_SPEC for units carrying the newer revision - verified on a biscuit
+# Dot whose stock hashes to v3. The revision tracks the owner's stock build, not
+# the product, so either can appear on either unit.
 BUNDLE_ID=mt8163-v181-stock-v1
 SPEC_DIR=${LIBREECHO_VENDOR_SPEC_DIR:-/etc/libreecho/vendor-assets}
 SPEC_OVERRIDE=${LIBREECHO_VENDOR_SPEC:-}
