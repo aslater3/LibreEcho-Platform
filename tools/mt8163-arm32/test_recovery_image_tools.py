@@ -9,11 +9,14 @@ import json
 import os
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -83,6 +86,47 @@ def newc_member(name: bytes, mode: int = stat.S_IFREG | 0o644,
 
 def newc_archive(*members: bytes, tail: bytes = b"") -> bytes:
     return b"".join(members) + newc_member(b"TRAILER!!!", 0) + tail
+
+
+def shell_for_blocks(source: str, header: str) -> list[str]:
+    """Return each ``for ... in \\ ... do ... done`` block introduced by ``header``."""
+    return [
+        source[match.start():source.index("done\n", match.end())]
+        for match in re.finditer(re.escape(header), source)
+    ]
+
+
+def shell_for_items(block: str) -> list[str]:
+    """Return the item list of a shell ``for <x> in \\ ... do`` block."""
+    head = block[:block.index("do\n")]
+    return head[head.index("\\\n"):].replace("\\\n", " ").split()
+
+
+def python_string_list(source: str, header: str) -> list[str]:
+    """Return the quoted names of the Python tuple introduced by ``header``."""
+    start = source.index(header) + len(header)
+    return re.findall(r'"([^"]+)"', source[start:source.index("):", start)])
+
+
+def production_service_graphs(init_source: str) -> list[list[str]]:
+    """Return every service list the PID 1 script can select, in file order.
+
+    A graph is a base ``services="..."`` assignment plus each following
+    ``services="$services ..."`` append.  The commented deferred-contract
+    snapshots are documentation and are ignored.
+    """
+    graphs: list[list[str]] = []
+    for line in init_source.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        appended = re.match(r'^\s*services="\$services ([^"]*)"\s*$', line)
+        if appended:
+            graphs[-1].extend(appended.group(1).split())
+            continue
+        base = re.match(r'^\s*services="([^"]*)"\s*$', line)
+        if base:
+            graphs.append(base.group(1).split())
+    return graphs
 
 
 class NewcTests(unittest.TestCase):
@@ -967,6 +1011,14 @@ class SourceTests(unittest.TestCase):
         init_hash = hashlib.sha256(
             (TOOLS_DIR / "initramfs/libreecho-init").read_bytes()
         ).hexdigest()
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        self.assertIn("/run/libreecho-control/runme", init)
+        self.assertIn('b"/run/libreecho-control/runme"', builder)
+        self.assertNotIn('b"/tmp/runme"', builder)
+        self.assertIn('b"/run/libreecho-control/runme"', verifier)
+        self.assertNotIn('b"/tmp/runme"', verifier)
         pins = {
             "build_recovery_image.py": "RECOVERY_INIT_SHA256",
             "verify_recovery_image.py": "INIT_SHA256",
@@ -1612,27 +1664,58 @@ class SourceTests(unittest.TestCase):
         self.assertIn("wireless-tools-COPYING", image_builder)
         self.assertIn("wireless-tools-COPYING", verifier)
 
-    def test_ssh_password_hash_is_salted_and_private(self) -> None:
+    def test_ssh_uses_deferred_webui_auth_and_packages_scp_server(self) -> None:
         dropbear_builder = TOOLS_DIR / "ssh/build_dropbear.sh"
-        self.assertIn("-DUSE_DEV_PTMX", dropbear_builder.read_text())
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            valid = root / "hash"
-            valid.write_text("$6$LibreEchoTest$0123456789012345678901234567890123456789012\n")
-            valid.chmod(0o600)
-            self.assertEqual(
-                builder.read_ssh_password_hash(valid),
-                "$6$LibreEchoTest$0123456789012345678901234567890123456789012",
-            )
-            for value in ("password\n", "!locked\n", "\n", "$6$missing-checksum\n"):
-                invalid = root / ("invalid-" + str(len(value)))
-                invalid.write_text(value)
-                invalid.chmod(0o600)
-                with self.subTest(value=value), self.assertRaises(SystemExit):
-                    builder.read_ssh_password_hash(invalid)
-            valid.chmod(0o622)
-            with self.assertRaises(SystemExit):
-                builder.read_ssh_password_hash(valid)
+        image_builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        image_verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        supervisor = (TOOLS_DIR / "ssh/libreecho-ssh.init").read_text()
+        recovery_init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        auth_source = (TOOLS_DIR / "ssh/libreecho-auth.c").read_text()
+        localoptions = (TOOLS_DIR / "ssh/localoptions.h").read_text()
+        patch_source = (TOOLS_DIR / "ssh/patches/0002-webui-users-password-auth.patch").read_text()
+        self.assertIn('PROGRAMS="dropbear dropbearkey scp"', dropbear_builder.read_text())
+        self.assertIn("dbutil.o", patch_source)
+        self.assertIn("scp_sha256", dropbear_builder.read_text())
+        self.assertIn('"usr/bin/scp"', image_builder)
+        self.assertIn('"usr/bin/scp"', image_verifier)
+        self.assertIn("--expected-scp-sha256", image_verifier)
+        self.assertNotIn("--ssh-root-password-hash", image_builder)
+        self.assertNotIn("/etc/shadow", image_builder)
+        self.assertNotIn('"root_login": True', image_builder)
+        self.assertIn('"authentication": "webui-users-sha256"', image_builder)
+        self.assertIn('"privilege_policy": "non-root-ephemeral-users"', image_builder)
+        self.assertIn("/data/libreecho/config/users", supervisor)
+        self.assertIn("waiting-for-valid-webui-users", supervisor)
+        self.assertIn("stop_dropbear", supervisor)
+        self.assertIn("-t ed25519", supervisor)
+        self.assertIn('name == "root"', supervisor)
+        self.assertIn('name == "."', supervisor)
+        self.assertIn('name == ".."', supervisor)
+        self.assertIn('STATE_ROOT=/run/libreecho-ssh', supervisor)
+        self.assertIn('chmod 0700 "$STATE_ROOT"', supervisor)
+        self.assertIn('uid_map="$STATE_ROOT/uids"', supervisor)
+        self.assertIn('known[tolower($1)] = $2', supervisor)
+        self.assertIn('printf "%s:%d\\n", tolower($1), known[tolower($1)] >> map', supervisor)
+        self.assertIn('>/run/libreecho-ssh/keygen.log 2>&1', supervisor)
+        self.assertIn('>/run/libreecho-ssh/dropbear.log 2>&1', supervisor)
+        self.assertIn('/run/libreecho-control/runme', recovery_init)
+        self.assertNotIn('/tmp/runme.active', recovery_init)
+        self.assertNotIn('/tmp/result', recovery_init)
+        self.assertIn('chmod 0700 /run/libreecho-control', recovery_init)
+        self.assertIn('strcmp(folded, "root") == 0', auth_source)
+        self.assertIn('strcmp(folded, ".") == 0', auth_source)
+        self.assertIn('memset(&users[users_count]', auth_source)
+        self.assertIn("digest[i] =", auth_source)
+        self.assertIn("web_users_file_ready()", recovery_init)
+        self.assertIn("web_listen=0.0.0.0:8080", recovery_init)
+        self.assertNotIn("[ ! -x /etc/init.d/libreecho-ssh.init ] ||", recovery_init)
+        sync_accounts = supervisor.split("sync_accounts()", 1)[1].split("dropbear_running()", 1)[0]
+        self.assertIn('chmod 0711 "$HOME_ROOT"', sync_accounts)
+        self.assertIn('cmp -s "$account_tmp" "$account_list"', sync_accounts)
+        self.assertIn("old_username", sync_accounts)
+        self.assertNotIn('$BB rm -rf "$HOME_ROOT"', sync_accounts)
+        self.assertIn("scp", image_verifier)
+        self.assertIn("DROPBEAR_SVR_PUBKEY_AUTH 0", localoptions)
 
 
 class VendorAssetContractTests(unittest.TestCase):
@@ -1684,6 +1767,67 @@ class VendorAssetContractTests(unittest.TestCase):
         self.assertIn("not distributed", text)
         self.assertIn("does not grant redistribution rights", text)
         self.assertIn("read-only system_a", text)
+
+    def test_data_contract_file_allowlist_rejects_directories(self) -> None:
+        cleanup = TOOLS_DIR / "initramfs/libreecho-data-cleanup"
+        file_only = (
+            "https-cert.pem", "https-key.pem", "users.sessions",
+            "radio-stations.json",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            data_root = Path(temporary) / "data"
+            config = data_root / "libreecho/config"
+            config.mkdir(parents=True)
+            environment = {
+                **os.environ,
+                "LIBREECHO_DATA_TEST_MODE": "1",
+                "DATA_ROOT": str(data_root),
+            }
+            for name in file_only:
+                path = config / name
+                path.mkdir()
+                result = subprocess.run(
+                    ["/bin/sh", str(cleanup)], env=environment,
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                self.assertEqual(result.returncode, 2, name)
+                path.rmdir()
+                path.write_text("file")
+                result = subprocess.run(
+                    ["/bin/sh", str(cleanup)], env=environment,
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                self.assertEqual(result.returncode, 0, name)
+
+    def test_ui_startup_services_are_built_packaged_and_verified(self) -> None:
+        bundle = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        for binary, script, service in (
+            ("libreecho-buttond", "libreecho-buttond.init", "buttond"),
+            ("libreecho-radiod", "libreecho-radiod.init", "radiod"),
+        ):
+            for source in (bundle, builder, verifier_source):
+                self.assertIn(binary, source)
+                self.assertIn(script, source)
+            self.assertIn(f" {service} ", init)
+
+    def test_missing_local_voice_stack_cannot_confirm_ota(self) -> None:
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        health = init[init.index("    voice_stack_absent()"):init.index(
+            "    ota_health_services_ready()"
+        )]
+        self.assertIn("custom|home-assistant)", health)
+        self.assertIn(
+            'log "ota-health-voice-stack-absent-remote:$vp_mode"', health
+        )
+        self.assertIn("local|'')", health)
+        self.assertIn(
+            'log "ota-health-voice-stack-missing-local:${vp_mode:-unknown}"',
+            health,
+        )
+        self.assertIn("ota-health-voice-stack-mode-invalid", health)
 
     def test_verifier_requires_wlan_firmware_compatibility_path(self) -> None:
         expected = {"etc/firmware": "../lib/firmware"}
@@ -1789,12 +1933,57 @@ class PolicyTests(unittest.TestCase):
         self.assertNotIn("--startup-audio", init_script)
         self.assertIn("log audio-startup-disabled", init_script)
 
+    def test_ui_bundle_ships_buttond_and_action_sounds(self) -> None:
+        bundle = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        image_builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        image_verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        self.assertIn("libreecho-buttond", bundle)
+        self.assertIn("libreecho-buttond.init", bundle)
+        self.assertIn('"share/libreecho/sounds/"', image_builder)
+        self.assertIn("libreecho-buttond", image_builder)
+        self.assertIn("libreecho-buttond", image_verifier)
+        for sound in ("action-1.raw", "action-2.raw", "action-3.raw"):
+            self.assertIn(sound, bundle)
+            self.assertIn(f"usr/local/share/libreecho/sounds/{sound}", image_verifier)
+
+    def test_ui_verifier_rejects_missing_button_members(self) -> None:
+        required = (
+            "usr/local/sbin/libreecho-buttond",
+            "etc/init.d/libreecho-buttond.init",
+            "usr/local/share/libreecho/sounds/action-1.raw",
+            "usr/local/share/libreecho/sounds/action-2.raw",
+            "usr/local/share/libreecho/sounds/action-3.raw",
+        )
+        for missing in required:
+            with self.subTest(missing=missing):
+                names = (verifier.UI_FIXED_NAMES | {"usr/local/share/libreecho/web/index.html"}) - {missing}
+                entries = {name: verifier.Entry(name, stat.S_IFREG | 0o644, 0, 0, 0, b"fixture") for name in names}
+                ui = {
+                    "enabled": True, "activation": "automatic-after-loopback",
+                    "autostart": True, "hardware_ownership": "existing-control-plane",
+                    "commit": "a" * 40, "diff_sha256": "b" * 64,
+                    "manifest_sha256": "c" * 64, "files": {name: {} for name in names},
+                }
+                with self.assertRaisesRegex(SystemExit, "UI file set changed"):
+                    verifier.validate_ui(entries, {"ui": ui}, "c" * 64, "a" * 40, "b" * 64)
+
     def test_ui_bundle_startup_contract_is_fail_closed(self) -> None:
         valid_led = "\n".join((
             "DAEMON=/usr/local/sbin/libreecho-ledd",
             "PIDFILE=/var/run/libreecho-ledd.pid",
             "STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}",
             "ARGS=${ARGS:---foreground --socket $SOCKET --startup-animation --startup-ready $STARTUP_READY}",
+            "start_service() {",
+            '    start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- $ARGS',
+            "}",
+            "case \"${1:-}\" in",
+            "    start) start_service ;;",
+            "esac",
+        )) + "\n"
+        valid_buttond = "\n".join((
+            "DAEMON=${DAEMON:-/usr/local/sbin/libreecho-buttond}",
+            "PIDFILE=${PIDFILE:-/var/run/libreecho-buttond.pid}",
+            "ARGS=${ARGS:---foreground}",
             "start_service() {",
             '    start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- $ARGS',
             "}",
@@ -1816,10 +2005,21 @@ class PolicyTests(unittest.TestCase):
             "        *) return 1 ;;",
             "    esac",
             "}",
+            "airplay_integration_state() {",
+            "    printf 'disabled\\n'",
+            "}",
             "startup_services_ready() {",
-            "    for socket in network audio mic led airplay; do",
+            "    for socket in network audio mic led; do",
             '        [ -S "/run/libreecho/$socket.sock" ] || return 1',
             "    done",
+            "    case \"$(airplay_integration_state)\" in",
+            "        disabled) ;;",
+            "        enabled)",
+            "            pidfile=/var/run/libreecho-airplayd.pid",
+            '            [ -S /run/libreecho/airplay.sock ] || return 1',
+            "            ;;",
+            "        *) return 1 ;;",
+            "    esac",
             "    case \"$(bluetooth_integration_state)\" in",
             "        disabled) ;;",
             "        enabled)",
@@ -1852,6 +2052,12 @@ class PolicyTests(unittest.TestCase):
         valid_agentd = "\n".join((
             "AGENT_DEPENDENCY_TIMEOUT_SECONDS=${AGENT_DEPENDENCY_TIMEOUT_SECONDS:-90}",
             "AGENT_DEPENDENCY_POLL_SECONDS=${AGENT_DEPENDENCY_POLL_SECONDS:-1}",
+            "PAYLOAD=/data/libreecho/features/assistant/payload.squashfs",
+            "RUNTIME_ROOT=/run/libreecho/features/assistant/root",
+            "mount_runtime() {",
+            "    mount -t squashfs -o loop,ro,none \"$PAYLOAD\" \"$RUNTIME_ROOT\"",
+            "}",
+            "unmount_runtime() { :; }",
             "dependency_sockets_ready() {",
             "    [ -S \"$WAKE_SOCKET\" ] &&",
             "        [ -S \"$STT_SOCKET\" ] &&",
@@ -1878,6 +2084,7 @@ class PolicyTests(unittest.TestCase):
             "    done",
             "}",
             "start_service() {",
+            "    mount_runtime || return 1",
             "    wait_for_dependency_sockets || {",
             "        unmount_runtime",
             "        return 1",
@@ -1891,12 +2098,42 @@ class PolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             bundle = Path(temporary)
             led = bundle / "etc/init.d/libreecho-ledd.init"
+            buttond = bundle / "etc/init.d/libreecho-buttond.init"
             web = bundle / "etc/init.d/libreecho-web.init"
             agentd = bundle / "etc/init.d/libreecho-agentd.init"
             led.parent.mkdir(parents=True)
             led.write_text(valid_led)
+            buttond.write_text(valid_buttond)
             web.write_text(valid_web)
             agentd.write_text(valid_agentd)
+            feature_script = "\n".join((
+                "PAYLOAD=/data/libreecho/features/feature/payload.squashfs",
+                "RUNTIME_ROOT=/run/libreecho/features/feature/root",
+                "mount_runtime() {",
+                "    mount -t squashfs -o loop,ro,none \"$PAYLOAD\" \"$RUNTIME_ROOT\"",
+                "}",
+                "unmount_runtime() { :; }",
+                "start_service() {",
+                "    mount_runtime || return 1",
+                "}",
+                "case \"${1:-}\" in",
+                "    start) start_service ;;",
+                "esac",
+            )) + "\n"
+            for name in (
+                "libreecho-airplayd.init",
+                "libreecho-sttd.init",
+                "libreecho-ttsd.init",
+                "libreecho-waked.init",
+            ):
+                path = bundle / "etc/init.d" / name
+                path.write_text(feature_script)
+            (bundle / "etc/init.d/libreecho-airplayd.init").write_text(
+                feature_script
+                + "airplay_enabled_at_boot=1\\n"
+                + "integrations=$((integrations & 16))\\n"
+                + "# persistent AirPlay disable is read from the user config\\n"
+            )
 
             builder.validate_ui_startup_contract(bundle)
 
@@ -1970,18 +2207,580 @@ class PolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "startup-animation"):
                 builder.validate_ui_startup_contract(bundle)
 
-    def test_streaming_voice_services_start_warm_in_dependency_order(self) -> None:
+    def test_production_boot_defers_payload_backed_services(self) -> None:
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
-        service_line = (
-            'services="logd networkd timed audiod micd waked sttd ledd buttond btd '
-            'airplayd ttsd agentd web"'
+        self.assertIn(
+            'services="logd networkd timed audiod micd ledd buttond btd web"',
+            init_script,
         )
+        self.assertIn(
+            'services="logd networkd timed audiod micd ledd buttond btd wyomingd web"',
+            init_script,
+        )
+        self.assertIn("feature-services-deferred-until-staged", init_script)
+        for service in ("airplayd", "sttd", "ttsd", "agentd"):
+            self.assertNotIn(f"services=\"logd networkd timed audiod micd waked {service}", init_script)
+
+    def test_post_staging_reconcile_is_shared_boot_and_final_setup_contract(self) -> None:
+        helper = TOOLS_DIR / "initramfs/libreecho-reconcile-features"
+        init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+
+        self.assertTrue(helper.is_file())
+        self.assertTrue(helper.stat().st_mode & stat.S_IXUSR)
+        source = helper.read_text()
+        self.assertIn("FEATURE_RECONCILE_ETC_ROOT:-/etc", source)
+        self.assertIn("$ETC_ROOT/libreecho/service-profile", source)
+        self.assertIn("$ETC_ROOT/libreecho/feature-policy", source)
+        self.assertIn('"integrations"', source)
+        self.assertIn("integrations & 1", source)
+        self.assertIn("integrations & 16", source)
+        self.assertIn("airplay_explicitly_disabled", source)
+        self.assertIn("feature-reconcile-airplay-disabled", source)
+        self.assertIn("$DATA_ROOT/libreecho/features/$feature/payload.squashfs", source)
+        self.assertIn("/staging", source)
+        self.assertIn('"$script" start', source)
+        self.assertIn("feature-services-reconcile-failed", source)
+        self.assertIn('return "$failed"', source)
+
+        order = (
+            'persisted_features="wakeword airplay2"',
+            'persisted_features=airplay2',
+            'persisted_features="wakeword stt airplay2 tts assistant"',
+            'persisted_features="stt airplay2 tts assistant"',
+        )
+        positions = [source.index(marker) for marker in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn(
+            "/usr/local/sbin/libreecho-reconcile-features",
+            init_script,
+        )
+        self.assertIn("libreecho-reconcile-features", builder_source)
+        self.assertIn("libreecho-reconcile-features", verifier_source)
+        self.assertIn(
+            'if init_script != read(stage / "libreecho-init"):',
+            builder_source,
+        )
+        self.assertNotIn(
+            'if init_script != read(stage / "init"):',
+            builder_source,
+        )
+
+    def test_post_staging_reconcile_executes_topology_and_failures(self) -> None:
+        helper = TOOLS_DIR / "initramfs/libreecho-reconcile-features"
+        busybox = shutil.which("busybox")
+        if busybox is None:
+            self.skipTest("busybox is required for the reconciliation fixture")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            etc = root / "etc"
+            data = root / "data"
+            run = root / "run"
+            var_run = root / "var-run"
+            init = root / "init.d"
+            states = root / "states"
+            actions = root / "actions"
+            sockets: list[socket.socket] = []
+            for path in (etc / "libreecho", data / "libreecho/config", run / "libreecho", var_run, init, states):
+                path.mkdir(parents=True, exist_ok=True)
+            (etc / "libreecho/service-profile").write_text("production\n")
+            (etc / "libreecho/feature-policy").write_text("community-noncommercial\n")
+            (data / "libreecho/config/web-config.json").write_text('{"integrations":20}\n')
+
+            services = {
+                "waked": ("wakeword", "wakeword.sock"),
+                "sttd": ("stt", "stt.sock"),
+                "airplayd": ("airplay2", "airplay.sock"),
+                "ttsd": ("tts", "tts.sock"),
+                "agentd": ("assistant", "agent.sock"),
+                "wyomingd": (None, None),
+            }
+            proc_lines = []
+            socket_paths = {}
+            for service, (feature, socket_name) in services.items():
+                if feature is not None:
+                    feature_dir = data / "libreecho/features" / feature
+                    feature_dir.mkdir(parents=True)
+                    (feature_dir / "payload.squashfs").write_bytes(b"verified-fixture")
+                socket_path = run / "libreecho" / socket_name if socket_name else None
+                socket_paths[service] = socket_path
+                if socket_path is not None:
+                    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    listener.bind(str(socket_path))
+                    listener.listen(1)
+                    sockets.append(listener)
+                    proc_lines.append(f"00000000: 00000002 00000000 00010000 0001 01 1 {socket_path}\n")
+                pidfile = var_run / f"libreecho-{service}.pid"
+                pidfile.write_text(f"{os.getpid()}\n")
+                stop_targets = f"'{pidfile}'"
+                if socket_path is not None:
+                    stop_targets += f" '{socket_path}'"
+                script = init / f"libreecho-{service}.init"
+                script.write_text(
+                    "#!/bin/sh\nset -eu\n"
+                    '[ -z "${ARGS+x}" ] || exit 9\n'
+                    f"state='{states / service}'\nactions='{actions}'\n"
+                    'case "${1:-}" in\n'
+                    '  start) printf "%s:start\\n" "${0##*/}" >>"$actions"; : >"$state"; '
+                    f"printf '%s\\n' '{os.getpid()}' >'{pidfile}' ;;\n"
+                    '  stop) printf "%s:stop\\n" "${0##*/}" >>"$actions"; rm -f "$state" '
+                    f"{stop_targets} ;;\n"
+                    '  status) test -f "$state" ;;\n'
+                    '  *) exit 2 ;;\nesac\n'
+                )
+                script.chmod(0o755)
+            proc_unix = root / "proc-net-unix"
+            proc_unix.write_text("".join(proc_lines))
+            env = {
+                **os.environ,
+                "BB": busybox,
+                "FEATURE_RECONCILE_ETC_ROOT": str(etc),
+                "FEATURE_RECONCILE_DATA_ROOT": str(data),
+                "FEATURE_RECONCILE_RUN_ROOT": str(run),
+                "FEATURE_RECONCILE_VAR_RUN_ROOT": str(var_run),
+                "FEATURE_RECONCILE_INIT_ROOT": str(init),
+                "FEATURE_RECONCILE_PROC_NET_UNIX": str(proc_unix),
+                "FEATURE_RECONCILE_LOG_FILE": str(root / "reconcile.log"),
+                "FEATURE_RECONCILE_KMSG": "/dev/null",
+                "FEATURE_RECONCILE_CONSOLE": "/dev/null",
+                "FEATURE_RECONCILE_READY_TIMEOUT_SECONDS": "1",
+                "ARGS": "--foreground --document-root /usr/local/share/libreecho/web",
+            }
+
+            subprocess.run(["sh", str(helper)], env=env, check=True)
+            self.assertEqual(
+                actions.read_text().splitlines(),
+                [
+                    "libreecho-wyomingd.init:stop",
+                    "libreecho-waked.init:start", "libreecho-sttd.init:start",
+                    "libreecho-airplayd.init:start", "libreecho-ttsd.init:start",
+                    "libreecho-agentd.init:start",
+                ],
+            )
+
+            actions.write_text("")
+            (data / "libreecho/config/web-config.json").write_text('{"integrations":4}\n')
+            subprocess.run(["sh", str(helper)], env=env, check=True)
+            disabled_actions = actions.read_text().splitlines()
+            self.assertIn("libreecho-airplayd.init:stop", disabled_actions)
+            self.assertNotIn("libreecho-airplayd.init:start", disabled_actions)
+
+            (data / "libreecho/features/assistant/payload.squashfs").unlink()
+            failed = subprocess.run(["sh", str(helper)], env=env, check=False)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn(
+                "feature-reconcile-payload-missing:assistant",
+                (root / "reconcile.log").read_text(),
+            )
+
+            (data / "libreecho/features/assistant/payload.squashfs").write_bytes(
+                b"verified-fixture"
+            )
+            airplay_socket = socket_paths["airplayd"]
+            self.assertIsNotNone(airplay_socket)
+            if not airplay_socket.exists():
+                airplay_listener = socket.socket(
+                    socket.AF_UNIX, socket.SOCK_STREAM
+                )
+                airplay_listener.bind(str(airplay_socket))
+                airplay_listener.listen(1)
+                sockets.append(airplay_listener)
+            (var_run / "libreecho-airplayd.pid").write_text(f"{os.getpid()}\n")
+            actions.write_text("")
+            (data / "libreecho/config/web-config.json").write_text(
+                '{"integrations":5}\n'
+            )
+            subprocess.run(["sh", str(helper)], env=env, check=True)
+            home_assistant_only_actions = actions.read_text().splitlines()
+            self.assertNotIn(
+                "libreecho-airplayd.init:start", home_assistant_only_actions
+            )
+            self.assertIn(
+                "libreecho-airplayd.init:stop", home_assistant_only_actions
+            )
+
+            actions.write_text("")
+            (data / "libreecho/config/web-config.json").write_text(
+                '{"integrations":21}\n'
+            )
+            (var_run / "libreecho-airplayd.pid").write_text(f"{os.getpid()}\n")
+            if not airplay_socket.exists():
+                airplay_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                airplay_listener.bind(str(airplay_socket))
+                airplay_listener.listen(1)
+                sockets.append(airplay_listener)
+            subprocess.run(["sh", str(helper)], env=env, check=True)
+            self.assertEqual(
+                actions.read_text().splitlines(),
+                [
+                    "libreecho-agentd.init:stop",
+                    "libreecho-sttd.init:stop",
+                    "libreecho-ttsd.init:stop",
+                    "libreecho-wyomingd.init:start",
+                    "libreecho-waked.init:start",
+                    "libreecho-airplayd.init:start",
+                ],
+            )
+            (etc / "libreecho/feature-policy").write_text("redistributable\n")
+            unsupported_ha = subprocess.run(["sh", str(helper)], env=env)
+            self.assertNotEqual(unsupported_ha.returncode, 0)
+            self.assertIn(
+                "feature-reconcile-home-assistant-requires-wakeword",
+                (root / "reconcile.log").read_text(),
+            )
+
+            invalid_env = env.copy()
+            invalid_env["FEATURE_RECONCILE_READY_TIMEOUT_SECONDS"] = "0"
+            invalid = subprocess.run(["sh", str(helper)], env=invalid_env)
+            self.assertNotEqual(invalid.returncode, 0)
+
+            ownerless_lock = run / "libreecho/reconcile-features.lock"
+            ownerless_lock.mkdir(parents=True, exist_ok=True)
+            lock_env = env.copy()
+            lock_env["FEATURE_RECONCILE_LOCK_TIMEOUT_SECONDS"] = "1"
+            started = time.monotonic()
+            blocked = subprocess.run(["sh", str(helper)], env=lock_env)
+            self.assertNotEqual(blocked.returncode, 0)
+            self.assertLess(time.monotonic() - started, 3)
+            self.assertTrue(ownerless_lock.is_dir())
+
+            for listener in sockets:
+                listener.close()
+
+    def test_health_and_reconcile_bounds_follow_persisted_topology(self) -> None:
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        helper = (TOOLS_DIR / "initramfs/libreecho-reconcile-features").read_text()
+        self.assertIn("health_airplay_enabled=0", init)
+        self.assertIn(
+            "[ $((health_integrations & 16)) -ne 0 ] && health_airplay_enabled=1",
+            init,
+        )
+        self.assertIn(
+            "[ $((health_integrations & 16)) -ne 0 ] && health_airplay_enabled=1",
+            init,
+        )
+        # Home Assistant discovery is independently supervised; it must not
+        # make the AirPlay payload/consumer a health prerequisite.
+        self.assertIn(
+            "[ $((health_integrations & 1)) -ne 0 ] && health_discovery_enabled=1",
+            init,
+        )
+        self.assertNotIn(
+            "[ $((health_integrations & 1)) -ne 0 ] && health_airplay_enabled=1",
+            init,
+        )
+        self.assertNotIn("wyomingd /run/libreecho/wyoming.sock", init)
+        self.assertIn("$BB awk -v port=29CC", init)
+        self.assertIn("LOCK_TIMEOUT_MAX_SECONDS=300", helper)
+        self.assertIn("READY_TIMEOUT_MAX_SECONDS=120", helper)
+        self.assertIn("feature-reconcile-invalid-timeout", helper)
+        self.assertIn("feature-reconcile-lock-ownership-lost", helper)
+        self.assertIn("feature-reconcile-lock-owner-missing\n                    return 1", helper)
+        self.assertIn("release_lock || rc=1", helper)
+
+        busybox = shutil.which("busybox")
+        if busybox:
+            with tempfile.TemporaryDirectory() as td:
+                lock = Path(td) / "reconcile.lock"
+                lock.mkdir()
+                (lock / "pid").write_text("999999\n")
+                start = helper.index("release_lock()\n")
+                end = helper.index("\n}\n", start) + 3
+                function = helper[start:end]
+                ownership_lost = subprocess.run(
+                    [
+                        "sh",
+                        "-c",
+                        f"""BB={busybox}
+LOCK={lock}
+LOCK_OWNER_PID=$$
+log() {{ :; }}
+{function}
+release_lock
+""",
+                    ]
+                )
+                self.assertNotEqual(ownership_lost.returncode, 0)
+                self.assertTrue(lock.is_dir())
+
+    def test_ota_health_requires_selected_wyoming_listener(self) -> None:
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertIn("home_assistant_integration_enabled()", init)
+
+        def shell_function(name: str) -> str:
+            start = init.index(f"{name}()\n")
+            end = init.index("\n    }\n", start) + 7
+            return init[start:end]
+
+        with tempfile.TemporaryDirectory() as td:
+            config = Path(td) / "web-config.json"
+            pidfile = Path(td) / "wyomingd.pid"
+            proc_tcp = Path(td) / "tcp"
+            config.write_text('{"integrations":1}\n')
+            pidfile.write_text(f"{os.getpid()}\n")
+            proc_tcp.write_text("")
+            functions = "\n".join(
+                shell_function(name)
+                for name in (
+                    "home_assistant_integration_enabled",
+                    "shared_discovery_ready",
+                    "ota_health_services_ready",
+                )
+            )
+            mdns_init = Path(td) / "mdnsd.init"
+            mdns_init.write_text("#!/bin/sh\n[ \"${1:-}\" = status ]\n")
+            mdns_init.chmod(0o755)
+            mdns_socket = Path(td) / "system_bus_socket"
+            mdns_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            mdns_listener.bind(str(mdns_socket))
+            mdns_listener.listen(1)
+            busybox = shutil.which("busybox")
+            functions = functions.replace(
+                "/data/libreecho/config/web-config.json", str(config)
+            ).replace(
+                "/var/run/libreecho-wyomingd.pid", str(pidfile)
+            ).replace("/proc/net/tcp", str(proc_tcp)).replace(
+                "/etc/init.d/libreecho-mdnsd.init", str(mdns_init)
+            ).replace(
+                "$MDNS_RUNTIME_ROOT/run/dbus/system_bus_socket", str(mdns_socket)
+            )
+            if busybox is None:
+                self.skipTest("busybox is required for the OTA health fixture")
+            harness = f"""
+BB={busybox}
+SERVICE_PROFILE=production
+{functions}
+log() {{ :; }}
+startup_ready_marker_valid() {{ return 0; }}
+service_process_ready() {{ return 0; }}
+led_handoff_ready() {{ return 0; }}
+voice_stack_absent() {{ return 0; }}
+ota_health_services_ready
+"""
+            missing = subprocess.run(["sh", "-c", harness])
+            self.assertNotEqual(missing.returncode, 0)
+            proc_tcp.write_text(
+                "  0: 00000000:29CC 00000000:0000 0A 00000000:00000000 "
+                "00:00000000 00000000 0 0 0 1 0000000000000000 100 0 0 10 0\n"
+            )
+            ready = subprocess.run(["sh", "-c", harness])
+            self.assertEqual(ready.returncode, 0)
+
+            airplay_harness = f"""
+BB={busybox}
+SERVICE_PROFILE=production
+{functions}
+log() {{ :; }}
+startup_ready_marker_valid() {{ return 0; }}
+service_process_ready() {{ [ "$1" != airplayd ]; }}
+led_handoff_ready() {{ return 0; }}
+voice_stack_absent() {{ return 0; }}
+ota_health_services_ready
+"""
+            config.write_text('{"integrations":4}\n')
+            disabled = subprocess.run(["sh", "-c", airplay_harness])
+            self.assertEqual(disabled.returncode, 0)
+            config.write_text('{"integrations":20}\n')
+            enabled = subprocess.run(["sh", "-c", airplay_harness])
+            self.assertNotEqual(enabled.returncode, 0)
+            # Home Assistant discovery uses the independent shared responder;
+            # with its listener and mDNS socket ready, HA-only configurations
+            # pass without requiring the AirPlay consumer.
+            config.write_text('{"integrations":1}\n')
+            pidfile.write_text(f"{os.getpid()}\n")
+            proc_tcp.write_text(
+                "  0: 00000000:29CC 00000000:0000 0A 00000000:00000000 "
+                "00:00000000 00000000 0 0 0 1 0000000000000000 100 0 0 10 0\n"
+            )
+            subprocess.run(["sh", "-c", harness])
+            self.assertEqual(subprocess.run(["sh", "-c", harness]).returncode, 0)
+            config.write_text('{"integrations":"invalid"}\n')
+            malformed = subprocess.run(["sh", "-c", airplay_harness])
+            self.assertNotEqual(malformed.returncode, 0)
+
+    def test_updater_identity_uses_compact_selected_topology(self) -> None:
+        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
+        start = updater.index("feature_daemon_required()\n")
+        end = updater.index("\n}\n", start) + 3
+        function = updater[start:end]
+        busybox = shutil.which("busybox")
+        if not busybox:
+            self.skipTest("busybox is required for updater shell behavior")
+        with tempfile.TemporaryDirectory() as td:
+            config = Path(td) / "web-config.json"
+            function = function.replace(
+                "/data/libreecho/config/web-config.json", str(config)
+            )
+            harness = f"""
+BB={busybox}
+CURRENT_SERVICE_PROFILE=production
+{function}
+feature_daemon_required tts
+"""
+            config.write_text('{"integrations":1}\n')
+            home_assistant = subprocess.run(["sh", "-c", harness])
+            self.assertNotEqual(home_assistant.returncode, 0)
+            config.write_text('{"integrations":0}\n')
+            local = subprocess.run(["sh", "-c", harness])
+            self.assertEqual(local.returncode, 0)
+
+    def test_feature_staging_requires_verified_service_liveness(self) -> None:
+        stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()
+        for marker in (
+            "feature_service_ready()",
+            'FEATURE_SOCKET=/run/libreecho/airplay.sock',
+            'FEATURE_SOCKET=/run/libreecho/stt.sock',
+            'FEATURE_SOCKET=/run/libreecho/tts.sock',
+            'FEATURE_SOCKET=/run/libreecho/agent.sock',
+            'FEATURE_SERVICE_READY_TIMEOUT_SECONDS=${FEATURE_SERVICE_READY_TIMEOUT_SECONDS:-30}',
+            '"$FEATURE_SERVICE_SCRIPT" status >/dev/null 2>&1',
+            '[ -S "$FEATURE_SOCKET" ]',
+            '$BB awk -v socket="$FEATURE_SOCKET"',
+            "/proc/net/unix >/dev/null 2>&1 || return 1",
+            "feature_service_ready || {",
+        ):
+            self.assertIn(marker, stager)
+
+    def test_feature_staging_removes_completed_staging_marker(self) -> None:
+        stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()
+        move = stager.index('$BB mv "$DEST/staging/payload.squashfs.new" "$DEST/payload.squashfs"')
+        manifest = stager.index('$BB cp "$MANIFEST_FILE" "$DEST/manifest.json"', move)
+        cleanup = stager.index('rmdir "$DEST/staging"', manifest)
+        first_sync = stager.index('$BB sync', manifest)
+        second_sync = stager.index('$BB sync', cleanup)
+        self.assertLess(move, manifest)
+        self.assertLess(manifest, first_sync)
+        self.assertLess(first_sync, cleanup)
+        self.assertLess(cleanup, second_sync)
+        self.assertIn('|| { echo FEATURE_STAGE_STAGING_CLEANUP_FAILED; exit 1; }', stager[cleanup:cleanup + 100])
+
+    def test_post_staging_reboot_starts_persisted_feature_services(self) -> None:
+        init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertIn("start_persisted_feature_services()", init_script)
+        start = init_script.index("start_persisted_feature_services()")
+        body = init_script[start:init_script.index("\n}\n", start) + 3]
+        self.assertIn(
+            "script=/usr/local/sbin/libreecho-reconcile-features", body
+        )
+        self.assertIn('"$script"', body)
+        self.assertIn('return "$rc"', body)
+        self.assertIn(
+            "    start_persisted_feature_services", init_script[init_script.index("start_ui_services()"):]
+        )
+        service_start = init_script[
+            init_script.index("start_ui_services()"):
+            init_script.index("start_ui_services &")
+        ]
+        self.assertIn('services="$services airplayd radiod ttsd web"', service_start)
+        self.assertNotIn('services="$services airplayd radiod ttsd agentd web"', service_start)
+
+    def test_airplay_controller_staging_follows_discovery_and_audio_toggles(self) -> None:
+        stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()
+        self.assertIn("airplay_explicitly_disabled()", stager)
+        self.assertIn("home_assistant_enabled()", stager)
+        self.assertIn("integrations & 16", stager)
+        self.assertIn("integrations & 1", stager)
+        self.assertIn("FEATURE_STAGE_AIRPLAY_DISABLED", stager)
+        self.assertIn("start_feature_service_if_enabled()", stager)
+
+        busybox = shutil.which("busybox")
+        if busybox is None:
+            self.skipTest("busybox is required for the feature staging fixture")
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "web-config.json"
+            functions = []
+            for name in (
+                "airplay_explicitly_disabled",
+                "home_assistant_enabled",
+                "start_feature_service_if_enabled",
+            ):
+                start = stager.index(f"{name}()\n")
+                end = stager.index("\n}\n", start) + 3
+                functions.append(stager[start:end])
+            source = "\n".join(functions).replace(
+                "/data/libreecho/config/web-config.json", str(config)
+            )
+
+            def stage(integrations: int, feature: str = "airplay2") -> list[str]:
+                config.write_text(f'{{"integrations":{integrations}}}\n')
+                harness = f"""
+BB={busybox}
+FEATURE_ID={feature}
+{source}
+start_feature_service() {{ echo FEATURE_STAGE_SERVICE_STARTED; }}
+start_feature_service_if_enabled
+"""
+                result = subprocess.run(
+                    ["sh", "-c", harness],
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                )
+                return result.stdout.splitlines()
+
+            self.assertEqual(stage(4), ["FEATURE_STAGE_AIRPLAY_DISABLED"])
+            for integrations in (5, 20, 21):
+                self.assertEqual(
+                    stage(integrations), ["FEATURE_STAGE_SERVICE_STARTED"]
+                )
+            self.assertEqual(
+                stage(4, feature="tts"), ["FEATURE_STAGE_SERVICE_STARTED"]
+            )
+
+    def test_home_assistant_discovery_service_is_packaged_with_ui(self) -> None:
+        ui_builder = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        image_builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        image_verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        service = "etc/libreecho/avahi-services/wyoming.service"
+        self.assertIn("config/wyoming.service", ui_builder)
+        self.assertIn(service, ui_builder)
+        self.assertIn(service, image_builder)
+        self.assertIn(service, image_verifier)
+        self.assertIn("<type>_wyoming._tcp</type>", ui_builder)
+        self.assertIn("<port>10700</port>", ui_builder)
+
+    def test_first_install_confirmation_requires_startup_ready_and_led_handoff(self) -> None:
+        init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertIn(
+            'STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}',
+            init_script,
+        )
+        self.assertIn("startup_ready_marker_valid()", init_script)
+        self.assertIn("startup-ready-marker-missing", init_script)
+        self.assertIn("led-handoff-not-ready", init_script)
+        self.assertIn("startup_ready_marker_valid || {", init_script)
+        self.assertLess(
+            init_script.index("startup_ready_marker_valid || {"),
+            init_script.index("libreecho-bootctl confirm \"$selected_slot\""),
+        )
+
+    def test_ui_startup_contract_covers_payload_services_and_airplay_default(self) -> None:
+        builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        for script in (
+            "libreecho-airplayd.init",
+            "libreecho-sttd.init",
+            "libreecho-ttsd.init",
+            "libreecho-agentd.init",
+        ):
+            self.assertIn(f'"etc/init.d/{script}"', builder_source)
+        self.assertIn("mount_runtime || return 1", builder_source)
+        self.assertIn("airplay_enabled_at_boot=1", builder_source)
+        self.assertIn("integrations & 16", builder_source)
+        self.assertIn("persistent AirPlay disable", builder_source)
+
+    def test_streaming_voice_services_defer_until_feature_staging(self) -> None:
+        init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        service_line = 'services="logd networkd timed audiod micd ledd buttond btd web"'
         self.assertIn(service_line, init_script)
         self.assertLess(service_line.index("audiod"), service_line.index("buttond"))
         self.assertLess(service_line.index("ledd"), service_line.index("buttond"))
-        self.assertLess(service_line.index("waked"), service_line.index("sttd"))
-        self.assertLess(service_line.index("sttd"), service_line.index("agentd"))
-        self.assertLess(service_line.index("ttsd"), service_line.index("agentd"))
+        self.assertIn("feature-services-deferred-until-staged", init_script)
+        for service in ("airplayd", "sttd", "ttsd", "agentd"):
+            self.assertNotIn(
+                f'services="logd networkd timed audiod micd {service}',
+                init_script,
+            )
 
     def test_hostname_is_derived_from_audited_idme_serial(self) -> None:
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
@@ -2176,7 +2975,8 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("reboot-supervisor-started", source)
         self.assertIn("/tmp/reboot.request", source)
         self.assertIn("runme-timeout", source)
-        self.assertIn("/tmp/runme.cancel", source)
+        self.assertIn("/run/libreecho-control/runme.cancel", source)
+        self.assertNotIn("/tmp/runme.cancel", source)
         self.assertIn("wmt_stock_compat", source)
         self.assertIn("--no-function-on", source)
         self.assertIn("--ok --once", source)
@@ -2227,6 +3027,246 @@ class PolicyTests(unittest.TestCase):
         self.assertIn(
             'services="logd networkd timed audiod', init_source
         )
+
+    def test_timer_daemon_is_packaged_in_every_layer(self) -> None:
+        """Issue #162: the timer daemon must survive every packaging layer.
+
+        LibreEcho-UI builds libreecho-timerd and installs
+        etc/init.d/libreecho-timerd.init, but Platform dropped both: the bundle
+        builder neither verified nor staged them, and the image stage copies an
+        explicit whitelist that never named them either.  The published image
+        therefore had neither file.  The independent verifier requires the
+        exact UI file set, so every layer has to be checked, not just one.
+        """
+        bundle_source = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
+
+        binary_blocks = shell_for_blocks(bundle_source, "for binary in \\\n")
+        verify_block = next(
+            block for block in binary_blocks if "statically linked" in block
+        )
+        install_block = next(
+            block for block in binary_blocks if "install -m 0755" in block
+        )
+        script_blocks = shell_for_blocks(bundle_source, "for script in \\\n")
+        self.assertEqual(len(script_blocks), 1)
+
+        # The static ARM32 loop rejects a dynamic or non-ARM binary, so a
+        # daemon that is installed but never verified would ship unvalidated.
+        self.assertIn("libreecho-timerd", shell_for_items(verify_block))
+        self.assertIn("libreecho-timerd", shell_for_items(install_block))
+        self.assertIn("libreecho-timerd.init", shell_for_items(script_blocks[0]))
+
+        builder_binaries = python_string_list(builder_source, "    for binary in (\n")
+        builder_scripts = python_string_list(builder_source, "    for script in (\n")
+        self.assertIn("libreecho-timerd", builder_binaries)
+        self.assertIn("libreecho-timerd.init", builder_scripts)
+
+        self.assertIn("usr/local/sbin/libreecho-timerd", verifier.UI_BINARY_NAMES)
+        self.assertIn("etc/init.d/libreecho-timerd.init", verifier.UI_INIT_NAMES)
+
+        # Deriving the expectation from the verifier catches a layer that is
+        # edited without the others: the image manifest has to contain exactly
+        # the files the bundle stages and the builder copies.
+        verified_binaries = {Path(name).name for name in verifier.UI_BINARY_NAMES}
+        verified_scripts = {Path(name).name for name in verifier.UI_INIT_NAMES}
+        self.assertEqual(set(shell_for_items(install_block)), verified_binaries)
+        self.assertEqual(set(builder_binaries), verified_binaries)
+        self.assertEqual(set(shell_for_items(script_blocks[0])), verified_scripts)
+        self.assertEqual(set(builder_scripts), verified_scripts)
+
+    def test_timer_daemon_is_in_every_production_service_graph(self) -> None:
+        """Issue #162: packaging the daemon is useless unless it is started."""
+        init_source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        graphs = production_service_graphs(init_source)
+        self.assertEqual(len(graphs), 5, graphs)
+
+        # The diagnostic/payload-excluded graph stays deliberately scoped: a
+        # diagnostic slot carries no timer state and must not start timerd.
+        self.assertEqual(graphs[0], ["logd", "timed", "web"])
+        self.assertIn(
+            '[ "$SERVICE_PROFILE" = diagnostic ] || [ "$FEATURE_POLICY" = exclude ]',
+            init_source,
+        )
+
+        for graph in graphs[1:]:
+            self.assertIn("timerd", graph)
+            # The Web UI/API plane reads /run/libreecho/timer.sock, so the
+            # daemon has to be running before the web daemon starts.
+            self.assertLess(graph.index("timerd"), graph.index("web"))
+            # timerd rings through audiod, so it starts after the audio daemon.
+            self.assertLess(graph.index("audiod"), graph.index("timerd"))
+
+    def test_timer_socket_becomes_ready_through_the_boot_service_graph(self) -> None:
+        """Issue #162: the shipped graph must reach the timer readiness socket.
+
+        ``start_ui_services`` and ``apply_timezone`` are extracted verbatim from
+        the image's PID 1 script and executed with only their filesystem roots
+        redirected into a temporary sandbox, so the graph selection, the
+        init-script dispatch and the artifact-presence decision under test are
+        the shipped ones.  The daemons are stubs: this proves the Platform
+        startup contract (the graph reaches libreecho-timerd and the readiness
+        socket the Web/API plane connects to appears before web), not the timer
+        logic inside the LibreEcho-UI daemon.
+        """
+        init_source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        extracted = {}
+        for name in ("apply_timezone", "start_ui_services"):
+            match = re.search(rf"(?ms)^{name}\(\)\n.*?^}}\n", init_source)
+            if match is None:
+                self.fail(f"{name}() is not extractable from libreecho-init")
+            extracted[name] = match.group(0)
+
+        roots = (
+            "/usr/local/sbin", "/etc/init.d", "/var/run", "/var/log",
+            "/run/libreecho", "/data/libreecho", "/tmp/",
+        )
+        function_text = "".join(extracted.values())
+        for root in roots:
+            self.assertIn(root, function_text, root)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            sandbox = Path(temporary)
+            # One pass: a replacement must never be rescanned, or the sandbox
+            # prefix itself would be rewritten a second time.
+            redirected = re.sub(
+                "|".join(re.escape(root) for root in roots),
+                lambda found: f"{sandbox}{found.group(0)}",
+                function_text,
+            )
+            for root in roots:
+                self.assertIn(f"{sandbox}{root}", redirected, root)
+            self.assertNotIn('"/etc/init.d', redirected)
+
+            busybox_shim = sandbox / "bb"
+            busybox_shim.write_text('#!/bin/sh\nexec "$@"\n')
+            busybox_shim.chmod(0o755)
+            web_binary = sandbox / "usr/local/sbin/libreecho-web"
+            web_binary.parent.mkdir(parents=True)
+            web_binary.write_text("#!/bin/sh\nexit 0\n")
+            web_binary.chmod(0o755)
+
+            run_dir = sandbox / "run/libreecho"
+            run_dir.mkdir(parents=True)
+            # start_ui_services writes its per-service log there.
+            (sandbox / "tmp").mkdir()
+            started_dir = sandbox / "started"
+            started_dir.mkdir()
+            timer_socket = run_dir / "timer.sock"
+            services = {
+                service
+                for graph in production_service_graphs(init_source)
+                for service in graph
+            }
+            for service in sorted(services):
+                stub = sandbox / "etc/init.d" / f"libreecho-{service}.init"
+                stub.parent.mkdir(parents=True, exist_ok=True)
+                lines = [
+                    "#!/bin/sh",
+                    f"# Stub for libreecho-{service}: the real init script in the",
+                    "# LibreEcho-UI bundle starts the daemon it packages.",
+                    f'marker="{started_dir}/{service}"',
+                    f'timer_socket="{timer_socket}"',
+                    'case "${1:-}" in',
+                    "    start)",
+                    '        : >"$marker"',
+                ]
+                if service == "timerd":
+                    # The timer daemon publishes the readiness socket the
+                    # Web/API plane connects to; the stub publishes the same
+                    # path so the startup contract can be observed.
+                    lines.append(
+                        f"        {sys.executable} -c \"import socket, sys; "
+                        "s = socket.socket(socket.AF_UNIX); "
+                        's.bind(sys.argv[1]); s.close()" "$timer_socket"'
+                    )
+                lines += ["        ;;", "esac", "exit 0", ""]
+                stub.write_text("\n".join(lines))
+                stub.chmod(0o755)
+
+            harness = sandbox / "harness.sh"
+            harness.write_text(
+                "#!/bin/sh\n"
+                "set -u\n"
+                f'BB="{busybox_shim}"\n'
+                "SERVICE_PROFILE=$1\n"
+                "FEATURE_POLICY=$2\n"
+                "DATA_CLEANUP_OK=1\n"
+                f'INIT_TEST_LOG="{sandbox}/log"\n'
+                ': >"$INIT_TEST_LOG"\n'
+                "log() { printf '%s\\n' \"$*\" >>\"$INIT_TEST_LOG\"; }\n"
+                "pmsg_marker() { :; }\n"
+                "# Hooks PID 1 defines elsewhere; start_ui_services only has to\n"
+                "# observe their success here.\n"
+                "activate_feature_transaction() { return 0; }\n"
+                "start_shared_discovery_runtime() { :; }\n"
+                "start_persisted_feature_services() { :; }\n"
+                + redirected
+                + "\nstart_ui_services\nexit $?\n"
+            )
+            harness.chmod(0o755)
+
+            config = sandbox / "data/libreecho/config/web-config.json"
+            config.parent.mkdir(parents=True)
+            cases = (
+                ("production", "preserve", None, True),
+                ("production", "preserve", 1, True),
+                ("production", "redistributable", None, True),
+                ("diagnostic", "preserve", None, False),
+                ("production", "exclude", None, False),
+            )
+            for profile, policy, integrations, expect_timerd in cases:
+                label = f"{profile}/{policy}/integrations={integrations}"
+                if integrations is None:
+                    config.unlink(missing_ok=True)
+                else:
+                    config.write_text(f'{{"integrations": {integrations}}}\n')
+                shutil.rmtree(started_dir)
+                started_dir.mkdir()
+                timer_socket.unlink(missing_ok=True)
+
+                result = subprocess.run(
+                    ["/bin/sh", str(harness), profile, policy],
+                    env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                self.assertEqual(result.returncode, 0, f"{label}: {result.stderr}")
+                started = sorted(entry.name for entry in started_dir.iterdir())
+                log_lines = (sandbox / "log").read_text().splitlines()
+                if expect_timerd:
+                    self.assertIn("timerd", started, label)
+                    self.assertTrue(timer_socket.exists(), label)
+                    self.assertTrue(
+                        stat.S_ISSOCK(timer_socket.lstat().st_mode), label
+                    )
+                    self.assertIn("ui-service-start:timerd:0", log_lines, label)
+                    self.assertLess(
+                        log_lines.index("ui-service-start:timerd:0"),
+                        log_lines.index("ui-service-start:web:0"),
+                        label,
+                    )
+                    # Every service the graph starts must be one the image
+                    # verifier requires, otherwise the graph names an
+                    # unpackaged daemon.
+                    for service in started:
+                        self.assertIn(
+                            f"etc/init.d/libreecho-{service}.init",
+                            verifier.UI_INIT_NAMES,
+                            label,
+                        )
+                    self.assertNotIn("ui-service-missing", "\n".join(log_lines), label)
+                else:
+                    self.assertNotIn("timerd", started, label)
+                    self.assertFalse(timer_socket.exists(), label)
+                    self.assertEqual(started, ["logd", "timed", "web"], label)
+                    expected_log = (
+                        "feature-services-excluded"
+                        if policy == "exclude"
+                        else "ui-connectivity-services-disabled-for-diagnostic-profile"
+                    )
+                    self.assertIn(expected_log, log_lines, label)
 
     def test_remote_wyoming_clients_use_pinned_musl_runtime(self) -> None:
         bundle_source = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
@@ -2396,7 +3436,13 @@ class PolicyTests(unittest.TestCase):
             ("assistant", "libreecho-agentd"),
         ):
             self.assertIn(f"{feature}) daemon={daemon}", updater)
-        self.assertIn("feature_root=/data/libreecho/features/$feature", updater)
+        # The shipped updater keeps the production data root immutable and
+        # derives the feature path only from that local constant.  The host
+        # fixture rewrites this literal in its generated copy; production does
+        # not accept a caller-selected feature root.
+        self.assertIn("DATA_ROOT=/data", updater)
+        self.assertIn("FEATURE_ROOT=$DATA_ROOT/libreecho/features", updater)
+        self.assertIn("feature_root=$FEATURE_ROOT/$feature", updater)
         self.assertIn("payload=$feature_root/payload.squashfs", updater)
         self.assertIn("manifest=$feature_root/manifest.json", updater)
         for field in (
@@ -2682,7 +3728,7 @@ class PolicyTests(unittest.TestCase):
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
         self.assertIn("version=$(download_and_inspect) || return 1", fetcher)
         self.assertIn(
-            'if [ -n "$rolled_back" ] && [ "$version" = "$rolled_back" ] && [ "$channel" = "$rolled_back_channel" ]; then',
+            'if [ -n "$rolled_back" ] && [ "$version" = "$rolled_back" ] && [ "$channel" = "$rolled_back_channel" ] && candidate_matches_record "$ROOT/rolled-back"; then',
             fetcher,
         )
         self.assertIn("check_status_write error", fetcher)
@@ -2763,7 +3809,11 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("cleanup_locks\n    trap - EXIT", fetcher)
         self.assertIn("record_channel()", fetcher)
         self.assertIn("record_channel \"$ROOT/installed\"", fetcher)
-        self.assertIn("install_lock\n    seed_channel\n    validate_source\n    install_unlock", fetcher)
+        self.assertIn(
+            "install_lock\n    seed_channel\n    validate_source\n"
+            "    prepare_https_client\n    resolve_dev_release || return 1\n    install_unlock",
+            fetcher,
+        )
         automatic = fetcher[fetcher.index("set_automatic_updates()"):fetcher.index("die()")]
         self.assertIn("fetch_lock\n    install_lock", automatic)
 
@@ -2786,6 +3836,53 @@ class PolicyTests(unittest.TestCase):
             'check_children "$DATA_ROOT/libreecho/update" \\\n    channel incoming',
             cleanup,
         )
+
+    def test_fetch_quarantine_survives_current_and_prior_cleanup(self) -> None:
+        """Run the real writer, then boot cleanup on its persistent output."""
+        fetch = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
+        function = 'quarantine_file()\n' + fetch.split('quarantine_file()\n', 1)[1].split('\ninspect_control_part()', 1)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            data = Path(temporary) / 'data'
+            root = data / 'libreecho/update'
+            root.mkdir(parents=True)
+            package = root / 'github-update.ota.tar'
+            package.write_bytes(b'previous verified candidate')
+            script = 'BB=busybox\ndie() { exit 1; }\n' + function + '\nquarantine_file "$ROOT/github-update.ota.tar"\n'
+            result = subprocess.run(['/bin/sh', '-c', script], env={**os.environ, 'ROOT': str(root)}, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            retained = list(root.glob('quarantine-*.bad'))
+            self.assertEqual(len(retained), 1)
+            self.assertEqual(retained[0].read_bytes(), b'previous verified candidate')
+            self.assertFalse((root / 'quarantine').exists())
+            for _ in range(2):  # candidate boot and fallback share userdata
+                result = self._run_cleanup(data)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(retained[0].read_bytes(), b'previous verified candidate')
+
+            # Repeated identical evidence is deduplicated, never overwritten.
+            package.write_bytes(b'previous verified candidate')
+            result = subprocess.run(['/bin/sh', '-c', script], env={**os.environ, 'ROOT': str(root)}, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(package.exists())
+            self.assertEqual(len(list(root.glob('quarantine-*.bad'))), 1)
+            # Reject a substituted target while preserving both source and link.
+            retained[0].unlink()
+            outside = Path(temporary) / 'outside'
+            outside.write_bytes(b'untouched')
+            retained[0].symlink_to(outside)
+            package.write_bytes(b'previous verified candidate')
+            result = subprocess.run(['/bin/sh', '-c', script], env={**os.environ, 'ROOT': str(root)}, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(outside.read_bytes(), b'untouched')
+            self.assertTrue(package.exists())
+            retained[0].unlink()
+            # Capacity exhaustion is explicit and does not evict history.
+            for i in range(8):
+                (root / ('quarantine-' + str(i) * 64 + '.bad')).write_bytes(b'history')
+            result = subprocess.run(['/bin/sh', '-c', script], env={**os.environ, 'ROOT': str(root)}, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(package.exists())
+            self.assertEqual(len(list(root.glob('quarantine-*.bad'))), 8)
 
     def test_userdata_cleanup_preserves_persisted_ota_channel(self) -> None:
         cleanup = TOOLS_DIR / "initramfs/libreecho-data-cleanup"
@@ -2956,6 +4053,1219 @@ class MkimgHeaderTests(unittest.TestCase):
         hdr[8:14] = b"ROOTFS"
         with self.assertRaises(SystemExit):
             verifier.validate_mkimg_header(bytes(hdr))
+
+
+
+
+class UserdataRegressionIntegrationTests(unittest.TestCase):
+    def test_userdata_regression_suite(self):
+        import subprocess
+        import sys
+        from pathlib import Path
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parent / 'test_userdata_geometry.py'),
+             '--require-compiler', "-v"],
+            text=True, capture_output=True, timeout=900,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class UiTlsPackagingTests(unittest.TestCase):
+    """Issue #250: the production UI bundle must ship real ARM32 TLS."""
+
+    verifier = TOOLS_DIR / "ui/verify_ui_tls.sh"
+
+    def test_ui_bundle_links_pinned_arm32_mbedtls(self) -> None:
+        bundle = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        self.assertIn("LIBREECHO_UI_MBEDTLS_ROOT", bundle)
+        # No default prefix: a bundle without the pinned dependency is not a
+        # production artifact, so the builder must fail closed instead.
+        self.assertIn("MBEDTLS_ROOT=${LIBREECHO_UI_MBEDTLS_ROOT:-}", bundle)
+        self.assertNotIn("LIBREECHO_UI_MBEDTLS_ROOT:-/", bundle)
+        self.assertIn('-I$MBEDTLS_ROOT/include', bundle)
+        self.assertIn('-L$MBEDTLS_ROOT/lib', bundle)
+        self.assertIn('WEB_TLS_LIBS="$TLS_LIBS"', bundle)
+        self.assertIn('RADIOD_TLS_LIBS="$TLS_LIBS"', bundle)
+        # The linkage names the archives inside the prefix the verifier just
+        # checked, by absolute path: a search path or a caller-supplied archive
+        # list could otherwise resolve a different API-compatible mbedTLS.
+        self.assertIn(
+            'TLS_LIBS="$MBEDTLS_ROOT/lib/libmbedtls.a'
+            ' $MBEDTLS_ROOT/lib/libmbedx509.a'
+            ' $MBEDTLS_ROOT/lib/libmbedcrypto.a"',
+            bundle,
+        )
+        self.assertNotIn("LIBREECHO_UI_TLS_LIBS", bundle)
+        self.assertNotIn("-lmbedtls", bundle)
+
+    def test_ui_bundle_verifies_compiled_and_packaged_tls(self) -> None:
+        bundle = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        self.assertIn("verify_ui_tls.sh", bundle)
+        self.assertIn('"$VERIFY_TLS" --prefix "$MBEDTLS_ROOT"', bundle)
+        self.assertIn('--binary "$UI_SOURCE/build/$binary"', bundle)
+        self.assertIn('--binary "$OUTPUT/sbin/$binary"', bundle)
+        self.assertIn("TLS_BINARIES=(libreecho-web libreecho-radiod)", bundle)
+
+    def test_mbedtls_dependency_is_pinned_and_provenanced(self) -> None:
+        lock = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())
+        self.assertEqual(lock["name"], "mbedtls")
+        self.assertEqual(lock["version"], "3.6.4")
+        self.assertEqual(lock["license"], "Apache-2.0")
+        self.assertRegex(lock["source_sha256"], r"^[0-9a-f]{64}$")
+        self.assertTrue(
+            lock["source_url"].endswith(f"mbedtls-{lock['version']}.tar.bz2")
+        )
+        self.assertIn("arm-linux-gnueabihf", lock["target"])
+        requirements = lock["build_requirements"]
+        for package in ("jinja2", "jsonschema"):
+            self.assertRegex(requirements[package], r"^\d+\.\d+\.\d+$")
+        # The pinned jsonschema release declares Requires-Python >=3.9 (jinja2
+        # 3.1.6 allows 3.7), so a lower advertised floor would name a build host
+        # that cannot install the pin the builder then requires.
+        floor = requirements["python3"]
+        self.assertRegex(floor, r"^>=\d+\.\d+$")
+        self.assertGreaterEqual(
+            tuple(int(part) for part in floor[2:].split(".")), (3, 9)
+        )
+
+        builder = (TOOLS_DIR / "mbedtls/build_mbedtls.sh").read_text()
+        self.assertIn("SOURCE.lock", builder)
+        self.assertIn("source_sha256", builder)
+        self.assertIn("libmbedcrypto.a", builder)
+        self.assertIn("libmbedx509.a", builder)
+        self.assertIn("libmbedtls.a", builder)
+        self.assertIn("static", builder)
+        self.assertIn("ELF 32-bit", builder)
+        self.assertIn("build_requirements", builder)
+        self.assertIn("mbedtls-source.json", builder)
+        # Source acquisition stays outside the repository: the builder consumes
+        # a pinned archive and never downloads one.
+        self.assertNotIn("curl", builder)
+        self.assertNotIn("wget", builder)
+
+    def test_ui_tls_verifier_rejects_untrusted_and_stub_artifacts(self) -> None:
+        verifier = self.verifier
+        self.assertTrue(verifier.is_file(), verifier)
+        source = verifier.read_text()
+        for required in (
+            "tls.o",
+            "tls_stub.o",
+            "libreecho-tls",
+            "MBEDTLS_SYMBOL_PREFIX=mbedtls_",
+            "statically linked",
+            "mbedtls/ssl.h",
+            "libmbedtls.a",
+            "SOURCE.lock",
+            "mbedtls-source.json",
+        ):
+            self.assertIn(required, source)
+
+    def run_tls_verifier(
+        self,
+        tmp: Path,
+        binary: Path,
+        *,
+        description: str,
+        objects: Path | None = None,
+    ) -> subprocess.CompletedProcess:
+        shims = tmp / "shims"
+        shims.mkdir(exist_ok=True)
+        (shims / "file").write_text('#!/bin/sh\nprintf "%s\\n" "$LE_TEST_FILE_DESCRIPTION"\n')
+        (shims / "readelf").write_text("#!/bin/sh\nexit 0\n")
+        for shim in ("file", "readelf"):
+            (shims / shim).chmod(0o755)
+        environment = os.environ.copy()
+        environment["PATH"] = f"{shims}:{environment['PATH']}"
+        environment["LE_TEST_FILE_DESCRIPTION"] = description
+        argv = ["bash", str(self.verifier), "--binary", str(binary)]
+        if objects is not None:
+            argv += ["--objects", str(objects)]
+        return subprocess.run(
+            argv, env=environment, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+    def test_ui_tls_verifier_accepts_real_tls_and_rejects_the_stub(self) -> None:
+        static_arm32 = (
+            "ELF 32-bit LSB executable, ARM, EABI5 version 1 (GNU/Linux), "
+            "statically linked, for GNU/Linux 3.2.0"
+        )
+        real_payload = (
+            "libreecho-tls CN=%s,O=LibreEcho 20200101000000 "
+            "-----BEGIN CERTIFICATE-----"
+        )
+        stub_payload = "LibreEcho listening on http://0.0.0.0:8080 HTTPS disabled"
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            objects = tmp / "objects"
+            objects.mkdir()
+            (objects / "tls.o").write_bytes(b"\x7fELF")
+            real = tmp / "libreecho-web"
+            real.write_text(real_payload)
+
+            accepted = self.run_tls_verifier(
+                tmp, real, description=static_arm32, objects=objects
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertIn("ui_tls=real", accepted.stdout)
+
+            stub = tmp / "libreecho-web-stub"
+            stub.write_text(stub_payload)
+            rejected = self.run_tls_verifier(
+                tmp, stub, description=static_arm32, objects=objects
+            )
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("real TLS implementation", rejected.stderr)
+
+            dynamic = tmp / "libreecho-web-dynamic"
+            dynamic.write_text(real_payload)
+            rejected = self.run_tls_verifier(
+                tmp, dynamic,
+                description=(
+                    "ELF 32-bit LSB executable, ARM, EABI5 version 1 "
+                    "(GNU/Linux), dynamically linked, interpreter "
+                    "/lib/ld-linux-armhf.so.3"
+                ),
+            )
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("not static ARM32", rejected.stderr)
+
+            stub_objects = tmp / "stub-objects"
+            stub_objects.mkdir()
+            (stub_objects / "tls.o").write_bytes(b"\x7fELF")
+            (stub_objects / "tls_stub.o").write_bytes(b"\x7fELF")
+            rejected = self.run_tls_verifier(
+                tmp, real, description=static_arm32, objects=stub_objects
+            )
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("tls_stub.c", rejected.stderr)
+
+    def test_ui_tls_verifier_rejects_incomplete_mbedtls_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            prefix = Path(tmp_name) / "mbedtls"
+            (prefix / "include/mbedtls").mkdir(parents=True)
+            (prefix / "lib").mkdir()
+            for header in ("ssl.h", "x509_crt.h", "pk.h", "entropy.h"):
+                (prefix / "include/mbedtls" / header).write_text("/* stub */\n")
+            (prefix / "include/mbedtls/build_info.h").write_text(
+                '#define MBEDTLS_VERSION_STRING         "3.6.4"\n'
+            )
+            for archive in ("libmbedcrypto.a", "libmbedx509.a", "libmbedtls.a"):
+                (prefix / "lib" / archive).write_text("not an archive\n")
+            result = subprocess.run(
+                ["bash", str(self.verifier), "--prefix", str(prefix)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("archive", result.stderr)
+
+            complete = subprocess.run(
+                ["bash", str(self.verifier), "--prefix", str(prefix / "missing")],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(complete.returncode, 1, complete.stdout)
+            self.assertIn("prefix is unavailable", complete.stderr)
+
+    def test_ui_tls_verifier_accepts_the_produced_prefix_and_both_consumers(self) -> None:
+        """Issue #250: the positive path must pass for the prefix and both consumers.
+
+        The failure this issue is about is a *false* HTTPS toggle, so the
+        verifier is only useful if it accepts a correct production bundle:
+        a complete pinned prefix, and both packaged consumers carrying the real
+        src/tls.c implementation plus linked mbedTLS.  The stub build must fail
+        for both names.
+        """
+        static_arm32 = (
+            "ELF 32-bit LSB executable, ARM, EABI5 version 1 (GNU/Linux), "
+            "statically linked, for GNU/Linux 3.2.0"
+        )
+        # Both shapes are stripped-equivalent: the mbedTLS static archives are
+        # only evidenced by retained read-only data, not by symbols.
+        consumers = {
+            "web": "libreecho-tls CN=%s,O=LibreEcho 20200101000000 -----BEGIN CERTIFICATE-----",
+            "radiod": "libreecho-tls -----BEGIN CERTIFICATE-----",
+        }
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            if shutil.which("ar") is None:
+                self.skipTest("ar is required to synthesise an mbedTLS prefix")
+            prefix = tmp / "prefix"
+            self.write_mbedtls_prefix(prefix)
+            accepted = subprocess.run(
+                ["bash", str(self.verifier), "--prefix", str(prefix)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertIn("ui_tls_prefix=ok mbedtls_version=3.6.4", accepted.stdout)
+
+            for name, payload in consumers.items():
+                binary = tmp / f"libreecho-{name}"
+                binary.write_text(payload)
+                result = self.run_tls_verifier(tmp, binary, description=static_arm32)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("ui_tls=real", result.stdout)
+
+                stub = tmp / f"libreecho-{name}-stub"
+                stub.write_text("LibreEcho listening on http://0.0.0.0:8080 HTTPS disabled")
+                rejected = self.run_tls_verifier(tmp, stub, description=static_arm32)
+                self.assertEqual(rejected.returncode, 1, rejected.stdout)
+                self.assertIn("real TLS implementation", rejected.stderr)
+
+    def run_tls_prefix(self, prefix: Path) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", str(self.verifier), "--prefix", str(prefix)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+    def test_ui_tls_verifier_rejects_a_prefix_that_is_not_the_pin(self) -> None:
+        """Issue #250: an API-compatible stale prefix must not be linked.
+
+        A different mbedTLS version, a missing provenance record, or an archive
+        that does not match its recorded digest would ship a dependency other
+        than the one recorded in SOURCE.lock, the license inventory, and the
+        release metadata.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            if shutil.which("ar") is None:
+                self.skipTest("ar is required to synthesise an mbedTLS prefix")
+
+            stale = tmp / "stale"
+            self.write_mbedtls_prefix(stale, version="3.6.3")
+            rejected = self.run_tls_prefix(stale)
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("does not match the pinned", rejected.stderr)
+
+            unprovenanced = tmp / "unprovenanced"
+            self.write_mbedtls_prefix(unprovenanced, provenance=False)
+            rejected = self.run_tls_prefix(unprovenanced)
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("no provenance record", rejected.stderr)
+
+            tampered = tmp / "tampered"
+            self.write_mbedtls_prefix(tampered, tamper_archive_hash="libmbedtls.a")
+            rejected = self.run_tls_prefix(tampered)
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("does not match its provenance record", rejected.stderr)
+
+    def test_ui_tls_verifier_rejects_a_consumer_that_gc_sections_literals(self) -> None:
+        """Issue #250: --gc-sections drops src/tls.c literals a consumer never reaches.
+
+        libreecho-radiod is a TLS client and never enters the self-signed
+        certificate path, so its release binary keeps only the TLS layer
+        identity string.  That is real TLS and must pass; a binary carrying the
+        identity string but no linked mbedTLS evidence must still fail closed.
+        """
+        static_arm32 = (
+            "ELF 32-bit LSB executable, ARM, EABI5 version 1 (GNU/Linux), "
+            "statically linked, for GNU/Linux 3.2.0"
+        )
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            consumer = tmp / "libreecho-radiod"
+            consumer.write_text("libreecho-tls -----BEGIN CERTIFICATE-----")
+            accepted = self.run_tls_verifier(
+                tmp, consumer, description=static_arm32
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertIn("tls_source_markers=1", accepted.stdout)
+
+            identity_only = tmp / "libreecho-web-identity-only"
+            identity_only.write_text("libreecho-tls")
+            rejected = self.run_tls_verifier(
+                tmp, identity_only, description=static_arm32
+            )
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("no linked mbedTLS evidence", rejected.stderr)
+
+    @staticmethod
+    def write_ar_fixture(path: Path, member: str) -> None:
+        """Write a minimal ar archive so the prefix check sees one member."""
+        payload = b"libreecho-mbedtls-prefix-fixture\n"
+        header = (
+            f"{member + '/':<16}{0:<12}{0:<6}{0:<6}{0o644:<8o}{len(payload):<10}`\n"
+        ).encode()
+        archive = b"!<arch>\n" + header + payload
+        if len(payload) % 2:
+            archive += b"\n"
+        path.write_bytes(archive)
+
+    @staticmethod
+    def include_tree_digest(root: Path) -> str:
+        """Digest the include tree exactly as build_mbedtls.sh records it."""
+        value = hashlib.sha256()
+        for path in sorted(root.rglob("*")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            value.update(path.relative_to(root).as_posix().encode("utf-8") + b"\0")
+            value.update(hashlib.sha256(path.read_bytes()).hexdigest().encode("ascii"))
+        return value.hexdigest()
+
+    def write_mbedtls_prefix(
+        self,
+        prefix: Path,
+        *,
+        archives: bool = True,
+        version: str | None = None,
+        provenance: bool = True,
+        tamper_archive_hash: str | None = None,
+    ) -> None:
+        """Synthesise the mbedTLS prefix shape build_ui_bundle.sh requires.
+
+        The version and source hash come from the repository's own SOURCE.lock,
+        so the fixture is pinned to the same identity the verifier enforces.
+        """
+        lock = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())
+        (prefix / "include/mbedtls").mkdir(parents=True)
+        (prefix / "include/psa").mkdir()
+        (prefix / "lib").mkdir()
+        for header in ("ssl.h", "x509_crt.h", "pk.h", "entropy.h"):
+            (prefix / "include/mbedtls" / header).write_text("/* fixture */\n")
+        (prefix / "include/psa/crypto.h").write_text("/* fixture */\n")
+        (prefix / "include/mbedtls/build_info.h").write_text(
+            '#define MBEDTLS_VERSION_STRING         "%s"\n'
+            % (version or lock["version"])
+        )
+        digests = {}
+        for archive in ("libmbedcrypto.a", "libmbedx509.a", "libmbedtls.a"):
+            target = prefix / "lib" / archive
+            if not archives:
+                target.write_text("not an archive\n")
+                continue
+            self.write_ar_fixture(target, archive[:-2] + ".o")
+            digests[archive] = hashlib.sha256(target.read_bytes()).hexdigest()
+        if not (archives and provenance):
+            return
+        if tamper_archive_hash:
+            digests[tamper_archive_hash] = "0" * 64
+        (prefix / "mbedtls-source.json").write_text(
+            json.dumps(
+                {
+                    "name": lock["name"],
+                    "version": lock["version"],
+                    "license": lock["license"],
+                    "source_url": lock["source_url"],
+                    "source_archive_sha256": lock["source_sha256"],
+                    "target": lock["target"],
+                    "build_requirements": lock["build_requirements"],
+                    "python": "3.11.0",
+                    "compiler": "fixture",
+                    "archives": digests,
+                    "include_sha256": hashlib.sha256(
+                        (prefix / "include/mbedtls/build_info.h").read_bytes()
+                    ).hexdigest(),
+                    "include_tree_sha256": self.include_tree_digest(
+                        prefix / "include"
+                    ),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+
+    def run_ui_bundle(
+        self,
+        tmp: Path,
+        mbedtls_root: str,
+        *,
+        env_extra: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess:
+        """Run the bundle builder with a stand-in musl and cross toolchain.
+
+        Every mbedTLS guard runs before the UI checkout is touched, so a
+        stand-in toolchain exercises them without a cross build or a real UI
+        source tree.
+        """
+        musl = tmp / "stand-in-musl"
+        (musl / "usr/bin").mkdir(parents=True, exist_ok=True)
+        (musl / "usr/lib").mkdir(parents=True, exist_ok=True)
+        (musl / "sysroot/usr/include").mkdir(parents=True, exist_ok=True)
+        (musl / "sysroot/usr/include/errno.h").write_text("\n")
+        stand_in_cc = musl / "usr/bin/armv7-alpine-linux-musleabihf-gcc"
+        stand_in_cc.write_text("#!/bin/sh\nexit 0\n")
+        stand_in_cc.chmod(0o755)
+        toolchain = tmp / "stand-in-toolchain"
+        toolchain.mkdir(exist_ok=True)
+        for tool in ("arm-linux-gnueabihf-gcc", "arm-linux-gnueabihf-strip"):
+            (toolchain / tool).write_text("#!/bin/sh\nexit 0\n")
+            (toolchain / tool).chmod(0o755)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "LIBREECHO_UI_MUSL_NATIVE_ROOT": str(musl),
+                "LIBREECHO_UI_MUSL_SYSROOT": str(musl / "sysroot"),
+                "LIBREECHO_UI_MUSL_CC": str(stand_in_cc),
+                "LIBREECHO_UI_MUSL_NATIVE_LIB": str(musl / "usr/lib"),
+                "LIBREECHO_UI_CROSS_COMPILE": str(toolchain / "arm-linux-gnueabihf-"),
+                "LIBREECHO_UI_MBEDTLS_ROOT": mbedtls_root,
+            }
+        )
+        if env_extra:
+            environment.update(env_extra)
+        return subprocess.run(
+            [
+                "bash",
+                str(TOOLS_DIR / "ui/build_ui_bundle.sh"),
+                str(tmp / "ui-source"),
+                str(tmp / "ui-bundle-out"),
+            ],
+            env=environment, text=True, cwd=tmp,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+    def test_ui_bundle_binds_the_link_to_the_verified_prefix(self) -> None:
+        """Codex review: the linked archives must be the verified ones.
+
+        `LIBREECHO_UI_TLS_LIBS` let a caller - or an inherited environment -
+        replace the archive list after `verify_ui_tls.sh` had checked the
+        prefix, so an API-compatible mbedTLS could be linked while the recorded
+        provenance described the pinned one.  The linkage must come from the
+        verified prefix itself, and the override must not reach the link line.
+        """
+        decoy = "/opt/decoy-mbedtls/lib/libmbedtls.a"
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            if shutil.which("ar") is None:
+                self.skipTest("ar is required to synthesise an mbedTLS prefix")
+            if shutil.which("git") is None:
+                self.skipTest("git is required to stage a stand-in UI checkout")
+            prefix = tmp / "prefix"
+            self.write_mbedtls_prefix(prefix)
+
+            # The builder records the UI source identity before it dispatches
+            # the build, so the stand-in checkout has to be a real repository.
+            source = tmp / "ui-source"
+            source.mkdir()
+            (source / "Makefile").write_text("release:\n\t@true\n")
+            for command in (
+                ("init", "--quiet"),
+                ("config", "user.email", "fixture@example.invalid"),
+                ("config", "user.name", "Fixture"),
+                ("add", "Makefile"),
+                ("commit", "--quiet", "-m", "fixture"),
+            ):
+                subprocess.run(
+                    ["git", *command], cwd=source, check=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+
+            record = tmp / "make-record.txt"
+            shim = tmp / "make-shim"
+            shim.write_text(
+                "#!/bin/sh\n"
+                'printf "%s\\n" "$*" >> "$LE_TEST_MAKE_RECORD"\n'
+                "exit 0\n"
+            )
+            shim.chmod(0o755)
+
+            result = self.run_ui_bundle(
+                tmp,
+                str(prefix),
+                env_extra={
+                    "MAKE": str(shim),
+                    "LE_TEST_MAKE_RECORD": str(record),
+                    "LIBREECHO_UI_TLS_LIBS": decoy,
+                },
+            )
+            # The stand-in UI checkout produces no binaries, so the builder
+            # stops on the compiled-artifact check after the link dispatch.
+            self.assertTrue(record.is_file(), result.stdout + result.stderr)
+            invocations = record.read_text().splitlines()
+            self.assertTrue(invocations, result.stdout + result.stderr)
+            for invocation in invocations:
+                self.assertNotIn(decoy, invocation)
+                self.assertNotIn("-lmbedtls", invocation)
+            release = [line for line in invocations if "release" in line]
+            self.assertTrue(release, invocations)
+            for line in release:
+                for archive in ("libmbedtls.a", "libmbedx509.a", "libmbedcrypto.a"):
+                    self.assertIn(f"{prefix}/lib/{archive}", line)
+
+    def test_ui_bundle_fails_closed_without_a_usable_mbedtls_prefix(self) -> None:
+        """Issue #250: the builder must never produce a stub TLS bundle.
+
+        These are the builder's own guards, executed rather than grepped: the
+        builder used to run `make ... release` with no TLS library at all, so
+        the UI Makefile silently selected src/tls_stub.c and the published
+        image kept advertising an HTTPS toggle that could not listen.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            (tmp / "ui-source").mkdir()
+
+            unset = self.run_ui_bundle(tmp, "")
+            self.assertEqual(unset.returncode, 1, unset.stdout + unset.stderr)
+            self.assertIn("mbedTLS prefix", unset.stderr)
+
+            missing = self.run_ui_bundle(tmp, str(tmp / "absent-prefix"))
+            self.assertEqual(missing.returncode, 1, missing.stdout + missing.stderr)
+            self.assertIn("mbedTLS prefix is unavailable", missing.stderr)
+
+            empty = tmp / "empty-prefix"
+            self.write_mbedtls_prefix(empty, archives=False)
+            empty_result = self.run_ui_bundle(tmp, str(empty))
+            self.assertEqual(
+                empty_result.returncode, 1, empty_result.stdout + empty_result.stderr
+            )
+            self.assertIn("mbedTLS archive is empty", empty_result.stderr)
+
+            if shutil.which("ar") is None:
+                self.skipTest("ar is required to synthesise an mbedTLS prefix")
+            valid = tmp / "valid-prefix"
+            self.write_mbedtls_prefix(valid)
+            prefix_ok = subprocess.run(
+                ["bash", str(self.verifier), "--prefix", str(valid)],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(prefix_ok.returncode, 0, prefix_ok.stderr)
+            self.assertIn("ui_tls_prefix=ok mbedtls_version=3.6.4", prefix_ok.stdout)
+            # A valid prefix must get past every TLS guard: the build then stops
+            # on the stand-in UI checkout, not on a TLS refusal.
+            reached = self.run_ui_bundle(tmp, str(valid))
+            self.assertNotEqual(reached.returncode, 0, reached.stdout + reached.stderr)
+            output = reached.stdout + reached.stderr
+            self.assertNotIn("mbedTLS prefix is unavailable", output)
+            self.assertNotIn("mbedTLS archive is empty", output)
+            self.assertNotIn("mbedTLS prefix (tools/mt8163-arm32/mbedtls)", output)
+
+    def prepare_mbedtls_builder(self, tmp: Path) -> dict[str, Path]:
+        """Synthesise the pinned archive and a stand-in cross toolchain.
+
+        build_mbedtls.sh owns the whole dependency contract, so that contract is
+        exercised by running the real script.  Only the pinned tar.bz2 (which is
+        not carried in this repository) and the external cross toolchain are
+        stand-ins; every guard the script performs itself runs for real.
+        """
+        for tool in ("ar", "tar", "strings"):
+            if shutil.which(tool) is None:
+                self.skipTest(f"{tool} is required to exercise build_mbedtls.sh")
+        lock = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())
+
+        shims = tmp / "shims"
+        shims.mkdir()
+        # The pinned archive hash cannot be reproduced from a fixture, so the
+        # digest check is answered by a stand-in that reports the locked value.
+        (shims / "sha256sum").write_text(
+            '#!/bin/sh\nprintf "%s  %s\\n" "$LE_TEST_PINNED_ARCHIVE_SHA256" "$1"\n'
+        )
+        (shims / "file").write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$LE_TEST_FILE_DESCRIPTION"\n'
+        )
+        (shims / "make").write_text(
+            textwrap.dedent(
+                """\
+                #!/bin/sh
+                # Stand-in for the mbedTLS library Makefile: emit the three
+                # static archives that the builder then validates.
+                set -eu
+                dir=
+                while [ $# -gt 0 ]; do
+                  case $1 in
+                    -C) dir=$2; shift 2 ;;
+                    *) shift ;;
+                  esac
+                done
+                [ -n "$dir" ] || exit 1
+                # A concurrent builder that started with the same absent output
+                # publishes it while this build is still running, so the target
+                # appears after the builder's own existence check has passed.
+                if [ -n "${LE_TEST_RACE_OUTPUT:-}" ] && [ ! -e "$LE_TEST_RACE_OUTPUT" ]; then
+                  mkdir -p "$LE_TEST_RACE_OUTPUT/lib" "$LE_TEST_RACE_OUTPUT/include/mbedtls"
+                  printf '%s\\n' incumbent > "$LE_TEST_RACE_OUTPUT/lib/libmbedtls.a"
+                  printf '%s\\n' incumbent > "$LE_TEST_RACE_OUTPUT/include/mbedtls/build_info.h"
+                  printf '%s\\n' incumbent > "$LE_TEST_RACE_OUTPUT/mbedtls-source.json"
+                fi
+                # The builder's private work directory, exactly as the real
+                # prefix-map flags would record it in the objects.
+                work=$(cd "$dir/../.." && pwd -P)
+                objs=$(mktemp -d)
+                pad() {
+                  i=0
+                  while [ "$i" -lt "$1" ]; do
+                    printf 'mbedtls_padding_%s_%08d_symbol\\n' "$2" "$i"
+                    i=$((i + 1))
+                  done
+                }
+                : > "$objs/leak.o"
+                if [ "${LE_TEST_ARCHIVE_LEAK:-0}" = 1 ]; then
+                  printf -- '-ffile-prefix-map=%s=/usr/src/mbedtls-3.6.4\\n' "$work" \\
+                    >> "$objs/leak.o"
+                  printf '%s\\n' "$work" > "$LE_TEST_FIXTURE_DIR/leaked-build-path.txt"
+                fi
+                pad 2000 leak >> "$objs/leak.o"
+                pad 6000 x509 > "$objs/x509.o"
+                pad 6000 crypto > "$objs/crypto.o"
+                ar rc "$dir/libmbedtls.a" "$objs/leak.o"
+                ar rc "$dir/libmbedx509.a" "$objs/x509.o"
+                ar rc "$dir/libmbedcrypto.a" "$objs/crypto.o"
+                rm -rf "$objs"
+                """
+            )
+        )
+        # The builder validates the compiler ABI from a probe object's ARM
+        # attributes.  The stand-in reports the hard-float set by default and a
+        # soft-float set on request, so both the accept and reject paths are
+        # exercised without a second cross toolchain on the host.
+        (shims / "readelf").write_text(
+            "#!/bin/sh\n"
+            'case "${LE_TEST_READELF_ABI:-hard}" in\n'
+            "  soft)\n"
+            '    printf "%s\\n" "Attribute Section: aeabi" "Tag_CPU_name: \\"7-A\\""\n'
+            "    ;;\n"
+            "  unreadable) exit 1 ;;\n"
+            "  *)\n"
+            '    printf "%s\\n" "Attribute Section: aeabi" "Tag_CPU_name: \\"7-A\\"" \\\n'
+            '      "Tag_ABI_VFP_args: VFP registers"\n'
+            "    ;;\n"
+            "esac\n"
+            "exit 0\n"
+        )
+        for shim in ("sha256sum", "file", "make", "readelf"):
+            (shims / shim).chmod(0o755)
+
+        toolchain = tmp / "toolchain"
+        toolchain.mkdir()
+        compiler = toolchain / "arm-linux-gnueabihf-gcc"
+        compiler.write_text(
+            "#!/bin/sh\n"
+            'if [ "${1:-}" = "--version" ]; then\n'
+            '  printf "%s\\n" "arm-linux-gnueabihf-gcc (fixture) 13.2.1"\n'
+            "  exit 0\n"
+            "fi\n"
+            "# The builder probes the compiler ABI with a compile; the ABI itself is\n"
+            "# reported by the readelf stand-in, so only the output must exist here.\n"
+            'if [ "${1:-}" = "-c" ]; then\n'
+            "  out=\n"
+            "  while [ $# -gt 0 ]; do\n"
+            '    case $1 in\n'
+            "      -o) out=$2; shift 2 ;;\n"
+            "      *) shift ;;\n"
+            "    esac\n"
+            "  done\n"
+            '  [ -n "$out" ] || exit 1\n'
+            '  printf "fixture object\\n" > "$out"\n'
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n"
+        )
+        compiler.chmod(0o755)
+        (toolchain / "arm-linux-gnueabihf-ar").write_text("#!/bin/sh\nexit 0\n")
+        (toolchain / "arm-linux-gnueabihf-ar").chmod(0o755)
+
+        # The builder's helper steps run with the real interpreter; only the
+        # pinned build requirements (jinja2/jsonschema) are stubbed, because the
+        # host that runs this test does not install them.
+        interpreter = toolchain / "fixture-python"
+        interpreter.write_text(
+            "#!/bin/sh\n"
+            'if [ "${1:-}" = "-c" ] || [ "${2:-}" = "-c" ]; then\n'
+            "  # The builder reads the interpreter version to check the locked\n"
+            "  # floor and to record the build, so a host older than that floor can\n"
+            "  # be exercised from a fixture.\n"
+            '  if [ -n "${LE_TEST_PYTHON_VERSION:-}" ]; then\n'
+            "    printf '%s\\n' \"$LE_TEST_PYTHON_VERSION\"\n"
+            "    exit 0\n"
+            "  fi\n"
+            f'  exec "{sys.executable}" "$@"\n'
+            "fi\n"
+            "captured=$(mktemp)\n"
+            "trap 'rm -f \"$captured\"' EXIT\n"
+            'cat > "$captured"\n'
+            'if grep -q PackageNotFoundError "$captured"; then\n'
+            "  exit 0\n"
+            "fi\n"
+            f'"{sys.executable}" "$@" < "$captured"\n'
+        )
+        interpreter.chmod(0o755)
+
+        source = tmp / "fixture-source" / f"mbedtls-{lock['version']}"
+        (source / "library").mkdir(parents=True)
+        (source / "include/mbedtls").mkdir(parents=True)
+        (source / "LICENSE").write_text("Apache-2.0 fixture\n")
+        (source / "library/Makefile").write_text("static:\n\t@true\n")
+        (source / "include/mbedtls/build_info.h").write_text(
+            '#define MBEDTLS_VERSION_STRING         "%s"\n' % lock["version"]
+        )
+        for header in ("ssl.h", "x509_crt.h", "pk.h", "entropy.h"):
+            (source / "include/mbedtls" / header).write_text("/* fixture */\n")
+        archive = tmp / f"mbedtls-{lock['version']}.tar.bz2"
+        with tarfile.open(archive, "w:bz2") as handle:
+            handle.add(source, arcname=f"mbedtls-{lock['version']}")
+        return {
+            "workdir": tmp,
+            "archive": archive,
+            "shims": shims,
+            "compiler": compiler,
+            "interpreter": interpreter,
+        }
+
+    def run_mbedtls_builder(
+        self,
+        fixture: dict[str, Path],
+        *,
+        leaked_path: bool,
+        name: str,
+        output: Path | str | None = None,
+        race_output: Path | None = None,
+        python_version: str | None = None,
+        tmpdir: Path | None = None,
+        readelf_abi: str | None = None,
+    ) -> tuple[subprocess.CompletedProcess, Path]:
+        lock = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())
+        environment = os.environ.copy()
+        environment["PATH"] = f"{fixture['shims']}:{environment['PATH']}"
+        environment["LE_TEST_PINNED_ARCHIVE_SHA256"] = lock["source_sha256"]
+        environment["LE_TEST_ARCHIVE_LEAK"] = "1" if leaked_path else "0"
+        environment["LE_TEST_FIXTURE_DIR"] = str(fixture["workdir"])
+        # Always set, so a value inherited from the host environment cannot
+        # inject the race into a build that is not asking for it.
+        environment["LE_TEST_RACE_OUTPUT"] = (
+            str(race_output) if race_output is not None else ""
+        )
+        # Empty means "report the real interpreter version"; the fixture shim
+        # answers only the version query, so a host below the locked floor can
+        # be exercised without changing the interpreter that runs the build.
+        environment["LE_TEST_PYTHON_VERSION"] = (
+            python_version if python_version is not None else ""
+        )
+        # The builder's private work directory is named after TMPDIR; a caller
+        # that needs a temporary path containing a shell or ERE metacharacter
+        # supplies one instead of relying on the host's TMPDIR.
+        if tmpdir is not None:
+            environment["TMPDIR"] = str(tmpdir)
+        environment["LE_TEST_FILE_DESCRIPTION"] = (
+            "ELF 32-bit LSB relocatable, ARM, EABI5 version 1 (SYSV)"
+        )
+        # Always set, so the host environment cannot make an ABI-rejection case
+        # look acceptable (or the reverse).
+        environment["LE_TEST_READELF_ABI"] = (
+            readelf_abi if readelf_abi is not None else "hard"
+        )
+        output = fixture["workdir"] / name if output is None else output
+        # The argument is passed verbatim, so a caller can exercise an output path
+        # as it was typed (for example with a trailing separator) while the
+        # returned path stays the one to assert against.
+        output_argument = str(output)
+        completed = subprocess.run(
+            [
+                "bash",
+                str(TOOLS_DIR / "mbedtls/build_mbedtls.sh"),
+                "--archive", str(fixture["archive"]),
+                "--output", output_argument,
+                "--cc", str(fixture["compiler"]),
+                "--python", str(fixture["interpreter"]),
+                "--jobs", "1",
+            ],
+            env=environment, text=True, cwd=fixture["workdir"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        return completed, Path(output_argument)
+
+    def test_mbedtls_builder_rejects_a_leaked_build_path_when_the_scan_short_circuits(
+        self,
+    ) -> None:
+        """Codex review: `strings | grep -q` under `pipefail` hid this rejection.
+
+        `grep -q` leaves as soon as it matches, so `strings` is still writing
+        when the read end closes; `pipefail` then reports the writer's SIGPIPE
+        (141) instead of the match, the `if` body is skipped, and an archive
+        that carries the private build path is accepted.  The guard must consume
+        the whole scan and still reject, without rejecting a clean pinned build.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+
+            leaked, leaked_output = self.run_mbedtls_builder(
+                fixture, leaked_path=True, name="output-leaked"
+            )
+            marker = fixture["workdir"] / "leaked-build-path.txt"
+            self.assertTrue(marker.is_file(), leaked.stdout + leaked.stderr)
+            embedded = marker.read_text().strip()
+            self.assertIn("libreecho-mbedtls-build.", embedded)
+            self.assertEqual(leaked.returncode, 1, leaked.stdout + leaked.stderr)
+            self.assertIn("private build path", leaked.stderr)
+            self.assertFalse((leaked_output / "mbedtls-source.json").exists())
+
+            clean, clean_output = self.run_mbedtls_builder(
+                fixture, leaked_path=False, name="output-clean"
+            )
+            self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+            self.assertIn("mbedtls_archives=3", clean.stdout)
+            self.assertTrue((clean_output / "mbedtls-source.json").is_file())
+
+    def test_mbedtls_builder_matches_a_leaked_path_literally(self) -> None:
+        """Codex review: the leak scan must not read the build path as a pattern.
+
+        `$work` was interpolated into a `grep -E` pattern, so an ERE
+        metacharacter in TMPDIR changed it: with a `+` in the temporary directory
+        the private build path no longer matched itself, the nonzero status was
+        read as "no leak", and an archive that carries that path was published.
+        The scan matches both patterns literally and fails closed on a status
+        that means neither "matched" nor "no match".
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+            pattern_tmp = fixture["workdir"] / "build+cache"
+            pattern_tmp.mkdir()
+
+            leaked, leaked_output = self.run_mbedtls_builder(
+                fixture,
+                leaked_path=True,
+                name="output-pattern",
+                tmpdir=pattern_tmp,
+            )
+            embedded = (fixture["workdir"] / "leaked-build-path.txt").read_text()
+            self.assertIn("build+cache", embedded)
+            self.assertEqual(leaked.returncode, 1, leaked.stdout + leaked.stderr)
+            self.assertIn("private build path", leaked.stderr)
+            self.assertFalse(leaked_output.exists(), leaked.stdout + leaked.stderr)
+
+            # A clean build under the same temporary directory still publishes.
+            clean, clean_output = self.run_mbedtls_builder(
+                fixture,
+                leaked_path=False,
+                name="output-pattern-clean",
+                tmpdir=pattern_tmp,
+            )
+            self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+            self.assertTrue((clean_output / "mbedtls-source.json").is_file())
+
+    def test_mbedtls_builder_refuses_to_erase_an_existing_output(self) -> None:
+        """Codex review: an existing output path must never be erased.
+
+        The builder removed the output directory up front, so an accidental
+        shared path was destroyed before the build even started and a later
+        failure left neither the old contents nor a usable prefix.  An existing
+        output path is refused, the prefix is staged next to it, and only a
+        successful build replaces it.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+
+            occupied = fixture["workdir"] / "occupied-output"
+            (occupied / "unrelated-artifacts").mkdir(parents=True)
+            sentinel = occupied / "unrelated-artifacts/keep.txt"
+            sentinel.write_text("must survive\n")
+
+            refused, _ = self.run_mbedtls_builder(
+                fixture, leaked_path=False, name="occupied-output", output=occupied
+            )
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("refusing to overwrite", refused.stderr)
+            self.assertEqual(sentinel.read_text(), "must survive\n")
+
+            # A build that fails must not leave a partial prefix in its place.
+            failed, failed_output = self.run_mbedtls_builder(
+                fixture, leaked_path=True, name="failed-output"
+            )
+            self.assertEqual(failed.returncode, 1, failed.stdout + failed.stderr)
+            self.assertFalse(failed_output.exists(), failed.stdout + failed.stderr)
+
+    @staticmethod
+    def mbedtls_tree_snapshot(root: Path) -> dict[str, bytes | None]:
+        """Map every path below root to its bytes; a directory maps to None.
+
+        The race assertions compare the published prefix against this snapshot,
+        so a nested staging tree, a partially written prefix, or any extra
+        directory is a difference rather than something to remember to check.
+        """
+        return {
+            path.relative_to(root).as_posix(): (
+                path.read_bytes() if path.is_file() else None
+            )
+            for path in sorted(root.rglob("*"))
+        }
+
+    def test_mbedtls_builder_refuses_a_concurrent_publication(self) -> None:
+        """Codex review: publication must not replace a prefix that arrived.
+
+        Two builders can both pass the initial "output is absent" check and then
+        build for minutes.  When the first publishes, a plain `mv STAGE OUTPUT`
+        treats the now-existing directory as a container: the second builder's
+        staging tree is renamed *inside* the published prefix and the command
+        still reports success, so the loser believes it published its validated
+        prefix while the incumbent is contaminated.  The publication rename must
+        be non-replacing and must fail closed instead, leaving the incumbent
+        prefix byte-identical, removing the losing stage, and writing nothing
+        partial over the published prefix.
+
+        The race is injected where it happens: the target appears while the
+        pinned build is running, after the builder's own existence check on the
+        output path has already passed.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+            workdir = fixture["workdir"]
+
+            raced, raced_output = self.run_mbedtls_builder(
+                fixture,
+                leaked_path=False,
+                name="raced-output",
+                race_output=workdir / "raced-output",
+            )
+            self.assertEqual(raced.returncode, 1, raced.stdout + raced.stderr)
+            self.assertIn("appeared during the build", raced.stderr)
+
+            # Exactly what the other builder published, and nothing else.
+            self.assertEqual(
+                self.mbedtls_tree_snapshot(raced_output),
+                {
+                    "include": None,
+                    "include/mbedtls": None,
+                    "include/mbedtls/build_info.h": b"incumbent\n",
+                    "lib": None,
+                    "lib/libmbedtls.a": b"incumbent\n",
+                    "mbedtls-source.json": b"incumbent\n",
+                },
+                raced.stdout + raced.stderr,
+            )
+            # The loser's stage is removed with its private work directory
+            # instead of being left beside the published prefix.
+            self.assertEqual(
+                sorted(path.name for path in workdir.glob("raced-output.stage.*")),
+                [],
+                raced.stdout + raced.stderr,
+            )
+
+    def test_mbedtls_builder_requires_no_replace_rename_semantics(self) -> None:
+        """The publication guard must not rest on an unchecked `mv`.
+
+        `-T` and `-n` are the whole no-replace contract, and an `mv` that accepts
+        those options but ignores them is exactly the implementation that nests a
+        stage inside a published prefix.  The builder probes the live `mv` before
+        doing any work, so such an `mv` fails closed at startup instead of
+        contaminating a prefix later.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+            shim = fixture["shims"] / "mv"
+            shim.write_text(
+                "#!/bin/bash\n"
+                "args=()\n"
+                'for a in "$@"; do\n'
+                '  case "$a" in\n'
+                "    -T|-n) ;;\n"
+                '    *) args+=("$a") ;;\n'
+                "  esac\n"
+                "done\n"
+                'exec /usr/bin/mv "${args[@]}"\n'
+            )
+            shim.chmod(0o755)
+
+            refused, output = self.run_mbedtls_builder(
+                fixture, leaked_path=False, name="unprobeable-output"
+            )
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("atomic no-replace publication", refused.stderr)
+            self.assertFalse(output.exists(), refused.stdout + refused.stderr)
+
+    def test_mbedtls_builder_accepts_an_output_with_a_trailing_separator(self) -> None:
+        """Codex review: a trailing separator must not name the stage as a child.
+
+        `--output /prefix/` derived the staging path `/prefix/.stage.$$`, so
+        creating the stage created `OUTPUT` itself; the no-replace publication then
+        refused an output that only the stage had created, so a valid build failed
+        after the whole compilation and validation had run, and the failed build
+        left that empty directory behind.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+
+            for index, suffix in enumerate((os.sep, os.sep * 2 + ".", os.sep * 3 + ".")):
+                with self.subTest(suffix=suffix):
+                    output = fixture["workdir"] / f"trailing-output-{index}"
+                    published, published_output = self.run_mbedtls_builder(
+                        fixture,
+                        leaked_path=False,
+                        name=f"trailing-output-{index}",
+                        output=f"{output}{suffix}",
+                    )
+                    self.assertEqual(
+                        published.returncode, 0, published.stdout + published.stderr
+                    )
+                    self.assertEqual(published_output, output)
+                    self.assertEqual(
+                        sorted(path.name for path in output.iterdir()),
+                        ["LICENSE", "include", "lib", "mbedtls-source.json"],
+                        published.stdout + published.stderr,
+                    )
+
+    def test_mbedtls_builder_enforces_the_locked_python_floor(self) -> None:
+        """Codex review: the advertised interpreter floor must be enforced.
+
+        `SOURCE.lock` advertised a floor its own pinned requirement cannot
+        support: jsonschema 4.25.1 declares `Requires-Python >=3.9`, so a host the
+        lock claimed was supported failed later with an uninstallable pinned
+        package instead of a clear refusal.  The floor is raised to the pin's own
+        requirement and read from the lock, so the builder refuses an older
+        interpreter before it does any work.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+            floor = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())[
+                "build_requirements"
+            ]["python3"]
+
+            older, older_output = self.run_mbedtls_builder(
+                fixture,
+                leaked_path=False,
+                name="older-python",
+                python_version="3.8.10",
+            )
+            self.assertEqual(older.returncode, 1, older.stdout + older.stderr)
+            self.assertIn("older than the pinned floor", older.stderr)
+            self.assertIn(floor, older.stderr)
+            self.assertFalse(older_output.exists(), older.stdout + older.stderr)
+
+            # The supported interpreter the fixture reports by default still
+            # builds and publishes, so the floor is not enforced over-eagerly.
+            supported, supported_output = self.run_mbedtls_builder(
+                fixture, leaked_path=False, name="supported-python"
+            )
+            self.assertEqual(
+                supported.returncode, 0, supported.stdout + supported.stderr
+            )
+            self.assertTrue((supported_output / "mbedtls-source.json").is_file())
+
+    def test_mbedtls_builder_validates_the_compiler_float_abi(self) -> None:
+        """Codex review: the pinned hard-float ABI must be verified, not assumed.
+
+        A soft-float `arm-linux-gnueabi-gcc` still emits objects that satisfy the
+        generic ARM32 relocatable check, so the prefix could be published while
+        `mbedtls-source.json` recorded the locked `arm-linux-gnueabihf-static`
+        target: the provenance would misstate the artifact, and the production
+        hard-float UI link may reject the cached prefix.  The builder now probes
+        the compiler's own output attributes before doing any work.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            fixture = self.prepare_mbedtls_builder(Path(tmp_name))
+
+            # A compiler whose objects carry VFP argument registers satisfies the
+            # locked hard-float target, and the build still publishes.
+            accepted, accepted_output = self.run_mbedtls_builder(
+                fixture, leaked_path=False, name="hard-float-abi"
+            )
+            self.assertEqual(
+                accepted.returncode, 0, accepted.stdout + accepted.stderr
+            )
+            self.assertTrue((accepted_output / "mbedtls-source.json").is_file())
+
+            # A soft-float compiler is refused before extraction or compilation,
+            # and never publishes a prefix.
+            rejected, rejected_output = self.run_mbedtls_builder(
+                fixture,
+                leaked_path=False,
+                name="soft-float-abi",
+                readelf_abi="soft",
+            )
+            self.assertEqual(
+                rejected.returncode, 1, rejected.stdout + rejected.stderr
+            )
+            self.assertIn("hard-float ABI", rejected.stderr)
+            self.assertFalse(rejected_output.exists(), rejected.stdout + rejected.stderr)
+            self.assertNotIn("mbedtls_archives=", rejected.stdout)
+
+            # An unreadable attribute section is an unverifiable compiler, so it
+            # fails closed rather than being treated as acceptable.
+            unreadable, unreadable_output = self.run_mbedtls_builder(
+                fixture,
+                leaked_path=False,
+                name="unreadable-abi",
+                readelf_abi="unreadable",
+            )
+            self.assertEqual(
+                unreadable.returncode, 1, unreadable.stdout + unreadable.stderr
+            )
+            self.assertIn("cannot read the mbedTLS probe object attributes", unreadable.stderr)
+            self.assertFalse(
+                unreadable_output.exists(), unreadable.stdout + unreadable.stderr
+            )
+
+    def test_mbedtls_builder_cleans_up_on_an_early_refusal(self) -> None:
+        """Codex review: an early refusal must not leak its work directory.
+
+        The output and staging-path guards run before the cleanup trap used to be
+        installed, so every refused retry left a `libreecho-mbedtls-build.*`
+        directory behind in TMPDIR even though no build had started.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            fixture = self.prepare_mbedtls_builder(tmp)
+            tmpdir = tmp / "builder-tmp"
+            tmpdir.mkdir()
+
+            occupied = fixture["workdir"] / "occupied-early-refusal"
+            occupied.mkdir()
+            (occupied / "keep.txt").write_text("must survive\n")
+
+            refused, _ = self.run_mbedtls_builder(
+                fixture,
+                leaked_path=False,
+                name="occupied-early-refusal",
+                output=occupied,
+                tmpdir=tmpdir,
+            )
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("refusing to overwrite", refused.stderr)
+            self.assertEqual((occupied / "keep.txt").read_text(), "must survive\n")
+            leftovers = sorted(path.name for path in tmpdir.iterdir())
+            self.assertEqual(
+                leftovers,
+                [],
+                f"refused build left work directories behind: {leftovers}",
+            )
+
+    def test_ui_tls_verifier_rejects_a_prefix_with_headers_off_the_pin(self) -> None:
+        """Codex review: the consumed headers must be bound to the pin.
+
+        A cached prefix can keep the archives and the provenance record while a
+        header is stale or hand-edited.  Verifying only that the headers exist
+        and that build_info.h still prints the pinned version would link and
+        compile the UI against declarations that do not belong to the recorded
+        archives, so the recorded include-tree digest is enforced for every
+        header in the tree, not only for the version text.
+        """
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            if shutil.which("ar") is None:
+                self.skipTest("ar is required to synthesise an mbedTLS prefix")
+
+            consumed = tmp / "rewritten-consumed-header"
+            self.write_mbedtls_prefix(consumed)
+            (consumed / "include/mbedtls/ssl.h").write_text("/* rewritten */\n")
+            rejected = self.run_tls_prefix(consumed)
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("headers do not match", rejected.stderr)
+
+            linked = tmp / "rewritten-linked-header"
+            self.write_mbedtls_prefix(linked)
+            (linked / "include/psa/crypto.h").write_text("/* rewritten */\n")
+            rejected = self.run_tls_prefix(linked)
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("headers do not match", rejected.stderr)
+
+            # The pinned version text is preserved, so only the digest can catch
+            # this: the prefix must not be accepted on the version alone.
+            version_text = tmp / "rewritten-build-info"
+            self.write_mbedtls_prefix(version_text)
+            build_info = version_text / "include/mbedtls/build_info.h"
+            build_info.write_text(build_info.read_text() + "\n/* rewritten */\n")
+            rejected = self.run_tls_prefix(version_text)
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("headers do not match", rejected.stderr)
+
+            # A prefix without the recorded include digests fails closed too.
+            unrecorded = tmp / "unrecorded-include-digests"
+            self.write_mbedtls_prefix(unrecorded)
+            record = json.loads((unrecorded / "mbedtls-source.json").read_text())
+            del record["include_tree_sha256"]
+            (unrecorded / "mbedtls-source.json").write_text(
+                json.dumps(record, indent=2, sort_keys=True) + "\n"
+            )
+            rejected = self.run_tls_prefix(unrecorded)
+            self.assertEqual(rejected.returncode, 1, rejected.stdout)
+            self.assertIn("include", rejected.stderr)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,277 @@
+#!/bin/busybox sh
+# Platform-owned init entry for the boot-contained shared mDNS discovery runtime.
+#
+# The shared Avahi/D-Bus responder lives in the boot image
+# (usr/local/lib/libreecho-mdns/root).  It is started from this entry and never
+# from an AirPlay feature squashfs or from a payload mounted under /data, so
+# Home Assistant discovery keeps working when no AirPlay payload is installed.
+# The entry refuses to launch when another responder already owns the local
+# stack: two Avahi instances must never race for multicast DNS.
+#
+# When the UI-owned supervisor /usr/local/sbin/libreecho-mdnsd exists it is the
+# owner of the responder lifecycle and this entry delegates to it; the
+# boot-contained daemon pair below is the Platform-owned fallback that keeps a
+# shared-runtime image reachable without the UI supervisor.
+#
+# shellcheck shell=dash
+
+BB=${BB:-/bin/busybox}
+RUNTIME_ROOT=${MDNS_RUNTIME_ROOT:-/usr/local/lib/libreecho-mdns/root}
+MARKER=${MDNS_RUNTIME_MARKER:-/etc/libreecho/mdns-runtime.json}
+SUPERVISOR=${MDNS_SUPERVISOR:-/usr/local/sbin/libreecho-mdnsd}
+RUN_ROOT=${MDNS_RUN_ROOT:-$RUNTIME_ROOT/run}
+STATE_ROOT=${MDNS_STATE_ROOT:-$RUNTIME_ROOT/var/lib/dbus}
+MACHINE_ID=${MDNS_MACHINE_ID:-$STATE_ROOT/machine-id}
+PIDFILE=${MDNS_PIDFILE:-/var/run/libreecho-mdnsd.pid}
+PROC_ROOT=${MDNS_PROC_ROOT:-/proc}
+LOG=${MDNS_LOG:-/tmp/libreecho-mdnsd.log}
+START_TIMEOUT=${MDNS_START_TIMEOUT:-15}
+STOP_TIMEOUT=${MDNS_STOP_TIMEOUT:-10}
+BUS_DIR=$RUN_ROOT/dbus
+SERVICES_DIR=$RUN_ROOT/services
+BUS_CONFIG=$BUS_DIR/system.conf
+BUS_SOCKET=$BUS_DIR/system_bus_socket
+AVAHI_CONFIG=$RUNTIME_ROOT/etc/avahi/avahi-daemon.conf
+LOADER=/lib/ld-linux-armhf.so.3
+LIBRARY_PATH=/usr/lib:/lib
+
+log() {
+    printf 'libreecho-mdnsd: %s\n' "$*" >>"$LOG" 2>/dev/null
+    printf '<6>libreecho-mdnsd: %s\n' "$*" >/dev/kmsg 2>/dev/null
+}
+
+pid_alive() {
+    [ -n "$1" ] || return 1
+    case "$1" in *[!0-9]*) return 1 ;; esac
+    [ -d "$PROC_ROOT/$1" ]
+}
+
+proc_field() {
+    # $1 pid, $2 awk field of /proc/<pid>/stat
+    $BB awk -v field="$2" '{print $field}' "$PROC_ROOT/$1/stat" 2>/dev/null
+}
+
+process_exe() {
+    $BB readlink "$PROC_ROOT/$1/exe" 2>/dev/null
+}
+
+own_process() {
+    # A live process whose executable really came from this runtime closure.
+    pid_alive "$1" || return 1
+    exe=$(process_exe "$1")
+    case "$exe" in
+        "$RUNTIME_ROOT"/*) return 0 ;;
+    esac
+    return 1
+}
+
+runtime_responder_pids() {
+    # Every live process whose executable is inside this runtime closure.
+    for entry in "$PROC_ROOT"/[0-9]*; do
+        [ -d "$entry" ] || continue
+        pid=${entry##*/}
+        own_process "$pid" || continue
+        printf '%s\n' "$pid"
+    done
+}
+
+foreign_responder_present() {
+    # Any avahi-daemon that did not come from this runtime is a competing stack.
+    for entry in "$PROC_ROOT"/[0-9]*; do
+        [ -d "$entry" ] || continue
+        pid=${entry##*/}
+        comm=$($BB cat "$PROC_ROOT/$pid/comm" 2>/dev/null)
+        case "$comm" in
+            avahi-daemon|avahi-daemon*) ;;
+            *) continue ;;
+        esac
+        own_process "$pid" && continue
+        log "mdns-competing-responder:$pid"
+        return 0
+    done
+    return 1
+}
+
+runtime_present() {
+    [ -f "$MARKER" ] || return 1
+    if [ ! -d "$RUNTIME_ROOT" ] || [ -L "$RUNTIME_ROOT" ]; then
+        return 1
+    fi
+    for path in \
+        "$RUNTIME_ROOT/usr/sbin/avahi-daemon" \
+        "$RUNTIME_ROOT/usr/bin/dbus-daemon" \
+        "$RUNTIME_ROOT/lib/ld-linux-armhf.so.3" \
+        "$RUNTIME_ROOT/etc/avahi/avahi-daemon.conf" \
+        "$RUNTIME_ROOT/etc/dbus-1/system.conf"; do
+        [ -f "$path" ] || return 1
+    done
+    return 0
+}
+
+status() {
+    [ -s "$PIDFILE" ] || return 1
+    pid=$($BB sed -n '1p' "$PIDFILE" 2>/dev/null)
+    server_pid=$($BB sed -n '2p' "$PIDFILE" 2>/dev/null)
+    own_process "$pid" || return 1
+    own_process "$server_pid" || return 1
+    [ -S "$BUS_SOCKET" ] || return 1
+    return 0
+}
+
+stopped_wait() {
+    pid=$1
+    count=0
+    while [ "$count" -lt "$STOP_TIMEOUT" ]; do
+        pid_alive "$pid" || return 0
+        $BB sleep 1
+        count=$((count + 1))
+    done
+    pid_alive "$pid" && return 1
+    return 0
+}
+
+stop() {
+    if [ -s "$PIDFILE" ]; then
+        server_pid=$($BB sed -n '2p' "$PIDFILE" 2>/dev/null)
+        pid=$($BB sed -n '1p' "$PIDFILE" 2>/dev/null)
+        # Withdraw the consumer advertisements before the responder goes away.
+        own_process "$pid" && $BB kill "$pid" 2>/dev/null
+        stopped_wait "$pid" || log "mdns-server-stop-timeout:$pid"
+        own_process "$server_pid" && $BB kill "$server_pid" 2>/dev/null
+        stopped_wait "$server_pid" || log "mdns-bus-stop-timeout:$server_pid"
+    fi
+    for pid in $(runtime_responder_pids); do
+        $BB kill "$pid" 2>/dev/null
+        stopped_wait "$pid"
+    done
+    $BB rm -f "$PIDFILE" "$BUS_SOCKET" 2>/dev/null
+    log mdns-shared-runtime-stopped
+    return 0
+}
+
+start_supervisor() {
+    "$SUPERVISOR" >>"$LOG" 2>&1 &
+    supervisor_pid=$!
+    count=0
+    while [ "$count" -lt "$START_TIMEOUT" ]; do
+        pid_alive "$supervisor_pid" && {
+            log "mdns-supervisor-started:$supervisor_pid"
+            return 0
+        }
+        $BB sleep 1
+        count=$((count + 1))
+    done
+    log "mdns-supervisor-not-ready:$supervisor_pid"
+    return 1
+}
+
+start_daemon_pair() {
+    $BB mkdir -p "$BUS_DIR" "$RUNTIME_ROOT/run/avahi-daemon" "$SERVICES_DIR" \
+        "$STATE_ROOT" "$RUNTIME_ROOT/dev" || return 1
+    for spec in 'null 1 3' 'random 1 8' 'urandom 1 9'; do
+        set -- $spec
+        node=$RUNTIME_ROOT/dev/$1
+        if [ ! -c "$node" ]; then
+            $BB rm -f "$node"
+            $BB mknod "$node" c "$2" "$3" || return 1
+        fi
+        $BB chmod 0666 "$node" || return 1
+    done
+    if [ ! -s "$MACHINE_ID" ]; then
+        # D-Bus reads only its standard machine-id locations. This image-local
+        # constant is runtime identity, never copied device identity material.
+        printf '%s\n' '0f1e2d3c4b5a69788796a5b4c3d2e1f0' >"$MACHINE_ID" || return 1
+        $BB chmod 0644 "$MACHINE_ID"
+    fi
+    $BB rm -f "$BUS_SOCKET"
+    $BB chroot "$RUNTIME_ROOT" "$LOADER" --library-path "$LIBRARY_PATH" \
+        /usr/bin/dbus-daemon --nofork --nopidfile \
+        --config-file=/etc/dbus-1/system.conf >>"$LOG" 2>&1 &
+    server_pid=$!
+    count=0
+    while [ "$count" -lt "$START_TIMEOUT" ]; do
+        [ -S "$BUS_SOCKET" ] && break
+        pid_alive "$server_pid" || break
+        $BB sleep 1
+        count=$((count + 1))
+    done
+    if [ ! -S "$BUS_SOCKET" ] || ! pid_alive "$server_pid" || ! own_process "$server_pid"; then
+        log "mdns-bus-not-ready:$server_pid"
+        $BB kill "$server_pid" 2>/dev/null
+        return 1
+    fi
+    DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket \
+        $BB chroot "$RUNTIME_ROOT" "$LOADER" --library-path "$LIBRARY_PATH" \
+        /usr/sbin/avahi-daemon --no-chroot --no-drop-root --no-rlimits \
+        --file=/etc/avahi/avahi-daemon.conf >>"$LOG" 2>&1 &
+    pid=$!
+    count=0
+    while [ "$count" -lt "$START_TIMEOUT" ]; do
+        own_process "$pid" && break
+        pid_alive "$pid" || break
+        $BB sleep 1
+        count=$((count + 1))
+    done
+    if ! own_process "$pid"; then
+        log "mdns-server-not-ready:$pid"
+        $BB kill "$server_pid" 2>/dev/null
+        return 1
+    fi
+    # Record the identity pair rather than trusting a bare PID number: status
+    # re-checks that the executable still resolves inside this runtime closure.
+    printf '%s\n%s\n' "$pid" "$server_pid" >"$PIDFILE" || return 1
+    $BB chmod 0644 "$PIDFILE"
+    log "mdns-shared-runtime-started:$pid:$server_pid"
+    return 0
+}
+
+start() {
+    if ! runtime_present; then
+        # Explicit, loud failure instead of a silent second responder.
+        log mdns-shared-runtime-unavailable
+        return 1
+    fi
+    if status; then
+        log mdns-shared-runtime-already-active
+        return 0
+    fi
+    if foreign_responder_present; then
+        log mdns-competing-responder-refused
+        return 1
+    fi
+    # Reconcile an orphaned previous generation from this same runtime before
+    # starting replacements; never a global kill of an unrecognized daemon.
+    for pid in $(runtime_responder_pids); do
+        log "mdns-orphan-reconcile:$pid"
+        $BB kill "$pid" 2>/dev/null
+        stopped_wait "$pid"
+    done
+    $BB mkdir -p "$RUN_ROOT" || return 1
+    if [ -x "$SUPERVISOR" ]; then
+        start_supervisor && return 0
+        log mdns-supervisor-fallback
+    fi
+    start_daemon_pair
+}
+
+action=${1:-status}
+case "$action" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    status)
+        status
+        ;;
+    *)
+        printf 'usage: %s {start|stop|restart|status}\n' "$0" >&2
+        exit 2
+        ;;
+esac
+exit $?

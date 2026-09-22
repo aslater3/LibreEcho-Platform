@@ -184,16 +184,12 @@ prefixes require maintainer agreement.
 
 ## AI agent rules
 
-- Before editing, read this file, the relevant part of `README.md`, and any
-  directly applicable `CONTRIBUTING.md`; do not recursively inspect unrelated
-  documentation or historical source.
-- Re-read the live branch, status, and diff before making changes.
-- Work only in a purpose-named branch when an edit has been explicitly
-  requested and the current branch is appropriate for that task.
-- Run the smallest relevant focused check first. Broader validation is
-  conditional on the user's request or explicit PR preparation.
-- Report exact commands and results. Do not claim image, CI, or hardware
-  evidence when only host-source checks were run.
+- Before editing, read this file, the relevant `README.md`, and any
+  applicable `CONTRIBUTING.md`; re-read live status, diff, and refs.
+- Work only in a purpose-named branch created from the current base; never
+  edit `main`, a `release/*` branch, or another task's branch in place.
+- Run focused checks first, then the aggregate suite before opening a PR,
+  and report exact results without claiming image or hardware evidence.
 - Record the exact commit SHA that was tested; the PR head must equal the
   tested head at merge time.
 - Do not merge, push to protected branches, tag releases, or perform hardware

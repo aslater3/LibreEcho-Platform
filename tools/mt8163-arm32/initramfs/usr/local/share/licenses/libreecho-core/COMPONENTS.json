@@ -61,6 +61,14 @@
       "version": "source-commit-in-image-manifest"
     },
     {
+      "id": "mbedtls",
+      "license": "Apache-2.0",
+      "source": "https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.4/mbedtls-3.6.4.tar.bz2",
+      "source_archive_sha256": "ec35b18a6c593cf98c3e30db8b98ff93e8940a8c4e690e66b41dfc011d678110",
+      "version": "3.6.4",
+      "note": "dual-licensed Apache-2.0 OR GPL-2.0-or-later; used under Apache-2.0, see mbedtls-3.6.4-NOTICE.txt"
+    },
+    {
       "id": "wireless-tools",
       "license": "GPL-2.0-only AND LGPL-2.1-or-later",
       "source": "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz",

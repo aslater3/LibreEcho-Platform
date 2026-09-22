@@ -12,6 +12,8 @@ from pathlib import Path
 
 from nacl.signing import SigningKey
 
+from feature_manifest import build_control_tar as build_v2_control_tar
+
 
 BOOT_SIZE = 16 * 1024 * 1024
 VALUE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~-]{0,95}\Z")
@@ -79,8 +81,56 @@ def preserved_feature_identities(build_manifest: dict[str, object]) -> dict[str,
     return identities
 
 
+def v2_manifest(args: argparse.Namespace, boot_digest: str, build_manifest: dict[str, object]) -> dict[str, object]:
+    plan_path = args.feature_plan
+    if plan_path is None or not plan_path.is_file() or plan_path.is_symlink():
+        raise SystemExit("ERROR: v2 requires a regular --feature-plan JSON")
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SystemExit("ERROR: feature plan is malformed") from error
+    records = plan.get("features") if isinstance(plan, dict) else plan
+    if not isinstance(records, list):
+        raise SystemExit("ERROR: feature plan must contain a features list")
+    transaction_id = "txn-" + hashlib.sha256((args.version + boot_digest + json.dumps(records, sort_keys=True, separators=(",", ":"))).encode()).hexdigest()[:24]
+    result = {
+        "format": "libreecho-ota-v2", "manifest_version": 1, "board": "radar_puffin",
+        "soc": "mt8163", "architecture": "armv7", "image_profile": "ota",
+        "transaction_type": "system", "transaction_id": transaction_id, "version": args.version,
+        "update_channel": args.update_channel, "service_profile": args.service_profile,
+        "feature_policy": args.feature_policy, "minimum_updater_schema": 2,
+        "feature_asset_base": "github-release-channel", "commit_policy": "after-slot-confirm",
+        "feature_ids": ",".join(r.get("feature_id", "") for r in records),
+        "boot_filename": "boot.img", "boot_size": BOOT_SIZE, "boot_sha256": boot_digest,
+        "features": records,
+    }
+    if build_manifest.get("v2_transaction_type", "system") != "system":
+        raise SystemExit("ERROR: build manifest requests a non-system transaction")
+    return result
+
+
+def write_v2_bundle(args: argparse.Namespace, boot: bytes, digest: str, build_manifest: dict[str, object]) -> None:
+    signing_key = read_signing_key(args.signing_key)
+    public_key = args.public_key.read_text(encoding="ascii").strip()
+    if public_key != signing_key.verify_key.encode().hex():
+        raise SystemExit("ERROR: signing key does not match the embedded OTA public key")
+    manifest = v2_manifest(args, digest, build_manifest)
+    try:
+        data = build_v2_control_tar(manifest, boot, signing_key)
+    except (ValueError, OSError) as error:
+        raise SystemExit(f"ERROR: invalid v2 feature plan: {error}") from error
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_bytes(data)
+    print(f"ota_bundle={args.output.resolve()}")
+    print(f"ota_version={args.version}")
+    print(f"boot_sha256={digest}")
+    print(f"bundle_sha256={hashlib.sha256(data).hexdigest()}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--format", choices=("v1", "v2"), default="v1")
+    parser.add_argument("--feature-plan", type=Path)
     parser.add_argument("--boot-image", type=Path, required=True)
     parser.add_argument("--build-manifest", type=Path, required=True)
     parser.add_argument("--version", required=True)
@@ -134,6 +184,10 @@ def main() -> None:
         raise SystemExit("ERROR: feature policy does not match build manifest")
     if build_manifest.get("update_channel") != args.update_channel:
         raise SystemExit("ERROR: update channel does not match build manifest")
+
+    if args.format == "v2":
+        write_v2_bundle(args, boot, digest, build_manifest)
+        return
 
     preserved_identities = {}
     if args.feature_policy == "preserve":
