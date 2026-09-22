@@ -379,7 +379,7 @@ write_boot_slots() {
         if [ "$got" != "$want" ]; then
             die "$write_slot readback mismatch (got $got want $want)"
         fi
-        ui_print "  $slot verified ($got)"
+        ui_print "  $write_slot verified ($got)"
     done
 }
 
