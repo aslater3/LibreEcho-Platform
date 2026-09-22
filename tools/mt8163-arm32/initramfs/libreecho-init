@@ -1031,6 +1031,28 @@ start_shared_discovery_runtime()
     return 0
 }
 
+# Which slot is running. The bootloader on this family writes the suffix empty
+# (`androidboot.slot_suffix=_`), so the kernel command line frequently does not
+# say -- measured on the biscuit Dot, whose cmdline carries the key with no
+# value. The boot control block is then the only thing that knows, which is why
+# ota_health_confirm_worker already falls back to it after
+# running-slot-not-reported. Both the local-install adoption and the candidate
+# mount need the same answer, so they ask the same question.
+running_slot_id()
+{
+    slot_cmdline=${LIBREECHO_CMDLINE_FILE:-/proc/cmdline}
+    slot_bootctl=${LIBREECHO_BOOTCTL_TOOL:-/usr/local/sbin/libreecho-bootctl}
+    slot=$($BB sed -n 's/.*androidboot.slot_suffix=_\([ab]\).*/\1/p' \
+        "$slot_cmdline" 2>/dev/null | $BB head -n 1)
+    if [ -z "$slot" ] && [ -x "$slot_bootctl" ]; then
+        slot=$("$slot_bootctl" status 2>/dev/null |
+            $BB sed -n 's/^selected_slot=//p' | $BB head -n 1)
+    fi
+    case "$slot" in
+        a|b) printf '%s\n' "$slot" ;;
+    esac
+}
+
 # A TWRP install stages a complete tree, writes both boot slots and leaves the
 # release's OTA package on /data -- and stops there. Nothing that runs in
 # recovery can prepare the feature transaction: prepare-boot belongs to this
@@ -1045,7 +1067,6 @@ adopt_staged_local_install()
     # Environment overrides, the same way libreecho-feature-transaction
     # exposes its own: this decision lives on the boot path and cannot be reached
     # by any test that has to boot a device, so the paths it reads are named.
-    install_cmdline=${LIBREECHO_CMDLINE_FILE:-/proc/cmdline}
     install_root=${LIBREECHO_INSTALL_ROOT:-/data/libreecho/update}
     install_slot_a=${LIBREECHO_SLOT_A_DEVICE:-/dev/mmcblk0p10}
     install_slot_b=${LIBREECHO_SLOT_B_DEVICE:-/dev/mmcblk0p11}
@@ -1067,8 +1088,7 @@ adopt_staged_local_install()
         ''|*[!0-9a-f]*) log local-install-manifest-unreadable; return 0 ;;
     esac
     [ "${#install_want}" -eq 64 ] || { log local-install-manifest-unreadable; return 0; }
-    install_slot=$($BB sed -n \
-        's/.*androidboot.slot_suffix=_\([ab]\).*/\1/p' "$install_cmdline")
+    install_slot=$(running_slot_id)
     case "$install_slot" in
         a) install_device=$install_slot_a ;;
         b) install_device=$install_slot_b ;;
@@ -1147,7 +1167,7 @@ activate_feature_transaction()
     schema=$($BB sed -n 's/^schema=//p' "$update/pending" 2>/dev/null)
     [ "$schema" = 2 ] || return 0
     pending_slot=$($BB sed -n 's/^slot=//p' "$update/pending" 2>/dev/null)
-    running_slot=$($BB sed -n 's/.*androidboot.slot_suffix=_\([ab]\).*/\1/p' /proc/cmdline)
+    running_slot=$(running_slot_id)
     [ "$running_slot" = "$pending_slot" ] || { log feature-transaction-fallback-canonical; return 0; }
     $BB mkdir -p "$update/staging" || { log feature-transaction-staging-failed; return 1; }
     if /usr/local/sbin/libreecho-bootctl status > "$update/staging/bootctl.readback" 2>/dev/null; then
