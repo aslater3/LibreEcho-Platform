@@ -245,5 +245,188 @@ class BundleBuilderTests(unittest.TestCase):
             self.build(assets=staging, out=self.work / "out-evil")
 
 
+class ReleaseLayoutTests(unittest.TestCase):
+    """The bundle must ship what the SIGNED manifest references, and must carry
+    a package the device's local-install path can actually accept.
+
+    A real release publishes the same feature bytes twice - build-tag names
+    inside the initial-install tar and version-named assets beside it - plus an
+    OTA tar. The bundle has to resolve that to one name per file, which is the
+    name the feature transaction stages under on the device.
+    """
+
+    def setUp(self) -> None:
+        self.work = Path(tempfile.mkdtemp(prefix="le-release-test-"))
+        self.assets = self.work / "release-assets"
+        self.assets.mkdir()
+        self.out = self.work / "out"
+        self.release = "0.14.0-test"
+        self._make_release()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.work, ignore_errors=True)
+
+    def _record(self, path: Path) -> dict:
+        return {"name": path.name, "sha256": builder.sha256_file(path),
+                "size": path.stat().st_size}
+
+    def _make_release(self, manifest_overrides: dict | None = None) -> None:
+        boot = self.assets / "boot.img"
+        boot.write_bytes(b"\0" * (builder.BOOT_SLOT_SECTORS * 512))
+        key = self.assets / "libreecho-radar-puffin-0.14.0-ota-public-key.hex"
+        key.write_bytes(b"b" * 64)
+        # The same bytes under both naming schemes, as a real release ships them.
+        self.payload_bytes = b"feature-payload"
+        self.manifest_bytes = b'{"feature":"tts"}'
+        build_tag_payload = self.assets / f"libreecho-radar-puffin-build-abc-{self.release}-tts.squashfs"
+        build_tag_payload.write_bytes(self.payload_bytes)
+        build_tag_manifest = self.assets / f"libreecho-radar-puffin-build-abc-{self.release}-tts.manifest.json"
+        build_tag_manifest.write_bytes(self.manifest_bytes)
+        self.signed_payload = self.assets / f"libreecho-radar-puffin-{self.release}-tts.payload.squashfs"
+        self.signed_payload.write_bytes(self.payload_bytes)
+        self.signed_manifest = self.assets / f"libreecho-radar-puffin-{self.release}-tts.manifest.json"
+        self.signed_manifest.write_bytes(self.manifest_bytes)
+
+        install = {
+            "schema": builder.SCHEMA,
+            "release": self.release,
+            "board": "radar_puffin",
+            "soc": "mt8163",
+            "image_profile": "ota",
+            "service_profile": "production",
+            "boot": self._record(boot),
+            "ota_public_key": self._record(key),
+            "features": [{"name": "tts",
+                          "payload": self._record(build_tag_payload),
+                          "manifest": self._record(build_tag_manifest)}],
+            "amonet": {"repository": "https://example.invalid/amonet",
+                       "tag": "0" * 40, "commit": "0" * 40},
+        }
+        with tarfile.open(self.assets / f"libreecho-{self.release}-initial-install.tar", "w") as tar:
+            tar.add(boot, arcname="boot.img")
+            tar.add(key, arcname=key.name)
+            tar.add(build_tag_payload, arcname=build_tag_payload.name)
+            tar.add(build_tag_manifest, arcname=build_tag_manifest.name)
+            install_path = self.work / builder.INSTALL_MANIFEST_NAME
+            install_path.write_text(json.dumps(install))
+            tar.add(install_path, arcname=builder.INSTALL_MANIFEST_NAME)
+
+        signed = {
+            "format": "libreecho-ota-v2",
+            "version": self.release,
+            "boot_sha256": builder.sha256_file(boot),
+            "feature_ids": "tts",
+            "feature_tts_action": "replace",
+            "feature_tts_asset": self.signed_payload.name,
+            "feature_tts_sha256": builder.sha256_file(self.signed_payload),
+            "feature_tts_manifest_asset": self.signed_manifest.name,
+            "feature_tts_manifest_sha256": builder.sha256_file(self.signed_manifest),
+        }
+        signed.update(manifest_overrides or {})
+        text = "".join(f"{k}={v}\n" for k, v in signed.items())
+        (self.assets / "manifest").write_text(text)
+        (self.assets / "manifest.sig").write_bytes(b"signature")
+        self._write_ota_tar(boot)
+
+    def _write_ota_tar(self, boot: Path) -> None:
+        tar_path = self.assets / f"libreecho-{self.release}.ota.tar"
+        with tarfile.open(tar_path, "w") as tar:
+            for name in ("manifest", "manifest.sig"):
+                tar.add(self.assets / name, arcname=name)
+            tar.add(boot, arcname="boot.img")
+        self.ota_tar = tar_path
+
+    def build(self) -> dict:
+        return builder.assemble(self.assets, self.out, SRC, self.release, 2153472)
+
+    def test_the_bundle_ships_the_signed_manifests_names(self) -> None:
+        self.build()
+        text = (self.out / builder.MANIFEST_NAME).read_text()
+        staging = [l for l in text.splitlines() if l.startswith("staging=")][0]
+        fields = staging.split("=", 1)[1].split(":")
+        self.assertEqual(fields[1], self.signed_payload.name)
+        self.assertEqual(fields[3], self.signed_manifest.name)
+        # One name per file: the build-tag twins must not also be shipped.
+        self.assertTrue((self.out / self.signed_payload.name).is_file())
+        self.assertFalse((self.out / f"libreecho-radar-puffin-build-abc-{self.release}-tts.squashfs").is_file())
+
+    def test_a_digest_disagreement_between_the_manifests_is_refused(self) -> None:
+        # Both manifests describe the same feature, so a digest that only one of
+        # them reports is a packaging disagreement, not a preference: refusing is
+        # the only safe answer, because the device stages under the signed name
+        # while the release shipped the other bytes.
+        self._make_assets_with_wrong_digest()
+        with self.assertRaises(builder.BuildError):
+            self.build()
+
+    def _make_assets_with_wrong_digest(self) -> None:
+        # The signed manifest has to be changed in both places: the loose copy and
+        # the one inside the OTA tar, because the tar's member is what the bundle
+        # actually reads.
+        corrected = (self.assets / "manifest").read_text().replace(
+            f"feature_tts_sha256={builder.sha256_file(self.signed_payload)}",
+            f"feature_tts_sha256={'0' * 64}")
+        (self.assets / "manifest").write_text(corrected)
+        self._write_ota_tar(self.assets / "boot.img")
+
+    def test_the_local_install_package_is_shipped_and_pinned(self) -> None:
+        summary = self.build()
+        self.assertEqual(summary["local_package"], self.ota_tar.name)
+        self.assertTrue((self.out / self.ota_tar.name).is_file())
+        declared = {}
+        for line in (self.out / builder.MANIFEST_NAME).read_text().splitlines():
+            for name, digest in builder._declared_assets(line):
+                declared[name] = digest
+        self.assertIn(self.ota_tar.name, declared)
+        self.assertEqual(declared[self.ota_tar.name], builder.sha256_file(self.ota_tar))
+
+    def test_an_oversized_package_is_refused(self) -> None:
+        # 32 MiB is the device-side cap; a package over it can never install.
+        with tarfile.open(self.ota_tar, "w") as tar:
+            for name in ("manifest", "manifest.sig"):
+                tar.add(self.assets / name, arcname=name)
+            padding = self.work / "boot.img"
+            padding.unlink(missing_ok=True)
+            with padding.open("wb") as handle:
+                handle.truncate(builder.LOCAL_PACKAGE_MAX_BYTES + 1)
+            info = tar.gettarinfo(str(padding), arcname="boot.img")
+            with padding.open("rb") as handle:
+                tar.addfile(info, handle)
+        with self.assertRaises(builder.BuildError):
+            self.build()
+
+    def test_a_package_with_the_wrong_members_is_refused(self) -> None:
+        with tarfile.open(self.ota_tar, "w") as tar:
+            tar.add(self.assets / "manifest", arcname="manifest")
+            tar.add(self.assets / "boot.img", arcname="boot.img")
+        with self.assertRaises(builder.BuildError):
+            self.build()
+
+    def test_a_package_carrying_a_different_boot_image_is_refused(self) -> None:
+        other = self.work / "other.img"
+        other.write_bytes(b"\1" * (builder.BOOT_SLOT_SECTORS * 512))
+        self._write_ota_tar(other)
+        with self.assertRaises(builder.BuildError):
+            self.build()
+
+    def test_the_installer_creates_the_live_feature_targets(self) -> None:
+        """The transaction refuses a target that is not already a real directory.
+        On an initial install nothing else creates it, so the installer must."""
+        installer = (SRC / "META-INF/com/google/android/update-binary").read_text()
+        self.assertIn("LIVE_FEATURES=/data/libreecho/features", installer)
+        self.assertIn("mkdir \"$live_dir\"", installer)
+        self.assertIn("feature-target-dir", installer)
+
+    def test_the_installer_places_the_package_and_names_the_local_install(self) -> None:
+        installer = (SRC / "META-INF/com/google/android/update-binary").read_text()
+        self.assertIn("local_package=", installer)
+        # --feature-dir comes AFTER the package: the verb only accepts the flag
+        # once package=$1 has been consumed, and the wrong order is ERROR:usage.
+        self.assertIn(
+            "libreecho-update install $LOCAL_PACKAGE --feature-dir $STAGING/features",
+            installer)
+        self.assertIn("LOCAL_PACKAGE_MAX_BYTES=33554432", installer)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

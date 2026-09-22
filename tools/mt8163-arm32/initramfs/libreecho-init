@@ -1031,8 +1031,96 @@ start_shared_discovery_runtime()
     return 0
 }
 
+# A TWRP install stages a complete tree, writes both boot slots and leaves the
+# release's OTA package on /data -- and stops there. Nothing that runs in
+# recovery can prepare the feature transaction: prepare-boot belongs to this
+# image, and the tree is only complete after the format. So the boot this image
+# is running adopts it, once, under a fingerprint strict enough that nothing
+# else can trigger it: the staged SIGNED manifest must name the exact boot image
+# that is running, which is what binds a staged tree to the install that made
+# it. An existing transaction, a non-OTA image profile, an unreadable manifest
+# or a boot hash that does not match is left alone for a human with the log.
+adopt_staged_local_install()
+{
+    # Environment overrides, the same way libreecho-feature-transaction
+    # exposes its own: this decision lives on the boot path and cannot be reached
+    # by any test that has to boot a device, so the paths it reads are named.
+    install_cmdline=${LIBREECHO_CMDLINE_FILE:-/proc/cmdline}
+    install_root=${LIBREECHO_INSTALL_ROOT:-/data/libreecho/update}
+    install_slot_a=${LIBREECHO_SLOT_A_DEVICE:-/dev/mmcblk0p10}
+    install_slot_b=${LIBREECHO_SLOT_B_DEVICE:-/dev/mmcblk0p11}
+    install_transaction=${LIBREECHO_TRANSACTION_TOOL:-/usr/local/sbin/libreecho-feature-transaction}
+    [ "$IMAGE_PROFILE" = ota ] || return 0
+    install_staging=$install_root/staging
+    [ -r "$install_staging/manifest" ] || return 0
+    [ -d "$install_staging/features" ] || return 0
+    for install_live in feature-commit pending installed; do
+        if [ -e "$install_root/$install_live" ]; then
+            # A transaction already exists: this tree is not unattended work.
+            log "local-install-transaction-present:$install_live"
+            return 0
+        fi
+    done
+    install_want=$($BB sed -n 's/^boot_sha256=//p' "$install_staging/manifest" 2>/dev/null |
+        $BB head -n 1)
+    case "$install_want" in
+        ''|*[!0-9a-f]*) log local-install-manifest-unreadable; return 0 ;;
+    esac
+    [ "${#install_want}" -eq 64 ] || { log local-install-manifest-unreadable; return 0; }
+    install_slot=$($BB sed -n \
+        's/.*androidboot.slot_suffix=_\([ab]\).*/\1/p' "$install_cmdline")
+    case "$install_slot" in
+        a) install_device=$install_slot_a ;;
+        b) install_device=$install_slot_b ;;
+        *) log local-install-running-slot-unknown; return 0 ;;
+    esac
+    install_hash=$($BB sha256sum "$install_device" 2>/dev/null | $BB awk '{print $1}')
+    [ -n "$install_hash" ] || { log local-install-running-hash-unavailable; return 0; }
+    if [ "$install_hash" != "$install_want" ]; then
+        # The staged tree describes some other image. Adopting it would commit
+        # features against bytes this slot is not running.
+        log "local-install-staged-tree-mismatch:$install_slot"
+        return 0
+    fi
+    if [ ! -x "$install_transaction" ]; then
+        log local-install-transaction-unavailable
+        return 0
+    fi
+    log "local-install-adopting:$install_slot"
+    pmsg_marker local-install-adopting
+    # The transaction is prepared for the slot that is RUNNING, not for the
+    # other one: a TWRP install writes both slots and boots one of them, so
+    # `libreecho-update install` -- which models the OTA case and therefore
+    # targets `inactive_slot` -- would prepare a candidate the booted slot is
+    # not, and this boot would take the failed-candidate path. prepare-boot
+    # takes its slot from this file, and preflight is the free-space check the
+    # OTA path runs immediately before it.
+    if ! $BB printf '%s\n' "$install_slot" > "$install_root/transaction-slot.tmp"; then
+        log local-install-slot-write-failed
+        return 0
+    fi
+    if ! $BB mv "$install_root/transaction-slot.tmp" "$install_root/transaction-slot"; then
+        log local-install-slot-write-failed
+        $BB rm -f "$install_root/transaction-slot.tmp" 2>/dev/null
+        return 0
+    fi
+    if "$install_transaction" preflight "$install_staging/manifest" prewrite \
+            > /tmp/local-install.log 2>&1 &&
+       "$install_transaction" prepare-boot >> /tmp/local-install.log 2>&1; then
+        log local-install-prepared
+        pmsg_marker local-install-prepared
+        return 0
+    fi
+    # Services still start. A staged tree that will not prepare is reported, not
+    # turned into an appliance that cannot be reached without a serial console.
+    log local-install-prepare-failed
+    pmsg_marker local-install-preparation-failed
+    return 0
+}
+
 activate_feature_transaction()
 {
+    adopt_staged_local_install
     transaction=/usr/local/sbin/libreecho-feature-transaction
     [ -x "$transaction" ] || return 0
     update=/data/libreecho/update
