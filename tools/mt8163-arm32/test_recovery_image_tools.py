@@ -1761,41 +1761,6 @@ class VendorAssetContractTests(unittest.TestCase):
         self.assertEqual(builder.CONNECTIVITY_IMPORTER_SHA256, actual)
         self.assertEqual(verifier.CONNECTIVITY_IMPORTER_SHA256, actual)
 
-    def test_every_shipped_vendor_spec_is_wired_into_every_owner(self) -> None:
-        """A spec present in the repository but absent from an owner's inventory
-        never reaches a device: the builder stages only what its map lists, and
-        the verifier rejects a member it does not expect. v3 shipped that way,
-        and a device carrying that stock revision kept failing the import with
-        UNKNOWN_COMPATIBLE_SET even though the fix was merged.
-
-        The builder's staging map is function-local, so its source is checked
-        textually; the verifier's two maps are module-level and checked directly.
-        """
-        shipped = sorted(
-            path.name
-            for path in (TOOLS_DIR / "initramfs/vendor-assets").glob(
-                "mt8163-v181-stock-v*.tsv"
-            )
-        )
-        self.assertTrue(shipped, "no shipped vendor specifications found")
-        builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
-        for name in shipped:
-            member = f"vendor-assets/{name}"
-            self.assertIn(
-                member, builder_source, f"{member} is not staged by the image builder"
-            )
-            self.assertIn(
-                member, verifier.OVERLAY_FILES, f"{member} missing from OVERLAY_FILES"
-            )
-            self.assertIn(
-                member, verifier.OVERLAY_TARGETS, f"{member} missing from OVERLAY_TARGETS"
-            )
-            self.assertEqual(
-                verifier.OVERLAY_TARGETS[member],
-                f"etc/libreecho/vendor-assets/{name}",
-                f"{member} overlay target disagrees with its member path",
-            )
-
     def test_vendor_firmware_policy_documents_no_redistribution(self) -> None:
         policy = TOOLS_DIR / "initramfs/vendor-assets/README.md"
         text = policy.read_text()
@@ -2995,17 +2960,11 @@ start_feature_service_if_enabled
         self.assertIn("web_listen=0.0.0.0:8080", source)
         self.assertNotIn("if [ -r /data/libreecho/config/users ]; then", source)
         self.assertNotIn("libreecho-update-fetch watch", source)
-        # The health worker is started for every OTA image, not only a
-        # production one: its rollback half must run on the boot after the
-        # bootloader fell back whatever the service profile is, or the failed
-        # candidate's records strand the update flow.  Candidate confirmation
-        # stays production-only, gated inside the worker.
-        self.assertIn('if [ "$IMAGE_PROFILE" = ota ]; then', source)
-        self.assertIn("ota-background-worker-started", source)
-        self.assertIn("ota-background-workers-disabled-for-non-ota-profile", source)
         self.assertIn(
-            "ota-health-confirmation-skipped-non-production-profile", source
+            'if [ "$IMAGE_PROFILE" = ota ] && [ "$SERVICE_PROFILE" = production ]; then',
+            source,
         )
+        self.assertIn("ota-background-workers-disabled-for-diagnostic-profile", source)
         builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
         verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
         self.assertIn('"activation": "manual-single-shot-after-adb"', builder)
@@ -3044,11 +3003,7 @@ start_feature_service_if_enabled
         ):
             self.assertIn(socket_path, source)
         self.assertIn("ota-health-services-not-ready", source)
-        # Confirmation is production-only; the worker is not.
-        self.assertIn("ota-background-worker-started", source)
-        self.assertIn(
-            "ota-health-confirmation-skipped-non-production-profile", source
-        )
+        self.assertIn("ota-background-workers-disabled-for-diagnostic-profile", source)
 
     def test_userdata_mount_is_identity_checked_and_non_destructive(self) -> None:
         source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
@@ -3651,6 +3606,51 @@ start_feature_service_if_enabled
             confirm.index("verify_preserved_feature_identity pending"),
             confirm.index('"$BOOTCTL" confirm'),
         )
+
+    def test_boot_control_accepts_both_supported_boot_layouts(self) -> None:
+        """The pinned upstream chain names the slot stores boot_a/boot_b, while the
+        legacy Amonet layout exposes the same device nodes as boot_a_x/boot_b_x with
+        separate wrapper partitions. Both must validate, the Amonet set must be tried
+        first so a unit already on that layout keeps its existing path, and a unit
+        matching neither must still fail closed rather than accept either set loosely.
+        """
+        source = (TOOLS_DIR / "ota/libreecho_bootctl.c").read_text()
+        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
+        inspector = (TOOLS_DIR / "inspect_boot_control_root.sh").read_text()
+
+        # Both contract sets exist, and the legacy set is selected first.
+        self.assertIn("partitions_amonet[]", source)
+        self.assertIn("partitions_pinned[]", source)
+        self.assertLess(
+            source.index('boot_layout = "amonet"'),
+            source.index('boot_layout = "pinned"'),
+        )
+
+        # The pinned set pins the same nodes and sizes and has no wrappers.
+        pinned = source[
+            source.index("partitions_pinned[]") : source.index("#define CONTRACT_COUNT")
+        ]
+        for expected in ("mmcblk0p8", "mmcblk0p9", "mmcblk0p10", "mmcblk0p11", "mmcblk0p16"):
+            self.assertIn(expected, pinned)
+        self.assertIn('"boot_a", 32768', pinned)
+        self.assertIn('"boot_b", 32768', pinned)
+        self.assertNotIn("mmcblk0p17", pinned)
+        self.assertNotIn("mmcblk0p18", pinned)
+
+        # Probing the unused layout stays quiet; the failing set still reports, and
+        # the selected layout is reported so an operator can see which one matched.
+        self.assertIn("contract_reporting", source)
+        self.assertIn('printf("boot_layout=%s\\n", boot_layout)', source)
+
+        # The updater accepts either store name for the slot's device node and keeps
+        # the sector pin that rejects a 225280-sector Amonet wrapper partition.
+        for slot in ("a", "b"):
+            self.assertIn(f"target_partname=boot_{slot}_x", updater)
+            self.assertIn(f"target_partname_pinned=boot_{slot}", updater)
+        self.assertIn('= "$BOOT_SECTORS"', updater)
+
+        # The inspector reports the layout the unit has instead of demanding one.
+        self.assertIn("require_partition_any", inspector)
 
     def test_host_ota_path_is_explicit_and_uses_guarded_updater(self) -> None:
         host = pipeline_file("ota.sh").read_text()

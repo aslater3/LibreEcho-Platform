@@ -56,35 +56,75 @@ class UserdataShellGeometryTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which('cc'), 'C contract test requires a host C compiler')
 class UserdataBootctlGeometryTests(unittest.TestCase):
-    def test_compiled_partition_contract(self):
-        source = (ROOT / 'ota/libreecho_bootctl.c').read_text()
-        self.assertIn('!partition_sectors_match(contract, text)', source)
+    # Both supported layouts declare a slot store at the same device node and the
+    # same reviewed 32768 sectors. The pinned set drops the Amonet wrapper
+    # partitions, so a wrapper size must never be accepted for a pinned store.
+    LAYOUTS = {
+        'partitions_amonet': {
+            'boot_a_x': 32768,
+            'boot_b_x': 32768,
+            'boot_a': 225280,
+            'boot_b': 225280,
+            'misc': 1025,
+            'persist': 32768,
+            'userdata': 2137088,
+        },
+        'partitions_pinned': {
+            'boot_a': 32768,
+            'boot_b': 32768,
+            'misc': 1025,
+            'persist': 32768,
+            'userdata': 2137088,
+        },
+    }
+
+    def compile_layout_harness(self, source, table_name, directory):
         contract = re.search(r'struct partition_contract \{.*?\n\};', source, re.S)[0]
-        table = re.search(r'static const struct partition_contract partitions\[\] = \{.*?\n\};', source, re.S)[0]
+        table = re.search(
+            r'static const struct partition_contract ' + table_name + r'\[\] = \{.*?\n\};',
+            source, re.S,
+        )[0]
         helper = re.search(r'static int partition_sectors_match\(.*?\n\}', source, re.S)[0]
-        code = '#include <stdio.h>\n#include <string.h>\n' + contract + '\n' + table + '\n' + helper + r'''
+        code = '#include <stdio.h>\n#include <string.h>\n' + contract + '\n' + table + '\n' + helper + (
+            r'''
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
-    for (size_t i = 0; i < sizeof(partitions)/sizeof(partitions[0]); ++i)
-        printf("%s:%lu:%d\n", partitions[i].name, partitions[i].sectors,
-               partition_sectors_match(&partitions[i], argv[1]));
+    for (size_t i = 0; i < sizeof(TABLE)/sizeof(TABLE[0]); ++i)
+        printf("%s:%lu:%d\n", TABLE[i].name, TABLE[i].sectors,
+               partition_sectors_match(&TABLE[i], argv[1]));
     struct partition_contract wrong = {"/dev/mmcblk0p99", "unused", "userdata", 2137088};
     if (partition_sectors_match(&wrong, "2153472")) return 3;
     return 0;
 }
 '''
+        ).replace('TABLE', table_name)
+        compiled_path = directory / ('%s.c' % table_name)
+        binary = directory / table_name
+        compiled_path.write_text(code)
+        compiled = subprocess.run(['cc', '-std=c99', '-Wall', '-Wextra', '-Werror', str(compiled_path), '-o', str(binary)], capture_output=True, text=True)
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        return binary
+
+    def test_compiled_partition_contract(self):
+        source = (ROOT / 'ota/libreecho_bootctl.c').read_text()
+        self.assertIn('!partition_sectors_match(contract, text)', source)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / 'test.c').write_text(code)
-            compiled = subprocess.run(['cc', '-std=c99', '-Wall', '-Wextra', '-Werror', str(root / 'test.c'), '-o', str(root / 'test')], capture_output=True, text=True)
-            self.assertEqual(compiled.returncode, 0, compiled.stderr)
-            for value in VALUES + ('1025', '32768', '225280'):
-                result = subprocess.run([str(root / 'test'), value], capture_output=True, text=True)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                for line in result.stdout.splitlines():
-                    name, standard, accepted = line.split(':')
-                    expected = value == standard or (name == 'userdata' and value == '2153472')
-                    self.assertEqual(accepted == '1', expected, (name, value))
+            for table_name, expected in self.LAYOUTS.items():
+                with self.subTest(layout=table_name):
+                    binary = self.compile_layout_harness(source, table_name, root)
+                    observed = {}
+                    for value in VALUES + ('1025', '32768', '225280'):
+                        result = subprocess.run([str(binary), value], capture_output=True, text=True)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        for line in result.stdout.splitlines():
+                            name, standard, accepted = line.split(':')
+                            observed[name] = standard
+                            wanted = value == standard or (name == 'userdata' and value == '2153472')
+                            self.assertEqual(accepted == '1', wanted, (table_name, name, value))
+                    self.assertEqual(
+                        observed, {name: str(sectors) for name, sectors in expected.items()}, table_name
+                    )
 
 
 if __name__ == '__main__':
