@@ -2322,17 +2322,18 @@ class FreshInstallActivationTests(PreConfirmAcceptanceTests):
         # invented in the live tree to satisfy the base gate.
         self.assertFalse(self.old_payload.exists())
 
-    def test_a_base_that_appears_while_the_journal_says_none_is_refused(self) -> None:
+    def test_a_base_that_does_not_match_the_declaration_is_refused(self) -> None:
         self.fresh()
         prepared = self.prepare_boot()
         self.assertEqual(prepared.returncode, 0, prepared.stderr)
         self.assertIn("feature_airplay2_old_payload_sha256=none", self.journal())
-        # Something appeared where prepare-boot recorded nothing: the commit would
-        # have to reconcile bytes that no declaration covers.
+        # A base present but not the one the release was built against is still a
+        # failure: the fresh-install allowance is for absence, not for any bytes.
         self.old_payload.write_bytes(b"unexpected-base")
+        self.old_manifest.write_bytes(b"unexpected-base-manifest")
         result = self.activate()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("base-payload-present", result.stderr)
+        self.assertIn("base-payload-hash", result.stderr)
 
 
 class CommittedRuntimeLifecycleTests(unittest.TestCase):
