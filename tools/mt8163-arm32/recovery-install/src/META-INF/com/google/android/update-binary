@@ -1,0 +1,504 @@
+#!/sbin/sh
+# LibreEcho initial-install - TWRP entry point and installer, in one file.
+#
+# Shipped byte-for-byte as the zip's META-INF/com/google/android/update-binary.
+# It is deliberately self-contained: TWRP's unzip is toybox's, which ignored both
+# the member pattern and the destination and silently extracted nothing (exit 0),
+# so an installer that unpacked its own scripts failed before running a check.
+# A dry run caught that, which is what dry runs are for.
+#
+# Everything below is the installer itself; there is nothing to unpack first.
+#
+# LibreEcho initial-install - device side, runs inside TWRP.
+#
+#   twrp install /cache/libreecho-bundle/libreecho-install.zip
+#
+# Why TWRP and not the host: sgdisk, mke2fs, sha256sum and /dev/block/by-name
+# all exist in recovery and NONE of them exist in the installed OS. Reshaping a
+# partition table and formatting a filesystem on the user's laptop would mean
+# depending on whatever versions they happen to have installed.
+#
+# Phases. The host orchestrator drives them and each ends with a receipt:
+#
+#   prepare   Reshape userdata to the contract size. REQUIRES A REBOOT: the
+#             kernel keeps the old partition table until it re-reads it, and a
+#             filesystem built against the stale size would be larger than the
+#             partition that holds it.
+#   install   Format userdata, write both boot slots, stage feature payloads.
+#
+# What this installer may write, and nothing else:
+#   boot_a, boot_b   the OS image
+#   userdata         partition table entry (prepare) and filesystem (install)
+# What it must never write:
+#   expdb            holds kaeru; the boot chain lives there
+#   lk_a, lk_b, tee1, tee2, preloader, GPT, persist, recovery, system_a, system_b
+#
+# Every payload is hash-checked before use, and every write is read back and
+# re-hashed afterwards. A flash command that returns success is not evidence.
+#
+# Shell note: TWRP's /sbin/sh is mksh and there is no busybox (`/bin/busybox:
+# not found`), so this file avoids bashisms and uses only /sbin tools.
+
+set -u
+
+# --- contract ---------------------------------------------------------------
+# Accepted userdata sizes from the image's own control plane. Any other size
+# means the layout is not the one the OS was built against, and the OS refuses
+# to mount /data rather than mounting something it cannot vouch for.
+USERDATA_CONTRACT_SECTORS="2137088 2153472"
+USERDATA_SECTORS_TARGET=2153472          # which of the two we reshape to
+BOOT_SLOT_SECTORS=32768                  # 16 MiB per boot slot
+USERDATA_TYPE_GUID="0FC63DAF-8483-4772-8E79-3D69D8477DE4"
+REQUIRED_PARTITIONS="boot_a boot_b userdata misc cache system_a"
+RECEIPT=/cache/libreecho-install-receipt
+LOG=/cache/libreecho-install.log
+DRY_RUN_FLAG=/cache/libreecho-install-dry-run
+BUNDLE_DIR=""
+DRY_RUN=0
+
+# --- output -----------------------------------------------------------------
+OUTFD=${OUTFD:-1}
+
+ui_print() {
+    if [ -n "${OUTFD:-}" ] && [ -w "/proc/self/fd/$OUTFD" ] 2>/dev/null; then
+        echo "ui_print $*" > "/proc/self/fd/$OUTFD" 2>/dev/null
+        echo "ui_print" > "/proc/self/fd/$OUTFD" 2>/dev/null
+    fi
+    log_line "$*"
+}
+
+log_line() {
+    echo "libreecho-install: $*" >> "$LOG" 2>/dev/null
+    echo "libreecho-install: $*" > /dev/console 2>/dev/null
+}
+
+die() {
+    ui_print "FAILED: $*"
+    receipt_set "result=failed" "error=$*"
+    exit 1
+}
+
+receipt_set() {
+    # key=value receipt the host reads back over adb. Appended, never rewritten,
+    # so a partial run still shows how far it got.
+    receipt_reset
+    for kv in "$@"; do
+        echo "$kv" >> "$RECEIPT"
+    done
+}
+
+receipt_reset() {
+    if [ "${RECEIPT_RESET_DONE:-0}" = 0 ]; then
+        : > "$RECEIPT"
+        RECEIPT_RESET_DONE=1
+    fi
+}
+
+# --- partition helpers ------------------------------------------------------
+# /dev/block/by-name exists in recovery but NOT in the installed OS, which
+# resolves partitions through sysfs PARTNAME. Resolve by PARTNAME first so the
+# same code works in both environments.
+partition_node() {
+    want=$1
+    if [ -e "/dev/block/by-name/$want" ]; then
+        echo "/dev/block/by-name/$want"
+        return 0
+    fi
+    for u in /sys/class/block/mmcblk0p*/uevent; do
+        [ -r "$u" ] || continue
+        if grep -qx "PARTNAME=$want" "$u" 2>/dev/null; then
+            dev=$(dirname "$u")
+            echo "/dev/$(basename "$dev")"
+            return 0
+        fi
+    done
+    return 1
+}
+
+part_node() {
+    # /dev/block/by-name/<name> is a symlink to the real node (mmcblk0pN), and
+    # sysfs is keyed on the real name, so resolve before asking the kernel.
+    readlink -f "$1" 2>/dev/null || echo "$1"
+}
+
+partition_sectors() {
+    # 512-byte sectors, straight from the kernel
+    base=$(basename "$(part_node "$1")")
+    cat "/sys/class/block/$base/size" 2>/dev/null
+}
+
+partition_number() {
+    # index inside the GPT, needed for sgdisk
+    base=$(basename "$(part_node "$1")")
+    echo "$base" | sed -n 's/^mmcblk0p\([0-9]*\)$/\1/p'
+}
+
+sha256_of() {
+    /sbin/sha256sum "$1" 2>/dev/null | awk '{print $1}'
+}
+
+# --- phase 1: validate (no writes) ------------------------------------------
+check_device() {
+    ui_print "Checking the device"
+    # Distinct variable names throughout: mksh has no function-local scope worth
+    # relying on, and a leaked $node silently corrupted a receipt once already.
+    for p in $REQUIRED_PARTITIONS; do
+        dev_node=$(partition_node "$p") || die "required partition '$p' is missing"
+        part_sectors=$(partition_sectors "$dev_node")
+        ui_print "  $p -> $dev_node ($part_sectors sectors)"
+    done
+    for check_slot in boot_a boot_b; do
+        dev_node=$(partition_node "$check_slot")
+        part_sectors=$(partition_sectors "$dev_node")
+        if [ "$part_sectors" != "$BOOT_SLOT_SECTORS" ]; then
+            die "$check_slot is $part_sectors sectors, expected $BOOT_SLOT_SECTORS (16 MiB)"
+        fi
+    done
+    if [ -e "$(partition_node expdb)" ]; then
+        ui_print "  expdb present - this installer never writes to it"
+    fi
+}
+
+verify_pair() {
+    # verify_pair <filename> <sha256> <label>
+    # Used for every declared asset: the boot image, the OTA key, the install
+    # manifest and both files of every feature. All of them are checked BEFORE
+    # the first write - discovering a corrupt feature payload after userdata has
+    # been formatted is discovering it too late to do anything about.
+    vp_file=$1
+    vp_want=$2
+    vp_label=$3
+    vp_path="$BUNDLE_DIR/$vp_file"
+    [ -f "$vp_path" ] || die "$vp_label missing: $vp_file"
+    vp_got=$(sha256_of "$vp_path")
+    if [ "$vp_got" != "$vp_want" ]; then
+        die "$vp_label digest mismatch: $vp_file (got $vp_got want $vp_want)"
+    fi
+    count=$((count + 1))
+}
+
+field() {
+    # field <n> <value> - colon-separated field, 1-based
+    echo "$2" | cut -d: -f"$1"
+}
+
+check_payloads() {
+    ui_print "Verifying payloads against the manifest"
+    [ -n "$BUNDLE_DIR" ] || die "bundle directory not set"
+    [ -f "$BUNDLE_DIR/bundle.manifest" ] || die "bundle.manifest not found in $BUNDLE_DIR"
+    count=0
+    while IFS='=' read -r key value; do
+        case "$key" in
+            payload)
+                verify_pair "$(field 1 "$value")" "$(field 2 "$value")" payload
+                ;;
+            install_manifest)
+                verify_pair "$(field 1 "$value")" "$(field 2 "$value")" "install manifest"
+                ;;
+            staging)
+                # staging=<feature>:<payload file>:<sha>:<manifest file>:<sha>
+                sname=$(field 1 "$value")
+                verify_pair "$(field 2 "$value")" "$(field 3 "$value")" "$sname payload"
+                verify_pair "$(field 4 "$value")" "$(field 5 "$value")" "$sname manifest"
+                ;;
+        esac
+    done < "$BUNDLE_DIR/bundle.manifest"
+    [ "$count" -gt 0 ] || die "manifest lists no payloads"
+    ui_print "  $count payloads verified"
+}
+
+fingerprint_ok() {
+    fp_node=$(partition_node userdata) || return 1
+    fp_sectors=$(partition_sectors "$fp_node")
+    for fp_allowed in $USERDATA_CONTRACT_SECTORS; do
+        [ "$fp_sectors" = "$fp_allowed" ] && return 0
+    done
+    return 1
+}
+
+# --- phase 1: prepare the layout --------------------------------------------
+resize_userdata() {
+    node=$(partition_node userdata) || die "userdata not found"
+    part=$(partition_number "$node") || die "cannot determine the GPT index of $node"
+    info=$(/sbin/sgdisk --info="$part" "$DISK" 2>/dev/null)
+    first=$(echo "$info" | sed -n 's/^First sector: \([0-9]*\).*/\1/p')
+    [ -n "$first" ] || die "cannot read the first sector of userdata"
+    last=$((first + USERDATA_SECTORS_TARGET - 1))
+    old_guid=$(echo "$info" | sed -n 's/^Partition unique GUID: \(.*\)$/\1/p')
+    old_name=$(echo "$info" | sed -n "s/^Partition name: '\(.*\)'$/\1/p")
+    [ -n "$old_name" ] || old_name=userdata
+
+    ui_print "Reshaping userdata to $USERDATA_SECTORS_TARGET sectors"
+    ui_print "  keeping start sector $first, name '$old_name'"
+    if [ "$DRY_RUN" = 1 ]; then
+        ui_print "  DRY RUN - no change written"
+        receipt_set "result=dry-run-ok" "phase=prepare" "dry_run=1" \
+            "userdata_sectors=$(partition_sectors "$node")" \
+            "would_write=userdata-gpt-entry"
+        return 0
+    fi
+
+    # delete + new in ONE invocation: sgdisk saves nothing unless every step
+    # succeeds, which is what makes this safe to attempt. Version 0.8.10.2 only
+    # accepts long options, and --new alone cannot replace an existing entry.
+    set -- --delete="$part" --new="$part:$first:$last" --change-name="$part:$old_name"
+    set -- "$@" --typecode="$part:$USERDATA_TYPE_GUID"
+    [ -n "$old_guid" ] && set -- "$@" --partition-guid="$part:$old_guid"
+    /sbin/sgdisk "$@" "$DISK" > /tmp/sgdisk.out 2>&1 || {
+        cat /tmp/sgdisk.out | while read -r l; do ui_print "  $l"; done
+        die "sgdisk refused to reshape userdata (no changes saved)"
+    }
+    grep -q "The operation has completed successfully" /tmp/sgdisk.out \
+        || die "sgdisk did not report success (no changes saved)"
+
+    now=$(/sbin/sgdisk --info="$part" "$DISK" 2>/dev/null | sed -n 's/^Last sector: \([0-9]*\).*/\1/p')
+    [ "$now" = "$last" ] || die "userdata ends at $now, expected $last"
+    ui_print "  done: userdata now ends at $last"
+    receipt_set "result=prepare-ok" "phase=prepare" \
+        "userdata_sectors=$USERDATA_SECTORS_TARGET" "reboot_required=1"
+    ui_print "A REBOOT IS REQUIRED before the install phase; the kernel is"
+    ui_print "still using the old partition table."
+}
+
+# --- phase 2: install -------------------------------------------------------
+unmount_userdata() {
+    # mke2fs refuses to touch a mounted filesystem, and that guard is why the
+    # first real run failed safely instead of formatting a live mount. Recovery
+    # mounts /data and /sdcard - the same block device - by itself, so they must
+    # be released before the format.
+    attempt=0
+    while [ "$attempt" -lt 3 ]; do
+        # Never invoke the recovery CLI from inside an installer the recovery
+        # launched: a nested `twrp` command blocks forever because the recovery
+        # is busy running this script, and it deadlocked the first real install
+        # at exactly this line. Use the binaries directly - `/sbin/umount` was
+        # measured to release both mountpoints in a single pass.
+        /sbin/umount /sdcard 2>/dev/null
+        /sbin/umount /data 2>/dev/null
+        if ! grep -qE ' /(data|sdcard) ' /proc/mounts; then
+            return 0
+        fi
+        sleep 1
+        attempt=$((attempt + 1))
+    done
+    grep -E ' /(data|sdcard) ' /proc/mounts | while read -r line; do
+        ui_print "  still mounted: $line"
+    done
+    return 1
+}
+
+tidy_userdata_root() {
+    # Recovery creates /data/media whenever it mounts userdata, and the OS's
+    # data contract allows exactly two entries at the userdata root
+    # (libreecho and lost+found). Left in place it makes the cleanup helper fail
+    # its contract on the next boot, which blocks the service graph - and on a
+    # first boot is the prime suspect for taking the staged features with it.
+    # Remove anything recovery left at the root, then prove the root is clean.
+    ui_print "Tidying the userdata root for the data contract"
+    if [ "$DRY_RUN" = 1 ]; then
+        ui_print "  DRY RUN - would remove recovery's own /data/media and friends"
+        return 0
+    fi
+    for stray in /data/media /data/local /data/tmp /data/test; do
+        if [ -e "$stray" ]; then
+            rm -rf "$stray" && ui_print "  removed $stray"
+        fi
+    done
+    sync
+    for entry in /data/*; do
+        [ -e "$entry" ] || continue
+        base=${entry##*/}
+        case "$base" in
+            libreecho|lost+found) ;;
+            *) ui_print "  WARNING: unexpected /data entry remains: $base" ;;
+        esac
+    done
+}
+
+format_userdata() {
+    node=$(partition_node userdata) || die "userdata not found"
+    sectors=$(partition_sectors "$node")
+    ok=0
+    for allowed in $USERDATA_CONTRACT_SECTORS; do
+        [ "$sectors" = "$allowed" ] && ok=1
+    done
+    [ "$ok" = 1 ] || die "userdata is $sectors sectors - run the prepare phase first"
+    ui_print "Formatting userdata (this erases it)"
+    if [ "$DRY_RUN" = 1 ]; then
+        ui_print "  DRY RUN - would unmount /data and /sdcard, then mke2fs -t ext4 $node"
+        return 0
+    fi
+    unmount_userdata || die "could not release /data and /sdcard; refusing to format a live mount"
+    /sbin/mke2fs -F -t ext4 -L userdata "$node" > /tmp/mke2fs.out 2>&1 \
+        || { cat /tmp/mke2fs.out | while read -r l; do ui_print "  $l"; done; die "mke2fs failed"; }
+    ui_print "  formatted"
+}
+
+write_boot_slots() {
+    img="$BUNDLE_DIR/$1"
+    [ -f "$img" ] || die "boot image missing: $1"
+    want=$(sha256_of "$img")
+    size=$(wc -c < "$img" | tr -d ' ')
+    [ "$size" = "$((BOOT_SLOT_SECTORS * 512))" ] || die "boot image is $size bytes, expected $((BOOT_SLOT_SECTORS * 512))"
+    ui_print "Writing the OS image to both slots"
+    for write_slot in boot_a boot_b; do
+        slot_node=$(partition_node "$write_slot") || die "$write_slot not found"
+        if [ "$DRY_RUN" = 1 ]; then
+            ui_print "  DRY RUN - would write $1 to $write_slot"
+            continue
+        fi
+        dd if="$img" of="$slot_node" bs=4096 > /tmp/dd.out 2>&1 || die "dd to $write_slot failed"
+        sync
+        got=$(sha256_of "$slot_node")
+        if [ "$got" != "$want" ]; then
+            die "$write_slot readback mismatch (got $got want $want)"
+        fi
+        ui_print "  $slot verified ($got)"
+    done
+}
+
+stage_features() {
+    # Stage what the OS's feature transaction consumes, driven by the release's
+    # SIGNED manifest (key=value, so it is readable here):
+    #   update/staging/manifest + manifest.sig   the transaction's own input
+    #   update/staging/features/<f>/<asset>      for action=replace
+    #   /data/libreecho/features/<f>/…           for action=preserve
+    # The installer deliberately does not commit: commit_policy is
+    # after-slot-confirm, so the OS commits once the slot confirms. Staging the
+    # signed manifest *is* the intent.
+    ui_print "Staging features against the signed manifest"
+    ota_manifest=$BUNDLE_DIR/manifest
+    ota_signature=$BUNDLE_DIR/manifest.sig
+    [ -f "$ota_manifest" ] || die "signed manifest missing: $ota_manifest"
+    [ -f "$ota_signature" ] || die "manifest signature missing: $ota_signature"
+    if [ "$DRY_RUN" = 1 ]; then
+        ui_print "  DRY RUN - would stage the signed manifest and its features"
+        return 0
+    fi
+    staging=/data/libreecho/update/staging
+    mkdir -p "$staging" || die "cannot create $staging"
+    cp "$ota_manifest" "$staging/manifest" || die "cannot stage the manifest"
+    cp "$ota_signature" "$staging/manifest.sig" || die "cannot stage the signature"
+
+    # One hashing pass over the bundle, so a payload is found by its digest
+    # rather than by assuming the release's build name matches the manifest's
+    # asset name. They do not: the same bytes ship under both schemes.
+    digest_map=$(for candidate in "$BUNDLE_DIR"/*; do
+        [ -f "$candidate" ] || continue
+        case "${candidate##*/}" in
+            manifest|manifest.sig|bundle.manifest|SHA256SUMS|bundle.json) continue ;;
+        esac
+        printf '%s %s\n' "$(sha256_of "$candidate")" "${candidate##*/}"
+    done)
+    lookup_digest() {
+        echo "$digest_map" | awk -v w="$1" '$1 == w { print $2; exit }'
+    }
+
+    feature_ids=$(sed -n 's/^feature_ids=//p' "$ota_manifest" | head -n 1)
+    [ -n "$feature_ids" ] || die "the signed manifest declares no features"
+    staged_count=0
+    for fname in $(echo "$feature_ids" | tr ',' ' '); do
+        action=$(sed -n "s/^feature_${fname}_action=//p" "$ota_manifest" | head -n 1)
+        case "$action" in
+            replace)
+                asset=$(sed -n "s/^feature_${fname}_asset=//p" "$ota_manifest" | head -n 1)
+                want=$(sed -n "s/^feature_${fname}_sha256=//p" "$ota_manifest" | head -n 1)
+                masset=$(sed -n "s/^feature_${fname}_manifest_asset=//p" "$ota_manifest" | head -n 1)
+                mwant=$(sed -n "s/^feature_${fname}_manifest_sha256=//p" "$ota_manifest" | head -n 1)
+                [ -n "$asset" ] && [ -n "$want" ] || die "manifest incomplete for $fname"
+                pname=$(lookup_digest "$want")
+                mname=$(lookup_digest "$mwant")
+                [ -n "$pname" ] || die "no bundled payload matches $fname ($want)"
+                [ -n "$mname" ] || die "no bundled manifest matches $fname ($mwant)"
+                mkdir -p "$staging/features/$fname" || die "cannot create staging for $fname"
+                cp "$BUNDLE_DIR/$pname" "$staging/features/$fname/$asset" || die "cannot stage $fname payload"
+                cp "$BUNDLE_DIR/$mname" "$staging/features/$fname/$masset" || die "cannot stage $fname manifest"
+                got=$(sha256_of "$staging/features/$fname/$asset")
+                [ "$got" = "$want" ] || die "$fname staged payload digest mismatch"
+                got=$(sha256_of "$staging/features/$fname/$masset")
+                [ "$got" = "$mwant" ] || die "$fname staged manifest digest mismatch"
+                ui_print "  $fname: replace staged under the manifest's asset name"
+                ;;
+            preserve)
+                want=$(sed -n "s/^feature_${fname}_base_payload_sha256=//p" "$ota_manifest" | head -n 1)
+                mwant=$(sed -n "s/^feature_${fname}_base_manifest_sha256=//p" "$ota_manifest" | head -n 1)
+                pname=$(lookup_digest "$want")
+                mname=$(lookup_digest "$mwant")
+                [ -n "$pname" ] || die "no bundled payload matches preserved $fname ($want)"
+                dest=/data/libreecho/features/$fname
+                mkdir -p "$dest" || die "cannot create $dest"
+                cp "$BUNDLE_DIR/$pname" "$dest/payload.squashfs" || die "cannot place $fname payload"
+                [ -n "$mname" ] && cp "$BUNDLE_DIR/$mname" "$dest/manifest.json"
+                got=$(sha256_of "$dest/payload.squashfs")
+                [ "$got" = "$want" ] || die "$fname preserved payload digest mismatch"
+                ui_print "  $fname: preserve satisfied in the live tree"
+                ;;
+            *)
+                die "unsupported action for $fname: ${action:-none}"
+                ;;
+        esac
+        staged_count=$((staged_count + 1))
+    done
+    [ "$staged_count" -gt 0 ] || die "no features staged"
+    sync
+    ui_print "  $staged_count feature(s) staged for the transaction to commit"
+}
+
+main() {
+    ZIPFILE=${3:-}
+    BUNDLE_DIR=$(dirname "$ZIPFILE")
+    [ -d "$BUNDLE_DIR" ] || die "cannot determine the bundle directory"
+
+    receipt_reset
+    ui_print "LibreEcho initial-install"
+    ui_print "  bundle: $BUNDLE_DIR"
+
+    if [ -f "$BUNDLE_DIR/bundle.manifest" ]; then
+        while IFS='=' read -r key value; do
+            case "$key" in
+                release) ui_print "  release: $value" ;;
+                device)  ui_print "  device:  $value" ;;
+            esac
+        done < "$BUNDLE_DIR/bundle.manifest"
+    fi
+
+    DISK=/dev/block/mmcblk0
+    check_device
+    check_payloads
+
+    if fingerprint_ok; then
+        node=$(partition_node userdata)
+        userdata_now=$(partition_sectors "$node")
+        ui_print "userdata $userdata_now sectors - matches the contract"
+        format_userdata
+        write_boot_slots "$(sed -n 's/^boot_image=//p' "$BUNDLE_DIR/bundle.manifest")"
+        stage_features
+        tidy_userdata_root
+        if [ "$DRY_RUN" = 1 ]; then
+            receipt_set "result=dry-run-ok" "phase=install" "dry_run=1" \
+                "userdata_sectors=$userdata_now" \
+                "would_write=boot_a,boot_b,userdata,features"
+            ui_print "DRY RUN COMPLETE - nothing was written"
+        else
+            receipt_set "result=installed" "phase=install" \
+                "userdata_sectors=$userdata_now" "reboot_required=1"
+            ui_print "INSTALL COMPLETE - reboot to start LibreEcho"
+        fi
+    else
+        node=$(partition_node userdata)
+        ui_print "userdata $(partition_sectors "$node") sectors - does not match the contract"
+        ui_print "  accepted: $USERDATA_CONTRACT_SECTORS"
+        resize_userdata
+    fi
+}
+
+# A dry run rehearses every check with no writes. Two ways to ask for one:
+#   * append --dry-run after the arguments TWRP supplies, or
+#   * create the flag file at $DRY_RUN_FLAG, which is the only way when the run
+#     is started by `twrp install`, since that passes no extra arguments.
+case "${4:-} ${5:-}" in
+    *--dry-run*|*--validate-only*) DRY_RUN=1 ;;
+esac
+[ -f "$DRY_RUN_FLAG" ] && DRY_RUN=1
+
+main "$@"
