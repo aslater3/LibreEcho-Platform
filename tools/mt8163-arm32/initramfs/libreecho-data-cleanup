@@ -156,8 +156,25 @@ remove_children() {
         remove_path "$child"
     done
 }
-remove_children "$DATA_ROOT/libreecho/update/incoming"
-remove_children "$DATA_ROOT/libreecho/update/staging"
+
+# A staged, SIGNED update is not residue.  It is prepared work that the
+# boot-bound feature transaction consumes later in this same boot
+# (commit_policy=after-slot-confirm).  Clearing it here destroys a prepared
+# transaction before the thing that would commit it ever runs -- which is
+# precisely what a recovery-staged single-pass install leaves behind, and why
+# such an install cannot otherwise work in one pass.  Preserve only a signed
+# set: the manifest and its detached signature, both plain files.  Unsigned
+# leftovers are still cleared at the steady-state boundary.
+staged_manifest=$DATA_ROOT/libreecho/update/staging/manifest
+staged_signature=$DATA_ROOT/libreecho/update/staging/manifest.sig
+if [ -f "$staged_manifest" ] && [ -f "$staged_signature" ] &&
+        [ ! -L "$staged_manifest" ] && [ ! -L "$staged_signature" ]; then
+    printf 'DATA_CLEANUP_STAGED_SIGNED_PRESERVED=%s\n' \
+        "${staged_manifest#"$DATA_ROOT"/}" >&2
+else
+    remove_children "$DATA_ROOT/libreecho/update/incoming"
+    remove_children "$DATA_ROOT/libreecho/update/staging"
+fi
 
 unknown=0
 unknown_item() {

@@ -5,7 +5,10 @@ set -eu
 
 DATA_ROOT=${DATA_ROOT:-/data}
 TEST_MODE=${LIBREECHO_VENDOR_TEST_MODE:-0}
-BUNDLE_ID=mt8163-v181-stock-v1
+# Standard pinned stock-vendor spec. v3 is the newer revision; v1/v2 remain
+# pinned alongside it for reference. The revision tracks the owner's stock
+# build rather than the product, so either can appear on either unit.
+BUNDLE_ID=mt8163-v181-stock-v3
 SPEC=${LIBREECHO_VENDOR_SPEC:-/etc/libreecho/vendor-assets/$BUNDLE_ID.tsv}
 FIRMWARE_ROOT=${LIBREECHO_VENDOR_FIRMWARE_ROOT:-/lib/firmware}
 SYSTEM_A_DEV=${LIBREECHO_VENDOR_SYSTEM_A_DEV:-/dev/mmcblk0p13}
