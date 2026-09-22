@@ -53,6 +53,18 @@ REQUIRED_PARTITIONS="boot_a boot_b userdata misc cache system_a"
 RECEIPT=/cache/libreecho-install-receipt
 LOG=/cache/libreecho-install.log
 DRY_RUN_FLAG=/cache/libreecho-install-dry-run
+# The two trees this installer writes inside the formatted userdata. They are
+# the same paths the OS's feature transaction uses, so the names live here
+# rather than at each use site: a typo in one of them stages a tree nothing will
+# ever read.
+LIVE_UPDATE=/data/libreecho/update
+STAGING=$LIVE_UPDATE/staging
+LIVE_FEATURES=/data/libreecho/features
+# Where the release's OTA tar is left for the device-side local install. The OS
+# cannot read /cache, so this has to live on /data to survive into the boot that
+# completes the transaction.
+LOCAL_PACKAGE="$LIVE_UPDATE/incoming/local-install.ota.tar"
+LOCAL_PACKAGE_MAX_BYTES=33554432          # libreecho-update refuses more
 BUNDLE_DIR=""
 DRY_RUN=0
 
@@ -187,6 +199,8 @@ check_payloads() {
     [ -n "$BUNDLE_DIR" ] || die "bundle directory not set"
     [ -f "$BUNDLE_DIR/bundle.manifest" ] || die "bundle.manifest not found in $BUNDLE_DIR"
     count=0
+    LOCAL_PACKAGE_FILE=
+    LOCAL_PACKAGE_SHA=
     while IFS='=' read -r key value; do
         case "$key" in
             payload)
@@ -194,6 +208,18 @@ check_payloads() {
                 ;;
             install_manifest)
                 verify_pair "$(field 1 "$value")" "$(field 2 "$value")" "install manifest"
+                ;;
+            local_package)
+                # The package the device-side local install consumes. Verified
+                # here with the rest, BEFORE the format: a package that cannot
+                # pass the device's own checks is a bundle that strands a
+                # freshly formatted userdata.
+                verify_pair "$(field 1 "$value")" "$(field 2 "$value")" "local-install package"
+                lp_size=$(wc -c < "$BUNDLE_DIR/$(field 1 "$value")" | tr -d ' ')
+                [ "$lp_size" -le "$LOCAL_PACKAGE_MAX_BYTES" ] || die \
+                    "$(field 1 "$value") is $lp_size bytes; libreecho-update refuses more than $LOCAL_PACKAGE_MAX_BYTES"
+                LOCAL_PACKAGE_FILE=$(field 1 "$value")
+                LOCAL_PACKAGE_SHA=$(field 2 "$value")
                 ;;
             staging)
                 # staging=<feature>:<payload file>:<sha>:<manifest file>:<sha>
@@ -357,12 +383,45 @@ write_boot_slots() {
     done
 }
 
+ensure_userdata_mounted() {
+    # Every staging step writes into the filesystem the format just created, and
+    # the format leaves it unmounted -- mke2fs refuses to touch a live mount.
+    # Writing to /data while it is not mounted writes into recovery's ramfs
+    # instead: the copies succeed, the digests read back, the receipt says the
+    # features were staged, and the tree is gone at the next boot. Prove the
+    # mount, against the right block device, before anything is staged into it.
+    ud_node=$(partition_node userdata) || die "userdata not found"
+    ud_mounted=$(awk '$2 == "/data" { print $1; exit }' /proc/mounts)
+    if [ -n "$ud_mounted" ]; then
+        ui_print "  /data already mounted ($ud_mounted)"
+        return 0
+    fi
+    mkdir -p /data || die "cannot create the /data mountpoint"
+    /sbin/mount -t ext4 -o rw,nosuid,nodev,noatime "$ud_node" /data \
+        || die "cannot mount the formatted userdata ($ud_node)"
+    ud_mounted=$(awk '$2 == "/data" { print $1; exit }' /proc/mounts)
+    [ -n "$ud_mounted" ] || die "the userdata mount did not take"
+    [ "$(part_node "$ud_mounted")" = "$(part_node "$ud_node")" ] \
+        || die "/data is mounted from $ud_mounted, not $ud_node"
+    ui_print "  /data mounted for staging ($ud_node)"
+}
+
 stage_features() {
     # Stage what the OS's feature transaction consumes, driven by the release's
     # SIGNED manifest (key=value, so it is readable here):
     #   update/staging/manifest + manifest.sig   the transaction's own input
     #   update/staging/features/<f>/<asset>      for action=replace
     #   /data/libreecho/features/<f>/…           for action=preserve
+    # It also creates the LIVE target directory of every feature the manifest
+    # names. The transaction refuses a target that is not already a real
+    # directory:
+    #
+    #     [ -d "$target_dir" ] && [ ! -L "$target_dir" ] || fail feature-target-dir
+    #
+    # That is deliberate anti-symlink hygiene, so it is not relaxed here. On an
+    # upgrade the directory exists from the previous commit; on an initial
+    # install nothing has ever created it, and the whole staged set is stranded
+    # at prepare-boot.
     # The installer deliberately does not commit: commit_policy is
     # after-slot-confirm, so the OS commits once the slot confirms. Staging the
     # signed manifest *is* the intent.
@@ -371,11 +430,23 @@ stage_features() {
     ota_signature=$BUNDLE_DIR/manifest.sig
     [ -f "$ota_manifest" ] || die "signed manifest missing: $ota_manifest"
     [ -f "$ota_signature" ] || die "manifest signature missing: $ota_signature"
+
+    feature_ids=$(sed -n 's/^feature_ids=//p' "$ota_manifest" | head -n 1)
+    [ -n "$feature_ids" ] || die "the signed manifest declares no features"
+    for check_feature in $(echo "$feature_ids" | tr ',' ' '); do
+        case "$check_feature" in
+            ''|*[!a-zA-Z0-9._-]*) die "unsafe feature name in the signed manifest: $check_feature" ;;
+        esac
+    done
+
     if [ "$DRY_RUN" = 1 ]; then
         ui_print "  DRY RUN - would stage the signed manifest and its features"
+        for dry_feature in $(echo "$feature_ids" | tr ',' ' '); do
+            ui_print "    $dry_feature: live target $LIVE_FEATURES/$dry_feature"
+        done
         return 0
     fi
-    staging=/data/libreecho/update/staging
+    staging=$STAGING
     mkdir -p "$staging" || die "cannot create $staging"
     cp "$ota_manifest" "$staging/manifest" || die "cannot stage the manifest"
     cp "$ota_signature" "$staging/manifest.sig" || die "cannot stage the signature"
@@ -394,8 +465,22 @@ stage_features() {
         echo "$digest_map" | awk -v w="$1" '$1 == w { print $2; exit }'
     }
 
-    feature_ids=$(sed -n 's/^feature_ids=//p' "$ota_manifest" | head -n 1)
-    [ -n "$feature_ids" ] || die "the signed manifest declares no features"
+    mkdir -p "$LIVE_FEATURES" || die "cannot create $LIVE_FEATURES"
+    live_created=0
+    for fname in $(echo "$feature_ids" | tr ',' ' '); do
+        live_dir=$LIVE_FEATURES/$fname
+        if [ -L "$live_dir" ]; then
+            die "live feature path is a symlink: $live_dir"
+        fi
+        if [ -d "$live_dir" ]; then
+            continue
+        fi
+        [ -e "$live_dir" ] && die "live feature path is not a directory: $live_dir"
+        mkdir "$live_dir" || die "cannot create the live target for $fname"
+        live_created=$((live_created + 1))
+    done
+    ui_print "  $live_created live feature target(s) created for the transaction"
+
     staged_count=0
     for fname in $(echo "$feature_ids" | tr ',' ' '); do
         action=$(sed -n "s/^feature_${fname}_action=//p" "$ota_manifest" | head -n 1)
@@ -425,7 +510,7 @@ stage_features() {
                 pname=$(lookup_digest "$want")
                 mname=$(lookup_digest "$mwant")
                 [ -n "$pname" ] || die "no bundled payload matches preserved $fname ($want)"
-                dest=/data/libreecho/features/$fname
+                dest=$LIVE_FEATURES/$fname
                 mkdir -p "$dest" || die "cannot create $dest"
                 cp "$BUNDLE_DIR/$pname" "$dest/payload.squashfs" || die "cannot place $fname payload"
                 [ -n "$mname" ] && cp "$BUNDLE_DIR/$mname" "$dest/manifest.json"
@@ -442,6 +527,38 @@ stage_features() {
     [ "$staged_count" -gt 0 ] || die "no features staged"
     sync
     ui_print "  $staged_count feature(s) staged for the transaction to commit"
+}
+
+stage_local_package() {
+    # A staged tree is not an install. Nothing on the device turns one into a
+    # prepared feature transaction except `libreecho-update install <package>`,
+    # which re-checks the SIGNED manifest, stages the feature payloads and runs
+    # the transaction's preflight + prepare-boot. That verb caps the package at
+    # 32 MiB and requires it to be a tar of exactly manifest, manifest.sig and
+    # boot.img, so the release's OTA tar is what is placed here -- the install
+    # bundle is 239 MiB and can never pass.
+    #
+    # It goes on /data, not /cache: the booted OS does not mount /cache.
+    if [ -z "${LOCAL_PACKAGE_FILE:-}" ]; then
+        ui_print "  WARNING: the bundle carries no local-install package"
+        ui_print "  the first boot will find a staged tree it cannot prepare"
+        return 0
+    fi
+    ui_print "Placing the local-install package for the first boot"
+    if [ "$DRY_RUN" = 1 ]; then
+        ui_print "  DRY RUN - would place $LOCAL_PACKAGE_FILE at $LOCAL_PACKAGE"
+        return 0
+    fi
+    mkdir -p "$LIVE_UPDATE/incoming" || die "cannot create $LIVE_UPDATE/incoming"
+    cp "$BUNDLE_DIR/$LOCAL_PACKAGE_FILE" "$LOCAL_PACKAGE" \
+        || die "cannot place the local-install package"
+    lp_got=$(sha256_of "$LOCAL_PACKAGE")
+    [ "$lp_got" = "$LOCAL_PACKAGE_SHA" ] || die "local-install package readback mismatch"
+    lp_size=$(wc -c < "$LOCAL_PACKAGE" | tr -d ' ')
+    [ "$lp_size" -le "$LOCAL_PACKAGE_MAX_BYTES" ] \
+        || die "local-install package is $lp_size bytes; the device refuses more than $LOCAL_PACKAGE_MAX_BYTES"
+    sync
+    ui_print "  $LOCAL_PACKAGE ($lp_size bytes, $lp_got)"
 }
 
 main() {
@@ -471,18 +588,31 @@ main() {
         userdata_now=$(partition_sectors "$node")
         ui_print "userdata $userdata_now sectors - matches the contract"
         format_userdata
+        if [ "$DRY_RUN" = 1 ]; then
+            ui_print "  DRY RUN - would mount the formatted userdata before staging"
+        else
+            ensure_userdata_mounted
+        fi
         write_boot_slots "$(sed -n 's/^boot_image=//p' "$BUNDLE_DIR/bundle.manifest")"
         stage_features
+        stage_local_package
         tidy_userdata_root
         if [ "$DRY_RUN" = 1 ]; then
             receipt_set "result=dry-run-ok" "phase=install" "dry_run=1" \
                 "userdata_sectors=$userdata_now" \
-                "would_write=boot_a,boot_b,userdata,features"
+                "would_write=boot_a,boot_b,userdata,features,local-package" \
+                "would_mount_userdata=1" \
+                "would_place_local_package=$LOCAL_PACKAGE"
             ui_print "DRY RUN COMPLETE - nothing was written"
         else
             receipt_set "result=installed" "phase=install" \
-                "userdata_sectors=$userdata_now" "reboot_required=1"
+                "userdata_sectors=$userdata_now" "reboot_required=1" \
+                "local_package=$LOCAL_PACKAGE" \
+                "local_install_command=libreecho-update install $LOCAL_PACKAGE --feature-dir $STAGING/features" \
+                "first_boot=prepares-and-commits-the-staged-features"
             ui_print "INSTALL COMPLETE - reboot to start LibreEcho"
+            ui_print "  the first boot prepares and commits the staged features"
+            ui_print "  the package is left at $LOCAL_PACKAGE for a host-driven re-install"
         fi
     else
         node=$(partition_node userdata)
