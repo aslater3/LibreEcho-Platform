@@ -1761,6 +1761,41 @@ class VendorAssetContractTests(unittest.TestCase):
         self.assertEqual(builder.CONNECTIVITY_IMPORTER_SHA256, actual)
         self.assertEqual(verifier.CONNECTIVITY_IMPORTER_SHA256, actual)
 
+    def test_every_shipped_vendor_spec_is_wired_into_every_owner(self) -> None:
+        """A spec present in the repository but absent from an owner's inventory
+        never reaches a device: the builder stages only what its map lists, and
+        the verifier rejects a member it does not expect. v3 shipped that way,
+        and a device carrying that stock revision kept failing the import with
+        UNKNOWN_COMPATIBLE_SET even though the fix was merged.
+
+        The builder's staging map is function-local, so its source is checked
+        textually; the verifier's two maps are module-level and checked directly.
+        """
+        shipped = sorted(
+            path.name
+            for path in (TOOLS_DIR / "initramfs/vendor-assets").glob(
+                "mt8163-v181-stock-v*.tsv"
+            )
+        )
+        self.assertTrue(shipped, "no shipped vendor specifications found")
+        builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        for name in shipped:
+            member = f"vendor-assets/{name}"
+            self.assertIn(
+                member, builder_source, f"{member} is not staged by the image builder"
+            )
+            self.assertIn(
+                member, verifier.OVERLAY_FILES, f"{member} missing from OVERLAY_FILES"
+            )
+            self.assertIn(
+                member, verifier.OVERLAY_TARGETS, f"{member} missing from OVERLAY_TARGETS"
+            )
+            self.assertEqual(
+                verifier.OVERLAY_TARGETS[member],
+                f"etc/libreecho/vendor-assets/{name}",
+                f"{member} overlay target disagrees with its member path",
+            )
+
     def test_vendor_firmware_policy_documents_no_redistribution(self) -> None:
         policy = TOOLS_DIR / "initramfs/vendor-assets/README.md"
         text = policy.read_text()
@@ -2960,11 +2995,17 @@ start_feature_service_if_enabled
         self.assertIn("web_listen=0.0.0.0:8080", source)
         self.assertNotIn("if [ -r /data/libreecho/config/users ]; then", source)
         self.assertNotIn("libreecho-update-fetch watch", source)
+        # The health worker is started for every OTA image, not only a
+        # production one: its rollback half must run on the boot after the
+        # bootloader fell back whatever the service profile is, or the failed
+        # candidate's records strand the update flow.  Candidate confirmation
+        # stays production-only, gated inside the worker.
+        self.assertIn('if [ "$IMAGE_PROFILE" = ota ]; then', source)
+        self.assertIn("ota-background-worker-started", source)
+        self.assertIn("ota-background-workers-disabled-for-non-ota-profile", source)
         self.assertIn(
-            'if [ "$IMAGE_PROFILE" = ota ] && [ "$SERVICE_PROFILE" = production ]; then',
-            source,
+            "ota-health-confirmation-skipped-non-production-profile", source
         )
-        self.assertIn("ota-background-workers-disabled-for-diagnostic-profile", source)
         builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
         verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
         self.assertIn('"activation": "manual-single-shot-after-adb"', builder)
@@ -3003,7 +3044,11 @@ start_feature_service_if_enabled
         ):
             self.assertIn(socket_path, source)
         self.assertIn("ota-health-services-not-ready", source)
-        self.assertIn("ota-background-workers-disabled-for-diagnostic-profile", source)
+        # Confirmation is production-only; the worker is not.
+        self.assertIn("ota-background-worker-started", source)
+        self.assertIn(
+            "ota-health-confirmation-skipped-non-production-profile", source
+        )
 
     def test_userdata_mount_is_identity_checked_and_non_destructive(self) -> None:
         source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
