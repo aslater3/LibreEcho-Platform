@@ -577,8 +577,19 @@ verify_candidate_components() {
         esac
         base_payload=$FEATURES/$feature/payload.squashfs
         base_manifest=$FEATURES/$feature/manifest.json
-        [ "$(file_hash "$base_payload")" = "$(value "feature_${feature}_base_payload_sha256" "$STAGING/manifest")" ] || fail base-payload-hash
-        [ "$(file_hash "$base_manifest")" = "$(value "feature_${feature}_base_manifest_sha256" "$STAGING/manifest")" ] || fail base-manifest-hash
+        # A fresh install has no base. prepare-boot recorded that as old=none, and
+        # the signed manifest's base_* digest then describes the release this one
+        # replaces rather than bytes that exist here, so what has to hold is the
+        # ABSENCE of a base -- not a match against a version that was never
+        # installed. A base that appears anyway is a failure, not a bonus: the
+        # commit would otherwise have to reconcile bytes nothing declared.
+        if [ "$(value "feature_${feature}_old_payload_sha256" "$JOURNAL")" = none ]; then
+            [ ! -e "$base_payload" ] && [ ! -L "$base_payload" ] || fail base-payload-present
+            [ ! -e "$base_manifest" ] && [ ! -L "$base_manifest" ] || fail base-manifest-present
+        else
+            [ "$(file_hash "$base_payload")" = "$(value "feature_${feature}_base_payload_sha256" "$STAGING/manifest")" ] || fail base-payload-hash
+            [ "$(file_hash "$base_manifest")" = "$(value "feature_${feature}_base_manifest_sha256" "$STAGING/manifest")" ] || fail base-manifest-hash
+        fi
         case "$action" in
             preserve)
                 runtime_authority_ready "$feature" "$STAGING/manifest" || :
