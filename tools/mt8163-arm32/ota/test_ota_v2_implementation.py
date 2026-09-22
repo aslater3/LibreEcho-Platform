@@ -2265,6 +2265,77 @@ class PreConfirmAcceptanceTests(unittest.TestCase):
         self.assertIn("slot_b_success=0", self.bcb.read_text())
 
 
+class FreshInstallActivationTests(PreConfirmAcceptanceTests):
+    """A base-less live tree is a fresh install, not a corrupt one.
+
+    The signed manifest of a release declares the base_* digest of the version it
+    replaces. On an initial install that version was never on the device, so
+    prepare-boot records `old_*=none`; activation then has to require the ABSENCE
+    of a base instead of a match. Measured on hardware before this fix: a
+    TWRP-installed Dot prepared its transaction, then activation failed with
+    ERROR:file-not-regular / ERROR:base-payload-hash and the boot came up with
+    ui-services-blocked-by-feature-transaction and no feature services.
+    """
+
+    def fresh(self) -> None:
+        """Make the replace feature base-less and stub the mount for activation."""
+        self.old_payload.unlink()
+        self.old_manifest.unlink()
+        self.mount_log = self.root / "mount.log"
+        busybox = self.root / "busybox"
+        busybox.write_text(
+            "#!/bin/sh\n"
+            "if [ \"${1:-}\" = mount ]; then printf '%s\\n' \"$*\" >> \"$MOUNT_LOG\"; exit 0; fi\n"
+            "exec /bin/busybox \"$@\"\n"
+        )
+        busybox.chmod(0o755)
+        self.env = self.env | {"BB": str(busybox), "MOUNT_LOG": str(self.mount_log)}
+
+    def prepare_boot(self) -> subprocess.CompletedProcess:
+        return run([str(transaction_fixture(self.root, self.env)), "prepare-boot"], env=self.env)
+
+    def journal(self) -> str:
+        return (self.update / "feature-commit").read_text()
+
+    def activate(self) -> subprocess.CompletedProcess:
+        return run([str(transaction_fixture(self.root, self.env)), "activate-mounts"], env=self.env)
+
+    def test_prepare_records_the_absent_base_as_none(self) -> None:
+        self.fresh()
+        prepared = self.prepare_boot()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        self.assertIn("feature_airplay2_old_payload_sha256=none", self.journal())
+        self.assertIn("feature_airplay2_old_manifest_sha256=none", self.journal())
+
+    def test_activation_accepts_a_fresh_install_without_a_base(self) -> None:
+        self.fresh()
+        prepared = self.prepare_boot()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        self.mountinfo.write_text(
+            f"36 25 0:32 / {self.run_root}/libreecho/features/airplay2/root ro - "
+            f"squashfs {self.new_payload} ro\n"
+        )
+        result = self.activate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("activation_validated", result.stdout)
+        # The candidate was mounted from the staged asset, and nothing was
+        # invented in the live tree to satisfy the base gate.
+        self.assertFalse(self.old_payload.exists())
+
+    def test_a_base_that_does_not_match_the_declaration_is_refused(self) -> None:
+        self.fresh()
+        prepared = self.prepare_boot()
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        self.assertIn("feature_airplay2_old_payload_sha256=none", self.journal())
+        # A base present but not the one the release was built against is still a
+        # failure: the fresh-install allowance is for absence, not for any bytes.
+        self.old_payload.write_bytes(b"unexpected-base")
+        self.old_manifest.write_bytes(b"unexpected-base-manifest")
+        result = self.activate()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("base-payload-hash", result.stderr)
+
+
 class CommittedRuntimeLifecycleTests(unittest.TestCase):
     """Run the real transaction script through candidate and steady state."""
 

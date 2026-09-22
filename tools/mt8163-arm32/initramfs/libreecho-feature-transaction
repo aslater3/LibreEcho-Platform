@@ -577,8 +577,20 @@ verify_candidate_components() {
         esac
         base_payload=$FEATURES/$feature/payload.squashfs
         base_manifest=$FEATURES/$feature/manifest.json
-        [ "$(file_hash "$base_payload")" = "$(value "feature_${feature}_base_payload_sha256" "$STAGING/manifest")" ] || fail base-payload-hash
-        [ "$(file_hash "$base_manifest")" = "$(value "feature_${feature}_base_manifest_sha256" "$STAGING/manifest")" ] || fail base-manifest-hash
+        # A fresh install has no base at all: prepare-boot recorded the absence as
+        # old=none and the signed manifest's base_* digest then describes the
+        # release this one replaces, so there is nothing here to verify against and
+        # the match below cannot be satisfied by any state the device can hold. The
+        # gate is decided by the base's own absence, not by old=none -- for a
+        # `runtime` action old_* describes the capsule, and a base is expected
+        # throughout. Anything partially present still has to match.
+        if [ ! -e "$base_payload" ] && [ ! -L "$base_payload" ] &&
+           [ ! -e "$base_manifest" ] && [ ! -L "$base_manifest" ]; then
+            :
+        else
+            [ "$(file_hash "$base_payload")" = "$(value "feature_${feature}_base_payload_sha256" "$STAGING/manifest")" ] || fail base-payload-hash
+            [ "$(file_hash "$base_manifest")" = "$(value "feature_${feature}_base_manifest_sha256" "$STAGING/manifest")" ] || fail base-manifest-hash
+        fi
         case "$action" in
             preserve)
                 runtime_authority_ready "$feature" "$STAGING/manifest" || :
