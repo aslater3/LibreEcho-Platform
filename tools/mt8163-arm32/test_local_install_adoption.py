@@ -273,5 +273,163 @@ class RunningSlotFallbackTests(unittest.TestCase):
         self.assertIn("LIBREECHO_CMDLINE_FILE", body)
 
 
+class FreshInstallCommitTests(unittest.TestCase):
+    """The boot that installs a device must be the boot that commits it.
+
+    The reconciler reads the live feature tree, which stays empty until the
+    transaction commits, so the feature services are deferred, startup-ready is
+    never written, and the commit - which waits for startup-ready - never runs.
+    That deadlock is why a TWRP-installed unit only came up completely on its
+    second boot. Measured on hardware: boot 1 logged
+    feature-services-reconcile-failed / payload-missing with startup-ready
+    absent, and boot 2 logged feature-services-reconciled with startup-ready
+    present and every feature service running.
+    """
+
+    def setUp(self) -> None:
+        self.work = Path(tempfile.mkdtemp(prefix="le-fresh-commit-"))
+        self.update_root = self.work / "update"
+        (self.update_root / "staging").mkdir(parents=True)
+        self.pending = self.update_root / "pending"
+        self.pending.write_text("schema=2\ntransaction_id=txn-test\nslot=a\nfeature_ids=tts\n")
+        (self.update_root / "feature-commit").write_text("schema=2\nphase=prepared\nslot=a\n")
+        self.cmdline = self.work / "cmdline"
+        self.cmdline.write_text("androidboot.slot_suffix=_a\n")
+        self.log = self.work / "init.log"
+        self.record = self.work / "invocation"
+        self.transaction = self.work / "libreecho-feature-transaction"
+        self.transaction.write_text(
+            "#!/bin/sh\n"
+            f'printf "tx %s\\n" "$*" >> "{self.record}"\n'
+            'case "${1:-}" in\n'
+            "  commit-after-confirm) exit ${COMMIT_RC:-0} ;;\n"
+            "  activate-committed) exit ${ACTIVATE_RC:-0} ;;\n"
+            "  *) exit 0 ;;\n"
+            "esac\n")
+        self.transaction.chmod(self.transaction.stat().st_mode | stat.S_IEXEC)
+        self.bootctl = self.work / "libreecho-bootctl"
+        self.bootctl.write_text(
+            "#!/bin/sh\n"
+            f'printf "bootctl %s\\n" "$*" >> "{self.record}"\n'
+            "case \"${1:-}\" in\n"
+            "  status) printf 'selected_slot=%s\\n' \"${BOOTCTL_SLOT:-a}\" ;;\n"
+            "  confirm) exit ${CONFIRM_RC:-0} ;;\n"
+            "esac\n"
+            "exit 0\n")
+        self.bootctl.chmod(self.bootctl.stat().st_mode | stat.S_IEXEC)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.work, ignore_errors=True)
+
+    def run_commit(self, *, image_profile: str = "ota", commit_rc: int = 0,
+                   activate_rc: int = 0, confirm_rc: int = 0,
+                   bootctl_slot: str = "a") -> subprocess.CompletedProcess[str]:
+        init = INIT.read_text()
+        functions = extract_function(init, "running_slot_id") + "\n" + \
+            extract_function(init, "commit_fresh_install")
+        harness = self.work / "harness.sh"
+        harness.write_text(
+            "#!/bin/sh\n"
+            "set -u\n"
+            "BB=\n"
+            f'LOG="{self.log}"\n'
+            'log() { printf "%s\\n" "$*" >> "$LOG"; }\n'
+            'pmsg_marker() { printf "PMSG %s\\n" "$*" >> "$LOG"; }\n'
+            f'IMAGE_PROFILE="{image_profile}"\n'
+            f'export LIBREECHO_INSTALL_ROOT="{self.update_root}"\n'
+            f'export LIBREECHO_CMDLINE_FILE="{self.cmdline}"\n'
+            f'export LIBREECHO_BOOTCTL_TOOL="{self.bootctl}"\n'
+            f'export LIBREECHO_TRANSACTION_TOOL="{self.transaction}"\n'
+            f'export BOOTCTL_SLOT="{bootctl_slot}"\n'
+            f'export COMMIT_RC="{commit_rc}"\n'
+            f'export ACTIVATE_RC="{activate_rc}"\n'
+            f'export CONFIRM_RC="{confirm_rc}"\n'
+            f"{functions}\n"
+            "commit_fresh_install\n"
+            'printf "rc=%s\\n" "$?"\n')
+        return subprocess.run(["sh", str(harness)], text=True, capture_output=True)
+
+    def logged(self) -> str:
+        return self.log.read_text() if self.log.is_file() else ""
+
+    def invocations(self) -> list[str]:
+        if not self.record.is_file():
+            return []
+        return self.record.read_text().splitlines()
+
+    def test_a_fresh_install_is_confirmed_and_committed_in_this_boot(self) -> None:
+        result = self.run_commit()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.invocations(), [
+            "bootctl confirm a",
+            "bootctl status",
+            "tx commit-after-confirm",
+            "tx activate-committed",
+        ])
+        self.assertIn("fresh-install-committed", self.logged())
+        self.assertIn("PMSG fresh-install-committed", self.logged())
+        self.assertTrue((self.update_root / "staging/bootctl.readback").is_file())
+
+    def test_an_already_installed_device_is_left_alone(self) -> None:
+        # This path exists for a base-less install with nothing to roll back to.
+        (self.update_root / "installed").write_text("schema=2\nphase=installed\n")
+        result = self.run_commit()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.invocations(), [])
+        self.assertNotIn("fresh-install-committed", self.logged())
+
+    def test_a_pending_transaction_for_another_slot_is_left_alone(self) -> None:
+        self.cmdline.write_text("androidboot.slot_suffix=_b\n")
+        self.pending.write_text("schema=2\ntransaction_id=txn-test\nslot=a\n")
+        result = self.run_commit()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.invocations(), [])
+        self.assertIn("fresh-commit-pending-slot-other:b", self.logged())
+
+    def test_a_rejected_commit_is_reported_and_does_not_activate(self) -> None:
+        result = self.run_commit(commit_rc=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("tx commit-after-confirm", self.invocations())
+        self.assertNotIn("tx activate-committed", self.invocations())
+        self.assertIn("fresh-commit-rejected", self.logged())
+        self.assertIn("PMSG fresh-commit-rejected", self.logged())
+
+    def test_a_rejected_activation_is_reported(self) -> None:
+        result = self.run_commit(activate_rc=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("fresh-commit-activation-rejected", self.logged())
+        self.assertNotIn("fresh-install-committed", self.logged())
+
+    def test_a_failed_confirmation_stops_before_committing(self) -> None:
+        result = self.run_commit(confirm_rc=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.invocations(), ["bootctl confirm a"])
+        self.assertIn("fresh-commit-bootctl-confirm-failed", self.logged())
+
+    def test_a_non_ota_image_never_commits(self) -> None:
+        result = self.run_commit(image_profile="diagnostic")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.invocations(), [])
+
+    def test_no_pending_transaction_means_nothing_to_commit(self) -> None:
+        self.pending.unlink()
+        result = self.run_commit()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.invocations(), [])
+
+    def test_the_commit_runs_before_the_feature_graph_is_evaluated(self) -> None:
+        """Ordering is the whole fix: reconcile must find the live tree populated."""
+        init = INIT.read_text()
+        body = extract_function(init, "activate_feature_transaction")
+        mounted = body.index("feature-transaction-candidate-mounted")
+        committed = body.index("commit_fresh_install")
+        self.assertLess(mounted, committed)
+        # start_ui_services calls the transaction activation before it starts
+        # persisted feature services, which is what reconciles the live tree.
+        services = extract_function(init, "start_ui_services")
+        self.assertLess(services.index("activate_feature_transaction"),
+                        services.index("start_persisted_feature_services"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
