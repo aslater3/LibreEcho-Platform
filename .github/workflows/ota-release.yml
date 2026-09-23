@@ -87,7 +87,7 @@ jobs:
             tools/mt8163-arm32/feature_runtime/package_runtime.py \
             tools/mt8163-arm32/feature_runtime/verify_runtime.py \
             tools/mt8163-arm32/test_issue_169_ota_health.py \
-            tools/mt8163-arm32/test_early_control_plane.py \
+            tools/mt8163-arm32/test_early_control_plane.py
           while IFS= read -r -d '' script; do
             bash -n "$script"
           done < <(git ls-files -z 'tools/mt8163-arm32/*.sh' 'tools/mt8163-arm32/**/*.sh')
