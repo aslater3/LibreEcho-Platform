@@ -251,19 +251,6 @@ shared_discovery_active()
     "$mdns_script" status >/dev/null 2>&1
 }
 
-stop_disabled_airplay()
-{
-    if [ ! -x "$INIT_ROOT/libreecho-airplayd.init" ]; then
-        # No AirPlay payload on this image.  Home Assistant discovery comes from
-        # the shared responder, so a missing AirPlay consumer is not an error.
-        log feature-reconcile-service-absent:airplayd
-        return 0
-    fi
-    stop_service airplayd "$RUN_ROOT/libreecho/airplay.sock" || return 1
-    log feature-reconcile-service-disabled:airplayd
-    return 0
-}
-
 reconcile_topology()
 {
     if [ "$ha_enabled" -eq 1 ]; then
@@ -288,10 +275,9 @@ start_feature()
         wakeword) service=waked; socket=$RUN_ROOT/libreecho/wakeword.sock ;;
         *) log "feature-reconcile-unknown-feature:$feature"; return 1 ;;
     esac
-    # AirPlay is an independent consumer now: the AirPlay integration bit alone
-    # decides it, whether or not Home Assistant is selected.  Home Assistant
-    # discovery is served by the boot-contained shared responder and must not
-    # require this payload.
+    # Home Assistant discovery has an independent shared responder, but this
+    # controller still owns shared local playback. The AirPlay integration bit
+    # selects only its protocol children, never the controller/runtime itself.
     if [ "$feature" = airplay2 ] && airplay_explicitly_disabled; then
         # airplayd owns the shared local playback engine as well as the optional
         # AirPlay protocol children.  Keep the controller/runtime alive when
