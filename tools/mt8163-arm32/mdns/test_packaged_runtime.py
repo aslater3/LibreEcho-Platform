@@ -89,6 +89,12 @@ def main():
         target.chmod(0o755)
         command = ['docker', 'run', '--rm', '--pull', 'never', '--network', 'none',
                    '--privileged',
+                   # The sandbox has no interfaces by construction (--network
+                   # none), so the production interface wait would consume its
+                   # whole startup budget before the responder is even reached.
+                   # Disable it here; the wait itself is covered by the host
+                   # tests in test_runtime.py.
+                   '--env', 'MDNS_INTERFACE_WAIT_SECONDS=0',
                    '--mount', f'type=bind,source={root},target=/runtime']
         for name in ('null', 'urandom', 'random'):
             (root / 'dev' / name).touch()
