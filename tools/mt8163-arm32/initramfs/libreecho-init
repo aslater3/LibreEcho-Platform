@@ -142,15 +142,38 @@ persist_failure_log()
     [ -d "$FAILURE_LOG_DIR" ] || return 0
     epoch=$($BB date -u +%s 2>/dev/null)
     case "$epoch" in ''|*[!0-9]*) epoch=0 ;; esac
+    # Slot identity at the moment of failure.  The bare `status` form is the
+    # only one that reads the boot-control block: `status <slot>` echoes its
+    # argument under the same field name, so a difference between what the BCB
+    # selects next and the slot actually running is visible only here.
+    bootctl=${LIBREECHO_BOOTCTL_TOOL:-/usr/local/sbin/libreecho-bootctl}
+    cmdline=${LIBREECHO_CMDLINE_FILE:-/proc/cmdline}
+    running_slot=$($BB sed -n 's/.*androidboot.slot_suffix=_\([ab]\).*/\1/p' \
+        "$cmdline" 2>/dev/null | $BB head -n 1)
+    pending_slot=$($BB sed -n 's/^slot=//p' "$FAILURE_LOG_DIR/pending" 2>/dev/null |
+        $BB head -n 1)
+    transaction_id=$($BB sed -n 's/^transaction_id=//p' "$FAILURE_LOG_DIR/journal" \
+        2>/dev/null | $BB head -n 1)
+    [ -n "$transaction_id" ] || transaction_id=$($BB sed -n \
+        's/^transaction_id=//p' "$FAILURE_LOG_DIR/pending" 2>/dev/null | $BB head -n 1)
     name=failure-$epoch-$$.log
     target=$FAILURE_LOG_DIR/$name
     tmp=$FAILURE_LOG_DIR/.$name.tmp
     {
         echo schema=1
         echo "reason=$reason"
-        echo "slot_suffix=$($BB sed -n 's/.*androidboot.slot_suffix=_\([ab]\).*/\1/p' /proc/cmdline 2>/dev/null)"
+        echo "slot_suffix=$running_slot"
         echo "uptime_seconds=$($BB cut -d' ' -f1 /proc/uptime 2>/dev/null)"
         echo "epoch=$epoch"
+        echo "running_slot=$running_slot"
+        echo "pending_slot=${pending_slot:-none}"
+        echo "transaction_id=${transaction_id:-none}"
+        echo "--- bcb-readback (bare status: next-boot eligibility, not the running slot)"
+        if [ -x "$bootctl" ]; then
+            "$bootctl" status 2>/dev/null | $BB head -n 20
+        else
+            echo bcb-readback-unavailable
+        fi
         echo "--- detail"
         printf '%s\n' "$detail" | sanitize_failure_text | $BB head -c 2048
         echo

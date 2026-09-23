@@ -180,6 +180,81 @@ class OtaFailureEvidenceContracts(unittest.TestCase):
             self.assertEqual(len(kept), 2, kept)
             self.assertIn(written, kept)
 
+    def test_failure_log_records_slot_identity_and_bcb_readback(self) -> None:
+        """The snapshot must carry what distinguishes a consumed final attempt."""
+        busybox = shutil.which("busybox") or ""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outdir = root / "update"
+            outdir.mkdir()
+            (outdir / "pending").write_text(
+                "schema=2\nslot=a\ntransaction_id=txn-test\n"
+            )
+            cmdline = root / "cmdline"
+            cmdline.write_text("console=ttyS0 androidboot.slot_suffix=_a quiet\n")
+            bootctl = root / "bootctl"
+            bootctl.write_text(
+                "#!/bin/sh\n"
+                "printf 'schema=1\\nselected_slot=b\\ninactive_slot=a\\n"
+                "slot_a_priority=15\\nslot_a_tries=0\\nslot_a_success=0\\n"
+                "slot_b_priority=14\\nslot_b_tries=0\\nslot_b_success=1\\n'\n"
+            )
+            bootctl.chmod(0o755)
+            script = (
+                "set -eu\n"
+                f"BB={shlex.quote(busybox)}\n"
+                f"FAILURE_LOG_DIR={shlex.quote(str(outdir))}\n"
+                f"LIBREECHO_CMDLINE_FILE={shlex.quote(str(cmdline))}\n"
+                f"LIBREECHO_BOOTCTL_TOOL={shlex.quote(str(bootctl))}\n"
+                f"INIT_LOG={shlex.quote(str(root / 'init.log'))}\n"
+                + shell_function(self.init, "sanitize_failure_text")
+                + shell_function(self.init, "persist_failure_log")
+                + 'persist_failure_log feature-activation-rejected "ERROR:activation-bcb-slot"\n'
+            )
+            result = subprocess.run(
+                ["sh", "-c", script], text=True, capture_output=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            written = result.stdout.strip()
+            self.assertRegex(written, r"^failure-[0-9]+-[0-9]+\.log$")
+            record = (outdir / written).read_text()
+            self.assertIn("reason=feature-activation-rejected", record)
+            self.assertIn("running_slot=a", record)
+            self.assertIn("pending_slot=a", record)
+            self.assertIn("transaction_id=txn-test", record)
+            self.assertIn("--- bcb-readback", record)
+            # The bare readback names the other slot: the BCB's next-boot
+            # selection, which is exactly the state that rejected the candidate.
+            self.assertIn("selected_slot=b", record)
+            self.assertIn("slot_a_tries=0", record)
+            self.assertIn("ERROR:activation-bcb-slot", record)
+
+    def test_failure_log_marks_a_missing_bootctl_rather_than_failing(self) -> None:
+        busybox = shutil.which("busybox") or ""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outdir = root / "update"
+            outdir.mkdir()
+            script = (
+                "set -eu\n"
+                f"BB={shlex.quote(busybox)}\n"
+                f"FAILURE_LOG_DIR={shlex.quote(str(outdir))}\n"
+                f"LIBREECHO_BOOTCTL_TOOL={shlex.quote(str(root / 'absent-bootctl'))}\n"
+                f"LIBREECHO_CMDLINE_FILE={shlex.quote(str(root / 'absent-cmdline'))}\n"
+                f"INIT_LOG={shlex.quote(str(root / 'init.log'))}\n"
+                + shell_function(self.init, "sanitize_failure_text")
+                + shell_function(self.init, "persist_failure_log")
+                + 'persist_failure_log ota-health-confirm-failed "startup-ready"\n'
+            )
+            result = subprocess.run(
+                ["sh", "-c", script], text=True, capture_output=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = (outdir / result.stdout.strip()).read_text()
+            self.assertIn("bcb-readback-unavailable", record)
+            self.assertIn("pending_slot=none", record)
+            self.assertIn("transaction_id=none", record)
+
 
 if __name__ == "__main__":
     unittest.main()
