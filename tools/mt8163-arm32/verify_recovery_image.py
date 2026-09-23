@@ -117,6 +117,7 @@ UI_BINARY_NAMES = {
     "usr/local/sbin/libreecho-wyomingd",
     "usr/local/sbin/libreecho-sttd-wyoming",
     "usr/local/sbin/libreecho-ttsd-wyoming",
+    "usr/local/sbin/libreecho-mdnsd",
 }
 UI_INIT_NAMES = {
     "etc/init.d/libreecho-web.init",

@@ -1058,6 +1058,13 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
         "libreecho-ledd", "libreecho-buttond", "libreecho-radiod", "libreecho-btd",
         "libreecho-airplayd", "libreecho-wyomingd",
         "libreecho-sttd-wyoming", "libreecho-ttsd-wyoming",
+        # The shared discovery supervisor: the 0.14 mDNS re-arch moved
+        # responder ownership here, and without the binary the init falls back
+        # to a bare Avahi that publishes nothing the image's own contract
+        # promises (no AirPlay service definition, no name from the device
+        # configuration). Its init script has always been staged - the binary
+        # was simply never added.
+        "libreecho-mdnsd",
     ):
         copy_file(f"sbin/{binary}", f"usr/local/sbin/{binary}", 0o755, True)
     for script in (
@@ -1103,6 +1110,41 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
         "manifest_sha256": sha256(manifest_data),
         "files": files,
     }
+
+
+def stage_mdns_runtime_dirs(stage: Path, contract: dict[str, object]) -> None:
+    """Create the mDNS runtime directories the contract names.
+
+    A directory carries no inventory record, so a staging step that walks the
+    runtime manifest's files silently drops every empty directory. The contract
+    publishes one - ``etc/avahi/services``, where the shared responder looks for
+    a service definition to announce - so it has to be created explicitly or the
+    shipped runtime does not match the contract it is verified against.
+
+    Only directories inside the image runtime root are staged; the control
+    socket and pidfile live outside it and are created at runtime.
+    """
+    runtime_dirs = contract["runtime_dirs"]
+    if not isinstance(runtime_dirs, dict) or not runtime_dirs.get("state_root"):
+        raise SystemExit("ERROR: mDNS runtime directory contract is malformed")
+    state_root = str(runtime_dirs["state_root"]).rstrip("/")
+    resolved_stage = stage.resolve()
+    for name in sorted(set(str(value).rstrip("/") for value in runtime_dirs.values())):
+        if not name.startswith(state_root + "/"):
+            continue
+        directory = stage
+        for part in (component for component in name.split("/") if component):
+            directory = directory / part
+            # Every component, not just the leaf: an intermediate symlink would
+            # carry the remainder of the path outside the stage.
+            if directory.is_symlink():
+                raise SystemExit(f"ERROR: mDNS runtime directory path is a symlink: {directory}")
+        if directory.exists() and not directory.is_dir():
+            raise SystemExit(f"ERROR: mDNS runtime directory collides with {name}")
+        directory.mkdir(parents=True, exist_ok=True)
+        if not directory.resolve().is_relative_to(resolved_stage):
+            raise SystemExit(f"ERROR: mDNS runtime directory escapes the stage: {name}")
+        directory.chmod(0o755)
 
 
 def add_mdns_runtime(stage: Path, runtime: Path, manifest: dict[str, object]) -> None:
@@ -1193,6 +1235,15 @@ def add_mdns_runtime(stage: Path, runtime: Path, manifest: dict[str, object]) ->
                 "dynamic": info[3],
             }
         runtime_records[relative] = entry
+
+    # The contract names runtime *directories* as well as files, and a directory
+    # carries no inventory record, so staging only the manifest's files silently
+    # drops them: the shipped runtime then does not match the contract it is
+    # verified against. That is how usr/local/lib/libreecho-mdns/root/etc/avahi/
+    # services went missing, which is where the shared responder expects a
+    # service definition to be published - so AirPlay discovery had nowhere to
+    # put one and a unit advertised no AirPlay service at all.
+    stage_mdns_runtime_dirs(stage, contract)
 
     marker = stage / contract["image_marker"]
     if marker.exists() or marker.is_symlink():

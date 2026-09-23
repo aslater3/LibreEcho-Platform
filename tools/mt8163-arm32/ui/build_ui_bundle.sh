@@ -137,7 +137,7 @@ for binary in \
     libreecho-timerd \
     libreecho-audiod libreecho-micd libreecho-ledd libreecho-buttond \
     libreecho-radiod libreecho-btd \
-    libreecho-airplayd libreecho-wyomingd
+    libreecho-airplayd libreecho-wyomingd libreecho-mdnsd
 do
     path="$UI_SOURCE/build/$binary"
     [[ -f "$path" && ! -L "$path" ]] || {
@@ -190,7 +190,7 @@ for binary in \
     libreecho-audiod libreecho-micd libreecho-ledd libreecho-buttond \
     libreecho-radiod libreecho-btd \
     libreecho-airplayd libreecho-wyomingd \
-    libreecho-sttd-wyoming libreecho-ttsd-wyoming
+    libreecho-sttd-wyoming libreecho-ttsd-wyoming libreecho-mdnsd
 do
     install -m 0755 "$UI_SOURCE/build/$binary" "$OUTPUT/sbin/$binary"
     "$STRIP_BIN" --strip-unneeded "$OUTPUT/sbin/$binary"
