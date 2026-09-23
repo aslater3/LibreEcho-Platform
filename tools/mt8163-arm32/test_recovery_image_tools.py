@@ -3120,6 +3120,85 @@ start_feature_service_if_enabled
         self.assertEqual(set(shell_for_items(script_blocks[0])), verified_scripts)
         self.assertEqual(set(builder_scripts), verified_scripts)
 
+    def test_discovery_supervisor_is_packaged_in_every_layer(self) -> None:
+        """The 0.14 mDNS re-arch moved responder ownership to libreecho-mdnsd.
+
+        LibreEcho-UI builds it and its init script shipped, but the binary was
+        absent from all three Platform layers: the bundle builder's static
+        verify loop and its install loop, the image stage's binary list, and the
+        verifier's expectation set. That is Issue #162's failure mode for a
+        different daemon. Its consequence is visible on hardware: with no
+        supervisor the init falls back to a bare Avahi, so a unit published its
+        RAOP record while publishing no _airplay._tcp record at all and stayed
+        invisible to AirPlay pickers.
+        """
+        bundle_source = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        builder_source = (TOOLS_DIR / "build_recovery_image.py").read_text()
+
+        binary_blocks = shell_for_blocks(bundle_source, "for binary in \\\n")
+        verify_block = next(block for block in binary_blocks if "statically linked" in block)
+        install_block = next(block for block in binary_blocks if "install -m 0755" in block)
+        self.assertIn("libreecho-mdnsd", shell_for_items(verify_block))
+        self.assertIn("libreecho-mdnsd", shell_for_items(install_block))
+
+        builder_binaries = python_string_list(builder_source, "    for binary in (\n")
+        self.assertIn("libreecho-mdnsd", builder_binaries)
+        self.assertIn("usr/local/sbin/libreecho-mdnsd", verifier.UI_BINARY_NAMES)
+
+    def test_shared_discovery_runtime_stages_its_contract_directories(self) -> None:
+        """A contract directory carries no inventory record, so stage it explicitly.
+
+        Measured on hardware: the shipped runtime had no
+        usr/local/lib/libreecho-mdns/root/etc/avahi/services although
+        runtime-contract.json declares it, because staging walked the runtime
+        manifest's files and an empty directory is not one. That directory is
+        where the shared responder looks for a service definition to announce.
+        """
+        contract = json.loads((TOOLS_DIR / "mdns/runtime-contract.json").read_text())
+        with tempfile.TemporaryDirectory() as work:
+            stage = Path(work)
+            builder.stage_mdns_runtime_dirs(stage, contract)
+            services = stage / "usr/local/lib/libreecho-mdns/root/etc/avahi/services"
+            self.assertTrue(services.is_dir(), sorted(p.as_posix() for p in stage.rglob("*")))
+            self.assertEqual(stat.S_IMODE(services.stat().st_mode), 0o755)
+            # The control socket and pidfile live outside the runtime root and
+            # are created at runtime, so staging must not invent them.
+            self.assertFalse((stage / "run/libreecho").exists())
+            self.assertFalse((stage / "var/run").exists())
+
+    def test_discovery_runtime_directory_staging_fails_closed(self) -> None:
+        contract = json.loads((TOOLS_DIR / "mdns/runtime-contract.json").read_text())
+        with tempfile.TemporaryDirectory() as work:
+            stage = Path(work)
+            # An intermediate symlink must be refused, not followed: the rest of
+            # the path would be created outside the stage.
+            etc = stage / "usr/local/lib/libreecho-mdns/root/etc"
+            etc.mkdir(parents=True)
+            (etc / "avahi").symlink_to(stage.parent)
+            with self.assertRaises(SystemExit):
+                builder.stage_mdns_runtime_dirs(stage, contract)
+            self.assertFalse((stage.parent / "services").exists())
+
+        with tempfile.TemporaryDirectory() as work:
+            stage = Path(work)
+            target = stage / "usr/local/lib/libreecho-mdns/root/etc/avahi"
+            target.mkdir(parents=True)
+            (target / "services").write_text("not a directory\n")
+            with self.assertRaises(SystemExit):
+                builder.stage_mdns_runtime_dirs(stage, contract)
+
+        for malformed in ({}, {"state_root": ""}, "not-a-dict"):
+            with tempfile.TemporaryDirectory() as work:
+                with self.assertRaises(SystemExit):
+                    builder.stage_mdns_runtime_dirs(Path(work), {"runtime_dirs": malformed})
+
+        # A contract that names only its state root has no directory to stage:
+        # that is a no-op, not a failure.
+        with tempfile.TemporaryDirectory() as work:
+            stage = Path(work)
+            builder.stage_mdns_runtime_dirs(stage, {"runtime_dirs": {"state_root": "/only/root"}})
+            self.assertEqual(sorted(p.as_posix() for p in stage.rglob("*")), [])
+
     def test_timer_daemon_is_in_every_production_service_graph(self) -> None:
         """Issue #162: packaging the daemon is useless unless it is started."""
         init_source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
