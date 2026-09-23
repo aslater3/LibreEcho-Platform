@@ -103,10 +103,11 @@ home_assistant_enabled()
 
 start_feature_service_if_enabled()
 {
-    if [ "$FEATURE_ID" = airplay2 ] && airplay_explicitly_disabled &&
-            ! home_assistant_enabled; then
-        echo FEATURE_STAGE_AIRPLAY_DISABLED
-        return 0
+    # airplayd also owns the shared local playback engine.  The integration bit
+    # disables the AirPlay protocol inside the controller; it must not prevent
+    # the controller/runtime from being restored after payload staging.
+    if [ "$FEATURE_ID" = airplay2 ] && airplay_explicitly_disabled; then
+        echo FEATURE_STAGE_AIRPLAY_PROTOCOL_DISABLED
     fi
     start_feature_service
 }
