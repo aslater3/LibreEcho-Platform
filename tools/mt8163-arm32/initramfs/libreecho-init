@@ -109,6 +109,67 @@ pmsg_marker()
     printf 'libreecho-init:%s\n' "$marker" > /dev/pmsg0 2>/dev/null || true
 }
 
+# A candidate slot that fails its health confirmation is rebooted by this
+# worker, which destroys /tmp and with it $INIT_LOG -- the only place the
+# underlying reason is written.  Keep a bounded, scrubbed copy on the
+# persistent userdata filesystem so a rollback stays diagnosable after the
+# reboot.  The record is deliberately never mirrored to pmsg: it carries more
+# than a token, and pmsg stays token-only.
+sanitize_failure_text()
+{
+    $BB sed \
+        -e 's#http://[^ ]*#URL#g' \
+        -e 's#https://[^ ]*#URL#g' \
+        -e 's#ssid:[^ ]*#ssid:SSID#g' \
+        -e 's#ssid=[^ ]*#ssid=SSID#g' \
+        -e 's#serialno=[^ ]*#serialno=SERIAL#g' \
+        -e 's#[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]#MAC#g'
+}
+
+# Never fails the caller: recording evidence must not change the boot outcome.
+# Prints the record basename on success, nothing otherwise.
+persist_failure_log()
+{
+    : "${FAILURE_LOG_DIR:=/data/libreecho/update}"
+    : "${FAILURE_LOG_MAX_BYTES:=8192}"
+    : "${FAILURE_LOG_KEEP:=3}"
+    : "${INIT_LOG:=/tmp/init.log}"
+    reason=${1:-unknown}
+    detail=${2:-}
+    case "$reason" in
+        ''|*[!A-Za-z0-9._-]*) reason=invalid-reason ;;
+    esac
+    [ -d "$FAILURE_LOG_DIR" ] || return 0
+    epoch=$($BB date -u +%s 2>/dev/null)
+    case "$epoch" in ''|*[!0-9]*) epoch=0 ;; esac
+    name=failure-$epoch-$$.log
+    target=$FAILURE_LOG_DIR/$name
+    tmp=$FAILURE_LOG_DIR/.$name.tmp
+    {
+        echo schema=1
+        echo "reason=$reason"
+        echo "slot_suffix=$($BB sed -n 's/.*androidboot.slot_suffix=_\([ab]\).*/\1/p' /proc/cmdline 2>/dev/null)"
+        echo "uptime_seconds=$($BB cut -d' ' -f1 /proc/uptime 2>/dev/null)"
+        echo "epoch=$epoch"
+        echo "--- detail"
+        printf '%s\n' "$detail" | sanitize_failure_text | $BB head -c 2048
+        echo
+        echo "--- init.log"
+        $BB tail -n 120 "$INIT_LOG" 2>/dev/null | sanitize_failure_text
+    } > "$tmp" 2>/dev/null || { $BB rm -f "$tmp"; return 0; }
+    if $BB head -c "$FAILURE_LOG_MAX_BYTES" "$tmp" > "$tmp.cut" 2>/dev/null; then
+        $BB mv "$tmp.cut" "$tmp" 2>/dev/null || $BB rm -f "$tmp.cut"
+    fi
+    $BB chmod 0600 "$tmp" 2>/dev/null || true
+    $BB mv "$tmp" "$target" 2>/dev/null || { $BB rm -f "$tmp"; return 0; }
+    $BB sync 2>/dev/null || true
+    $BB ls -1dt "$FAILURE_LOG_DIR"/failure-*.log 2>/dev/null |
+        $BB tail -n "+$((FAILURE_LOG_KEEP + 1))" |
+        while read -r stale; do $BB rm -f "$stale" 2>/dev/null || true; done
+    printf '%s\n' "$name"
+    return 0
+}
+
 # The kernel already carries ramoops/pstore and pmsg support, but this reduced
 # userspace previously mounted neither pstore nor the dynamically allocated
 # pmsg character device. Materialise both without assuming a fixed major.
@@ -1273,7 +1334,12 @@ activate_feature_transaction()
     [ "$running_slot" = "$pending_slot" ] || { log feature-transaction-fallback-canonical; return 0; }
     $BB mkdir -p "$update/staging" || { log feature-transaction-staging-failed; return 1; }
     if /usr/local/sbin/libreecho-bootctl status > "$update/staging/bootctl.readback" 2>/dev/null; then
-        "$transaction" activate-mounts || { log feature-transaction-activation-rejected; pmsg_marker feature-activation-rejected; return 1; }
+        if ! activation_error=$("$transaction" activate-mounts 2>&1); then
+            log feature-transaction-activation-rejected
+            pmsg_marker feature-activation-rejected
+            persist_failure_log feature-activation-rejected "$activation_error" >/dev/null 2>&1
+            return 1
+        fi
         log feature-transaction-candidate-mounted
         pmsg_marker feature-candidate-mounted
         commit_fresh_install
@@ -2443,6 +2509,7 @@ ota_health_confirm_worker()
     fi
     log ota-health-confirm-failed-rebooting
     pmsg_marker "ota-confirm-failed-$last_check"
+    failure_log=$(persist_failure_log ota-health-confirm-failed "$last_check" 2>/dev/null) || failure_log=
     # Issue #41: leave persistent evidence for why this worker restarted the
     # device.  The record lives on the persistent userdata filesystem (not
     # tmpfs), is written atomically and synced before the reboot, and is
@@ -2457,6 +2524,7 @@ ota_health_confirm_worker()
         echo pending_slot=$pending_slot
         echo selected_slot=$selected_slot
         echo epoch=$(date -u +%s)
+        echo "failure_log=${failure_log:-none}"
     } > /data/libreecho/update/restart-record.tmp &&
         $BB mv /data/libreecho/update/restart-record.tmp \
             /data/libreecho/update/restart-record
