@@ -50,19 +50,60 @@ class EarlyControlPlaneContracts(unittest.TestCase):
         self.assertIn("grep -q ':15B3 ' /proc/net/tcp", self.init)
 
     # ------------------------------------------------------------ networking
+    def test_exactly_one_automatic_activation_exists(self) -> None:
+        # Any spelling counts. The earlier duplicate slipped past a check that
+        # only matched the redirected call.
+        invocations = [
+            line.strip()
+            for line in self.init.splitlines()
+            if re.match(r"^\s*start_wifi_network(\s|'|\"|&|$)", line)
+            and not line.strip().startswith("start_wifi_network()")
+        ]
+        self.assertEqual(
+            invocations,
+            [
+                "start_wifi_network",
+                "start_wifi_network >>/tmp/wifi-boot.log 2>&1 &",
+            ],
+        )
+        # The bare call is the operator path inside wifi_request_loop; the
+        # redirected call is the single automatic activation on the boot path.
+        self.assertEqual(
+            self.init.count("start_wifi_network >>/tmp/wifi-boot.log 2>&1 &"), 1
+        )
+        loop_start = self.init.index("wifi_request_loop()")
+        loop_end = self.init.index("\n}\n", loop_start)
+        manual = [
+            match.start()
+            for match in re.finditer(r"^\s*start_wifi_network\s*$", self.init, re.M)
+            if loop_start < match.start() < loop_end
+        ]
+        self.assertEqual(len(manual), 1)
+        # The automatic call is on the boot path, ahead of the supervisor that
+        # serves the operator request path.
+        self.assertLess(
+            self.init.index("start_wifi_network >>/tmp/wifi-boot.log 2>&1 &"),
+            self.init.index("wifi_request_loop &"),
+        )
+
     def test_network_activation_runs_on_the_boot_path(self) -> None:
         activation = self.init.index("start_wifi_network >>/tmp/wifi-boot.log 2>&1 &")
-        self.assertIn("log wifi-boot-activation-started", self.init)
         self.assertIn("pmsg_marker wifi-boot-activation", self.init)
-        # Only ever started once, and before the service graph.
-        self.assertEqual(self.init.count("start_wifi_network >>"), 1)
         self.assertLess(activation, self.init.index("apply_timezone()"))
+        self.assertLess(activation, self.init.index("wifi_request_loop &"))
 
-    def test_network_activation_after_the_wmt_nodes_and_vendor_assets(self) -> None:
-        activation = self.init.index("wifi-boot-activation-started")
+    def test_network_activation_keeps_the_profile_and_firmware_policy(self) -> None:
+        activation = self.init.index("start_wifi_network >>/tmp/wifi-boot.log 2>&1 &")
+        guard = self.init.rindex('if [ "${VENDOR_ASSETS_OK:-0}" -ne 1 ]; then', 0, activation)
+        self.assertLess(guard, activation)
+        # The activation is the last branch of the policy chain, not an
+        # unconditional call: diagnostic images stay manual/single-shot.
+        branch = self.init[guard:activation]
+        self.assertIn('elif [ "$SERVICE_PROFILE" = diagnostic ]; then', branch)
+        self.assertIn("log wifi-network-policy-manual-single-shot", branch)
+        self.assertIn("else", branch)
+        # And it still happens after the WMT nodes exist.
         self.assertLess(self.init.index("log wmt-nodes-created"), activation)
-        # The activation refuses to run without the owner-local firmware.
-        self.assertIn('if [ "${VENDOR_ASSETS_OK:-0}" -eq 1 ]; then', self.init)
 
     def test_loopback_is_up_before_the_network_starts(self) -> None:
         loopback = self.init.index("ifconfig lo 127.0.0.1 up")

@@ -975,17 +975,25 @@ else
     log loopback-config-failed
 fi
 
-# Bring the network up on the boot path instead of waiting for the service
-# graph to request it below.  Reachability -- OTA, AirPlay, and the OTA health
-# probes that require the network -- must not depend on the graph having
-# started.  start_wifi_network keeps its single-shot claim, so a failed
-# activation still refuses a second one in the same boot.
-if [ "${VENDOR_ASSETS_OK:-0}" -eq 1 ]; then
-    start_wifi_network >>/tmp/wifi-boot.log 2>&1 &
-    log wifi-boot-activation-started
-    pmsg_marker wifi-boot-activation
+# Connectivity comes up on the boot path, not at the end of init: reachability
+# (OTA, AirPlay, and the OTA health probes that need the network) must not
+# depend on the service graph having started.  This is the single automatic
+# activation.  Its conditions are unchanged from the original late call -- a
+# profile-bearing image performs one bounded activation after the ADB/FunctionFS
+# control plane is ready (HW61, matching the verified 3.18 baseline), and a
+# diagnostic image keeps connectivity manual/single-shot.  The ADB control
+# plane is already established above, so the FunctionFS condition is satisfied
+# by construction here.  start_wifi_network keeps its single-shot claim, so a
+# failed activation still refuses a second attempt in the same boot, and the
+# request supervisor below remains available for the free-claim case.
+if [ "${VENDOR_ASSETS_OK:-0}" -ne 1 ]; then
+    log wifi-network-skipped-vendor-assets-unavailable
+elif [ "$SERVICE_PROFILE" = diagnostic ]; then
+    log wifi-network-policy-manual-single-shot
 else
-    log wifi-network-worker-deferred
+    start_wifi_network >>/tmp/wifi-boot.log 2>&1 &
+    log wifi-network-worker-started-after-adb
+    pmsg_marker wifi-boot-activation
 fi
 
 # Preserve v97's root command loop, but never let one experiment monopolize
@@ -2561,21 +2569,9 @@ fi
 # an old audio asset is accidentally present in an overlay or persistent store.
 log audio-startup-disabled
 
-# Connectivity is launched only after the ADB/FunctionFS control plane is
-# ready (HW61, matching the verified 3.18 baseline).  A profile-bearing image
-# performs one bounded Wi-Fi activation; a failed activation is recorded but
-# never takes PID 1 or the recovery runner down.  When USB diagnostic mode is
-# active, connectivity stays manual/single-shot.
-if [ "${VENDOR_ASSETS_OK:-0}" -ne 1 ]; then
-    log wifi-network-skipped-vendor-assets-unavailable
-elif [ "$SERVICE_PROFILE" = diagnostic ]; then
-    log wifi-network-policy-manual-single-shot
-elif [ "${ffs_ready:-0}" -eq 1 ]; then
-    start_wifi_network &
-    log wifi-network-worker-started-after-adb
-else
-    log wifi-network-skipped-adb-not-ready
-fi
+# The single automatic connectivity activation runs on the boot path above.
+# Nothing here starts the network, so a profile-bearing image cannot launch it
+# twice; the diagnostic/manual policy is enforced at that one site.
 
 # Android init remains PID 1.  Keep this service alive so the runme loop and
 # recovery diagnostics survive optional driver failures.
