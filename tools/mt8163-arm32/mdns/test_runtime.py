@@ -11,6 +11,8 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import sys
@@ -253,6 +255,138 @@ class VerifierTests(unittest.TestCase):
         record = self.verifier.verify(Path(runtime), manifest_sha)
         self.assertEqual(record['manifest_sha256'], manifest_sha)
         self.assertGreater(record['files'], 0)
+
+
+class ResponderInterfaceReadinessTests(unittest.TestCase):
+    """The responder must not start before an interface it may use exists.
+
+    Avahi binds and advertises on the interfaces present when it starts, so a
+    responder launched before the network comes up publishes nothing on the LAN
+    and keeps that state until it is restarted. Measured on hardware: a unit
+    whose wifi is configured after first boot ran its responder as
+    ``[none.local]`` and stayed invisible on the LAN until it was restarted by
+    hand. The wait is bounded and fail-open - it delays advertising, never gates
+    the responder - so a wired-only or not-yet-connected unit still gets
+    discovery.
+    """
+
+    INIT = HERE.parent / "initramfs/libreecho-mdnsd"
+    WAIT_FUNCTIONS = ("interface_ready", "wait_for_interface")
+
+    def setUp(self) -> None:
+        self.work = Path(tempfile.mkdtemp(prefix="le-mdns-interface-"))
+        self.net_class = self.work / "net"
+        self.net_class.mkdir()
+        self.config = self.work / "avahi-daemon.conf"
+        self.log = self.work / "mdns.log"
+        self._extract()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.work, ignore_errors=True)
+
+    def _extract(self) -> None:
+        source = self.INIT.read_text()
+        bodies = []
+        for name in self.WAIT_FUNCTIONS:
+            marker = next(m for m in (f"{name}()\n{{\n", f"{name}() {{") if m in source)
+            start = source.index(marker)
+            depth = 0
+            for offset, char in enumerate(source[start:], start):
+                if char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        bodies.append(source[start:offset + 1])
+                        break
+            else:
+                raise AssertionError(f"unterminated function: {name}")
+        self.functions = "\n".join(bodies)
+
+    def _interface(self, name: str, state: str) -> None:
+        directory = self.net_class / name
+        directory.mkdir(exist_ok=True)
+        (directory / "operstate").write_text(f"{state}\n")
+
+    def _configure(self, allow: str | None) -> None:
+        lines = ["[server]", "use-ipv4=yes"]
+        if allow is not None:
+            lines.append(f"allow-interfaces={allow}")
+        self.config.write_text("\n".join(lines) + "\n")
+
+    def _run(self, call: str, wait_seconds: int = 0) -> subprocess.CompletedProcess[str]:
+        import subprocess
+        harness = self.work / "harness.sh"
+        harness.write_text(
+            "#!/bin/sh\n"
+            "set -u\n"
+            "BB=\n"
+            f'AVAHI_CONFIG="{self.config}"\n'
+            f'export LIBREECHO_NET_CLASS_ROOT="{self.net_class}"\n'
+            f'export MDNS_INTERFACE_WAIT_SECONDS="{wait_seconds}"\n'
+            f'log() {{ printf "%s\\n" "$*" >> "{self.log}"; }}\n'
+            f"{self.functions}\n"
+            f"{call}\n"
+            'printf "rc=%s\\n" "$?"\n')
+        return subprocess.run(["sh", str(harness)], text=True, capture_output=True)
+
+    def test_an_allowed_interface_that_is_up_is_ready(self) -> None:
+        self._configure("wlan0,eth0")
+        self._interface("wlan0", "up")
+        self.assertIn("rc=0", self._run("interface_ready").stdout)
+
+    def test_an_interface_that_exists_but_is_down_is_not_ready(self) -> None:
+        self._configure("wlan0")
+        self._interface("wlan0", "down")
+        self.assertIn("rc=1", self._run("interface_ready").stdout)
+
+    def test_an_absent_interface_is_not_ready(self) -> None:
+        self._configure("wlan0")
+        self.assertIn("rc=1", self._run("interface_ready").stdout)
+
+    def test_no_allow_list_waits_for_nothing(self) -> None:
+        self._configure(None)
+        self.assertIn("rc=0", self._run("interface_ready").stdout)
+
+    def test_loopback_alone_does_not_satisfy_the_wait(self) -> None:
+        self._configure("lo")
+        self._interface("lo", "unknown")
+        self.assertIn("rc=1", self._run("interface_ready").stdout)
+
+    def test_the_wait_is_bounded_and_fails_open(self) -> None:
+        # No interface ever appears: the wait expires and the responder still
+        # starts, because failing closed would cost discovery entirely.
+        self._configure("wlan0")
+        result = self._run("wait_for_interface", wait_seconds=1)
+        self.assertIn("rc=0", result.stdout)
+        self.assertIn("interface-wait-expired", self.log.read_text())
+
+    def test_the_wait_returns_as_soon_as_an_interface_is_up(self) -> None:
+        self._configure("wlan0")
+        self._interface("wlan0", "up")
+        result = self._run("wait_for_interface", wait_seconds=30)
+        self.assertIn("rc=0", result.stdout)
+        self.assertFalse(self.log.is_file() and "interface-wait-expired" in self.log.read_text())
+
+    def test_the_wait_delays_the_responder_start(self) -> None:
+        """Ordering is the fix: the wait must run before the responder launches."""
+        source = self.INIT.read_text()
+        # Brace-balanced so the search is confined to start() and cannot match
+        # the earlier definition of the launcher.
+        start = source.index("start() {\n")
+        depth = 0
+        for offset, char in enumerate(source[start:], start):
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    body = source[start:offset + 1]
+                    break
+        else:
+            raise AssertionError("start() is unterminated")
+        launched = body.index("start_daemon_pair")
+        self.assertLess(body.index("wait_for_interface"), launched)
 
 
 if __name__ == '__main__':

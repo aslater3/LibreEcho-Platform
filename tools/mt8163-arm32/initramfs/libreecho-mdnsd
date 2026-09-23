@@ -225,6 +225,47 @@ start_daemon_pair() {
     return 0
 }
 
+# Avahi binds and advertises on the interfaces that exist when it starts, so a
+# responder launched before the network comes up publishes nothing on the LAN and
+# keeps that state until it is restarted. Measured on hardware: a unit whose wifi
+# is configured after first boot ran its responder as [none.local] and stayed
+# invisible on the LAN until the responder was restarted by hand.
+interface_ready() {
+    net_class=${LIBREECHO_NET_CLASS_ROOT:-/sys/class/net}
+    allowed=
+    if [ -r "$AVAHI_CONFIG" ]; then
+        allowed=$($BB sed -n 's/^[[:space:]]*allow-interfaces[[:space:]]*=[[:space:]]*//p' \
+            "$AVAHI_CONFIG" 2>/dev/null | $BB head -n 1)
+    fi
+    # No allow-list means no declared expectation: nothing to wait for.
+    [ -n "$allowed" ] || return 0
+    for candidate in $(printf '%s' "$allowed" | $BB tr ',' ' '); do
+        [ "$candidate" = lo ] && continue
+        [ -e "$net_class/$candidate" ] || continue
+        # An interface that exists but is down cannot carry multicast yet.
+        case "$(cat "$net_class/$candidate/operstate" 2>/dev/null)" in
+            up|unknown) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Bounded and fail-open on purpose: this is a delay before advertising, never a
+# gate on starting the responder. A wired-only or not-yet-connected unit must
+# still get discovery.
+wait_for_interface() {
+    interface_wait=${MDNS_INTERFACE_WAIT_SECONDS:-20}
+    case "$interface_wait" in ''|*[!0-9]*) interface_wait=0 ;; esac
+    interface_attempt=0
+    while [ "$interface_attempt" -lt "$interface_wait" ]; do
+        interface_ready && return 0
+        $BB sleep 1
+        interface_attempt=$((interface_attempt + 1))
+    done
+    [ "$interface_wait" -eq 0 ] || log interface-wait-expired
+    return 0
+}
+
 start() {
     if ! runtime_present; then
         # Explicit, loud failure instead of a silent second responder.
@@ -247,6 +288,7 @@ start() {
         stopped_wait "$pid"
     done
     $BB mkdir -p "$RUN_ROOT" || return 1
+    wait_for_interface
     if [ -x "$SUPERVISOR" ]; then
         start_supervisor && return 0
         log mdns-supervisor-fallback

@@ -1138,6 +1138,78 @@ adopt_staged_local_install()
     return 0
 }
 
+# A fresh install has nothing committed yet, and the service graph is gated on
+# the live feature tree: the reconciler reads
+# $DATA_ROOT/libreecho/features/<feature>, which stays empty until the
+# transaction commits. So the feature services are deferred, startup-ready is
+# never written, and the commit -- which waits for startup-ready before
+# confirming the slot -- never runs either. That deadlock is why a
+# TWRP-installed unit only came up completely on its second boot.
+#
+# Complete the commit on the boot that installed it. The candidate tree was just
+# validated for this running slot, and there is nothing to roll back to: this
+# path is scoped to a device with no installed record and no committed evidence,
+# so an upgrade, which has a base and a previous version worth falling back to,
+# keeps the confirm-then-commit sequence it has today.
+commit_fresh_install()
+{
+    install_root=${LIBREECHO_INSTALL_ROOT:-/data/libreecho/update}
+    install_bootctl=${LIBREECHO_BOOTCTL_TOOL:-/usr/local/sbin/libreecho-bootctl}
+    install_transaction_tool=${LIBREECHO_TRANSACTION_TOOL:-/usr/local/sbin/libreecho-feature-transaction}
+
+    [ "$IMAGE_PROFILE" = ota ] || return 0
+    [ -r "$install_root/pending" ] || return 0
+    [ -r "$install_root/feature-commit" ] || return 0
+    # Anything already committed means this is not a fresh install.
+    [ -e "$install_root/installed" ] && return 0
+    [ -e "$install_root/committed-manifest" ] && return 0
+    [ -e "$install_root/committed-manifest.sig" ] && return 0
+    [ -x "$install_transaction_tool" ] || return 0
+
+    fresh_slot=$(running_slot_id)
+    case "$fresh_slot" in
+        a|b) ;;
+        *) log fresh-commit-running-slot-unknown; return 0 ;;
+    esac
+    fresh_pending_slot=$($BB sed -n 's/^slot=//p' "$install_root/pending" 2>/dev/null | $BB head -n 1)
+    [ "$fresh_pending_slot" = "$fresh_slot" ] || {
+        # The prepared transaction belongs to another slot: this boot is the
+        # fallback path, not the install it describes.
+        log "fresh-commit-pending-slot-other:$fresh_slot"
+        return 0
+    }
+    [ -x "$install_bootctl" ] || return 0
+    # commit requires a confirmed slot and a boot-control readback, and on a
+    # fresh install the confirmation would otherwise happen later in this boot,
+    # after the commit has already been skipped.
+    "$install_bootctl" confirm "$fresh_slot" >/dev/null 2>&1 || {
+        log fresh-commit-bootctl-confirm-failed
+        return 0
+    }
+    $BB mkdir -p "$install_root/staging" 2>/dev/null
+    "$install_bootctl" status > "$install_root/staging/bootctl.readback" 2>/dev/null || {
+        log fresh-commit-bootctl-readback-failed
+        return 0
+    }
+    if ! "$install_transaction_tool" commit-after-confirm \
+            > /tmp/fresh-install-commit.log 2>&1; then
+        # Services still start: a staged set that will not commit is reported,
+        # and the existing confirm/commit path still gets its chance later.
+        log fresh-commit-rejected
+        pmsg_marker fresh-commit-rejected
+        return 0
+    fi
+    if ! "$install_transaction_tool" activate-committed \
+            >> /tmp/fresh-install-commit.log 2>&1; then
+        log fresh-commit-activation-rejected
+        pmsg_marker fresh-commit-activation-rejected
+        return 0
+    fi
+    log fresh-install-committed
+    pmsg_marker fresh-install-committed
+    return 0
+}
+
 activate_feature_transaction()
 {
     adopt_staged_local_install
@@ -1174,6 +1246,7 @@ activate_feature_transaction()
         "$transaction" activate-mounts || { log feature-transaction-activation-rejected; pmsg_marker feature-activation-rejected; return 1; }
         log feature-transaction-candidate-mounted
         pmsg_marker feature-candidate-mounted
+        commit_fresh_install
         return 0
     fi
     log feature-transaction-bcb-read-failed
