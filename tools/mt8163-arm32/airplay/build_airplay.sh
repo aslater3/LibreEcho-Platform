@@ -24,6 +24,7 @@ RELINK_OUTPUT=${LIBREECHO_AIRPLAY_RELINK_OUTPUT:-}
 python3 "$SCRIPT_DIR/test_audio_engine_contract.py"
 python3 "$SCRIPT_DIR/test_audio_period_buffer.py"
 python3 "$SCRIPT_DIR/test_airplay_volume_contract.py"
+"$SCRIPT_DIR/test_speaker_dsp.sh"
 
 for archive in "$NQPTP_ARCHIVE" "$SHAIRPORT_ARCHIVE" "$FFMPEG_ARCHIVE" "$TINYALSA_ARCHIVE"; do
     [[ -f "$archive" ]] || { echo "ERROR: AirPlay source archive is missing: $archive" >&2; exit 1; }

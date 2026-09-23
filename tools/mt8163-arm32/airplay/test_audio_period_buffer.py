@@ -98,6 +98,7 @@ int main(void)
 {
     struct source_bus sources[SOURCE_COUNT];
     struct puffin_dynamics dynamics;
+    struct speaker_dsp speaker;
     int pipes[SOURCE_COUNT][2];
     int16_t half[PERIOD_SIZE * INPUT_CHANNELS / 2];
     int16_t output[PERIOD_SIZE * OUTPUT_CHANNELS];
@@ -143,7 +144,8 @@ int main(void)
         return fail("ready source was blocked by partial source");
 
     puffin_dynamics_init(&dynamics);
-    render_period(sources, output, &dynamics);
+    speaker_dsp_init(&speaker, 100);
+    render_period(sources, output, &dynamics, &speaker);
     for (i = 0; i < PERIOD_SIZE; ++i) {
         if (output[i * OUTPUT_CHANNELS] == 0 ||
             output[i * OUTPUT_CHANNELS] != output[i * OUTPUT_CHANNELS + 1])
@@ -200,7 +202,7 @@ int main(void)
         return fail("one-period startup write failed");
     if (read_sources(sources, "/tmp") < 0 ||
         prepare_initial_period(sources, "/tmp", output, &dynamics,
-                               &activity_mask) != 1 ||
+                               &speaker, &activity_mask) != 1 ||
         activity_mask == 0)
         return fail("one complete period was not accepted at startup");
     for (i = 0; i < PERIOD_SIZE; ++i) {

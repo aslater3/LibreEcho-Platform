@@ -32,6 +32,7 @@
 #include "audio_visualizer.h"
 #include "playback_status.h"
 #include "puffin_downmix.h"
+#include "speaker_dsp.h"
 
 #define DEFAULT_ROOT "/run/libreecho-audio"
 #define AIRPLAY_ACTIVE_FILE "airplay.active"
@@ -763,7 +764,8 @@ static unsigned int ready_activity_mask(const struct source_bus *sources)
 }
 
 static void render_period(struct source_bus *sources, int16_t *output,
-			  struct puffin_dynamics *dynamics)
+			  struct puffin_dynamics *dynamics,
+			  struct speaker_dsp *speaker)
 {
 	size_t frame;
 	int higher_priority =
@@ -774,6 +776,7 @@ static void render_period(struct source_bus *sources, int16_t *output,
 
 	for (frame = 0; frame < PERIOD_SIZE; ++frame) {
 		int32_t mixed = 0;
+		int16_t rendered;
 		unsigned int source;
 
 		for (source = 0; source < SOURCE_COUNT; ++source) {
@@ -794,16 +797,51 @@ static void render_period(struct source_bus *sources, int16_t *output,
 				gain = (gain * MEDIA_DUCK_Q15) >> 15;
 			mixed += (int32_t)(((int64_t)mono * gain) >> 15);
 		}
-		int16_t rendered = puffin_render_mono(dynamics, mixed);
+		/*
+		 * Speaker tuning runs on the mono programme bus and before the
+		 * trim/limiter, matching the stock order (equaliser and
+		 * parametric EQ, then OutputTrim and the full-band limiter).
+		 */
+		mixed = speaker_dsp_process(speaker, mixed);
+		rendered = puffin_render_mono(dynamics, mixed);
 
 		output[frame * OUTPUT_CHANNELS] = rendered;
 		output[frame * OUTPUT_CHANNELS + 1] = rendered;
 	}
 }
 
+/*
+ * The tuned loudness curve is indexed by the user's volume, in percent, matching
+ * the stock pipeline's volume-boundary selection.  AirPlay's phone volume is the
+ * authoritative control during a session; otherwise the media volume file (a dB
+ * value) decides.  A negative result means "unknown", and the caller must leave
+ * the speaker bus untuned rather than guess.
+ */
+static int speaker_volume_percent(const char *root)
+{
+	int mixer;
+	int gain;
+
+	if (airplay_is_active(root)) {
+		mixer = airplay_volume_to_mixer(root);
+		if (mixer < 0)
+			return -1;
+		if (mixer > 127)
+			mixer = 127;
+		return (mixer * 100 + 63) / 127;
+	}
+	gain = read_media_gain(root);
+	if (gain >= 32768)
+		return 100;
+	if (gain <= 0)
+		return 0;
+	return (gain * 100 + 16383) / 32768;
+}
+
 static int prepare_initial_period(struct source_bus *sources, const char *root,
 				  int16_t *output,
 				  struct puffin_dynamics *dynamics,
+				  struct speaker_dsp *speaker,
 				  unsigned int *activity_mask)
 {
 	int ready = wait_for_period(sources, root);
@@ -811,7 +849,8 @@ static int prepare_initial_period(struct source_bus *sources, const char *root,
 	if (ready <= 0)
 		return ready;
 	puffin_dynamics_init(dynamics);
-	render_period(sources, output, dynamics);
+	speaker_dsp_init(speaker, speaker_volume_percent(root));
+	render_period(sources, output, dynamics, speaker);
 	if (activity_mask)
 		*activity_mask = ready_activity_mask(sources);
 	return 1;
@@ -849,6 +888,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	const size_t bytes = PERIOD_SIZE * OUTPUT_CHANNELS * sizeof(int16_t);
 	struct source_bus sources[SOURCE_COUNT];
 	struct puffin_dynamics dynamics;
+	struct speaker_dsp speaker;
 	struct music_visualizer visualizer;
 	struct playback_status status;
 	struct le_aec_reference_sender reference;
@@ -907,7 +947,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		if (read_or_retain_sources(sources, root) <= 0)
 			continue;
 		ready = prepare_initial_period(sources, root, output, &dynamics,
-					      &first_activity);
+					      &speaker, &first_activity);
 		if (ready <= 0) {
 			if (ready < 0 || stopping)
 				break;
@@ -1056,7 +1096,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				break;
 			sync_announcement_led(sources, &announcement_led_active);
 			sync_playback_status(sources, &status);
-			render_period(sources, output, &dynamics);
+			render_period(sources, output, &dynamics, &speaker);
 			if (write_period(pcm, output, &reference,
 					 ready_activity_mask(sources)) < 0) {
 				fprintf(stderr,
