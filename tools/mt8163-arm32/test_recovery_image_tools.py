@@ -2272,7 +2272,13 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("integrations & 1", source)
         self.assertIn("integrations & 16", source)
         self.assertIn("airplay_explicitly_disabled", source)
-        self.assertIn("feature-reconcile-airplay-disabled", source)
+        # Disabling the AirPlay protocol must retain the shared controller.
+        # Keep the packaging/startup checks below, and reject the old stop path.
+        self.assertIn("feature-reconcile-airplay-protocol-disabled", source)
+        self.assertNotIn("feature-reconcile-airplay-disabled", source)
+        self.assertNotIn("stop_disabled_airplay", source)
+        self.assertNotIn("stop_service airplayd", source)
+        self.assertIn('feature_service_ready "$service" "$socket"', source)
         self.assertIn("$DATA_ROOT/libreecho/features/$feature/payload.squashfs", source)
         self.assertIn("/staging", source)
         self.assertIn('"$script" start', source)
@@ -2398,8 +2404,51 @@ class PolicyTests(unittest.TestCase):
             (data / "libreecho/config/web-config.json").write_text('{"integrations":4}\n')
             subprocess.run(["sh", str(helper)], env=env, check=True)
             disabled_actions = actions.read_text().splitlines()
-            self.assertIn("libreecho-airplayd.init:stop", disabled_actions)
-            self.assertNotIn("libreecho-airplayd.init:start", disabled_actions)
+            # AirPlay-off still needs local playback: require the complete
+            # selected graph, not merely the absence of a stop operation.
+            self.assertEqual(
+                disabled_actions,
+                [
+                    "libreecho-wyomingd.init:stop",
+                    "libreecho-waked.init:start", "libreecho-sttd.init:start",
+                    "libreecho-airplayd.init:start", "libreecho-ttsd.init:start",
+                    "libreecho-agentd.init:start",
+                ],
+            )
+            self.assertNotIn("libreecho-airplayd.init:stop", disabled_actions)
+            self.assertTrue((states / "airplayd").is_file())
+            self.assertTrue(socket_paths["airplayd"].is_socket())
+            self.assertEqual(
+                (var_run / "libreecho-airplayd.pid").read_text(),
+                f"{os.getpid()}\n",
+            )
+
+            # Disabled protocol is not permission to skip payload or liveness
+            # validation. These failures must still prevent successful setup.
+            airplay_payload = data / "libreecho/features/airplay2/payload.squashfs"
+            airplay_payload.unlink()
+            missing_audio = subprocess.run(
+                ["sh", str(helper)], env=env, check=False, timeout=10
+            )
+            self.assertNotEqual(missing_audio.returncode, 0)
+            self.assertIn(
+                "feature-reconcile-payload-missing:airplay2",
+                (root / "reconcile.log").read_text(),
+            )
+            airplay_payload.write_bytes(b"verified-fixture")
+            proc_unix.write_text("".join(
+                line for line in proc_lines
+                if not line.rstrip().endswith(str(socket_paths["airplayd"]))
+            ))
+            unready_audio = subprocess.run(
+                ["sh", str(helper)], env=env, check=False, timeout=10
+            )
+            self.assertNotEqual(unready_audio.returncode, 0)
+            self.assertIn(
+                "feature-reconcile-service-not-ready:airplayd",
+                (root / "reconcile.log").read_text(),
+            )
+            proc_unix.write_text("".join(proc_lines))
 
             (data / "libreecho/features/assistant/payload.squashfs").unlink()
             failed = subprocess.run(["sh", str(helper)], env=env, check=False)
@@ -2428,11 +2477,26 @@ class PolicyTests(unittest.TestCase):
             )
             subprocess.run(["sh", str(helper)], env=env, check=True)
             home_assistant_only_actions = actions.read_text().splitlines()
-            self.assertNotIn(
-                "libreecho-airplayd.init:start", home_assistant_only_actions
+            # HA changes the voice topology, not shared playback ownership.
+            self.assertEqual(
+                home_assistant_only_actions,
+                [
+                    "libreecho-agentd.init:stop",
+                    "libreecho-sttd.init:stop",
+                    "libreecho-ttsd.init:stop",
+                    "libreecho-wyomingd.init:start",
+                    "libreecho-waked.init:start",
+                    "libreecho-airplayd.init:start",
+                ],
             )
-            self.assertIn(
+            self.assertNotIn(
                 "libreecho-airplayd.init:stop", home_assistant_only_actions
+            )
+            self.assertTrue((states / "airplayd").is_file())
+            self.assertTrue(airplay_socket.is_socket())
+            self.assertEqual(
+                (var_run / "libreecho-airplayd.pid").read_text(),
+                f"{os.getpid()}\n",
             )
 
             actions.write_text("")
@@ -2713,10 +2777,9 @@ feature_daemon_required tts
     def test_airplay_controller_staging_follows_discovery_and_audio_toggles(self) -> None:
         stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()
         self.assertIn("airplay_explicitly_disabled()", stager)
-        self.assertIn("home_assistant_enabled()", stager)
         self.assertIn("integrations & 16", stager)
-        self.assertIn("integrations & 1", stager)
-        self.assertIn("FEATURE_STAGE_AIRPLAY_DISABLED", stager)
+        self.assertIn("FEATURE_STAGE_AIRPLAY_PROTOCOL_DISABLED", stager)
+        self.assertNotIn("FEATURE_STAGE_AIRPLAY_DISABLED", stager)
         self.assertIn("start_feature_service_if_enabled()", stager)
 
         busybox = shutil.which("busybox")
@@ -2727,7 +2790,6 @@ feature_daemon_required tts
             functions = []
             for name in (
                 "airplay_explicitly_disabled",
-                "home_assistant_enabled",
                 "start_feature_service_if_enabled",
             ):
                 start = stager.index(f"{name}()\n")
@@ -2737,13 +2799,17 @@ feature_daemon_required tts
                 "/data/libreecho/config/web-config.json", str(config)
             )
 
-            def stage(integrations: int, feature: str = "airplay2") -> list[str]:
+            # HA must not gate restoration of the shared playback owner.
+            self.assertNotIn("home_assistant_enabled", functions[-1])
+
+            def stage(integrations: int, feature: str = "airplay2",
+                      start_status: int = 0) -> list[str]:
                 config.write_text(f'{{"integrations":{integrations}}}\n')
                 harness = f"""
 BB={busybox}
 FEATURE_ID={feature}
 {source}
-start_feature_service() {{ echo FEATURE_STAGE_SERVICE_STARTED; }}
+start_feature_service() {{ echo FEATURE_STAGE_SERVICE_STARTED; return {start_status}; }}
 start_feature_service_if_enabled
 """
                 result = subprocess.run(
@@ -2751,14 +2817,27 @@ start_feature_service_if_enabled
                     check=True,
                     text=True,
                     capture_output=True,
+                    timeout=10,
                 )
                 return result.stdout.splitlines()
 
-            self.assertEqual(stage(4), ["FEATURE_STAGE_AIRPLAY_DISABLED"])
-            for integrations in (5, 20, 21):
+            # Both AirPlay-off masks report protocol disablement AND start
+            # the controller; neither local voice nor HA may skip shared audio.
+            for integrations in (4, 5):
+                with self.subTest(integrations=integrations):
+                    self.assertEqual(stage(integrations), [
+                        "FEATURE_STAGE_AIRPLAY_PROTOCOL_DISABLED",
+                        "FEATURE_STAGE_SERVICE_STARTED",
+                    ])
+            for integrations in (20, 21):
                 self.assertEqual(
                     stage(integrations), ["FEATURE_STAGE_SERVICE_STARTED"]
                 )
+            for integrations in (4, 5, 20, 21):
+                with self.subTest(integrations=integrations, start_status=23):
+                    with self.assertRaises(subprocess.CalledProcessError) as error:
+                        stage(integrations, start_status=23)
+                    self.assertEqual(error.exception.returncode, 23)
             self.assertEqual(
                 stage(4, feature="tts"), ["FEATURE_STAGE_SERVICE_STARTED"]
             )
