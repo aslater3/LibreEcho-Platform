@@ -293,9 +293,11 @@ start_feature()
     # discovery is served by the boot-contained shared responder and must not
     # require this payload.
     if [ "$feature" = airplay2 ] && airplay_explicitly_disabled; then
-        log feature-reconcile-airplay-disabled
-        stop_disabled_airplay
-        return $?
+        # airplayd owns the shared local playback engine as well as the optional
+        # AirPlay protocol children.  Keep the controller/runtime alive when
+        # AirPlay is disabled; the controller reads the integration bit and
+        # suppresses only the AirPlay protocol processes.
+        log feature-reconcile-airplay-protocol-disabled
     fi
     payload=$DATA_ROOT/libreecho/features/$feature/payload.squashfs
     if [ ! -f "$payload" ]; then
