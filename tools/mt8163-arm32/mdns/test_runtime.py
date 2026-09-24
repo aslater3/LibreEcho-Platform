@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 import shutil
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -387,6 +388,131 @@ class ResponderInterfaceReadinessTests(unittest.TestCase):
             raise AssertionError("start() is unterminated")
         launched = body.index("start_daemon_pair")
         self.assertLess(body.index("wait_for_interface"), launched)
+
+
+class SupervisorReadinessTests(unittest.TestCase):
+    """The wrapper must wait for the shared bus/status, not only a PID."""
+
+    INIT = HERE.parent / "initramfs/libreecho-mdnsd"
+
+    def test_supervisor_start_waits_until_status_is_ready(self) -> None:
+        busybox = shutil.which("busybox") or ""
+        if not busybox:
+            self.skipTest("busybox unavailable")
+        with tempfile.TemporaryDirectory(prefix="le-mdns-supervisor-") as tmp:
+            root = Path(tmp)
+            ready = root / "ready"
+            log_path = root / "supervisor.log"
+            supervisor = root / "supervisor.sh"
+            supervisor.write_text(
+                "#!/bin/sh\n"
+                "sleep 1\n"
+                f": > {shlex.quote(str(ready))}\n"
+                "exec sleep 30\n"
+            )
+            supervisor.chmod(0o755)
+            source = self.INIT.read_text()
+            marker = "start_supervisor() {\n"
+            start = source.index(marker)
+            depth = 0
+            for offset, char in enumerate(source[start:], start):
+                if char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        function = source[start:offset + 1]
+                        break
+            else:
+                raise AssertionError("start_supervisor() is unterminated")
+            harness = root / "harness.sh"
+            harness.write_text(
+                "\n".join([
+                    "#!/bin/sh",
+                    "set -u",
+                    f"BB={shlex.quote(busybox)}",
+                    f"SUPERVISOR={shlex.quote(str(supervisor))}",
+                    f"READY={shlex.quote(str(ready))}",
+                    f"LOG={shlex.quote(str(log_path))}",
+                    "START_TIMEOUT=5",
+                    'status() { [ -f "$READY" ]; }',
+                    'pid_alive() { $BB kill -0 "$1" 2>/dev/null; }',
+                    'log() { printf "%s\n" "$*" >> "$LOG"; }',
+                    function,
+                    "start_supervisor",
+                    "rc=$?",
+                    'if [ -f "$READY" ]; then ready=yes; else ready=no; fi',
+                    'printf "rc=%s ready=%s\n" "$rc" "$ready"',
+                    '$BB kill "$supervisor_pid" 2>/dev/null || true',
+                    'wait "$supervisor_pid" 2>/dev/null || true',
+                    "",
+                ])
+            )
+            result = subprocess.run(
+                [busybox, "sh", str(harness)], text=True, capture_output=True,
+                timeout=12,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("rc=0 ready=yes", result.stdout)
+            self.assertIn("mdns-supervisor-ready:", log_path.read_text())
+    def test_unready_supervisor_is_stopped_before_fallback(self) -> None:
+        busybox = shutil.which("busybox") or ""
+        if not busybox:
+            self.skipTest("busybox unavailable")
+        with tempfile.TemporaryDirectory(prefix="le-mdns-supervisor-timeout-") as tmp:
+            root = Path(tmp)
+            log_path = root / "supervisor.log"
+            supervisor = root / "supervisor.sh"
+            supervisor.write_text("#!/bin/sh\nexec sleep 30\n")
+            supervisor.chmod(0o755)
+            source = self.INIT.read_text()
+            marker = "start_supervisor() {\n"
+            start = source.index(marker)
+            depth = 0
+            for offset, char in enumerate(source[start:], start):
+                if char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        function = source[start:offset + 1]
+                        break
+            else:
+                raise AssertionError("start_supervisor() is unterminated")
+            harness = root / "harness.sh"
+            harness.write_text(
+                "\n".join([
+                    "#!/bin/sh",
+                    "set -u",
+                    f"BB={shlex.quote(busybox)}",
+                    f"SUPERVISOR={shlex.quote(str(supervisor))}",
+                    f"LOG={shlex.quote(str(log_path))}",
+                    f"BUS_SOCKET={shlex.quote(str(root / 'bus.sock'))}",
+                    "START_TIMEOUT=1",
+                    "STOP_TIMEOUT=1",
+                    "status() { return 1; }",
+                    'pid_alive() { $BB kill -0 "$1" 2>/dev/null; }',
+                    'stopped_wait() { wait "$1" 2>/dev/null || true; return 0; }',
+                    'runtime_responder_pids() { return 1; }',
+                    'stop() { echo cleaned >> "$LOG"; return 0; }',
+                    'log() { printf "%s\n" "$*" >> "$LOG"; }',
+                    function,
+                    "start_supervisor",
+                    "rc=$?",
+                    'if pid_alive "$supervisor_pid"; then alive=yes; else alive=no; fi',
+                    'printf "rc=%s alive=%s\n" "$rc" "$alive"',
+                    "",
+                ])
+            )
+            result = subprocess.run(
+                [busybox, "sh", str(harness)], text=True, capture_output=True,
+                timeout=12,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("rc=1 alive=no", result.stdout)
+            log_text = log_path.read_text()
+            self.assertIn("mdns-supervisor-not-ready:", log_text)
+            self.assertIn("cleaned", log_text)
 
 
 if __name__ == '__main__':
