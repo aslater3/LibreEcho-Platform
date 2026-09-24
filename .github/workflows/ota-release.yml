@@ -21,7 +21,7 @@ concurrency:
 jobs:
   source_checks:
     name: Platform source checks
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - name: Check out Platform source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
