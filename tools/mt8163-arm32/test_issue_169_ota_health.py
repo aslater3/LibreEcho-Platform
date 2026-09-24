@@ -257,6 +257,52 @@ class OtaFailureEvidenceContracts(unittest.TestCase):
             self.assertIn("transaction_id=none", record)
 
 
+    def test_failure_log_captures_failed_airplay_reconcile_output(self) -> None:
+        busybox = shutil.which("busybox") or ""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outdir = root / "update"
+            outdir.mkdir()
+            init_log = root / "init.log"
+            init_log.write_text("feature-reconcile-service-start-failed:airplayd:1\n")
+            airplay_log = root / "airplayd.reconcile.log"
+            airplay_log.write_text(
+                "libreecho-airplayd: shared D-Bus socket unavailable\n"
+                'libreecho-airplayd: AirPlay service name is "Kitchen Speaker"\n'
+                "https://example.invalid/path?token=PRIVATE\n"
+                "ssid:PrivateNetworkName serialno=FAKESERIAL000001 "
+                "00:11:22:33:44:55\n"
+            )
+            script = (
+                "set -eu\n"
+                f"BB={shlex.quote(busybox)}\n"
+                f"FAILURE_LOG_DIR={shlex.quote(str(outdir))}\n"
+                f"INIT_LOG={shlex.quote(str(init_log))}\n"
+                "FAILURE_LOG_MAX_BYTES=4096\n"
+                + shell_function(self.init, "sanitize_failure_text")
+                + shell_function(self.init, "persist_failure_log")
+                + f'persist_failure_log ota-health-confirm-failed "startup-ready" {shlex.quote(str(airplay_log))}\n'
+            )
+            result = subprocess.run(
+                ["sh", "-c", script], text=True, capture_output=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record_path = outdir / result.stdout.strip()
+            record = record_path.read_text()
+            self.assertIn("--- airplayd-reconcile-log", record)
+            self.assertIn("shared D-Bus socket unavailable", record)
+            for secret in (
+                "Kitchen Speaker", "PRIVATE", "PrivateNetworkName",
+                "FAKESERIAL000001", "00:11:22:33:44:55",
+            ):
+                self.assertNotIn(secret, record)
+            self.assertIn("URL", record)
+            self.assertIn("ssid:SSID", record)
+            self.assertIn("serialno=SERIAL", record)
+            self.assertIn("MAC", record)
+            self.assertLessEqual(record_path.stat().st_size, 4096)
+            self.assertEqual(record_path.stat().st_mode & 0o777, 0o600)
+
     def test_failure_log_reads_the_transaction_journal_under_its_real_name(self) -> None:
         """The journal is $ROOT/feature-commit, not a file named "journal"."""
         body = shell_function(self.init, "persist_failure_log")
