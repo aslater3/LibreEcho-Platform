@@ -645,7 +645,9 @@ class SourceTests(unittest.TestCase):
             'if [ "${VENDOR_ASSETS_OK:-0}" -ne 1 ]; then', activation_definition
         )
         sequence_call = source.index("\n    start_wifi_network_sequence\n", vendor_gate)
-        startup_call = source.index("\n    start_wifi_network &\n", activation_end)
+        startup_call = source.index(
+            "\n    start_wifi_network >>/tmp/wifi-boot.log 2>&1 &\n", activation_end
+        )
         self.assertLess(userdata, vendor_import)
         self.assertLess(vendor_import, vendor_ready)
         self.assertLess(vendor_ready, wmt_nodes)
@@ -3041,7 +3043,7 @@ start_feature_service_if_enabled
         self.assertIn("/dev/input/$name", source)
         self.assertIn("input-devnodes-created", source)
         self.assertIn("log init-ready-pid1-managed", source)
-        self.assertIn("start_wifi_network &", source)
+        self.assertIn("start_wifi_network >>/tmp/wifi-boot.log 2>&1 &", source)
         self.assertIn("wifi-network-worker-started-after-adb", source)
         self.assertIn("/tmp/wifi.activation.claim", source)
         self.assertIn('$BB mkdir /tmp/wifi.activation.claim', source)
@@ -3061,7 +3063,9 @@ start_feature_service_if_enabled
         self.assertIn("service-profile-invalid-fallback-diagnostic", source)
         policy = source.index('if [ "$SERVICE_PROFILE" = diagnostic ]; then')
         manual = source.index("log wifi-network-policy-manual-single-shot", policy)
-        automatic = source.index("start_wifi_network &", policy)
+        automatic = source.index(
+            "start_wifi_network >>/tmp/wifi-boot.log 2>&1 &", policy
+        )
         automatic_log = source.index("log wifi-network-worker-started-after-adb", automatic)
         self.assertLess(manual, automatic)
         self.assertLess(automatic, automatic_log)
