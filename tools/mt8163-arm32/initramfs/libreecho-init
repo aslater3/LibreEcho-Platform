@@ -990,10 +990,12 @@ if [ "${VENDOR_ASSETS_OK:-0}" -ne 1 ]; then
     log wifi-network-skipped-vendor-assets-unavailable
 elif [ "$SERVICE_PROFILE" = diagnostic ]; then
     log wifi-network-policy-manual-single-shot
-else
+elif [ "${ffs_ready:-0}" -eq 1 ]; then
     start_wifi_network >>/tmp/wifi-boot.log 2>&1 &
     log wifi-network-worker-started-after-adb
     pmsg_marker wifi-boot-activation
+else
+    log wifi-network-skipped-adb-not-ready
 fi
 
 # Preserve v97's root command loop, but never let one experiment monopolize

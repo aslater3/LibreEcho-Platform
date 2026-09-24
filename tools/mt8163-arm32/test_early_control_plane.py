@@ -51,40 +51,63 @@ class EarlyControlPlaneContracts(unittest.TestCase):
 
     # ------------------------------------------------------------ networking
     def test_exactly_one_automatic_activation_exists(self) -> None:
-        # Any spelling counts. The earlier duplicate slipped past a check that
-        # only matched the redirected call.
-        invocations = [
-            line.strip()
-            for line in self.init.splitlines()
-            if re.match(r"^\s*start_wifi_network(\s|'|\"|&|$)", line)
-            and not line.strip().startswith("start_wifi_network()")
+        # Match the call wherever it appears in a command position. An earlier
+        # version anchored at the start of the line and so missed
+        # "$BB start_wifi_network &" or "busybox start_wifi_network &",
+        # which is how a duplicate could have slipped through again. re.M is
+        # required: without it "^" only matches the start of the whole file, so
+        # an indented call would be missed as well.
+        invocation = re.compile(
+            r"(?:^[ \t]*|[;&|]\s*|\bexec\s+|\bbusybox\s+|\$BB\s+)"
+            r"start_wifi_network(?=[ \t;&|]|$)",
+            re.M,
+        )
+        calls = [
+            match.start()
+            for match in invocation.finditer(self.init)
+            # the function definition and its internal sequence call are not
+            # invocations of the automatic/operator entry point
+            if "()" not in self.init[match.start() - 2 : match.start() + 20]
+            and "start_wifi_network_sequence" not in self.init[match.start() : match.start() + 40]
         ]
-        self.assertEqual(
-            invocations,
-            [
-                "start_wifi_network",
-                "start_wifi_network >>/tmp/wifi-boot.log 2>&1 &",
-            ],
-        )
-        # The bare call is the operator path inside wifi_request_loop; the
-        # redirected call is the single automatic activation on the boot path.
-        self.assertEqual(
-            self.init.count("start_wifi_network >>/tmp/wifi-boot.log 2>&1 &"), 1
-        )
+        self.assertEqual(len(calls), 2, [self.init[c : c + 60] for c in calls])
+        # Classify by the enclosing function body, not by file position:
+        # wifi_request_loop is *defined* before the boot-path activation but
+        # *called* after it, so an ordering test picked the wrong one.
         loop_start = self.init.index("wifi_request_loop()")
         loop_end = self.init.index("\n}\n", loop_start)
-        manual = [
-            match.start()
-            for match in re.finditer(r"^\s*start_wifi_network\s*$", self.init, re.M)
-            if loop_start < match.start() < loop_end
-        ]
+        manual = [c for c in calls if loop_start < c < loop_end]
+        automatic = [c for c in calls if c not in manual]
         self.assertEqual(len(manual), 1)
-        # The automatic call is on the boot path, ahead of the supervisor that
-        # serves the operator request path.
-        self.assertLess(
-            self.init.index("start_wifi_network >>/tmp/wifi-boot.log 2>&1 &"),
-            self.init.index("wifi_request_loop &"),
+        self.assertEqual(len(automatic), 1)
+        self.assertIn(
+            "start_wifi_network >>/tmp/wifi-boot.log 2>&1 &",
+            self.init[automatic[0] : automatic[0] + 80],
         )
+        self.assertIn("start_wifi_network_sequence", self.init)
+        self.assertEqual(self.init.count("start_wifi_network >>/tmp/wifi-boot.log 2>&1 &"), 1)
+
+    def test_wifi_activation_conditions_are_all_present(self) -> None:
+        """A self-review found the FunctionFS condition dropped from the chain.
+
+        ffs_ready happens to be 1 at this point, so the call still works, but
+        the condition had been replaced by a comment claiming it was satisfied
+        "by construction". Assert each condition exists.
+        """
+        activation = self.init.index("start_wifi_network >>/tmp/wifi-boot.log 2>&1 &")
+        chain = self.init.rindex('if [ "${VENDOR_ASSETS_OK:-0}" -ne 1 ]; then', 0, activation)
+        block = self.init[chain : activation + 200]
+        self.assertIn('if [ "${VENDOR_ASSETS_OK:-0}" -ne 1 ]; then', block)
+        self.assertIn('elif [ "$SERVICE_PROFILE" = diagnostic ]; then', block)
+        self.assertIn('elif [ "${ffs_ready:-0}" -eq 1 ]; then', block)
+        self.assertIn("log wifi-network-skipped-vendor-assets-unavailable", block)
+        self.assertIn("log wifi-network-policy-manual-single-shot", block)
+        self.assertIn("log wifi-network-worker-started-after-adb", block)
+        self.assertIn("log wifi-network-skipped-adb-not-ready", block)
+        # ffs_ready is initialised and set before this chain, so the guard is
+        # meaningful rather than always true.
+        self.assertLess(self.init.index("ffs_ready=0"), chain)
+        self.assertLess(self.init.index("ffs_ready=1"), chain)
 
     def test_network_activation_runs_on_the_boot_path(self) -> None:
         activation = self.init.index("start_wifi_network >>/tmp/wifi-boot.log 2>&1 &")
@@ -101,7 +124,7 @@ class EarlyControlPlaneContracts(unittest.TestCase):
         branch = self.init[guard:activation]
         self.assertIn('elif [ "$SERVICE_PROFILE" = diagnostic ]; then', branch)
         self.assertIn("log wifi-network-policy-manual-single-shot", branch)
-        self.assertIn("else", branch)
+        self.assertIn('elif [ "${ffs_ready:-0}" -eq 1 ]; then', branch)
         # And it still happens after the WMT nodes exist.
         self.assertLess(self.init.index("log wmt-nodes-created"), activation)
 
