@@ -152,13 +152,19 @@ persist_failure_log()
         "$cmdline" 2>/dev/null | $BB head -n 1)
     pending_slot=$($BB sed -n 's/^slot=//p' "$FAILURE_LOG_DIR/pending" 2>/dev/null |
         $BB head -n 1)
-    transaction_id=$($BB sed -n 's/^transaction_id=//p' "$FAILURE_LOG_DIR/journal" \
-        2>/dev/null | $BB head -n 1)
+    # The transaction tool's journal is $ROOT/feature-commit, not a file named
+    # "journal"; fall back to the pending record, which carries the same field
+    # while the candidate is still pending.
+    transaction_id=$($BB sed -n 's/^transaction_id=//p' \
+        "$FAILURE_LOG_DIR/feature-commit" 2>/dev/null | $BB head -n 1)
     [ -n "$transaction_id" ] || transaction_id=$($BB sed -n \
         's/^transaction_id=//p' "$FAILURE_LOG_DIR/pending" 2>/dev/null | $BB head -n 1)
     name=failure-$epoch-$$.log
     target=$FAILURE_LOG_DIR/$name
     tmp=$FAILURE_LOG_DIR/.$name.tmp
+    # Cap the free-form detail well below the record budget, so the identity
+    # and readback that make the snapshot useful survive truncation.
+    detail_limit=$((FAILURE_LOG_MAX_BYTES / 4))
     {
         echo schema=1
         echo "reason=$reason"
@@ -175,7 +181,7 @@ persist_failure_log()
             echo bcb-readback-unavailable
         fi
         echo "--- detail"
-        printf '%s\n' "$detail" | sanitize_failure_text | $BB head -c 2048
+        printf '%s\n' "$detail" | sanitize_failure_text | $BB head -c "$detail_limit"
         echo
         echo "--- init.log"
         $BB tail -n 120 "$INIT_LOG" 2>/dev/null | sanitize_failure_text

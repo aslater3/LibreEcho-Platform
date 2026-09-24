@@ -3,6 +3,7 @@
 from pathlib import Path
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -254,6 +255,96 @@ class OtaFailureEvidenceContracts(unittest.TestCase):
             self.assertIn("bcb-readback-unavailable", record)
             self.assertIn("pending_slot=none", record)
             self.assertIn("transaction_id=none", record)
+
+
+    def test_failure_log_reads_the_transaction_journal_under_its_real_name(self) -> None:
+        """The journal is $ROOT/feature-commit, not a file named "journal"."""
+        body = shell_function(self.init, "persist_failure_log")
+        self.assertIn("feature-commit", body)
+        self.assertNotIn('FAILURE_LOG_DIR/journal', body)
+        # The id is taken from the journal first, then from the pending record,
+        # which carries the same field while the candidate is still pending.
+        # Compare by read order rather than by literal text: both reads are
+        # line-wrapped, so an exact quoted string is brittle. Anchor on the
+        # path each sed expression reads.
+        flat = re.sub(r"\\\s*\n\s*", " ", body)
+        # Anchor on the path each sed expression reads; the indentation left by
+        # the wrap is not stable, so do not match the whole command text.
+        self.assertLess(
+            flat.index("FAILURE_LOG_DIR/feature-commit"),
+            flat.index("FAILURE_LOG_DIR/pending", flat.index("transaction_id=$($BB sed -n 's/^transaction_id=//p'")),
+        )
+
+    def test_failure_log_keeps_identity_when_only_the_journal_exists(self) -> None:
+        busybox = shutil.which("busybox") or ""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outdir = root / "update"
+            outdir.mkdir()
+            # The rollback path can leave the journal behind without pending;
+            # the id must still be recovered from the journal alone.
+            (outdir / "feature-commit").write_text(
+                "schema=2\ntransaction_id=txn-journal-only\n"
+            )
+            bootctl = root / "bootctl"
+            bootctl.write_text("#!/bin/sh\nprintf 'selected_slot=b\\n'\n")
+            bootctl.chmod(0o755)
+            script = (
+                "set -eu\n"
+                f"BB={shlex.quote(busybox)}\n"
+                f"FAILURE_LOG_DIR={shlex.quote(str(outdir))}\n"
+                f"LIBREECHO_BOOTCTL_TOOL={shlex.quote(str(bootctl))}\n"
+                f"LIBREECHO_CMDLINE_FILE={shlex.quote(str(root / 'absent-cmdline'))}\n"
+                f"INIT_LOG={shlex.quote(str(root / 'init.log'))}\n"
+                + shell_function(self.init, "sanitize_failure_text")
+                + shell_function(self.init, "persist_failure_log")
+                + 'persist_failure_log feature-activation-rejected "ERROR:activation-bcb-slot"\n'
+            )
+            result = subprocess.run(
+                ["sh", "-c", script], text=True, capture_output=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = (outdir / result.stdout.strip()).read_text()
+            self.assertIn("transaction_id=txn-journal-only", record)
+            self.assertIn("pending_slot=none", record)
+
+    def test_failure_log_keeps_identity_and_readback_under_truncation(self) -> None:
+        """A huge detail must not push out the identity or the readback."""
+        busybox = shutil.which("busybox") or ""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outdir = root / "update"
+            outdir.mkdir()
+            (outdir / "pending").write_text("schema=2\nslot=a\ntransaction_id=txn-t\n")
+            bootctl = root / "bootctl"
+            bootctl.write_text(
+                "#!/bin/sh\nprintf 'selected_slot=b\\nslot_a_tries=0\\n'\n"
+            )
+            bootctl.chmod(0o755)
+            big = "ERROR:" + ("x" * 20000)
+            script = (
+                "set -eu\n"
+                f"BB={shlex.quote(busybox)}\n"
+                f"FAILURE_LOG_DIR={shlex.quote(str(outdir))}\n"
+                f"LIBREECHO_BOOTCTL_TOOL={shlex.quote(str(bootctl))}\n"
+                f"LIBREECHO_CMDLINE_FILE={shlex.quote(str(root / 'absent-cmdline'))}\n"
+                f"INIT_LOG={shlex.quote(str(root / 'init.log'))}\n"
+                "FAILURE_LOG_MAX_BYTES=4096\n"
+                + shell_function(self.init, "sanitize_failure_text")
+                + shell_function(self.init, "persist_failure_log")
+                + f'persist_failure_log feature-activation-rejected {shlex.quote(big)}\n'
+            )
+            result = subprocess.run(
+                ["sh", "-c", script], text=True, capture_output=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record_path = outdir / result.stdout.strip()
+            record = record_path.read_text()
+            self.assertLessEqual(record_path.stat().st_size, 4096)
+            # Identity and readback come first, so they survive the cap.
+            self.assertIn("transaction_id=txn-t", record)
+            self.assertIn("selected_slot=b", record)
+            self.assertIn("slot_a_tries=0", record)
 
 
 if __name__ == "__main__":
