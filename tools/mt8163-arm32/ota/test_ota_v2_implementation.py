@@ -2245,6 +2245,72 @@ class PreConfirmAcceptanceTests(unittest.TestCase):
         result = run([str(transaction_fixture(self.root, self.env)), "verify-running"], env=self.env)
         self.assertNotEqual(result.returncode, 0)
 
+    def _running_slot(self) -> str:
+        """The slot the fixture's command line says is running."""
+        import re as _re
+        match = _re.search(
+            rb"androidboot\.slot_suffix=_([ab])", self.proc.joinpath("cmdline").read_bytes()
+        )
+        assert match, "fixture cmdline does not name a running slot"
+        return match.group(1).decode()
+
+    def test_running_slot_need_not_be_the_bcbs_next_boot_selection(self) -> None:
+        """Final permitted boot attempt: the BCB names the fallback.
+
+        The bootloader decrements a candidate's tries before it boots, so on the
+        last permitted attempt the candidate runs with zero tries and the next
+        selection calculation names the fallback. The candidate is still the
+        running slot, so activation and runtime verification must proceed.
+        """
+        self.prepare()
+        running = self._running_slot()
+        other = "b" if running == "a" else "a"
+        # The BCB's next-boot selection is the fallback; the running slot's
+        # success flag is unset because it is an unconfirmed candidate.
+        self.bcb.write_text(
+            f"selected_slot={other}\n"
+            f"inactive_slot={running}\n"
+            f"slot_{running}_success=0\n"
+            f"slot_{other}_success=1\n"
+        )
+        # Mounts are stubbed the same way the tamper test does it: the subject
+        # here is the BCB gate, not a real loop mount.
+        mount_log = self.root / "mount.log"
+        busybox = self.root / "busybox"
+        busybox.write_text(
+            "#!/bin/sh\n"
+            "if [ \"${1:-}\" = mount ]; then printf '%s\\n' \"$*\" >> \"$MOUNT_LOG\"; exit 0; fi\n"
+            "exec /bin/busybox \"$@\"\n"
+        )
+        busybox.chmod(0o755)
+        env = self.env | {"BB": str(busybox), "MOUNT_LOG": str(mount_log)}
+        result = run([str(transaction_fixture(self.root, env)), "activate-mounts"], env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("activation-bcb-slot", result.stderr)
+        self.assertNotIn("bcb-running-slot-mismatch", result.stderr)
+        # The features were actually mounted, so the gate passed rather than
+        # short-circuiting somewhere else.
+        self.assertTrue(mount_log.exists())
+
+    def test_bcb_running_state_is_still_validated(self) -> None:
+        """The BCB gate is not deleted: a malformed success flag still fails."""
+        self.prepare()
+        running = self._running_slot()
+        other = "b" if running == "a" else "a"
+        self.bcb.write_text(
+            f"selected_slot={other}\nslot_{running}_success=not-a-flag\n"
+        )
+        result = run([str(transaction_fixture(self.root, self.env)), "activate-mounts"], env=self.env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("bcb-running-state", result.stderr)
+
+    def test_bcb_selected_slot_must_still_name_a_real_slot(self) -> None:
+        self.prepare()
+        self.bcb.write_text("selected_slot=?\nslot_a_success=0\nslot_b_success=1\n")
+        result = run([str(transaction_fixture(self.root, self.env)), "activate-mounts"], env=self.env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("bcb-selected-slot-invalid", result.stderr)
+
     def test_tampered_signed_manifest_is_rejected_before_activation_mount(self) -> None:
         self.prepare()
         self.manifest_path.write_bytes(self.manifest_path.read_bytes() + b"unknown_field=1\n")

@@ -532,6 +532,31 @@ running_slot() {
     case "$slot" in a|b) printf '%s\n' "$slot";; *) fail running-slot-unavailable;; esac
 }
 
+# State the boot-control block must hold for the candidate running now.
+#
+# `selected_slot` is NOT the running slot. libreecho-bootctl derives it from
+# priority, remaining tries and the success flag, and the bootloader decrements a
+# candidate's tries before it boots, so on the final permitted attempt the
+# candidate runs with zero tries left and a later selection calculation names
+# the fallback for the *next* boot. Requiring selected_slot to equal the running
+# slot therefore refuses the candidate that is in fact running, which is what
+# blocked activation on 2026-09-23 with ERROR:activation-bcb-slot.
+#
+# The running slot's identity comes from the command line and the pending
+# record, which the caller has already matched. The BCB is consulted only for
+# the state that must hold: the record is readable, names a valid selected slot,
+# and carries a well-formed success flag for the running slot. Its selection is
+# still read by the install, fallback and recovery paths, which decide the next
+# boot rather than the current one.
+verify_running_bcb_state() {
+    local running=$1 selected success
+    selected=$(value selected_slot "$BCB_FILE")
+    case "$selected" in a|b) ;; *) fail bcb-selected-slot-invalid;; esac
+    success=$(value "slot_${running}_success" "$BCB_FILE")
+    case "$success" in 0|1) ;; *) fail bcb-running-state;; esac
+    return 0
+}
+
 boot_partition() {
     local slot=$1
     case "$slot" in
@@ -619,7 +644,7 @@ activate_mounts() {
     running=$(running_slot)
     [ "$running" = "$(value slot "$PENDING")" ] || fail activation-slot
     regular "$BCB_FILE" bcb-readback
-    [ "$(value selected_slot "$BCB_FILE")" = "$running" ] || fail activation-bcb-slot
+    verify_running_bcb_state "$running"
     verify_candidate_components
     ids=$(value feature_ids "$JOURNAL")
     # All mutable inputs are authenticated and hashed before the first mount.
@@ -846,8 +871,7 @@ verify_running() {
     running=$(running_slot)
     [ "$running" = "$(value slot "$PENDING")" ] || fail running-slot-mismatch
     regular "$BCB_FILE" bcb-readback
-    [ "$(value selected_slot "$BCB_FILE")" = "$running" ] || fail bcb-running-slot-mismatch
-    case "$(value slot_${running}_success "$BCB_FILE")" in 0|1) ;; *) fail bcb-running-state;; esac
+    verify_running_bcb_state "$running"
     verify_boot_identity "$running"
     profile=$($BB cat "$ETC_ROOT/libreecho/service-profile" 2>/dev/null)
     [ "$profile" = "$(value service_profile "$STAGING/manifest")" ] || fail service-profile-identity
