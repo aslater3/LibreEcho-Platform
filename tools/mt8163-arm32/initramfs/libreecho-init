@@ -136,6 +136,7 @@ persist_failure_log()
     : "${INIT_LOG:=/tmp/init.log}"
     reason=${1:-unknown}
     detail=${2:-}
+    airplay_start_log=${3:-/tmp/libreecho-airplayd.reconcile.log}
     case "$reason" in
         ''|*[!A-Za-z0-9._-]*) reason=invalid-reason ;;
     esac
@@ -183,6 +184,15 @@ persist_failure_log()
         echo "--- detail"
         printf '%s\n' "$detail" | sanitize_failure_text | $BB head -c "$detail_limit"
         echo
+        if $BB grep -q 'feature-reconcile-service-start-failed:airplayd' "$INIT_LOG" 2>/dev/null &&
+                [ -r "$airplay_start_log" ]; then
+            echo "--- airplayd-reconcile-log"
+            # This is the wrapper's bounded start output, not the daemon's
+            # unrestricted service log. Redact user-selected names and the
+            # common network/device identifiers before persisting it.
+            $BB tail -c 1024 "$airplay_start_log" 2>/dev/null | sanitize_failure_text | \
+                $BB sed 's/AirPlay service name is "[^"]*"/AirPlay service name is "REDACTED"/g'
+        fi
         echo "--- init.log"
         $BB tail -n 120 "$INIT_LOG" 2>/dev/null | sanitize_failure_text
     } > "$tmp" 2>/dev/null || { $BB rm -f "$tmp"; return 0; }
