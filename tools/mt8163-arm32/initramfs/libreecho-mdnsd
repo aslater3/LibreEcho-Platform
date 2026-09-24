@@ -154,14 +154,26 @@ start_supervisor() {
     supervisor_pid=$!
     count=0
     while [ "$count" -lt "$START_TIMEOUT" ]; do
-        pid_alive "$supervisor_pid" && {
-            log "mdns-supervisor-started:$supervisor_pid"
+        if status; then
+            log "mdns-supervisor-ready:$supervisor_pid"
             return 0
-        }
+        fi
         $BB sleep 1
         count=$((count + 1))
     done
     log "mdns-supervisor-not-ready:$supervisor_pid"
+    if pid_alive "$supervisor_pid"; then
+        $BB kill "$supervisor_pid" 2>/dev/null || true
+        stopped_wait "$supervisor_pid" || {
+            log "mdns-supervisor-stop-timeout:$supervisor_pid"
+            return 2
+        }
+    fi
+    stop
+    [ -z "$(runtime_responder_pids)" ] && [ ! -S "$BUS_SOCKET" ] || {
+        log mdns-supervisor-cleanup-incomplete
+        return 2
+    }
     return 1
 }
 
@@ -290,8 +302,13 @@ start() {
     $BB mkdir -p "$RUN_ROOT" || return 1
     wait_for_interface
     if [ -x "$SUPERVISOR" ]; then
-        start_supervisor && return 0
-        log mdns-supervisor-fallback
+        start_supervisor
+        supervisor_status=$?
+        case "$supervisor_status" in
+            0) return 0 ;;
+            1) log mdns-supervisor-fallback ;;
+            *) log mdns-supervisor-fallback-refused; return 1 ;;
+        esac
     fi
     start_daemon_pair
 }
