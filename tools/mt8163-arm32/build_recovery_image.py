@@ -267,12 +267,32 @@ def copy_adbd(adbd: Path, metadata_path: Path, stage: Path,
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(data)
     target.chmod(0o750)
+    # Stage the transport policy the builder just validated. init reads this
+    # instead of inferring a transport from the running system: a canonical
+    # build is USB FunctionFS-only, so "no TCP listener" is the expected
+    # policy outcome and must never be reported as a failure. The verifier
+    # checks this file's presence and contents.
+    policy = stage / "etc/libreecho/adb-transport"
+    policy.parent.mkdir(parents=True, exist_ok=True)
+    policy.write_text(
+        f"schema=1\n"
+        f"transport={metadata['transport']}\n"
+        f"tcp_listener={'true' if metadata['tcp_listener'] else 'false'}\n"
+        f"binary_sha256={expected}\n"
+    )
+    policy.chmod(0o644)
     manifest["adbd"] = {
         "path": "/sbin/adbd",
         "sha256": expected,
         "size": len(data),
         "mode": "0750",
         "source": metadata,
+        "transport_policy": {
+            "path": "/etc/libreecho/adb-transport",
+            "transport": metadata["transport"],
+            "tcp_listener": metadata["tcp_listener"],
+            "binary_sha256": expected,
+        },
     }
 
 
