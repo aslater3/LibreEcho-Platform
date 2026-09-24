@@ -142,17 +142,46 @@ persist_failure_log()
     [ -d "$FAILURE_LOG_DIR" ] || return 0
     epoch=$($BB date -u +%s 2>/dev/null)
     case "$epoch" in ''|*[!0-9]*) epoch=0 ;; esac
+    # Slot identity at the moment of failure.  The bare `status` form is the
+    # only one that reads the boot-control block: `status <slot>` echoes its
+    # argument under the same field name, so a difference between what the BCB
+    # selects next and the slot actually running is visible only here.
+    bootctl=${LIBREECHO_BOOTCTL_TOOL:-/usr/local/sbin/libreecho-bootctl}
+    cmdline=${LIBREECHO_CMDLINE_FILE:-/proc/cmdline}
+    running_slot=$($BB sed -n 's/.*androidboot.slot_suffix=_\([ab]\).*/\1/p' \
+        "$cmdline" 2>/dev/null | $BB head -n 1)
+    pending_slot=$($BB sed -n 's/^slot=//p' "$FAILURE_LOG_DIR/pending" 2>/dev/null |
+        $BB head -n 1)
+    # The transaction tool's journal is $ROOT/feature-commit, not a file named
+    # "journal"; fall back to the pending record, which carries the same field
+    # while the candidate is still pending.
+    transaction_id=$($BB sed -n 's/^transaction_id=//p' \
+        "$FAILURE_LOG_DIR/feature-commit" 2>/dev/null | $BB head -n 1)
+    [ -n "$transaction_id" ] || transaction_id=$($BB sed -n \
+        's/^transaction_id=//p' "$FAILURE_LOG_DIR/pending" 2>/dev/null | $BB head -n 1)
     name=failure-$epoch-$$.log
     target=$FAILURE_LOG_DIR/$name
     tmp=$FAILURE_LOG_DIR/.$name.tmp
+    # Cap the free-form detail well below the record budget, so the identity
+    # and readback that make the snapshot useful survive truncation.
+    detail_limit=$((FAILURE_LOG_MAX_BYTES / 4))
     {
         echo schema=1
         echo "reason=$reason"
-        echo "slot_suffix=$($BB sed -n 's/.*androidboot.slot_suffix=_\([ab]\).*/\1/p' /proc/cmdline 2>/dev/null)"
+        echo "slot_suffix=$running_slot"
         echo "uptime_seconds=$($BB cut -d' ' -f1 /proc/uptime 2>/dev/null)"
         echo "epoch=$epoch"
+        echo "running_slot=$running_slot"
+        echo "pending_slot=${pending_slot:-none}"
+        echo "transaction_id=${transaction_id:-none}"
+        echo "--- bcb-readback (bare status: next-boot eligibility, not the running slot)"
+        if [ -x "$bootctl" ]; then
+            "$bootctl" status 2>/dev/null | $BB head -n 20
+        else
+            echo bcb-readback-unavailable
+        fi
         echo "--- detail"
-        printf '%s\n' "$detail" | sanitize_failure_text | $BB head -c 2048
+        printf '%s\n' "$detail" | sanitize_failure_text | $BB head -c "$detail_limit"
         echo
         echo "--- init.log"
         $BB tail -n 120 "$INIT_LOG" 2>/dev/null | sanitize_failure_text
@@ -555,20 +584,66 @@ fi
 # Persistent readiness evidence for the control plane.  pmsg survives a forced
 # reboot, so a boot where adb never came up is distinguishable from one where
 # it did -- adbd's own diagnostics live on the ramdisk and are lost with it.
+#
+# The configured transport is read from the image, not inferred from the running
+# system.  A canonical build is USB FunctionFS-only, so the absence of a TCP
+# listener is the expected policy outcome and must never be reported as a
+# failure; a TCP listener is only probed when the image says one is configured.
+ADBD_TRANSPORT_FILE=/etc/libreecho/adb-transport
+adbd_tcp_configured=0
+if [ -r "$ADBD_TRANSPORT_FILE" ]; then
+    log adb-transport-policy-read
+    if $BB sed -n 's/^tcp_listener=//p' "$ADBD_TRANSPORT_FILE" 2>/dev/null |
+            $BB grep -qx true; then
+        adbd_tcp_configured=1
+    fi
+else
+    # No policy record means the image does not know its own transport, so no
+    # conclusion about TCP may be drawn from its absence.
+    log adb-transport-policy-absent
+fi
 if [ "${ffs_ready:-0}" -eq 1 ]; then
     pmsg_marker adb-ffs-ready
 else
     pmsg_marker adb-ffs-not-ready
 fi
-i=0
-while [ "$i" -lt 5 ] && ! $BB grep -q ':15B3 ' /proc/net/tcp 2>/dev/null; do
-    $BB sleep 1
-    i=$((i + 1))
-done
-if $BB grep -q ':15B3 ' /proc/net/tcp 2>/dev/null; then
-    pmsg_marker adb-tcp-5555-bound
+# USB endpoint readiness is the transport this build actually uses.
+if [ "${ffs_ready:-0}" -eq 1 ] && [ -e /dev/usb-ffs/adb/ep0 ] &&
+   [ -e /dev/usb-ffs/adb/ep1 ]; then
+    pmsg_marker adb-usb-endpoints-ready
 else
-    pmsg_marker adb-tcp-5555-unbound
+    pmsg_marker adb-usb-endpoints-missing
+fi
+# Daemon liveness, not a listener guess. The state must be 0A (LISTEN) and the
+# 5555 port must appear in the local address of a listening row, on the
+# wildcard or a loopback address. The remote side must be the wildcard: a
+# listening row with a real remote address is a client socket, and a row whose
+# remote port is 5555 in state 01 is a connection *to* adbd, not a listener.
+adb_listening() {
+    $BB awk 'NR > 1 && $4 == "0A" {
+                 split($2, l, ":")
+                 split($3, r, ":")
+                 if (l[2] == "15B3" && (l[1] == "00000000" || l[1] == "0100007F"))
+                     listening = 1
+                 if (r[2] == "15B3" && r[1] == "00000000") listening = 1
+             }
+             END { exit(listening ? 0 : 1) }' \
+        /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+if [ "$adbd_tcp_configured" -eq 1 ]; then
+    i=0
+    while [ "$i" -lt 5 ] && ! adb_listening; do
+        $BB sleep 1
+        i=$((i + 1))
+    done
+    if adb_listening; then
+        pmsg_marker adb-tcp-5555-bound
+    else
+        pmsg_marker adb-tcp-5555-unbound
+    fi
+else
+    # Expected for a USB-only build: the policy, not a failure.
+    pmsg_marker adb-tcp-not-configured
 fi
 
 # The GPT used by Biscuit exposes expdb as Linux partition 7.  Wait for the

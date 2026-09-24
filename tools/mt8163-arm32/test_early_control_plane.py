@@ -9,6 +9,10 @@ waits.
 """
 from pathlib import Path
 import re
+import shlex
+import shutil
+import subprocess
+import tempfile
 import unittest
 
 HERE = Path(__file__).resolve().parent
@@ -41,13 +45,86 @@ class EarlyControlPlaneContracts(unittest.TestCase):
         for marker in (
             "adb-ffs-ready",
             "adb-ffs-not-ready",
-            "adb-tcp-5555-bound",
-            "adb-tcp-5555-unbound",
+            "adb-usb-endpoints-ready",
+            "adb-usb-endpoints-missing",
+            "adb-tcp-not-configured",
         ):
             self.assertIn(f"pmsg_marker {marker}", self.init)
             self.assertRegex(marker, PMSG_TOKEN)
-        # The bind probe reads the kernel's own listener table.
-        self.assertIn("grep -q ':15B3 ' /proc/net/tcp", self.init)
+        # The TCP markers are only emitted when the image configures a listener.
+        for marker in ("adb-tcp-5555-bound", "adb-tcp-5555-unbound"):
+            self.assertIn(f"pmsg_marker {marker}", self.init)
+            self.assertRegex(marker, PMSG_TOKEN)
+
+    def test_adb_transport_policy_is_read_not_inferred(self) -> None:
+        """A USB-only build must not report an absent TCP listener as a failure."""
+        self.assertIn("ADBD_TRANSPORT_FILE=/etc/libreecho/adb-transport", self.init)
+        self.assertIn("adb-transport-policy-read", self.init)
+        self.assertIn("adb-transport-policy-absent", self.init)
+        # The TCP probe is gated on the configured policy.
+        policy = self.init.index("adbd_tcp_configured=")
+        gate = self.init.index('if [ "$adbd_tcp_configured" -eq 1 ]; then')
+        self.assertLess(policy, gate)
+        self.assertIn("pmsg_marker adb-tcp-not-configured", self.init)
+        # No blanket 5-second wait on a USB-only boot.
+        self.assertNotIn("grep -q ':15B3 ' /proc/net/tcp", self.init)
+
+    def test_adb_listener_check_requires_listen_state_and_local_port(self) -> None:
+        """A connection to 5555, or a client socket, is not a listener."""
+        start = self.init.index("adb_listening()")
+        body = self.init[start : self.init.index("\n}\n", start)]
+        self.assertIn('NR > 1 && $4 == "0A"', body)
+        # A local listener may be wildcard or loopback; the remote side of a
+        # listening row must be the wildcard, so a client socket is excluded.
+        self.assertIn(
+            'l[2] == "15B3" && (l[1] == "00000000" || l[1] == "0100007F")', body
+        )
+        self.assertIn('r[2] == "15B3" && r[1] == "00000000"', body)
+
+    def test_adb_listener_check_behaviour_on_real_proc_net_tcp(self) -> None:
+        """Run the shipped predicate against representative /proc/net/tcp rows."""
+        busybox = shutil.which("busybox") or ""
+        start = self.init.index("adb_listening()")
+        # Include the closing brace: the function is executed, not inspected.
+        body = self.init[start : self.init.index("\n}\n", start) + len("\n}\n")]
+        cases = {
+            "listen_wildcard": (
+                "  sl local rem st\n"
+                "   0: 00000000:15B3 00000000:0000 0A 0 0 0 0 0 0 1\n", True
+            ),
+            "listen_loopback": (
+                "  sl local rem st\n"
+                "   1: 0100007F:15B3 00000000:0000 0A 0 0 0 0 0 0 1\n", True
+            ),
+            "established_to_5555": (
+                "  sl local rem st\n"
+                "   2: 0100007F:1F91 0100007F:15B3 01 0 0 0 0 0 0 1\n", False
+            ),
+            "client_socket": (
+                "  sl local rem st\n"
+                "   3: 0A000005:1F90 0200A8C0:C1FE 01 0 0 0 0 0 0 1\n", False
+            ),
+            "other_port_listening": (
+                "  sl local rem st\n"
+                "   4: 00000000:1F90 00000000:0000 0A 0 0 0 0 0 0 1\n", False
+            ),
+        }
+        for label, (table, expected) in cases.items():
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "tcp"
+                path.write_text(table)
+                script = (
+                    f"BB={shlex.quote(busybox)}\n"
+                    + body.replace("/proc/net/tcp /proc/net/tcp6", shlex.quote(str(path)))
+                    + "\nadb_listening\n"
+                    'echo "adb_listening_rc=$?"\n'
+                )
+                result = subprocess.run(["sh", "-c", script], capture_output=True, text=True)
+                # adb_listening exits 0 when a listener was found.
+                found = "adb_listening_rc=0" in result.stdout
+                self.assertEqual(
+                    found, bool(expected), f"{label}: {result.stdout}{result.stderr}"
+                )
 
     # ------------------------------------------------------------ networking
     def test_exactly_one_automatic_activation_exists(self) -> None:
