@@ -55,7 +55,7 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "e3bf0c00b982021033abaf634154521cc9ad627d8d5e514d5eff911822172b23"
+RECOVERY_INIT_SHA256 = "3fc74f6ca9e99ca6f94ec8ab51a9fedb8bbc8e2159fa621d0be5b1cb8fd20ed4"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
@@ -267,32 +267,12 @@ def copy_adbd(adbd: Path, metadata_path: Path, stage: Path,
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(data)
     target.chmod(0o750)
-    # Stage the transport policy the builder just validated. init reads this
-    # instead of inferring a transport from the running system: a canonical
-    # build is USB FunctionFS-only, so "no TCP listener" is the expected
-    # policy outcome and must never be reported as a failure. The verifier
-    # checks this file's presence and contents.
-    policy = stage / "etc/libreecho/adb-transport"
-    policy.parent.mkdir(parents=True, exist_ok=True)
-    policy.write_text(
-        f"schema=1\n"
-        f"transport={metadata['transport']}\n"
-        f"tcp_listener={'true' if metadata['tcp_listener'] else 'false'}\n"
-        f"binary_sha256={expected}\n"
-    )
-    policy.chmod(0o644)
     manifest["adbd"] = {
         "path": "/sbin/adbd",
         "sha256": expected,
         "size": len(data),
         "mode": "0750",
         "source": metadata,
-        "transport_policy": {
-            "path": "/etc/libreecho/adb-transport",
-            "transport": metadata["transport"],
-            "tcp_listener": metadata["tcp_listener"],
-            "binary_sha256": expected,
-        },
     }
 
 
