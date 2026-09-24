@@ -279,10 +279,32 @@ static int activate(uint8_t *bcb, int target)
 
 static int confirm(uint8_t *bcb, int target)
 {
-    int current = selected_slot(bcb);
-
-    if (current != target) {
-        fprintf(stderr, "ERROR: selected slot does not match pending slot\n");
+    /* `target` is the slot the caller has established is running (the pending
+     * record, matched against the running slot by the transaction).  It is NOT
+     * necessarily what selected_slot() reports: the bootloader decrements a
+     * candidate's tries before it boots, so on the final permitted attempt the
+     * candidate runs with zero tries left and a later selection calculation
+     * names the fallback for the next boot.  Requiring the two to agree would
+     * refuse to confirm the very candidate that is executing, so the guard is
+     * against a target that cannot be running or is already confirmed --
+     * not against the BCB's next-boot selection, which is a different fact and
+     * is preserved for installation and fallback decisions.
+     *
+     * Confirming still restores the priority, exhausts the remaining tries and
+     * sets the success flag, so the confirmed slot wins every later selection.
+     */
+    if (target < 0 || target > 1) {
+        fprintf(stderr, "ERROR: invalid confirm target\n");
+        return -1;
+    }
+    if (slot_success(bcb, target)) {
+        fprintf(stderr, "ERROR: slot is already confirmed successful\n");
+        return -1;
+    }
+    if (!slot_tries(bcb, target) && !slot_success(bcb, 1 - target)) {
+        /* Neither slot can boot and the target is unconfirmed: there is
+         * nothing to confirm against. */
+        fprintf(stderr, "ERROR: BCB has no bootable slot\n");
         return -1;
     }
     bcb[5 + target] = slot_metadata(15, 0, 1);
