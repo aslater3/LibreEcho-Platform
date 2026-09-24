@@ -555,20 +555,66 @@ fi
 # Persistent readiness evidence for the control plane.  pmsg survives a forced
 # reboot, so a boot where adb never came up is distinguishable from one where
 # it did -- adbd's own diagnostics live on the ramdisk and are lost with it.
+#
+# The configured transport is read from the image, not inferred from the running
+# system.  A canonical build is USB FunctionFS-only, so the absence of a TCP
+# listener is the expected policy outcome and must never be reported as a
+# failure; a TCP listener is only probed when the image says one is configured.
+ADBD_TRANSPORT_FILE=/etc/libreecho/adb-transport
+adbd_tcp_configured=0
+if [ -r "$ADBD_TRANSPORT_FILE" ]; then
+    log adb-transport-policy-read
+    if $BB sed -n 's/^tcp_listener=//p' "$ADBD_TRANSPORT_FILE" 2>/dev/null |
+            $BB grep -qx true; then
+        adbd_tcp_configured=1
+    fi
+else
+    # No policy record means the image does not know its own transport, so no
+    # conclusion about TCP may be drawn from its absence.
+    log adb-transport-policy-absent
+fi
 if [ "${ffs_ready:-0}" -eq 1 ]; then
     pmsg_marker adb-ffs-ready
 else
     pmsg_marker adb-ffs-not-ready
 fi
-i=0
-while [ "$i" -lt 5 ] && ! $BB grep -q ':15B3 ' /proc/net/tcp 2>/dev/null; do
-    $BB sleep 1
-    i=$((i + 1))
-done
-if $BB grep -q ':15B3 ' /proc/net/tcp 2>/dev/null; then
-    pmsg_marker adb-tcp-5555-bound
+# USB endpoint readiness is the transport this build actually uses.
+if [ "${ffs_ready:-0}" -eq 1 ] && [ -e /dev/usb-ffs/adb/ep0 ] &&
+   [ -e /dev/usb-ffs/adb/ep1 ]; then
+    pmsg_marker adb-usb-endpoints-ready
 else
-    pmsg_marker adb-tcp-5555-unbound
+    pmsg_marker adb-usb-endpoints-missing
+fi
+# Daemon liveness, not a listener guess. The state must be 0A (LISTEN) and the
+# 5555 port must appear in the local address of a listening row, on the
+# wildcard or a loopback address. The remote side must be the wildcard: a
+# listening row with a real remote address is a client socket, and a row whose
+# remote port is 5555 in state 01 is a connection *to* adbd, not a listener.
+adb_listening() {
+    $BB awk 'NR > 1 && $4 == "0A" {
+                 split($2, l, ":")
+                 split($3, r, ":")
+                 if (l[2] == "15B3" && (l[1] == "00000000" || l[1] == "0100007F"))
+                     listening = 1
+                 if (r[2] == "15B3" && r[1] == "00000000") listening = 1
+             }
+             END { exit(listening ? 0 : 1) }' \
+        /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+if [ "$adbd_tcp_configured" -eq 1 ]; then
+    i=0
+    while [ "$i" -lt 5 ] && ! adb_listening; do
+        $BB sleep 1
+        i=$((i + 1))
+    done
+    if adb_listening; then
+        pmsg_marker adb-tcp-5555-bound
+    else
+        pmsg_marker adb-tcp-5555-unbound
+    fi
+else
+    # Expected for a USB-only build: the policy, not a failure.
+    pmsg_marker adb-tcp-not-configured
 fi
 
 # The GPT used by Biscuit exposes expdb as Linux partition 7.  Wait for the

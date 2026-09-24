@@ -53,7 +53,7 @@ WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-INIT_SHA256 = "a1ffc882363f968187bc52cf025bc9d67f70595688620bd9e6123427589c1fba"
+INIT_SHA256 = "e3bf0c00b982021033abaf634154521cc9ad627d8d5e514d5eff911822172b23"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -1782,6 +1782,8 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         "size": len(adbd.data),
         "mode": "0750",
         "source": adbd_record.get("source") if isinstance(adbd_record, dict) else None,
+        "transport_policy": adbd_record.get("transport_policy")
+        if isinstance(adbd_record, dict) else None,
     }:
         fail("adbd manifest record mismatch")
     source_record = adbd_record["source"]
@@ -1796,6 +1798,28 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         or not re.fullmatch(r"[0-9a-f]{64}", str(source_record.get("patch_sha256", "")))
     ):
         fail("adbd source provenance or transport policy is invalid")
+    # The image must carry the transport policy init reports, and it must agree
+    # with the validated source record: a build that is USB-only must not be
+    # reported as TCP-capable, and the staged file must bind to this binary.
+    policy_record = adbd_record["transport_policy"]
+    expected_policy = (
+        f"schema=1\n"
+        f"transport={source_record['transport']}\n"
+        f"tcp_listener={'true' if source_record['tcp_listener'] else 'false'}\n"
+        f"binary_sha256={expected_adbd_sha256}\n"
+    ).encode()
+    if not isinstance(policy_record, dict) or policy_record != {
+        "path": "/etc/libreecho/adb-transport",
+        "transport": source_record["transport"],
+        "tcp_listener": source_record["tcp_listener"],
+        "binary_sha256": expected_adbd_sha256,
+    }:
+        fail("adbd transport policy record mismatch")
+    policy_member = require_member(
+        entries, "etc/libreecho/adb-transport", sha256(expected_policy), 0o644
+    )
+    if policy_member.data != expected_policy:
+        fail("staged adbd transport policy does not match the validated source")
     if "stock_userspace" in manifest:
         fail("stock userspace manifest entry is forbidden")
     busybox = require_member(entries, "bin/busybox", expected_busybox_sha256, 0o755)
