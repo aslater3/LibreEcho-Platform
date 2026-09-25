@@ -158,6 +158,25 @@ static void test_loudness_ladder(void)
 	      mid50 - mid100, 0.0, 1.5);
 }
 
+static void test_upper_boundary_selection(void)
+{
+	static const int input[] = {0, 50, 51, 59, 60, 61, 69, 70, 71, 79, 80, 81, 99, 100};
+	static const int expected[] = {50, 50, 60, 60, 60, 70, 70, 70, 80, 80, 80, 100, 100, 100};
+	int i;
+	printf("stock first-upper-boundary preset selection\n");
+	for (i = 0; i < (int)(sizeof(input) / sizeof(input[0])); ++i) {
+		double bass = chain_gain_db(input[i], 120.0);
+		double anchor_bass = chain_gain_db(expected[i], 120.0);
+		double treble = chain_gain_db(input[i], 9000.0);
+		double anchor_treble = chain_gain_db(expected[i], 9000.0);
+		char label[80];
+		(void)snprintf(label, sizeof(label), "index %d uses preset %d at bass", input[i], expected[i]);
+		check(fabs(bass - anchor_bass) < 0.01, label, bass - anchor_bass, 0.0, 0.01);
+		(void)snprintf(label, sizeof(label), "index %d uses preset %d at treble", input[i], expected[i]);
+		check(fabs(treble - anchor_treble) < 0.01, label, treble - anchor_treble, 0.0, 0.01);
+	}
+}
+
 static void test_volume_clamping(void)
 {
 	double a, b;
@@ -345,6 +364,7 @@ int main(void)
 	test_biquad_shapes();
 	test_stability();
 	test_loudness_ladder();
+	test_upper_boundary_selection();
 	test_volume_clamping();
 	test_inactive_is_transparent();
 	test_midband_shaping();
