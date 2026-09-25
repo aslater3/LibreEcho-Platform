@@ -232,10 +232,12 @@ static inline int32_t speaker_dsp_process(struct speaker_dsp *dsp, int32_t sampl
 	for (i = 0; i < SPEAKER_DSP_SECTIONS; ++i)
 		x = speaker_dsp_step(&dsp->sections[i], x);
 
-	if (x > 32767.0f)
-		x = 32767.0f;
-	else if (x < -32767.0f)
-		x = -32767.0f;
+	/* Keep normal EQ overshoot in the wide bus for the output limiter.  This
+	 * guard only bounds pathological filter state before converting to int32. */
+	if (x > (float)(INT32_MAX / 4))
+		x = (float)(INT32_MAX / 4);
+	else if (x < (float)(-INT32_MAX / 4))
+		x = (float)(-INT32_MAX / 4);
 	return (int32_t)lrintf(x);
 }
 

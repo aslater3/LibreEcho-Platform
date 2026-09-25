@@ -16,6 +16,7 @@
 #include <assert.h>
 
 #include "speaker_dsp.h"
+#include "puffin_downmix.h"
 
 /* M_PI is a POSIX extension, not exposed under strict -std=c99. */
 #define TEST_TWO_PI 6.28318530717958647692
@@ -197,6 +198,40 @@ static void test_midband_shaping(void)
 	check(g > -6.0 && g < 12.0, "12 kHz stays within a sane range", g, 0.0, 1e9);
 }
 
+static void test_bass_boost_reaches_limiter_without_preclipping(void)
+{
+	struct speaker_dsp dsp;
+	struct puffin_dynamics dynamics;
+	int32_t peak_before_limiter = 0;
+	int32_t peak_after_limiter = 0;
+	long n;
+
+	printf("bass boost headroom before output limiter\n");
+	speaker_dsp_init(&dsp, 50);
+	puffin_dynamics_init(&dynamics);
+	for (n = 0; n < (long)RATE / 2; ++n) {
+		int32_t input = (int32_t)lrint(4000.0 *
+			sin(TEST_TWO_PI * 80.0 * (double)n / RATE));
+		int32_t tuned = speaker_dsp_process(&dsp, input);
+		int16_t output = puffin_render_mono(&dynamics, tuned);
+		int32_t magnitude = tuned < 0 ? -tuned : tuned;
+		int32_t final_magnitude = output < 0 ? -(int32_t)output : output;
+
+		if (n < (long)RATE / 4)
+			continue;
+		if (magnitude > peak_before_limiter)
+			peak_before_limiter = magnitude;
+		if (final_magnitude > peak_after_limiter)
+			peak_after_limiter = final_magnitude;
+	}
+	check(peak_before_limiter > 45000 && peak_before_limiter < 80000,
+	      "80 Hz boost remains wide until the output limiter",
+	      peak_before_limiter, 55000, 25000);
+	check(peak_after_limiter <= 32767,
+	      "output stays within signed 16-bit PCM",
+	      peak_after_limiter, 32767, 0);
+}
+
 int main(void)
 {
 	test_biquad_shapes();
@@ -205,6 +240,7 @@ int main(void)
 	test_volume_clamping();
 	test_inactive_is_transparent();
 	test_midband_shaping();
+	test_bass_boost_reaches_limiter_without_preclipping();
 
 	if (failures) {
 		printf("\nspeaker_dsp: %d check(s) FAILED\n", failures);
