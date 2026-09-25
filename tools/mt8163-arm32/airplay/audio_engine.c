@@ -67,6 +67,8 @@ struct source_bus {
 	int fd;
 	unsigned int idle_periods;
 	int32_t gain_q15;
+	int airplay_volume_missing;
+	int airplay_session_seen;
 	int16_t *samples;
 	size_t capacity;
 	size_t received;
@@ -130,23 +132,16 @@ static int set_single_control(struct mixer *mixer, const char *name, int value)
 
 /* Arm the output while keeping the codec muted.  This is used before a
  * stream exists, so enabling the physical amplifier cannot produce a pop. */
-static int arm_output_controls(unsigned int card, int volume,
-                               int *saved_volume)
+static int arm_output_controls(unsigned int card)
 {
     struct mixer *mixer;
     int result = 0;
-
-    if (saved_volume)
-        *saved_volume = -1;
 
     mixer = mixer_open(card);
     if (!mixer) {
         fprintf(stderr, "audio-engine: mixer %u unavailable\n", card);
         return -1;
     }
-    if (saved_volume &&
-        get_stereo_control(mixer, "PCM Playback Volume", saved_volume) < 0)
-        *saved_volume = -1;
     if (set_enum_control(mixer, "MFP Gpio Mute", "On") < 0)
         result = -1;
     if (set_enum_control(mixer, "Ext_Speaker_Amp_Switch", "Off") < 0)
@@ -166,9 +161,6 @@ static int arm_output_controls(unsigned int card, int volume,
     if (set_single_control(mixer, "HPR Output Mixer IN1_R Switch", 0) < 0)
         result = -1;
     if (set_stereo_control(mixer, "HP Driver Gain Volume", 6) < 0)
-        result = -1;
-    if (volume >= 0 &&
-        set_stereo_control(mixer, "PCM Playback Volume", volume) < 0)
         result = -1;
     mixer_close(mixer);
     return result;
@@ -216,7 +208,7 @@ static int unmute_output_controls(unsigned int card)
     return result;
 }
 
-static int disable_output_controls(unsigned int card, int restore_volume)
+static int disable_output_controls(unsigned int card)
 {
     struct mixer *mixer;
     int result = 0;
@@ -230,9 +222,6 @@ static int disable_output_controls(unsigned int card, int restore_volume)
     if (set_enum_control(mixer, "MFP Gpio Mute", "On") < 0)
         result = -1;
     if (set_enum_control(mixer, "Ext_Speaker_Amp_Switch", "Off") < 0)
-        result = -1;
-    if (restore_volume >= 0 &&
-        set_stereo_control(mixer, "PCM Playback Volume", restore_volume) < 0)
         result = -1;
     mixer_close(mixer);
     if (result < 0)
@@ -524,22 +513,15 @@ static int airplay_volume_to_mixer(const char *root)
 	return (int)lround(127.0 + (db * 2.0));
 }
 
-static int set_pcm_volume(unsigned int card, int volume)
+static int32_t airplay_media_gain(int raw)
 {
-	struct mixer *mixer;
-	int result;
-
-	if (volume < 0 || volume > 127)
-		return -1;
-	mixer = mixer_open(card);
-	if (!mixer)
-		return -1;
-	result = set_stereo_control(mixer, "PCM Playback Volume", volume);
-	mixer_close(mixer);
-	return result;
+	/* Missing callback and sender mute affect only the media bus. */
+	if (raw <= 0)
+		return 0;
+	return db_to_q15(((double)raw - 127.0) / 2.0);
 }
 
-static int read_media_gain(const char *root)
+static int32_t read_media_gain(const char *root)
 {
 	char path[256];
 	char buffer[64];
@@ -627,11 +609,44 @@ static int poll_sources(struct source_bus *sources, int timeout_ms)
 	return result;
 }
 
+/* The bridge closes its writer before dropping the session marker.  On the
+ * falling edge, buffered media and FIFO bytes still belong to that sender;
+ * never re-label them as full-level generic media after a mute callback. */
+static int discard_disconnected_media(struct source_bus *media)
+{
+	unsigned char input[4096];
+	size_t drained = 0;
+
+	media->received = 0;
+	media->idle_periods = 0;
+	for (;;) {
+		ssize_t n = read(media->fd, input, sizeof(input));
+		if (n > 0) {
+			drained += (size_t)n;
+			if (drained > media->capacity * 4)
+				return -1; /* fail closed if a producer never quiesces */
+			continue;
+		}
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n == 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)))
+			return 0;
+		return -1;
+	}
+}
+
 static int read_sources(struct source_bus *sources, const char *root)
 {
 	const size_t period_bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
+	int airplay = airplay_is_active(root);
+	int phone = airplay ? airplay_volume_to_mixer(root) : -1;
 	unsigned int i;
 	int received_any = 0;
+
+	if (!airplay && sources[SOURCE_MEDIA].airplay_session_seen &&
+	    discard_disconnected_media(&sources[SOURCE_MEDIA]) < 0)
+		return -1;
+	sources[SOURCE_MEDIA].airplay_session_seen = airplay;
 
 	for (i = 0; i < SOURCE_COUNT; ++i) {
 		unsigned char *cursor = (unsigned char *)sources[i].samples;
@@ -676,11 +691,11 @@ static int read_sources(struct source_bus *sources, const char *root)
 		    sources[i].received < period_bytes)
 			sources[i].received = 0;
 	}
-	/* During an AirPlay session the codec volume is the authoritative phone
-	 * volume.  Do not attenuate the media bus a second time. */
-	sources[SOURCE_MEDIA].gain_q15 = airplay_is_active(root)
-		? (airplay_volume_to_mixer(root) >= 0 ? 32768 : 0)
-		: read_media_gain(root);
+	/* Sender attenuation is confined to media, ahead of shared EQ and MBCL.
+	 * A missing callback holds media periods when priority audio plays. */
+	sources[SOURCE_MEDIA].airplay_volume_missing = airplay && phone < 0;
+	sources[SOURCE_MEDIA].gain_q15 = airplay
+		? airplay_media_gain(phone) : read_media_gain(root);
 	return received_any;
 }
 
@@ -742,10 +757,13 @@ static void consume_period(struct source_bus *sources)
 	const size_t period_bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
 	unsigned int i;
 
-	for (i = 0; i < SOURCE_COUNT; ++i)
+	for (i = 0; i < SOURCE_COUNT; ++i) {
+		if (i == SOURCE_MEDIA && sources[i].airplay_volume_missing)
+			continue;
 		le_audio_period_buffer_consume(
 			(unsigned char *)sources[i].samples, &sources[i].received,
 			period_bytes);
+	}
 }
 
 static unsigned int ready_activity_mask(const struct source_bus *sources)
@@ -797,11 +815,8 @@ static void render_period(struct source_bus *sources, int16_t *output,
 				gain = (gain * MEDIA_DUCK_Q15) >> 15;
 			mixed += (int32_t)(((int64_t)mono * gain) >> 15);
 		}
-		/*
-		 * Speaker tuning runs on the mono programme bus and before the
-		 * trim/limiter, matching the stock order (equaliser and
-		 * parametric EQ, then OutputTrim and the full-band limiter).
-		 */
+		/* All four producer buses meet here: mono EQ, then multiband
+		 * protection, then the +3 dB trim and final PCM safety limiter. */
 		mixed = speaker_dsp_process(speaker, mixed);
 		rendered = puffin_render_mono(dynamics, mixed);
 
@@ -810,46 +825,77 @@ static void render_period(struct source_bus *sources, int16_t *output,
 	}
 }
 
-/*
- * The tuned loudness curve is indexed by the user's volume, in percent, matching
- * the stock pipeline's volume-boundary selection.  AirPlay's phone volume is the
- * authoritative control during a session; otherwise the media volume file (a dB
- * value) decides.  A negative result means "unknown", and the caller must leave
- * the speaker bus untuned rather than guess.
- */
-static int speaker_volume_percent(const char *root)
+/* All sources share the hardware master.  Index the equaliser using the
+ * currently audible bus, never a device-wide sender-volume override. */
+static int speaker_volume_percent_for_mix(int master, int32_t media_gain,
+					   int media_ready, int priority_ready)
 {
-	int mixer;
-	int gain;
+	int raw = master;
+	double db;
 
-	if (airplay_is_active(root)) {
-		mixer = airplay_volume_to_mixer(root);
-		if (mixer < 0)
-			return -1;
-		if (mixer > 127)
-			mixer = 127;
-		return (mixer * 100 + 63) / 127;
+	if (raw < 0)
+		return -1;
+	if (raw > 127)
+		raw = 127;
+	db = ((double)raw - 127.0) / 2.0;
+	if (media_ready && !priority_ready) {
+		if (media_gain <= 0)
+			return 0;
+		db += 20.0 * log10((double)media_gain / 32768.0);
 	}
-	gain = read_media_gain(root);
-	if (gain >= 32768)
-		return 100;
-	if (gain <= 0)
-		return 0;
-	return (gain * 100 + 16383) / 32768;
+	raw = (int)lround(127.0 + 2.0 * db);
+	if (raw < 0)
+		raw = 0;
+	if (raw > 127)
+		raw = 127;
+	return (raw * 100 + 63) / 127;
+}
+
+static int current_pcm_volume(unsigned int card)
+{
+	struct mixer *mixer = mixer_open(card);
+	int volume = -1;
+
+	if (mixer) {
+		(void)get_stereo_control(mixer, "PCM Playback Volume", &volume);
+		mixer_close(mixer);
+	}
+	return volume;
+}
+
+static int speaker_volume_percent(const struct source_bus *sources, int master)
+{
+	return speaker_volume_percent_for_mix(master,
+		sources[SOURCE_MEDIA].gain_q15,
+		source_period_ready(&sources[SOURCE_MEDIA]),
+		higher_priority_active(sources));
 }
 
 static int prepare_initial_period(struct source_bus *sources, const char *root,
 				  int16_t *output,
 				  struct puffin_dynamics *dynamics,
 				  struct speaker_dsp *speaker,
-				  unsigned int *activity_mask)
+				  unsigned int *activity_mask,
+				  int master_volume)
 {
 	int ready = wait_for_period(sources, root);
 
 	if (ready <= 0)
 		return ready;
+	/* The FIFO read may precede the first sender-volume callback.  Decide
+	 * whether to defer before rendering, then refresh the media gain using
+	 * that callback; an already-rendered zero-gain period cannot be fixed
+	 * by a later startup gate.  Priority sources remain independently live. */
+	if (airplay_is_active(root)) {
+		int phone = airplay_volume_to_mixer(root);
+		sources[SOURCE_MEDIA].airplay_volume_missing = phone < 0;
+		if (phone < 0 && source_period_ready(&sources[SOURCE_MEDIA]) &&
+		    !higher_priority_active(sources))
+			return 2;
+		sources[SOURCE_MEDIA].gain_q15 = airplay_media_gain(phone);
+	}
 	puffin_dynamics_init(dynamics);
-	speaker_dsp_init(speaker, speaker_volume_percent(root));
+	speaker_dsp_init(speaker, speaker_volume_percent(sources, master_volume));
 	render_period(sources, output, dynamics, speaker);
 	if (activity_mask)
 		*activity_mask = ready_activity_mask(sources);
@@ -895,10 +941,6 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	int16_t *output = NULL;
 	int result = -1;
 	int announcement_led_active = 0;
-	int saved_volume = -1;
-	int airplay_volume = -1;
-	int airplay_session = 0;
-	int airplay_volume_applied = 0;
 	unsigned int i;
 
 	memset(sources, 0, sizeof(sources));
@@ -947,21 +989,21 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		if (read_or_retain_sources(sources, root) <= 0)
 			continue;
 		ready = prepare_initial_period(sources, root, output, &dynamics,
-					      &speaker, &first_activity);
+					      &speaker, &first_activity,
+					      current_pcm_volume(card));
 		if (ready <= 0) {
 			if (ready < 0 || stopping)
 				break;
 			continue;
 		}
+		if (ready == 2) {
+			/* Keep the buffered media period until its first valid callback. */
+			continue;
+		}
 		sync_announcement_led(sources, &announcement_led_active);
 		sync_playback_status(sources, &status);
 
-		saved_volume = -1;
-		airplay_volume_applied = 0;
-		airplay_session = airplay_is_active(root);
-		airplay_volume = airplay_session
-			? airplay_volume_to_mixer(root) : -1;
-		if (airplay_session && airplay_volume < 0) {
+		if (airplay_is_active(root) && airplay_volume_to_mixer(root) < 0) {
 			if (!higher_priority_active(sources)) {
 				/* Defer only AirPlay media.  Do not clear priority buses while
 				 * waiting for the sender's first volume callback. */
@@ -978,7 +1020,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				"audio-engine: priority audio continues while AirPlay "
 				"volume is unavailable\n");
 		}
-		if (arm_output_controls(card, -1, &saved_volume) < 0) {
+		if (arm_output_controls(card) < 0) {
 			fprintf(stderr, "audio-engine: output arm failed\n");
 			clear_source_activity(sources, &announcement_led_active,
 					      &visualizer, &status);
@@ -991,61 +1033,24 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				pcm ? pcm_get_error(pcm) : "open failed");
 			if (pcm)
 				pcm_close(pcm);
-			(void)disable_output_controls(card,
-				airplay_volume_applied ? saved_volume : -1);
+			(void)disable_output_controls(card);
 			clear_source_activity(sources, &announcement_led_active,
 					      &visualizer, &status);
 			usleep(250000);
 			continue;
 		}
-		/*
-		 * The sender's volume applies to AirPlay media, not to everything
-		 * the device plays.  Applying it unconditionally meant a system
-		 * tone, an announcement or a spoken assistant reply was played at
-		 * the AirPlay sender's level: with a sender at 0 dB that is a raw
-		 * 127, the codec's unity point, so any local playback silently
-		 * pushed the device to full volume and left it there.
-		 *
-		 * Observed on hardware with a plain test tone -- no AirPlay
-		 * streaming involved -- via audiod's guard:
-		 *
-		 *   volume changed underneath us: requested 25%, control now
-		 *   reads 100% (raw 127 of 0..175)
-		 *
-		 * 127 is only ever produced by airplay_volume_to_mixer(), which
-		 * returns it for any sender volume at or above 0 dB.  Use the
-		 * sender's level only when AirPlay media is actually one of the
-		 * sources being rendered; otherwise keep the level the device was
-		 * already at, which is what audiod and the physical buttons set.
-		 */
-		int airplay_media_playing =
-			(first_activity & PLAYBACK_BUS_MEDIA) != 0;
-		int startup_volume = saved_volume;
+		/* audiod owns the shared PCM volume.  Keep its current setting across
+		 * all buses, including the first queued frame and teardown. */
 		int playback_start_failed = 0;
-		int airplay_volume_attempted = 0;
-		if (airplay_volume >= 0 && airplay_media_playing)
-			startup_volume = airplay_volume;
 
 		if (pcm_prepare(pcm) < 0)
 			playback_start_failed = 1;
 		else {
-			if (startup_volume >= 0) {
-				if (airplay_volume >= 0 && airplay_media_playing)
-					airplay_volume_attempted = 1;
-				if (set_pcm_volume(card, startup_volume) < 0)
-					playback_start_failed = 1;
-			}
-			if (!playback_start_failed &&
-			    power_output_controls(card) < 0)
+			if (power_output_controls(card) < 0)
 				playback_start_failed = 1;
 			if (!playback_start_failed) {
-				/* Mark ownership immediately after a successful sender write so
-				 * any later start failure can restore exactly what we changed. */
-				if (airplay_volume >= 0 && airplay_media_playing)
-					airplay_volume_applied = 1;
 				/* Queue the first period only after amp settle.  The PCM starts
-				 * with mute still asserted, and unmute follows this write so a
-				 * one-period clip is not consumed during the settle delay. */
+				 * muted, and unmute follows this write. */
 				if (write_period(pcm, output, &reference, first_activity) < 0 ||
 				    unmute_output_controls(card) < 0)
 					playback_start_failed = 1;
@@ -1054,11 +1059,8 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		if (playback_start_failed) {
 			fprintf(stderr, "audio-engine: playback start failed: %s\n",
 				pcm_get_error(pcm));
-			(void)disable_output_controls(card, -1);
+			(void)disable_output_controls(card);
 			pcm_close(pcm);
-			if (airplay_volume_attempted || airplay_volume_applied)
-				if (saved_volume >= 0)
-					(void)set_pcm_volume(card, saved_volume);
 			clear_source_activity(sources, &announcement_led_active,
 					      &visualizer, &status);
 			continue;
@@ -1067,26 +1069,6 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		consume_period(sources);
 
 		while (!stopping && sources_active(sources)) {
-			/* Same scoping for live volume changes from the sender. */
-			if (airplay_session && airplay_is_active(root) &&
-			    (ready_activity_mask(sources) & PLAYBACK_BUS_MEDIA)) {
-				int requested = airplay_volume_to_mixer(root);
-
-				if (requested >= 0 &&
-				    (!airplay_volume_applied || requested != airplay_volume))
-				{
-					int previous_airplay_volume =
-						airplay_volume_applied ? airplay_volume : -1;
-					if (set_pcm_volume(card, requested) == 0) {
-						airplay_volume = requested;
-						airplay_volume_applied = 1;
-					} else if (previous_airplay_volume >= 0) {
-						(void)set_pcm_volume(card, previous_airplay_volume);
-					} else if (saved_volume >= 0) {
-						(void)set_pcm_volume(card, saved_volume);
-					}
-				}
-			}
 			if (poll_sources(sources, 20) < 0 ||
 			    read_sources(sources, root) < 0) {
 				stopping = 1;
@@ -1096,6 +1078,10 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				break;
 			sync_announcement_led(sources, &announcement_led_active);
 			sync_playback_status(sources, &status);
+			/* Read the *current* master.  Button/API writes can occur while
+			 * the PCM is open, but the engine must not overwrite them. */
+			speaker_dsp_set_volume(&speaker,
+				speaker_volume_percent(sources, current_pcm_volume(card)));
 			render_period(sources, output, &dynamics, &speaker);
 			if (write_period(pcm, output, &reference,
 					 ready_activity_mask(sources)) < 0) {
@@ -1109,11 +1095,8 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		}
 		clear_source_activity(sources, &announcement_led_active,
 				      &visualizer, &status);
-		(void)disable_output_controls(card, -1);
+		(void)disable_output_controls(card);
 		pcm_close(pcm);
-		/* Only undo a level this engine actually imposed. */
-		if (airplay_session && airplay_volume_applied && saved_volume >= 0)
-			(void)set_pcm_volume(card, saved_volume);
 	}
 	result = stopping ? 0 : -1;
 out:
@@ -1128,8 +1111,6 @@ out:
 	le_aec_reference_close(&reference);
 	free(output);
 	close_sources(sources);
-	if (airplay_volume_applied && saved_volume >= 0)
-		(void)disable_output_controls(card, saved_volume);
 	return result;
 }
 

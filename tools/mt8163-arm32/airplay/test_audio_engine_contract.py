@@ -31,8 +31,10 @@ def main() -> None:
         "power_output_controls(card)",
         "unmute_output_controls(card)",
         '#include "speaker_dsp.h"',
-        "speaker_dsp_init(speaker, speaker_volume_percent(root));",
+        "speaker_dsp_init(speaker, speaker_volume_percent(sources, master_volume));",
         "mixed = speaker_dsp_process(speaker, mixed);",
+        "speaker_dsp_set_volume(&speaker,",
+        "speaker_volume_percent(sources, current_pcm_volume(card))",
     )
     missing = [fragment for fragment in required if fragment not in text]
     if missing:
@@ -45,10 +47,9 @@ def main() -> None:
     if "output=S16_LE/48000/mono MonoRight" in text:
         raise SystemExit("MonoRight output banner must not remain")
 
-    # The tuned speaker stage must run before the trim/limiter: the stock
-    # pipeline equalises first and applies OutputTrim and its full-band limiter
-    # afterwards, and this engine's limiter must stay the last thing the
-    # programme bus passes through.
+    # The stock order is EQ -> MBCL -> OutputTrim.  The original MBCL module
+    # lives inside speaker_dsp_process, and the final PCM safety limiter must
+    # remain after the common mixed-bus processing.
     tune_at = text.index("mixed = speaker_dsp_process(speaker, mixed);")
     trim_at = text.index("rendered = puffin_render_mono(dynamics, mixed);")
     if tune_at > trim_at:
@@ -83,7 +84,9 @@ def main() -> None:
             raise SystemExit(f"loudness ladder is missing volume boundary {boundary}")
 
     for fragment in ("speaker_dsp_process", "speaker_dsp_init",
-                     "speaker_biquad_design", "SPEAKER_DSP_SECTIONS"):
+                     "speaker_biquad_design", "SPEAKER_DSP_SECTIONS",
+                     '#include "speaker_mbcl.h"', "speaker_mbcl_init(&dsp->mbcl)",
+                     "speaker_mbcl_process(&dsp->mbcl, x)"):
         if fragment not in dsp:
             raise SystemExit(f"speaker tuning module is missing {fragment}")
 

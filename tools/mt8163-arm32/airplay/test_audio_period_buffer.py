@@ -202,7 +202,7 @@ int main(void)
         return fail("one-period startup write failed");
     if (read_sources(sources, "/tmp") < 0 ||
         prepare_initial_period(sources, "/tmp", output, &dynamics,
-                               &speaker, &activity_mask) != 1 ||
+                               &speaker, &activity_mask, 127) != 1 ||
         activity_mask == 0)
         return fail("one complete period was not accepted at startup");
     for (i = 0; i < PERIOD_SIZE; ++i) {
@@ -212,6 +212,165 @@ int main(void)
     }
 
     consume_period(sources);
+
+    /* Every producer reaches the same mono EQ/MBCL/output path.  Reset DSP
+     * state for each solo bus and demand identical final PCM bytes. */
+    {
+        int16_t reference[PERIOD_SIZE * OUTPUT_CHANNELS];
+        size_t bus, frame;
+        for (bus = 0; bus < SOURCE_COUNT; ++bus) {
+            for (i = 0; i < SOURCE_COUNT; ++i) {
+                sources[i].idle_periods = 0;
+                sources[i].received = 0;
+                sources[i].gain_q15 = 32768;
+            }
+            for (frame = 0; frame < PERIOD_SIZE; ++frame) {
+                int16_t value = (frame % 600 < 300) ? 4000 : -4000;
+                sources[bus].samples[frame * INPUT_CHANNELS] = value;
+                sources[bus].samples[frame * INPUT_CHANNELS + 1] = value;
+            }
+            sources[bus].received = period_bytes;
+            puffin_dynamics_init(&dynamics);
+            speaker_dsp_init(&speaker, 60);
+            render_period(sources, output, &dynamics, &speaker);
+            if (bus == 0)
+                memcpy(reference, output, sizeof(reference));
+            else if (memcmp(reference, output, sizeof(reference)) != 0)
+                return fail("source bus bypassed the common EQ/MBCL output");
+        }
+    }
+
+    /* AirPlay phone attenuation is media-only; the UI owns the codec mixer.
+     * Its callback must not change a priority bus or any physical master. */
+    {
+        char root[] = "/tmp/radar-volume-test-XXXXXX";
+        char path[256];
+        int fd;
+        if (!mkdtemp(root))
+            return fail("mkdtemp failed");
+        if (snprintf(path, sizeof(path), "%s/airplay.active", root) >= (int)sizeof(path))
+            return fail("marker path too long");
+        fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+        if (fd < 0)
+            return fail("marker create failed");
+        close(fd);
+        if (snprintf(path, sizeof(path), "%s/airplay.volume", root) >= (int)sizeof(path))
+            return fail("volume path too long");
+        fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+        if (fd < 0 || write(fd, "-20\n", 4) != 4)
+            return fail("volume write failed");
+        close(fd);
+        if (read_sources(sources, root) < 0 ||
+            sources[SOURCE_MEDIA].gain_q15 < 3200 ||
+            sources[SOURCE_MEDIA].gain_q15 > 3300 ||
+            sources[SOURCE_ANNOUNCEMENT].gain_q15 != 32768)
+            return fail("AirPlay phone level did not attenuate only media");
+        unlink(path);
+        if (read_sources(sources, root) < 0 ||
+            sources[SOURCE_MEDIA].gain_q15 != 0 ||
+            sources[SOURCE_ANNOUNCEMENT].gain_q15 != 32768)
+            return fail("missing phone callback did not mute only media");
+        if (snprintf(path, sizeof(path), "%s/airplay.active", root) >= (int)sizeof(path))
+            return fail("marker cleanup path too long");
+        unlink(path);
+        rmdir(root);
+    }
+    /* A callback arriving after source read but before the first PCM write
+     * must not leave a rendered zero-gain first period. */
+    {
+        char root[] = "/tmp/radar-first-period-XXXXXX";
+        char marker[256], volume[256];
+        int fd;
+        unsigned int mask = 0;
+        if (!mkdtemp(root)) return fail("first-period mkdtemp failed");
+        if (snprintf(marker, sizeof(marker), "%s/airplay.active", root) >= (int)sizeof(marker) ||
+            snprintf(volume, sizeof(volume), "%s/airplay.volume", root) >= (int)sizeof(volume))
+            return fail("first-period path too long");
+        fd = open(marker, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+        if (fd < 0) return fail("first-period marker create failed");
+        close(fd);
+        for (i = 0; i < SOURCE_COUNT; ++i) {
+            sources[i].idle_periods = 0;
+            sources[i].received = 0;
+        }
+        for (i = 0; i < PERIOD_SIZE * INPUT_CHANNELS; ++i)
+            sources[SOURCE_MEDIA].samples[i] = 8000;
+        sources[SOURCE_MEDIA].received = period_bytes;
+        sources[SOURCE_MEDIA].idle_periods = SOURCE_IDLE_PERIODS;
+        if (prepare_initial_period(sources, root, output, &dynamics,
+                                   &speaker, &mask, 127) != 2)
+            return fail("media rendered before the first phone callback");
+        for (i = 0; i < PERIOD_SIZE * INPUT_CHANNELS; ++i)
+            sources[SOURCE_ALARM].samples[i] = 1000;
+        sources[SOURCE_ALARM].received = period_bytes;
+        sources[SOURCE_ALARM].idle_periods = SOURCE_IDLE_PERIODS;
+        if (prepare_initial_period(sources, root, output, &dynamics,
+                                   &speaker, &mask, 127) != 1 ||
+            !(mask & PLAYBACK_BUS_ALARM) || output[0] == 0)
+            return fail("missing callback blocked alarm playback");
+        consume_period(sources);
+        if (sources[SOURCE_MEDIA].received != period_bytes ||
+            sources[SOURCE_ALARM].received != 0)
+            return fail("priority alarm discarded buffered AirPlay media");
+        fd = open(volume, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+        if (fd < 0 || write(fd, "-20\n", 4) != 4)
+            return fail("late phone callback write failed");
+        close(fd);
+        if (prepare_initial_period(sources, root, output, &dynamics,
+                                   &speaker, &mask, 127) != 1 ||
+            ! (mask & PLAYBACK_BUS_MEDIA) || output[0] == 0 ||
+            sources[SOURCE_MEDIA].gain_q15 < 3200)
+            return fail("valid late callback left the first media period silent");
+        unlink(volume); unlink(marker); rmdir(root);
+    }
+    /* A queued period from a muted sender must not become a full-level
+     * generic media period when that AirPlay session disconnects. */
+    {
+        char root[] = "/tmp/radar-disconnect-XXXXXX";
+        char marker[256], volume[256];
+        int fd;
+        if (!mkdtemp(root)) return fail("disconnect mkdtemp failed");
+        if (snprintf(marker, sizeof(marker), "%s/airplay.active", root) >= (int)sizeof(marker) ||
+            snprintf(volume, sizeof(volume), "%s/airplay.volume", root) >= (int)sizeof(volume))
+            return fail("disconnect path too long");
+        fd = open(marker, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+        if (fd < 0) return fail("disconnect marker failed");
+        close(fd);
+        fd = open(volume, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+        if (fd < 0 || write(fd, "-144\n", 5) != 5)
+            return fail("disconnect mute failed");
+        close(fd);
+        for (i = 0; i < SOURCE_COUNT; ++i) {
+            sources[i].received = 0;
+            sources[i].idle_periods = 0;
+        }
+        sources[SOURCE_MEDIA].received = period_bytes;
+        sources[SOURCE_MEDIA].idle_periods = SOURCE_IDLE_PERIODS;
+        if (read_sources(sources, root) < 0 || sources[SOURCE_MEDIA].gain_q15 != 0)
+            return fail("sender mute not applied to queued period");
+        for (i = 0; i < sizeof(half) / sizeof(half[0]); ++i)
+            half[i] = 16000;
+        if (write(pipes[SOURCE_MEDIA][1], half, sizeof(half)) != (ssize_t)sizeof(half))
+            return fail("queued sender bytes write failed");
+        unlink(marker); unlink(volume);
+        if (read_sources(sources, root) < 0 || sources[SOURCE_MEDIA].received != 0 ||
+            period_ready(sources) ||
+            read(pipes[SOURCE_MEDIA][0], half, sizeof(half)) != -1 ||
+            errno != EAGAIN)
+            return fail("sender mute became audible after disconnect");
+        rmdir(root);
+    }
+    if (speaker_volume_percent_for_mix(87, 32768, 0, 1) !=
+        speaker_volume_percent_for_mix(87, 3277, 0, 1) ||
+        speaker_volume_percent_for_mix(87, 32768, 1, 1) !=
+        speaker_volume_percent_for_mix(87, 3277, 1, 1))
+        return fail("priority EQ followed unrelated media volume");
+    if (speaker_volume_percent_for_mix(127, 3277, 1, 0) < 60 ||
+        speaker_volume_percent_for_mix(127, 3277, 1, 0) > 80)
+        return fail("media attenuation did not map to the volume boundary");
+    if (speaker_volume_percent_for_mix(87, 3277, 1, 0) >=
+        speaker_volume_percent_for_mix(87, 32768, 1, 0))
+        return fail("AirPlay media EQ ignored software attenuation");
 
     for (i = 0; i < SOURCE_COUNT; ++i) {
         close(pipes[i][0]);
