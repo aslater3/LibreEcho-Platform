@@ -32,8 +32,14 @@ higher-priority audio; and renders one mono programme sample with clipping-safe
 `0,23` (`S16_LE`, 48 kHz, 2 channels), selects `Board Channel Config=Stereo`,
 and uses normal codec `DACSETUP=0x14` routing. The stock Puffin profile sends
 the left/HPL high-pass band to the tweeter and the right/HPR low-pass band to
-the woofer. A linked peak limiter restores the stock pipeline's +3 dB output
-trim without allowing PCM clipping or positive codec gain.
+the woofer. The shared mono bus then uses a re-derived loudness/parametric EQ
+followed by an original four-band compressor/limiter approximation at the
+Radar stock split frequencies (70/200/3250 Hz). A -3 dB full-band limit
+precedes +3 dB OutputTrim; the linked PCM limiter is only a final safety gate.
+The vendor's filter-bank slope, detector and compressor timing are not specified
+by the stored configuration, so these are independently designed substitutes,
+**not a claim of stock acoustic parity**. Human listening and level-matched
+spectral/dynamic tests remain required before a release.
 
 This two-channel container is mandatory even though programme semantics remain
 mono. The superseded one-channel `MonoRight` / `DACSETUP=0x24` transport made
@@ -61,17 +67,21 @@ mode `0644`. It records only playback state (`idle`, `playing`, `system`,
 all four buses. The file is replaced only when that state changes and carries
 no track metadata.
 
-Shairport's pipe must use `ignore_volume_control = "yes"` because the external
-volume hook owns codec attenuation. Otherwise Shairport attenuates the PCM in
-software and the hook applies the same AirPlay attenuation again.
-The bridge clears the previous session's AirPlay volume before publishing a new
-active marker. The shared engine waits for the new session's first valid volume
-callback before arming the PCM; a missing callback therefore cannot fall back
-to the device's current volume.
-The engine reapplies the physical amplifier controls after the codec starts
-DMA. AirPlay dB callbacks update only the media-bus software gain, so an
-announcement can remain audible above quiet media without changing the
-device-wide codec volume.
+Shairport's pipe must use `ignore_volume_control = "yes"` because the
+shared engine applies the sender's attenuation on the **media bus only**,
+before EQ and multiband protection. Otherwise Shairport and the engine would
+attenuate the same samples twice. The bridge writes only `airplay.volume`,
+clears it at disconnect, and removes legacy `media.volume` leftovers from its
+former dual-write behavior. The engine defers the *unrendered* first media
+period until a valid callback; missing volume mutes media
+but must not prevent system, announcement, or alarm playback. `audiod` owns
+the hardware `PCM Playback Volume` master at all times, including AirPlay:
+the engine reads it to select EQ, never writes or restores it, and leaves
+button/API changes intact. The sender's level is therefore *additional*
+media attenuation beneath the device master, not an override of the master.
+All four buses meet at the same EQ/MBCL before the PCM write. Source-priority
+ducking and volume-curve transitions still require real-device listening and
+waveform testing; the vendor compressor is an approximation, not stock-exact.
 
 The Avahi/D-Bus payload remains inside the fixed 16 MiB boot envelope by using
 the free range below the DT-reserved RAM console at `0x44400000`.

@@ -47,7 +47,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python tools/mt8163-arm32/airplay/test_audio_engine_contract.py
+          python tools/mt8163-arm32/airplay/test_airplay_volume_contract.py
           python tools/mt8163-arm32/airplay/test_audio_period_buffer.py
+          bash tools/mt8163-arm32/airplay/test_speaker_dsp.sh
+          bash tools/mt8163-arm32/airplay/test_speaker_mbcl.sh
           python -m unittest -q tools/mt8163-arm32/feature_runtime/test_runtime_package.py
           cd tools/mt8163-arm32
           python -m unittest -q \

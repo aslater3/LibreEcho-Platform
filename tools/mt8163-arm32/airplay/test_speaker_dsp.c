@@ -16,6 +16,7 @@
 #include <assert.h>
 
 #include "speaker_dsp.h"
+#include "puffin_downmix.h"
 
 /* M_PI is a POSIX extension, not exposed under strict -std=c99. */
 #define TEST_TWO_PI 6.28318530717958647692
@@ -69,7 +70,7 @@ static double chain_gain_db(int volume, double f)
 	speaker_dsp_init(&dsp, volume);
 	for (n = 0; n < settle + measure; ++n) {
 		int32_t x = (int32_t)lrint(AMPL * sin(w * (double)n));
-		int32_t y = speaker_dsp_process(&dsp, x);
+		float y = speaker_dsp_equalize(&dsp, x);
 
 		if (n >= settle)
 			acc += (double)y * (double)y;
@@ -175,13 +176,13 @@ static void test_inactive_is_transparent(void)
 	struct speaker_dsp dsp;
 	int i, same = 1;
 
-	printf("inactive stage is bit transparent\n");
+	printf("unknown-volume loudness EQ bypass\n");
 	speaker_dsp_init(&dsp, -1);
 	for (i = -32768; i < 32768; i += 379) {
-		if (speaker_dsp_process(&dsp, i) != i)
+		if (speaker_dsp_equalize(&dsp, i) != i)
 			same = 0;
 	}
-	check(same, "volume -1 passes samples through unchanged", same ? 0.0 : 1.0, 0.0, 0.0);
+	check(same, "volume -1 bypasses EQ but keeps MBCL available", same ? 0.0 : 1.0, 0.0, 0.0);
 }
 
 static void test_midband_shaping(void)
@@ -197,6 +198,148 @@ static void test_midband_shaping(void)
 	check(g > -6.0 && g < 12.0, "12 kHz stays within a sane range", g, 0.0, 1e9);
 }
 
+static void test_bass_boost_reaches_limiter_without_preclipping(void)
+{
+	struct speaker_dsp raw_eq, protected;
+	struct puffin_dynamics dynamics;
+	int32_t peak_before_mbcl = 0;
+	int32_t peak_after_limiter = 0;
+	long n;
+
+	printf("bass boost headroom before MBCL and output limiter\n");
+	speaker_dsp_init(&raw_eq, 50);
+	speaker_dsp_init(&protected, 50);
+	puffin_dynamics_init(&dynamics);
+	for (n = 0; n < (long)RATE / 2; ++n) {
+		int32_t input = (int32_t)lrint(4000.0 *
+			sin(TEST_TWO_PI * 80.0 * (double)n / RATE));
+		int32_t wide = (int32_t)lrintf(speaker_dsp_equalize(&raw_eq, input));
+		int32_t protected_sample = speaker_dsp_process(&protected, input);
+		int16_t output = puffin_render_mono(&dynamics, protected_sample);
+		int32_t magnitude = wide < 0 ? -wide : wide;
+		int32_t final_magnitude = output < 0 ? -(int32_t)output : output;
+
+		if (n < (long)RATE / 4)
+			continue;
+		if (magnitude > peak_before_mbcl)
+			peak_before_mbcl = magnitude;
+		if (final_magnitude > peak_after_limiter)
+			peak_after_limiter = final_magnitude;
+	}
+	check(peak_before_mbcl > 45000 && peak_before_mbcl < 80000,
+	      "80 Hz EQ remains wide until multiband protection",
+	      peak_before_mbcl, 55000, 25000);
+	check(peak_after_limiter <= 32767,
+	      "output stays within signed 16-bit PCM",
+	      peak_after_limiter, 32767, 0);
+}
+
+static void test_bass_band_protection_keeps_full_bus_limiter_idle(void)
+{
+	struct speaker_dsp dsp;
+	struct puffin_dynamics dynamics;
+	int32_t peak = 0;
+	int limited = 0;
+	int rail = 0;
+	long n;
+
+	speaker_dsp_init(&dsp, 60);
+	puffin_dynamics_init(&dynamics);
+	for (n = 0; n < (long)RATE; ++n) {
+		int32_t sample = (int32_t)lrint(4000.0 *
+			sin(TEST_TWO_PI * 80.0 * (double)n / RATE));
+		int32_t protected = speaker_dsp_process(&dsp, sample);
+		int16_t output = puffin_render_mono(&dynamics, protected);
+
+		if (n < (long)RATE / 2)
+			continue;
+		if (abs(protected) > peak)
+			peak = abs(protected);
+		if (dynamics.gain_q15 < PUFFIN_OUTPUT_TRIM_Q15)
+			limited++;
+		if (output == 32767 || output == -32767)
+			rail++;
+	}
+	printf("80 Hz sustained bass: pre-trim peak=%d full-bus-limited=%d rail=%d\n",
+	       peak, limited, rail);
+	check(peak < 23000 && peak > 1000,
+	      "bass-band protection acts before output trim",
+	      peak, 0, 23000);
+	check(limited < RATE / 20 && rail < RATE / 200,
+	      "bass no longer pumps or rails the full-band limiter",
+	      limited, 0, RATE / 20);
+}
+
+static void test_live_volume_change_updates_loudness_without_stream_restart(void)
+{
+	struct speaker_dsp dsp;
+	double rms50 = 0.0, rms100 = 0.0;
+	long n;
+
+	speaker_dsp_init(&dsp, 50);
+	for (n = 0; n < (long)RATE; ++n) {
+		int32_t sample = (int32_t)lrint(100.0 *
+			sin(TEST_TWO_PI * 80.0 * (double)n / RATE));
+		int32_t output = speaker_dsp_process(&dsp, sample);
+		if (n >= (long)RATE * 3 / 4)
+			rms50 += (double)output * output;
+	}
+	/* The PCM stays open while the AirPlay sender changes volume. */
+	speaker_dsp_set_volume(&dsp, 100);
+	for (n = 0; n < (long)RATE; ++n) {
+		int32_t sample = (int32_t)lrint(100.0 *
+			sin(TEST_TWO_PI * 80.0 * (double)n / RATE));
+		int32_t output = speaker_dsp_process(&dsp, sample);
+		if (n >= (long)RATE * 3 / 4)
+			rms100 += (double)output * output;
+	}
+	rms50 = sqrt(rms50 / (RATE / 4));
+	rms100 = sqrt(rms100 / (RATE / 4));
+	check(rms50 > rms100 * 1.6,
+	      "live phone volume changes the bass EQ without reopening PCM",
+	      20.0 * log10(rms50 / rms100), 4.0, 2.0);
+}
+
+static void test_mid_ramp_volume_retarget_is_continuous(void)
+{
+	struct speaker_dsp dsp, unchanged, target;
+	long n;
+	float actual, expected;
+	double candidate_rms = 0.0, target_rms = 0.0;
+
+	speaker_dsp_init(&dsp, 50);
+	for (n = 0; n < RATE; ++n)
+		(void)speaker_dsp_equalize(&dsp, (int32_t)lrint(4000.0 *
+			sin(TEST_TWO_PI * 80.0 * (double)n / RATE)));
+	speaker_dsp_set_volume(&dsp, 100);
+	for (n = 0; n < 2048; ++n)
+		(void)speaker_dsp_equalize(&dsp, (int32_t)lrint(4000.0 *
+			sin(TEST_TWO_PI * 80.0 * (double)n / RATE)));
+	unchanged = dsp;
+	speaker_dsp_set_volume(&dsp, 70);
+	actual = speaker_dsp_equalize(&dsp, 4000);
+	expected = speaker_dsp_equalize(&unchanged, 4000);
+	check(fabs(actual - expected) < 100.0,
+	      "mid-ramp retarget does not jump to the old cascade",
+	      actual - expected, 0.0, 100.0);
+	/* Multiple phone callbacks during one transition must still converge. */
+	speaker_dsp_set_volume(&dsp, 80);
+	speaker_dsp_init(&target, 80);
+	for (n = 0; n < RATE; ++n) {
+		int32_t sample = (int32_t)lrint(100.0 *
+			sin(TEST_TWO_PI * 80.0 * (double)n / RATE));
+		float y = speaker_dsp_equalize(&dsp, sample);
+		float z = speaker_dsp_equalize(&target, sample);
+		if (n >= RATE * 3 / 4) {
+			candidate_rms += (double)y * y;
+			target_rms += (double)z * z;
+		}
+	}
+	check(fabs(10.0 * log10(candidate_rms / target_rms)) < 0.5,
+	      "queued volume callbacks converge on the latest EQ setting",
+	      10.0 * log10(candidate_rms / target_rms), 0.0, 0.5);
+}
+
 int main(void)
 {
 	test_biquad_shapes();
@@ -205,6 +348,10 @@ int main(void)
 	test_volume_clamping();
 	test_inactive_is_transparent();
 	test_midband_shaping();
+	test_bass_boost_reaches_limiter_without_preclipping();
+	test_bass_band_protection_keeps_full_bus_limiter_idle();
+	test_live_volume_change_updates_loudness_without_stream_restart();
+	test_mid_ramp_volume_retarget_is_continuous();
 
 	if (failures) {
 		printf("\nspeaker_dsp: %d check(s) FAILED\n", failures);

@@ -2,13 +2,15 @@
 #define LIBREECHO_SPEAKER_DSP_H
 
 /*
- * Radar-Puffin speaker tuning stage: volume-indexed loudness equalisation and
- * the stock parametric EQ, applied to the mono programme bus ahead of the
- * existing trim/limiter in puffin_downmix.h.
+ * Radar-Puffin speaker processing on the mixed mono programme bus: a
+ * volume-indexed loudness approximation, parametric EQ and an independently
+ * designed four-band compressor/limiter, before the existing +3 dB trim and
+ * final PCM safety guard in puffin_downmix.h.
  *
- * Order matches the stock pipeline, which runs its equaliser and parametric EQ
- * before OutputTrim and the full-band limiter.  Trim and limiting already live
- * in puffin_render_mono(); this module only adds the two EQ stages.
+ * The stock chain orders FIR EQ, parametric EQ, MBCL and OutputTrim. Its
+ * filter-bank and compressor detector internals are not specified by the
+ * stored configuration, so speaker_mbcl.h matches the documented parameters
+ * without claiming sample-exact stock processing.
  *
  * Provenance: the stock device drove these from vendor tuning files
  * (audio-algorithms/EQ_<volume>.cfg and ParametricEQ.cfg).  Those files are not
@@ -29,6 +31,7 @@
 
 #include <math.h>
 #include <stdint.h>
+#include "speaker_mbcl.h"
 
 /* M_PI is a POSIX extension and is not exposed under strict -std=c99. */
 #define SPEAKER_DSP_TWO_PI 6.28318530717958647692f
@@ -36,6 +39,7 @@
 /* five loudness sections, then two parametric-EQ sections */
 #define SPEAKER_DSP_SECTIONS 7
 #define SPEAKER_DSP_LOUDNESS_SECTIONS 5
+#define SPEAKER_DSP_VOLUME_RAMP_FRAMES 4800
 
 /* Volume steps the loudness ladder is anchored on (stock "Volume Boundary"). */
 #define SPEAKER_DSP_STEP_COUNT 5
@@ -60,7 +64,13 @@ struct speaker_dsp_biquad {
 
 struct speaker_dsp {
 	struct speaker_dsp_biquad sections[SPEAKER_DSP_SECTIONS];
+	struct speaker_dsp_biquad next_sections[SPEAKER_DSP_SECTIONS];
+	struct speaker_mbcl mbcl;
 	int active;
+	int next_active;
+	int volume_percent;
+	int queued_volume_percent;
+	int volume_ramp_remaining;
 };
 
 /*
@@ -191,9 +201,14 @@ static inline void speaker_dsp_init(struct speaker_dsp *dsp, int volume_percent)
 		dsp->sections[i].z2 = 0.0f;
 	}
 	dsp->active = 0;
+	dsp->next_active = 0;
+	dsp->volume_percent = volume_percent;
+	dsp->queued_volume_percent = -2; /* -1 is a valid unknown level. */
+	dsp->volume_ramp_remaining = 0;
+	speaker_mbcl_init(&dsp->mbcl);
 
-	/* Only Radar-Puffin's mono programme bus is tuned; a zero volume means
-	 * the caller has no valid volume yet and must leave the bus untouched. */
+	/* Unknown volume bypasses the loudness EQ, but never the common output
+	 * protection: all sources still pass through the same MBCL. */
 	if (volume_percent < 0)
 		return;
 
@@ -210,6 +225,33 @@ static inline void speaker_dsp_init(struct speaker_dsp *dsp, int volume_percent)
 	dsp->active = 1;
 }
 
+/* Run both stable cascades during a volume change.  Blending their outputs
+ * leaves the filter history intact and avoids resetting the shared dynamics
+ * while AirPlay updates its phone volume in a single open PCM stream. */
+static inline void speaker_dsp_set_volume(struct speaker_dsp *dsp,
+					  int volume_percent)
+{
+	struct speaker_dsp next;
+	int i;
+
+	if (dsp->volume_ramp_remaining > 0) {
+		/* Do not discard a half-complete blend: queue the latest callback
+		 * and start its transition from the just-completed target. */
+		dsp->queued_volume_percent =
+			volume_percent == dsp->volume_percent ? -2 : volume_percent;
+		return;
+	}
+	if (dsp->volume_percent == volume_percent)
+		return;
+	speaker_dsp_init(&next, volume_percent);
+	for (i = 0; i < SPEAKER_DSP_SECTIONS; ++i)
+		dsp->next_sections[i] = next.sections[i];
+	dsp->next_active = next.active;
+	dsp->volume_percent = volume_percent;
+	dsp->queued_volume_percent = -2;
+	dsp->volume_ramp_remaining = SPEAKER_DSP_VOLUME_RAMP_FRAMES;
+}
+
 static inline float speaker_dsp_step(struct speaker_dsp_biquad *bq, float x)
 {
 	float y = bq->b0 * x + bq->z1;
@@ -219,23 +261,49 @@ static inline float speaker_dsp_step(struct speaker_dsp_biquad *bq, float x)
 	return y;
 }
 
-/* Process one mono sample: returns the tuned sample, pre trim/limiter. */
-static inline int32_t speaker_dsp_process(struct speaker_dsp *dsp, int32_t sample)
+/* Equalise on the wide mono bus; no S16 conversion happens before MBCL. */
+static inline float speaker_dsp_equalize(struct speaker_dsp *dsp, int32_t sample)
 {
-	float x;
+	float x = (float)sample;
 	int i;
 
-	if (!dsp->active)
-		return sample;
+	if (dsp->active)
+		for (i = 0; i < SPEAKER_DSP_SECTIONS; ++i)
+			x = speaker_dsp_step(&dsp->sections[i], x);
+	if (dsp->volume_ramp_remaining > 0) {
+		float next = (float)sample;
+		float fraction = 1.0f - (float)dsp->volume_ramp_remaining /
+			(float)SPEAKER_DSP_VOLUME_RAMP_FRAMES;
 
-	x = (float)sample;
-	for (i = 0; i < SPEAKER_DSP_SECTIONS; ++i)
-		x = speaker_dsp_step(&dsp->sections[i], x);
+		if (dsp->next_active)
+			for (i = 0; i < SPEAKER_DSP_SECTIONS; ++i)
+				next = speaker_dsp_step(&dsp->next_sections[i], next);
+		x += (next - x) * fraction;
+		if (--dsp->volume_ramp_remaining == 0) {
+			int queued = dsp->queued_volume_percent;
+			for (i = 0; i < SPEAKER_DSP_SECTIONS; ++i)
+				dsp->sections[i] = dsp->next_sections[i];
+			dsp->active = dsp->next_active;
+			dsp->queued_volume_percent = -2;
+			if (queued != -2 && queued != dsp->volume_percent)
+				speaker_dsp_set_volume(dsp, queued);
+		}
+	}
+	return x;
+}
 
-	if (x > 32767.0f)
-		x = 32767.0f;
-	else if (x < -32767.0f)
-		x = -32767.0f;
+/* Stock-like multiband protection acts once on the mixed programme, before
+ * OutputTrim.  The later linked limiter remains an emergency PCM guard. */
+static inline int32_t speaker_dsp_process(struct speaker_dsp *dsp, int32_t sample)
+{
+	float x = speaker_dsp_equalize(dsp, sample);
+
+	x = speaker_mbcl_process(&dsp->mbcl, x);
+	/* This guard is for pathological filter state, never normal EQ overshoot. */
+	if (x > (float)(INT32_MAX / 4))
+		x = (float)(INT32_MAX / 4);
+	else if (x < (float)(-INT32_MAX / 4))
+		x = (float)(-INT32_MAX / 4);
 	return (int32_t)lrintf(x);
 }
 

@@ -118,6 +118,11 @@ static int clear_session_state(void)
 	 * inherit the previous phone's volume before its first callback. */
 	if (unlink(DEFAULT_AIRPLAY_VOLUME_FILE) < 0 && errno != ENOENT)
 		result = 1;
+	/* Old bridge versions also wrote the same callback to media.volume.
+	 * This bridge is its only writer; clear a legacy sender mute before a
+	 * non-AirPlay media producer takes over the shared bus. */
+	if (unlink(DEFAULT_VOLUME_FILE) < 0 && errno != ENOENT)
+		result = 1;
 	return result;
 }
 
@@ -174,12 +179,14 @@ static int forward_stream(const char *input_path, const char *output_path)
 	if (stopping)
 		result = 0;
 out:
-	if (active)
-		(void)set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 0);
+	/* Close the writer first: when the marker falls, the shared engine
+	 * can discard all remaining queued bytes from this session safely. */
 	if (output >= 0)
 		close(output);
 	if (input >= 0)
 		close(input);
+	if (active)
+		(void)set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 0);
 	return result;
 }
 
@@ -200,11 +207,8 @@ int main(int argc, char **argv)
 		 */
 		return set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 0);
 	}
-	if (argc == 3 && !strcmp(argv[1], "--set-volume")) {
-		if (set_volume(DEFAULT_VOLUME_FILE, argv[2]) != 0)
-			return 1;
+	if (argc == 3 && !strcmp(argv[1], "--set-volume"))
 		return set_volume(DEFAULT_AIRPLAY_VOLUME_FILE, argv[2]);
-	}
 	if (argc > 1)
 		input_path = argv[1];
 	if (argc > 2)
