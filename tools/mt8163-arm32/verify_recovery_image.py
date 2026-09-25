@@ -53,7 +53,7 @@ WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-INIT_SHA256 = "29215f75208cbbd34e6334f72b8f6b445bfa9142a9406a5d30aed189620b43a0"
+INIT_SHA256 = "39bc4d7489f7bb8763f092da6218578a814dc09796ff622e1ed252ff5cf1f331"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -1787,11 +1787,17 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     }:
         fail("adbd manifest record mismatch")
     source_record = adbd_record["source"]
+    expected_transport = (
+        ("usb-functionfs-and-tcp", True, 5555) if expected_update_channel == "dev"
+        else ("usb-functionfs-only", False, 0)
+    )
     if (
         not isinstance(source_record, dict)
         or source_record.get("source_license") != "Apache-2.0"
-        or source_record.get("transport") != "usb-functionfs-only"
-        or source_record.get("tcp_listener") is not False
+        or source_record.get("transport") != expected_transport[0]
+        or source_record.get("tcp_listener") is not expected_transport[1]
+        or type(source_record.get("tcp_port")) is not int
+        or source_record["tcp_port"] != expected_transport[2]
         or not isinstance(source_record.get("kernel_headers"), str)
         or not source_record.get("kernel_headers")
         or not re.fullmatch(r"[0-9a-f]{40}", str(source_record.get("source_commit", "")))
@@ -1806,12 +1812,14 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         f"schema=1\n"
         f"transport={source_record['transport']}\n"
         f"tcp_listener={'true' if source_record['tcp_listener'] else 'false'}\n"
+        f"tcp_port={source_record['tcp_port']}\n"
         f"binary_sha256={expected_adbd_sha256}\n"
     ).encode()
     if not isinstance(policy_record, dict) or policy_record != {
         "path": "/etc/libreecho/adb-transport",
         "transport": source_record["transport"],
         "tcp_listener": source_record["tcp_listener"],
+        "tcp_port": source_record["tcp_port"],
         "binary_sha256": expected_adbd_sha256,
     }:
         fail("adbd transport policy record mismatch")

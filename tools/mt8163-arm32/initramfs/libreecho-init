@@ -461,6 +461,31 @@ log input-node-worker-started
 
 # Linux 6.1 has no Android android_usb class.  Compose an ADB-only gadget with
 # ConfigFS and FunctionFS, and bind the UDC only after adbd publishes endpoints.
+ADBD_TRANSPORT_FILE=/etc/libreecho/adb-transport
+adbd_dev_tcp_policy()
+{
+    [ -r /etc/libreecho/update-channel ] &&
+        [ "$($BB cat /etc/libreecho/update-channel 2>/dev/null)" = dev ] &&
+        [ -r "$ADBD_TRANSPORT_FILE" ] &&
+        $BB grep -qxF 'schema=1' "$ADBD_TRANSPORT_FILE" &&
+        $BB grep -qxF 'transport=usb-functionfs-and-tcp' "$ADBD_TRANSPORT_FILE" &&
+        $BB grep -qxF 'tcp_listener=true' "$ADBD_TRANSPORT_FILE" &&
+        $BB grep -qxF 'tcp_port=5555' "$ADBD_TRANSPORT_FILE"
+}
+adbd_tcp_configured=0
+if [ -r "$ADBD_TRANSPORT_FILE" ]; then
+    log adb-transport-policy-read
+    adbd_dev_tcp_policy && adbd_tcp_configured=1
+else
+    log adb-transport-policy-absent
+fi
+start_adbd()
+{
+    export ADB_TRACE=all
+    /sbin/adbd --device_banner=device </dev/null >/tmp/adbd.log 2>&1 &
+    adbd_pid=$!
+    log "adbd-started:$adbd_pid"
+}
 G=/sys/kernel/config/usb_gadget/libreecho
 ffs_ready=0
 $BB mkdir -p /sys/kernel/config
@@ -497,10 +522,7 @@ if $BB grep -q ' /sys/kernel/config ' /proc/mounts 2>/dev/null; then
         # exit before opening FunctionFS, so retain only its device banner.
         # HW18 enables adbd's own bounded trace so UART can distinguish a
         # missing transport thread from a FunctionFS endpoint failure.
-        export ADB_TRACE=all
-        /sbin/adbd --device_banner=device </dev/null >/tmp/adbd.log 2>&1 &
-        adbd_pid=$!
-        log "adbd-started:$adbd_pid"
+        start_adbd
 
         i=0
         while [ "$i" -lt 15 ]; do
@@ -590,28 +612,20 @@ if $BB grep -q ' /sys/kernel/config ' /proc/mounts 2>/dev/null; then
 else
     log configfs-unavailable
 fi
+if [ "$adbd_tcp_configured" -eq 1 ] &&
+        { [ -z "${adbd_pid:-}" ] || ! $BB kill -0 "$adbd_pid" 2>/dev/null; }; then
+    # Dev TCP remains available even when USB FunctionFS cannot be mounted.
+    # Keep the same single daemon and never retry a running USB instance.
+    start_adbd
+    log adbd-tcp-fallback-started
+fi
 
 # Persistent readiness evidence for the control plane.  pmsg survives a forced
 # reboot, so a boot where adb never came up is distinguishable from one where
 # it did -- adbd's own diagnostics live on the ramdisk and are lost with it.
 #
-# The configured transport is read from the image, not inferred from the running
-# system.  A canonical build is USB FunctionFS-only, so the absence of a TCP
-# listener is the expected policy outcome and must never be reported as a
-# failure; a TCP listener is only probed when the image says one is configured.
-ADBD_TRANSPORT_FILE=/etc/libreecho/adb-transport
-adbd_tcp_configured=0
-if [ -r "$ADBD_TRANSPORT_FILE" ]; then
-    log adb-transport-policy-read
-    if $BB sed -n 's/^tcp_listener=//p' "$ADBD_TRANSPORT_FILE" 2>/dev/null |
-            $BB grep -qx true; then
-        adbd_tcp_configured=1
-    fi
-else
-    # No policy record means the image does not know its own transport, so no
-    # conclusion about TCP may be drawn from its absence.
-    log adb-transport-policy-absent
-fi
+# The configured transport is immutable image policy. A stable USB-only build
+# reports an absent TCP listener as expected, never as a startup failure.
 if [ "${ffs_ready:-0}" -eq 1 ]; then
     pmsg_marker adb-ffs-ready
 else
@@ -639,6 +653,11 @@ adb_listening() {
              }
              END { exit(listening ? 0 : 1) }' \
         /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+adb_tcp_ready() {
+    case "${adbd_pid:-}" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$adbd_tcp_configured" -eq 1 ] &&
+        adb_listening && $BB kill -0 "$adbd_pid" 2>/dev/null
 }
 if [ "$adbd_tcp_configured" -eq 1 ]; then
     i=0
@@ -1066,16 +1085,19 @@ fi
 # activation.  Its conditions are unchanged from the original late call -- a
 # profile-bearing image performs one bounded activation after the ADB/FunctionFS
 # control plane is ready (HW61, matching the verified 3.18 baseline), and a
-# diagnostic image keeps connectivity manual/single-shot.  The ADB control
-# plane is already established above, so the FunctionFS condition is satisfied
-# by construction here.  start_wifi_network keeps its single-shot claim, so a
+# diagnostic image keeps connectivity manual/single-shot. Stable requires USB
+# FunctionFS; dev may use its verified TCP listener if USB failed.
+# start_wifi_network keeps its single-shot claim, so a
 # failed activation still refuses a second attempt in the same boot, and the
 # request supervisor below remains available for the free-claim case.
+adb_control_ready=0
+[ "${ffs_ready:-0}" -eq 1 ] && adb_control_ready=1
+adb_tcp_ready && adb_control_ready=1
 if [ "${VENDOR_ASSETS_OK:-0}" -ne 1 ]; then
     log wifi-network-skipped-vendor-assets-unavailable
 elif [ "$SERVICE_PROFILE" = diagnostic ]; then
     log wifi-network-policy-manual-single-shot
-elif [ "${ffs_ready:-0}" -eq 1 ]; then
+elif [ "$adb_control_ready" -eq 1 ]; then
     start_wifi_network >>/tmp/wifi-boot.log 2>&1 &
     log wifi-network-worker-started-after-adb
     pmsg_marker wifi-boot-activation
@@ -2546,7 +2568,9 @@ ota_health_confirm_worker()
             attempt=$((attempt + 1))
             if ! $BB grep -q ' /data ' /proc/mounts 2>/dev/null; then
                 last_check=data-mount
-            elif [ "${ffs_ready:-0}" -ne 1 ]; then
+            elif [ "$adbd_tcp_configured" -eq 1 ] && ! adb_tcp_ready; then
+                last_check=adb-tcp-ready
+            elif [ "$adbd_tcp_configured" -ne 1 ] && [ "${ffs_ready:-0}" -ne 1 ]; then
                 last_check=ffs-ready
             elif ! /etc/init.d/libreecho-web.init status >/dev/null 2>&1; then
                 last_check=web-status

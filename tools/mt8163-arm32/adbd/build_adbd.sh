@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  printf '%s\n' 'usage: build_adbd.sh --source DIR --output DIR --cc COMPILER --kernel-headers DIR [--sysroot DIR] [--test-ffs-root DIR]'
+  printf '%s\n' 'usage: build_adbd.sh --source DIR --output DIR --cc COMPILER --kernel-headers DIR [--sysroot DIR] [--test-ffs-root DIR] [--tcp-port 0|5555]'
 }
 
 SOURCE=
@@ -11,6 +11,7 @@ CC=
 sysroot=
 kernel_headers=
 test_ffs_root=
+tcp_port=0
 while (($#)); do
   case "$1" in
     --source) shift; (($#)) || { usage >&2; exit 2; }; SOURCE=$1 ;;
@@ -19,11 +20,15 @@ while (($#)); do
     --sysroot) shift; (($#)) || { usage >&2; exit 2; }; sysroot=$1 ;;
     --kernel-headers) shift; (($#)) || { usage >&2; exit 2; }; kernel_headers=$1 ;;
     --test-ffs-root) shift; (($#)) || { usage >&2; exit 2; }; test_ffs_root=$1 ;;
+    --tcp-port) shift; (($#)) || { usage >&2; exit 2; }; tcp_port=$1 ;;
     -h|--help) usage; exit 0 ;;
     *) printf 'ERROR: unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
   shift
 done
+[[ "$tcp_port" == 0 || "$tcp_port" == 5555 ]] || {
+  printf 'ERROR: adbd TCP port must be 0 or 5555\n' >&2; exit 2
+}
 [[ -n "$SOURCE" && -n "$OUTPUT" && -n "$CC" && -n "$kernel_headers" ]] || { usage >&2; exit 2; }
 ADBD_SOURCE=$SOURCE
 ADBD_SOURCE_COMMIT=
@@ -83,6 +88,7 @@ CFLAGS=(
   "-fmacro-prefix-map=$work=/usr/src/libreecho-adbd"
   -DADB_HOST=0 -DHAVE_FORKEXEC=1 -D_XOPEN_SOURCE -D_GNU_SOURCE
   -DALLOW_ADBD_ROOT=1 -DHAVE_SYMLINKS -DBOARD_ALWAYS_INSECURE -DHAVE_TERMIO_H
+  "-DLIBREECHO_ADB_TCP_PORT=$tcp_port"
   "-I$work/include" "-I$work/include/cutils" "-I$work/adb"
   "-I$work/libmincrypt" "-I$work/libcutils" "-I$work/include/private"
   "-I$work/include/system" "-I$work/compat" "-I$work/kernel-headers"
@@ -129,7 +135,8 @@ binary_size=$(stat -c %s "$OUTPUT/adbd")
 patch_sha=$(sha256sum "$SCRIPT_DIR/libreecho-adbd.patch" | awk '{print $1}')
 compiler_version=$("$CC" --version | python3 -c 'import sys; print(sys.stdin.readline().strip())')
 python3 -c 'import json, pathlib, sys
-out, commit, patch_sha, compiler, kernel_headers, size, binary_sha = sys.argv[1:]
+out, commit, patch_sha, compiler, kernel_headers, size, binary_sha, tcp_port = sys.argv[1:]
+tcp_port = int(tcp_port)
 pathlib.Path(out).write_text(json.dumps({
   "source": "AOSP platform/system/core",
   "source_url": "https://android.googlesource.com/platform/system/core",
@@ -140,9 +147,10 @@ pathlib.Path(out).write_text(json.dumps({
   "kernel_headers": "exported-linux-uapi",
   "binary_sha256": binary_sha,
   "binary_size": int(size),
-  "transport": "usb-functionfs-only",
-  "tcp_listener": False,
+  "transport": "usb-functionfs-and-tcp" if tcp_port else "usb-functionfs-only",
+  "tcp_listener": bool(tcp_port),
+  "tcp_port": tcp_port,
 }, sort_keys=True, indent=2) + "\n")' \
-  "$OUTPUT/adbd-source.json" "$source_commit" "$patch_sha" "$compiler_version" "$kernel_headers" "$binary_size" "$binary_sha"
+  "$OUTPUT/adbd-source.json" "$source_commit" "$patch_sha" "$compiler_version" "$kernel_headers" "$binary_size" "$binary_sha" "$tcp_port"
 printf 'adbd_source_commit=%s\nadbd_patch_sha256=%s\nadbd_sha256=%s\nadbd_size=%s\n' \
   "$source_commit" "$patch_sha" "$binary_sha" "$binary_size"
