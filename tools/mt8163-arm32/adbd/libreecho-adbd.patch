@@ -15,7 +15,7 @@ index 07bfbe5d5536be8053f099b655fd981d491a71ca..26924b1d956dfb9dd4cfa2e68c8b196c
      }
  
      int usb = 0;
-@@ -1192,20 +1186,14 @@ int adb_main(int is_daemon, int server_port)
+@@ -1192,20 +1186,18 @@ int adb_main(int is_daemon, int server_port)
          usb = 1;
      }
  
@@ -30,7 +30,11 @@ index 07bfbe5d5536be8053f099b655fd981d491a71ca..26924b1d956dfb9dd4cfa2e68c8b196c
 -        printf("using port=%d\n", port);
 -        // listen on TCP port specified by service.adb.tcp.port property
 -        local_init(port);
++#if LIBREECHO_ADB_TCP_PORT == 5555
++        local_init(port);
++#else
 +        D("Ignoring target TCP ADB request; USB FunctionFS is the only transport\n");
++#endif
      } else if (!usb) {
 -        // listen on default port
 -        local_init(DEFAULT_ADB_LOCAL_TRANSPORT_PORT);

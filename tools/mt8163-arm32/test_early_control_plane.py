@@ -69,6 +69,43 @@ class EarlyControlPlaneContracts(unittest.TestCase):
         # No blanket 5-second wait on a USB-only boot.
         self.assertNotIn("grep -q ':15B3 ' /proc/net/tcp", self.init)
 
+    def test_dev_tcp_policy_rejects_stable_missing_and_malformed_records(self) -> None:
+        start = self.init.index("adbd_dev_tcp_policy()")
+        body = self.init[start : self.init.index("\n}\n", start) + len("\n}\n")]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            channel_file = root / "channel"
+            policy_file = root / "adb-transport"
+            body = body.replace("/etc/libreecho/update-channel", str(channel_file))
+            for channel, policy, expected in (
+                ("dev", "schema=1\ntransport=usb-functionfs-and-tcp\ntcp_listener=true\ntcp_port=5555\n", True),
+                ("stable", "schema=1\ntransport=usb-functionfs-and-tcp\ntcp_listener=true\ntcp_port=5555\n", False),
+                ("dev", "schema=1\ntransport=usb-functionfs-only\ntcp_listener=false\ntcp_port=0\n", False),
+                ("dev", "schema=1\ntransport=usb-functionfs-and-tcp\ntcp_listener=true\ntcp_port=5556\n", False),
+            ):
+                channel_file.write_text(channel)
+                policy_file.write_text(policy)
+                proc = subprocess.run(
+                    ["sh", "-c", body + "\nadbd_dev_tcp_policy"],
+                    env={"PATH": "/usr/bin:/bin", "BB": "", "ADBD_TRANSPORT_FILE": str(policy_file)},
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(proc.returncode == 0, expected, (channel, policy, proc.stderr))
+            channel_file.unlink()
+            self.assertNotEqual(subprocess.run(
+                ["sh", "-c", body + "\nadbd_dev_tcp_policy"],
+                env={"PATH": "/usr/bin:/bin", "BB": "", "ADBD_TRANSPORT_FILE": str(policy_file)},
+                capture_output=True,
+            ).returncode, 0)
+
+    def test_dev_tcp_fallback_does_not_start_stable_adbd(self) -> None:
+        self.assertEqual(self.init.count("/sbin/adbd --device_banner=device"), 1)
+        self.assertIn('if [ "$adbd_tcp_configured" -eq 1 ] &&', self.init)
+        self.assertIn("log adbd-tcp-fallback-started", self.init)
+        self.assertIn("adb_listening && $BB kill -0", self.init)
+        self.assertIn("last_check=adb-tcp-ready", self.init)
+        self.assertIn("last_check=ffs-ready", self.init)
+
     def test_adb_listener_check_requires_listen_state_and_local_port(self) -> None:
         """A connection to 5555, or a client socket, is not a listener."""
         start = self.init.index("adb_listening()")
@@ -176,7 +213,9 @@ class EarlyControlPlaneContracts(unittest.TestCase):
         block = self.init[chain : activation + 200]
         self.assertIn('if [ "${VENDOR_ASSETS_OK:-0}" -ne 1 ]; then', block)
         self.assertIn('elif [ "$SERVICE_PROFILE" = diagnostic ]; then', block)
-        self.assertIn('elif [ "${ffs_ready:-0}" -eq 1 ]; then', block)
+        self.assertIn('elif [ "$adb_control_ready" -eq 1 ]; then', block)
+        self.assertIn('[ "${ffs_ready:-0}" -eq 1 ] && adb_control_ready=1', self.init)
+        self.assertIn('adb_tcp_ready && adb_control_ready=1', self.init)
         self.assertIn("log wifi-network-skipped-vendor-assets-unavailable", block)
         self.assertIn("log wifi-network-policy-manual-single-shot", block)
         self.assertIn("log wifi-network-worker-started-after-adb", block)
@@ -201,7 +240,9 @@ class EarlyControlPlaneContracts(unittest.TestCase):
         branch = self.init[guard:activation]
         self.assertIn('elif [ "$SERVICE_PROFILE" = diagnostic ]; then', branch)
         self.assertIn("log wifi-network-policy-manual-single-shot", branch)
-        self.assertIn('elif [ "${ffs_ready:-0}" -eq 1 ]; then', branch)
+        self.assertIn('elif [ "$adb_control_ready" -eq 1 ]; then', branch)
+        self.assertIn('[ "${ffs_ready:-0}" -eq 1 ] && adb_control_ready=1', self.init)
+        self.assertIn('adb_tcp_ready && adb_control_ready=1', self.init)
         # And it still happens after the WMT nodes exist.
         self.assertLess(self.init.index("log wmt-nodes-created"), activation)
 

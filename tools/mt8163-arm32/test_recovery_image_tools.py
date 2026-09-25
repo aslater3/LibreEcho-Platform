@@ -1263,6 +1263,33 @@ class SourceTests(unittest.TestCase):
         self.assertIn('"source_license"', builder_source)
         self.assertIn("stock_userspace", verifier_source)
 
+    def test_adbd_metadata_is_bound_to_update_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "adbd"
+            binary.write_bytes(b"test-adbd")
+            metadata = root / "adbd-source.json"
+            base = {
+                "source": "AOSP platform/system/core", "source_url": "https://android.googlesource.com/platform/system/core",
+                "source_commit": "a" * 40, "source_license": "Apache-2.0",
+                "patch_sha256": "b" * 64, "compiler": "test", "kernel_headers": "exported-linux-uapi",
+                "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(), "binary_size": binary.stat().st_size,
+            }
+            for channel, transport, tcp_port, listener in (
+                ("dev", "usb-functionfs-and-tcp", 5555, True),
+                ("stable", "usb-functionfs-only", 0, False),
+            ):
+                record = {**base, "transport": transport, "tcp_listener": listener, "tcp_port": tcp_port}
+                metadata.write_text(json.dumps(record))
+                builder.copy_adbd(binary, metadata, root / channel, {}, channel)
+                with self.assertRaises(SystemExit):
+                    builder.copy_adbd(binary, metadata, root / (channel + "-wrong"), {},
+                                      "stable" if channel == "dev" else "dev")
+            record["tcp_port"] = 2222
+            metadata.write_text(json.dumps(record))
+            with self.assertRaises(SystemExit):
+                builder.copy_adbd(binary, metadata, root / "invalid", {}, "stable")
+
     def test_adbd_is_source_built_and_notice_bound(self) -> None:
         adbd_dir = TOOLS_DIR / "adbd"
         builder = adbd_dir / "build_adbd.sh"
@@ -2963,7 +2990,9 @@ start_feature_service_if_enabled
         self.assertIn("functionfs-ready", source)
         create = source.index('G=/sys/kernel/config/usb_gadget/libreecho')
         ffs_mount = source.index("mount -t functionfs", create)
-        adbd = source.index("/sbin/adbd ", ffs_mount)
+        adbd = source.index("start_adbd\n", ffs_mount)
+        self.assertEqual(source.count("/sbin/adbd --device_banner=device"), 1)
+        self.assertLess(source.index("/sbin/adbd --device_banner=device"), create)
         endpoints = source.index("/dev/usb-ffs/adb/ep1", adbd)
         bind = source.index('> "$G/UDC"', endpoints)
         self.assertLess(create, ffs_mount)

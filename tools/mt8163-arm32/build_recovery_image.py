@@ -55,7 +55,7 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "29215f75208cbbd34e6334f72b8f6b445bfa9142a9406a5d30aed189620b43a0"
+RECOVERY_INIT_SHA256 = "39bc4d7489f7bb8763f092da6218578a814dc09796ff622e1ed252ff5cf1f331"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
@@ -236,7 +236,7 @@ def pinned_source(root: Path, relative: str, label: str) -> Path:
 
 
 def copy_adbd(adbd: Path, metadata_path: Path, stage: Path,
-              manifest: dict[str, object]) -> None:
+              manifest: dict[str, object], update_channel: str) -> None:
     if adbd.is_symlink() or not adbd.is_file():
         raise SystemExit(f"ERROR: adbd is not a regular file: {adbd}")
     if metadata_path.is_symlink() or not metadata_path.is_file():
@@ -247,7 +247,7 @@ def copy_adbd(adbd: Path, metadata_path: Path, stage: Path,
         raise SystemExit(f"ERROR: invalid adbd source metadata: {exc}") from exc
     required_metadata = {
         "source", "source_url", "source_commit", "source_license", "patch_sha256",
-        "compiler", "kernel_headers", "binary_sha256", "binary_size", "transport", "tcp_listener",
+        "compiler", "kernel_headers", "binary_sha256", "binary_size", "transport", "tcp_listener", "tcp_port",
     }
     if set(metadata) != required_metadata:
         raise SystemExit("ERROR: adbd source metadata schema mismatch")
@@ -261,23 +261,31 @@ def copy_adbd(adbd: Path, metadata_path: Path, stage: Path,
         raise SystemExit("ERROR: adbd source license is not Apache-2.0")
     if not isinstance(metadata["kernel_headers"], str) or not metadata["kernel_headers"]:
         raise SystemExit("ERROR: adbd kernel-header provenance is missing")
-    if metadata["transport"] != "usb-functionfs-only" or metadata["tcp_listener"] is not False:
-        raise SystemExit("ERROR: adbd transport policy is not USB FunctionFS-only")
+    expected_policy = {
+        "dev": ("usb-functionfs-and-tcp", True, 5555),
+        "stable": ("usb-functionfs-only", False, 0),
+    }.get(update_channel)
+    if expected_policy is None or (
+        metadata["transport"] != expected_policy[0]
+        or metadata["tcp_listener"] is not expected_policy[1]
+        or type(metadata["tcp_port"]) is not int
+        or metadata["tcp_port"] != expected_policy[2]
+    ):
+        raise SystemExit("ERROR: adbd transport policy does not match update channel")
     target = stage / "sbin/adbd"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(data)
     target.chmod(0o750)
     # Stage the transport policy the builder just validated. init reads this
-    # instead of inferring a transport from the running system: a canonical
-    # build is USB FunctionFS-only, so "no TCP listener" is the expected
-    # policy outcome and must never be reported as a failure. The verifier
-    # checks this file's presence and contents.
+    # instead of inferring a transport from the running system. Stable is
+    # USB-only; dev carries an explicitly channel-bound TCP listener.
     policy = stage / "etc/libreecho/adb-transport"
     policy.parent.mkdir(parents=True, exist_ok=True)
     policy.write_text(
         f"schema=1\n"
         f"transport={metadata['transport']}\n"
         f"tcp_listener={'true' if metadata['tcp_listener'] else 'false'}\n"
+        f"tcp_port={metadata['tcp_port']}\n"
         f"binary_sha256={expected}\n"
     )
     policy.chmod(0o644)
@@ -291,6 +299,7 @@ def copy_adbd(adbd: Path, metadata_path: Path, stage: Path,
             "path": "/etc/libreecho/adb-transport",
             "transport": metadata["transport"],
             "tcp_listener": metadata["tcp_listener"],
+            "tcp_port": metadata["tcp_port"],
             "binary_sha256": expected,
         },
     }
@@ -2715,7 +2724,8 @@ def main() -> None:
     overlay = Path(__file__).resolve().parent / "initramfs"
     with tempfile.TemporaryDirectory(prefix="libreecho-arm32-initramfs-") as temporary:
         stage = Path(temporary)
-        copy_adbd(args.adbd.resolve(), args.adbd_source_metadata.resolve(), stage, manifest)
+        copy_adbd(args.adbd.resolve(), args.adbd_source_metadata.resolve(), stage, manifest,
+                  args.update_channel)
         add_overlay(
             stage, overlay, args.busybox.resolve(), args.musl_loader.resolve(),
             args.expected_busybox_sha256, args.expected_musl_loader_sha256,
