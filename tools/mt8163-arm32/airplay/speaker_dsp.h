@@ -18,9 +18,9 @@
  * here.  What this module contains is:
  *
  *   - a designed replacement for the loudness curve: five biquad sections whose
- *     topology is fixed and whose gains vary linearly with the volume step.  The
- *     parameters were fitted to the measured response of the stock curve and
- *     reproduce it to 1.44 dB RMS across the referenced volume ladder;
+ *     topology is fixed and whose gains select the first upper volume boundary.
+ *     The original fitted shapes are a normalized approximation, not a claim
+ *     of absolute stock gain or full-chain parity;
  *   - the parametric EQ as its two *active* filter specifications (the stock
  *     file defines eight biquads, six of which are BYPASS), turned into
  *     coefficients here by our own RBJ design code.
@@ -148,41 +148,16 @@ static inline void speaker_biquad_design(struct speaker_dsp_biquad *bq,
 	bq->z2 = 0.0f;
 }
 
-/*
- * Interpolate the loudness ladder at the given volume percentage.  Volumes at
- * or below the first boundary take the first step; at or above the last take
- * the last, matching the stock "Volume Boundary" selection.
- */
+/* Select the first configured upper boundary, without interpolating presets. */
 static inline void speaker_dsp_loudness_gains(float volume, float *gains)
 {
-	int i;
-	float f;
-	int last = SPEAKER_DSP_STEP_COUNT - 1;
+	int i, k;
 
-	if (volume <= speaker_loudness_volume[0]) {
-		for (i = 0; i < SPEAKER_DSP_LOUDNESS_SECTIONS; ++i)
-			gains[i] = speaker_loudness_gain_db[0][i];
-		return;
-	}
-	if (volume >= speaker_loudness_volume[last]) {
-		for (i = 0; i < SPEAKER_DSP_LOUDNESS_SECTIONS; ++i)
-			gains[i] = speaker_loudness_gain_db[last][i];
-		return;
-	}
-	for (i = 0; i < last; ++i) {
-		if (volume >= speaker_loudness_volume[i] &&
-		    volume <= speaker_loudness_volume[i + 1]) {
-			int k;
-			f = (volume - speaker_loudness_volume[i]) /
-			    (speaker_loudness_volume[i + 1] - speaker_loudness_volume[i]);
-			for (k = 0; k < SPEAKER_DSP_LOUDNESS_SECTIONS; ++k) {
-				float lo = speaker_loudness_gain_db[i][k];
-				float hi = speaker_loudness_gain_db[i + 1][k];
-				gains[k] = lo + (hi - lo) * f;
-			}
-			return;
-		}
-	}
+	for (i = 0; i < SPEAKER_DSP_STEP_COUNT - 1; ++i)
+		if (volume <= speaker_loudness_volume[i])
+			break;
+	for (k = 0; k < SPEAKER_DSP_LOUDNESS_SECTIONS; ++k)
+		gains[k] = speaker_loudness_gain_db[i][k];
 }
 
 static inline void speaker_dsp_init(struct speaker_dsp *dsp, int volume_percent)
