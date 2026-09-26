@@ -34,24 +34,49 @@ static double measure_tone(double hz, float amplitude, int lead, int frames)
     return 2.0 * hypot(sin_part, cos_part) / frames;
 }
 
-static void test_complementary_reconstruction(void)
+static void test_filterbank_delay_and_allpass_sum(void)
 {
     struct speaker_mbcl m;
-    int n;
-    double peak_error = 0.0;
+    double energy = 0.0;
+    int n, k;
+    speaker_mbcl_init(&m);
+    for (n = 0; n < 4096; ++n) {
+        float bands[4], sum = 0.0f;
+        speaker_mbcl_split(&m, n == 0 ? 1.0f : 0.0f, bands);
+        for (k = 0; k < 4; ++k) {
+            if (n < 3) CHECK(bands[k] == 0.0f);
+            sum += bands[k];
+        }
+        energy += (double)sum * sum;
+    }
+    /* LR4 band summation is allpass, not sample-wise input identity. */
+    CHECK(fabs(energy - 1.0) < 0.001);
+    CHECK(fabsf(speaker_mbcl_process(&m, 0.0f)) < 0.001f);
+}
+
+static void test_lr4_crossover_transfer(void)
+{
+    const double frequency = 125.0;
+    struct speaker_mbcl m;
+    double sine[4] = {0}, cosine[4] = {0};
+    int n, k;
     speaker_mbcl_init(&m);
     for (n = 0; n < RATE; ++n) {
-        float x = tone(n, 53.0, 70.0f) + tone(n, 137.0, 60.0f)
-                + tone(n, 950.0, 50.0f) + tone(n, 8200.0, 40.0f);
-        float bands[4], sum;
-        double err;
-        speaker_mbcl_split(&m, x, bands);
-        sum = bands[0] + bands[1] + bands[2] + bands[3];
-        err = fabs((double)sum - x);
-        if (err > peak_error) peak_error = err;
+        float bands[4];
+        speaker_mbcl_split(&m, tone(n, frequency, 1.0f), bands);
+        if (n < RATE / 2) continue;
+        for (k = 0; k < 4; ++k) {
+            sine[k] += bands[k] * sin(2.0 * PI * frequency * n / RATE);
+            cosine[k] += bands[k] * cos(2.0 * PI * frequency * n / RATE);
+        }
     }
-    CHECK(peak_error < 0.0001);
-    printf("complementary reconstruction peak error: %.8f PCM\n", peak_error);
+    /* Analytic 70/200/3250-Hz LR4 target, rather than one-pole residual. */
+    {
+        double low = 2.0 * hypot(sine[0], cosine[0]) / (RATE / 2);
+        double mid = 2.0 * hypot(sine[1], cosine[1]) / (RATE / 2);
+        CHECK(low > 0.08 && low < 0.10); /* approximately -21 dB */
+        CHECK(mid > 0.77 && mid < 0.81); /* approximately -2 dB */
+    }
 }
 
 static void test_band_isolation(void)
@@ -193,7 +218,8 @@ static void test_release_times(void)
 
 int main(void)
 {
-    test_complementary_reconstruction();
+    test_filterbank_delay_and_allpass_sum();
+    test_lr4_crossover_transfer();
     test_band_isolation();
     test_low_level_gain_and_distinct_dynamics();
     test_bass_suppression_before_bus_limiter();
