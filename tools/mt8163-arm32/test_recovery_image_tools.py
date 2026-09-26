@@ -1489,21 +1489,24 @@ class SourceTests(unittest.TestCase):
         self.assertIn("samples[frame * 2] = mono", downmix)
         self.assertIn("samples[frame * 2 + 1] = mono", downmix)
 
-    def test_airplay_volume_attenuates_only_media_without_overriding_master(self) -> None:
+    def test_airplay_media_waits_for_master_ack_and_uses_unity_gain(self) -> None:
         engine = (TOOLS_DIR / "airplay/audio_engine.c").read_text()
         producer = (TOOLS_DIR / "airplay/airplay_audio.c").read_text()
 
         self.assertIn('#define AIRPLAY_ACTIVE_FILE "airplay.active"', engine)
         self.assertIn('#define AIRPLAY_VOLUME_FILE "airplay.volume"', engine)
+        self.assertIn('#define AIRPLAY_MASTER_FILE "airplay.master"', engine)
         self.assertIn("airplay_is_active(root)", engine)
         self.assertIn("airplay_volume_to_mixer(root)", engine)
         self.assertIn("? airplay_media_gain(phone) : read_media_gain(root)", engine)
+        self.assertIn("return raw <= 0 ? 0 : 32768;", engine)
         self.assertIn("speaker_volume_percent(sources, current_pcm_volume(card))", engine)
         self.assertNotIn("set_pcm_volume(", engine)
         self.assertNotIn('"PCM Playback Volume", volume', engine)
         self.assertIn("(void)disable_output_controls(card);", engine)
         self.assertIn("DEFAULT_AIRPLAY_ACTIVE_FILE", producer)
-        self.assertIn("These hooks are retained for compatibility", producer)
+        self.assertIn("DEFAULT_AIRPLAY_MASTER_FILE", producer)
+        self.assertIn("unlink(DEFAULT_AIRPLAY_MASTER_FILE)", producer)
         self.assertNotIn("set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, active)", producer)
         self.assertIn("DEFAULT_AIRPLAY_VOLUME_FILE", producer)
         self.assertIn("set_volume(DEFAULT_AIRPLAY_VOLUME_FILE, argv[2])", producer)
