@@ -146,9 +146,11 @@ int main(void)
     puffin_dynamics_init(&dynamics);
     speaker_dsp_init(&speaker, 100);
     render_period(sources, output, &dynamics, &speaker);
+    /* A new LR4 filterbank has a measured three-frame startup delay. */
     for (i = 0; i < PERIOD_SIZE; ++i) {
-        if (output[i * OUTPUT_CHANNELS] == 0 ||
-            output[i * OUTPUT_CHANNELS] != output[i * OUTPUT_CHANNELS + 1])
+        if (output[i * OUTPUT_CHANNELS] != output[i * OUTPUT_CHANNELS + 1] ||
+            (i < 3 && output[i * OUTPUT_CHANNELS] != 0) ||
+            (i >= 3 && output[i * OUTPUT_CHANNELS] == 0))
             return fail("ready source did not render while another was partial");
     }
     consume_period(sources);
@@ -206,8 +208,8 @@ int main(void)
         activity_mask == 0)
         return fail("one complete period was not accepted at startup");
     for (i = 0; i < PERIOD_SIZE; ++i) {
-        if (output[i * OUTPUT_CHANNELS] == 0 ||
-            output[i * OUTPUT_CHANNELS] != output[i * OUTPUT_CHANNELS + 1])
+        if (output[i * OUTPUT_CHANNELS] != output[i * OUTPUT_CHANNELS + 1] ||
+            (i >= 3 && output[i * OUTPUT_CHANNELS] == 0))
             return fail("one-period startup render contains a gap");
     }
 
@@ -306,7 +308,7 @@ int main(void)
         sources[SOURCE_ALARM].idle_periods = SOURCE_IDLE_PERIODS;
         if (prepare_initial_period(sources, root, output, &dynamics,
                                    &speaker, &mask, 127) != 1 ||
-            !(mask & PLAYBACK_BUS_ALARM) || output[0] == 0)
+            !(mask & PLAYBACK_BUS_ALARM) || output[3 * OUTPUT_CHANNELS] == 0)
             return fail("missing callback blocked alarm playback");
         consume_period(sources);
         if (sources[SOURCE_MEDIA].received != period_bytes ||
@@ -318,7 +320,7 @@ int main(void)
         close(fd);
         if (prepare_initial_period(sources, root, output, &dynamics,
                                    &speaker, &mask, 127) != 1 ||
-            ! (mask & PLAYBACK_BUS_MEDIA) || output[0] == 0 ||
+            ! (mask & PLAYBACK_BUS_MEDIA) || output[3 * OUTPUT_CHANNELS] == 0 ||
             sources[SOURCE_MEDIA].gain_q15 < 3200)
             return fail("valid late callback left the first media period silent");
         unlink(volume); unlink(marker); rmdir(root);
