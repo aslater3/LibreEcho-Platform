@@ -94,6 +94,23 @@ static int fail(const char *message)
     return 1;
 }
 
+static int ack_callback(const char *root)
+{
+    char marker[256], volume[256], ack[256];
+    struct stat m, v;
+    FILE *file;
+    if (snprintf(marker, sizeof(marker), "%s/airplay.active", root) >= (int)sizeof(marker) ||
+        snprintf(volume, sizeof(volume), "%s/airplay.volume", root) >= (int)sizeof(volume) ||
+        snprintf(ack, sizeof(ack), "%s/airplay.master", root) >= (int)sizeof(ack) ||
+        stat(marker, &m) || stat(volume, &v) || !(file = fopen(ack, "w"))) return -1;
+    fprintf(file, "%llu %llu %lld %ld %llu %llu %lld %ld\n",
+            (unsigned long long)m.st_dev, (unsigned long long)m.st_ino,
+            (long long)m.st_ctim.tv_sec, m.st_ctim.tv_nsec,
+            (unsigned long long)v.st_dev, (unsigned long long)v.st_ino,
+            (long long)v.st_ctim.tv_sec, v.st_ctim.tv_nsec);
+    return fclose(file);
+}
+
 int main(void)
 {
     struct source_bus sources[SOURCE_COUNT];
@@ -263,17 +280,52 @@ int main(void)
             return fail("volume write failed");
         close(fd);
         if (read_sources(sources, root) < 0 ||
-            sources[SOURCE_MEDIA].gain_q15 < 3200 ||
-            sources[SOURCE_MEDIA].gain_q15 > 3300 ||
+            !sources[SOURCE_MEDIA].airplay_volume_missing ||
             sources[SOURCE_ANNOUNCEMENT].gain_q15 != 32768)
-            return fail("AirPlay phone level did not attenuate only media");
+            return fail("unacknowledged callback leaked into playback");
+        if (ack_callback(root) < 0 || read_sources(sources, root) < 0 ||
+            sources[SOURCE_MEDIA].airplay_volume_missing ||
+            sources[SOURCE_MEDIA].gain_q15 != 32768 ||
+            sources[SOURCE_ANNOUNCEMENT].gain_q15 != 32768)
+            return fail("acknowledged callback did not play at unity media gain");
         unlink(path);
         if (read_sources(sources, root) < 0 ||
             sources[SOURCE_MEDIA].gain_q15 != 0 ||
             sources[SOURCE_ANNOUNCEMENT].gain_q15 != 32768)
             return fail("missing phone callback did not mute only media");
+        fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+        if (fd < 0 || write(fd, "-144\n", 5) != 5) return fail("mute callback failed");
+        close(fd);
+        if (airplay_volume_to_mixer(root) >= 0) return fail("old ack accepted new callback");
+        if (ack_callback(root) < 0 || airplay_volume_to_mixer(root) != 0)
+            return fail("acknowledged sender mute lost");
+        if (snprintf(path, sizeof(path), "%s/airplay.master", root) >= (int)sizeof(path))
+            return fail("ack path too long");
+        unlink(path);
+        if (mkfifo(path, 0600) < 0 || airplay_volume_to_mixer(root) >= 0)
+            return fail("FIFO ack was accepted or blocked");
+        unlink(path);
+        fd = open(path, O_CREAT | O_WRONLY, 0600);
+        if (fd < 0) return fail("oversized ack create failed");
+        for (i = 0; i < 200; ++i)
+            if (write(fd, "1", 1) != 1) return fail("oversized ack write failed");
+        close(fd);
+        if (airplay_volume_to_mixer(root) >= 0)
+            return fail("oversized ack was accepted");
+        unlink(path);
+        if (snprintf(path, sizeof(path), "%s/airplay.volume", root) >= (int)sizeof(path))
+            return fail("callback path too long");
+        unlink(path);
         if (snprintf(path, sizeof(path), "%s/airplay.active", root) >= (int)sizeof(path))
             return fail("marker cleanup path too long");
+        unlink(path);
+        fd = open(path, O_CREAT | O_WRONLY, 0600);
+        if (fd < 0) return fail("reconnect marker failed");
+        close(fd);
+        if (airplay_volume_to_mixer(root) >= 0) return fail("old ack accepted reconnect");
+        unlink(path);
+        if (snprintf(path, sizeof(path), "%s/airplay.master", root) >= (int)sizeof(path))
+            return fail("ack cleanup path too long");
         unlink(path);
         rmdir(root);
     }
@@ -319,11 +371,18 @@ int main(void)
             return fail("late phone callback write failed");
         close(fd);
         if (prepare_initial_period(sources, root, output, &dynamics,
+                                   &speaker, &mask, 127) != 2)
+            return fail("unacknowledged late callback played media");
+        if (ack_callback(root) < 0 ||
+            prepare_initial_period(sources, root, output, &dynamics,
                                    &speaker, &mask, 127) != 1 ||
-            ! (mask & PLAYBACK_BUS_MEDIA) || output[3 * OUTPUT_CHANNELS] == 0 ||
-            sources[SOURCE_MEDIA].gain_q15 < 3200)
-            return fail("valid late callback left the first media period silent");
-        unlink(volume); unlink(marker); rmdir(root);
+            !(mask & PLAYBACK_BUS_MEDIA) || output[3 * OUTPUT_CHANNELS] == 0 ||
+            sources[SOURCE_MEDIA].gain_q15 != 32768)
+            return fail("acknowledged late callback left the first media period silent");
+        unlink(volume); unlink(marker);
+        if (snprintf(volume, sizeof(volume), "%s/airplay.master", root) >= (int)sizeof(volume))
+            return fail("ack cleanup path too long");
+        unlink(volume); rmdir(root);
     }
     /* A queued period from a muted sender must not become a full-level
      * generic media period when that AirPlay session disconnects. */

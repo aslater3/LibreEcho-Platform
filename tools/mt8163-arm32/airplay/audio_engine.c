@@ -37,6 +37,7 @@
 #define DEFAULT_ROOT "/run/libreecho-audio"
 #define AIRPLAY_ACTIVE_FILE "airplay.active"
 #define AIRPLAY_VOLUME_FILE "airplay.volume"
+#define AIRPLAY_MASTER_FILE "airplay.master"
 #define LED_SOCKET "/run/libreecho/led.sock"
 #define DEFAULT_CARD 0U
 #define DEFAULT_DEVICE 23U
@@ -480,45 +481,86 @@ static int airplay_is_active(const char *root)
 
 static int airplay_volume_to_mixer(const char *root)
 {
-	char path[256];
-	char buffer[64];
+	char path[256], marker[256], ack_path[256];
+	char buffer[64], ack_text[160];
 	char *end;
 	double db;
 	int fd;
 	ssize_t n;
+	struct stat active, callback, current, ack_stat;
+	unsigned long long md, mi, vd, vi;
+	long long ms, vs;
+	long mn, vn;
 
-	if (snprintf(path, sizeof(path), "%s/%s", root,
-		     AIRPLAY_VOLUME_FILE) < 0)
+	if (snprintf(marker, sizeof(marker), "%s/%s", root,
+		     AIRPLAY_ACTIVE_FILE) >= (int)sizeof(marker) ||
+	    snprintf(path, sizeof(path), "%s/%s", root,
+		     AIRPLAY_VOLUME_FILE) >= (int)sizeof(path) ||
+	    snprintf(ack_path, sizeof(ack_path), "%s/%s", root,
+		     AIRPLAY_MASTER_FILE) >= (int)sizeof(ack_path) ||
+	    stat(marker, &active) < 0)
 		return -1;
 	fd = open(path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0)
 		return -1;
+	if (fstat(fd, &callback) < 0) {
+		close(fd);
+		return -1;
+	}
 	n = read(fd, buffer, sizeof(buffer) - 1);
 	close(fd);
-	if (n <= 0)
+	if (n <= 0 || stat(path, &current) < 0 ||
+	    current.st_dev != callback.st_dev || current.st_ino != callback.st_ino)
 		return -1;
 	buffer[n] = '\0';
 	errno = 0;
 	db = strtod(buffer, &end);
-	if (end == buffer || errno == ERANGE || !isfinite(db))
+	if (end == buffer || errno == ERANGE || !isfinite(db) ||
+	    (db != -144.0 && (db < -30.0 || db > 0.0)))
 		return -1;
-	while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')
+	while (*end == ' ' || *end == '	' || *end == '\n' || *end == '\r')
 		end++;
 	if (*end != '\0')
 		return -1;
-	if (db <= -63.5)
-		return 0;
-	if (db >= 0.0)
-		return 127;
-	return (int)lround(127.0 + (db * 2.0));
+	/* Open without following links or waiting for a FIFO writer. Only bounded
+	 * regular ack files can enter the PCM loop's parser. */
+	fd = open(ack_path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0)
+		return -1;
+	if (fstat(fd, &ack_stat) < 0 || !S_ISREG(ack_stat.st_mode) ||
+	    ack_stat.st_size <= 0 || ack_stat.st_size >= (off_t)sizeof(ack_text)) {
+		close(fd);
+		return -1;
+	}
+	n = read(fd, ack_text, (size_t)ack_stat.st_size);
+	close(fd);
+	if (n != ack_stat.st_size)
+		return -1;
+	ack_text[n] = '\0';
+	n = sscanf(ack_text, "%llu %llu %lld %ld %llu %llu %lld %ld",
+		   &md, &mi, &ms, &mn, &vd, &vi, &vs, &vn);
+	if (n != 8 || md != (unsigned long long)active.st_dev ||
+	    mi != (unsigned long long)active.st_ino ||
+	    ms != (long long)active.st_ctim.tv_sec || mn != active.st_ctim.tv_nsec ||
+	    vd != (unsigned long long)callback.st_dev ||
+	    vi != (unsigned long long)callback.st_ino ||
+	    vs != (long long)callback.st_ctim.tv_sec || vn != callback.st_ctim.tv_nsec ||
+	    stat(marker, &current) < 0 || current.st_dev != active.st_dev ||
+	    current.st_ino != active.st_ino ||
+	    current.st_ctim.tv_sec != active.st_ctim.tv_sec ||
+	    current.st_ctim.tv_nsec != active.st_ctim.tv_nsec ||
+	    stat(path, &current) < 0 || current.st_dev != callback.st_dev ||
+	    current.st_ino != callback.st_ino ||
+	    current.st_ctim.tv_sec != callback.st_ctim.tv_sec ||
+	    current.st_ctim.tv_nsec != callback.st_ctim.tv_nsec)
+		return -1;
+	return db <= -144.0 ? 0 : 127;
 }
 
 static int32_t airplay_media_gain(int raw)
 {
-	/* Missing callback and sender mute affect only the media bus. */
-	if (raw <= 0)
-		return 0;
-	return db_to_q15(((double)raw - 127.0) / 2.0);
+	/* Only explicit sender mute affects media; audiod owns the level. */
+	return raw <= 0 ? 0 : 32768;
 }
 
 static int32_t read_media_gain(const char *root)
