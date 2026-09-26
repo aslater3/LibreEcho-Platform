@@ -67,21 +67,25 @@ mode `0644`. It records only playback state (`idle`, `playing`, `system`,
 all four buses. The file is replaced only when that state changes and carries
 no track metadata.
 
-Shairport's pipe must use `ignore_volume_control = "yes"` because the
-shared engine applies the sender's attenuation on the **media bus only**,
-before EQ and multiband protection. Otherwise Shairport and the engine would
-attenuate the same samples twice. The bridge writes only `airplay.volume`,
-clears it at disconnect, and removes legacy `media.volume` leftovers from its
-former dual-write behavior. The engine defers the *unrendered* first media
-period until a valid callback; missing volume mutes media
-but must not prevent system, announcement, or alarm playback. `audiod` owns
-the hardware `PCM Playback Volume` master at all times, including AirPlay:
-the engine reads it to select EQ, never writes or restores it, and leaves
-button/API changes intact. The sender's level is therefore *additional*
-media attenuation beneath the device master, not an override of the master.
-All four buses meet at the same EQ/MBCL before the PCM write. Source-priority
-ducking and volume-curve transitions still require real-device listening and
-waveform testing; the vendor compressor is an approximation, not stock-exact.
+Shairport's pipe uses `ignore_volume_control = "yes"`: the callback is
+consumed outside the chroot by UI `airplayd`, which maps the standard
+`-30..0 dB` slider to audiod's `1..100` PCM master (and `-144 dB`
+to master mute, `0`). The same master is used by buttons and the API;
+button changes persist until another sender callback, without reverse
+synchronization to the sender. The engine plays non-muted AirPlay media at
+unity software gain, avoiding a second attenuation; explicit sender mute also
+zeros its media bus while the shared master mutes all output buses. Generic
+media still uses `media.volume`. The bridge removes session files at disconnect;
+Shairport's blocking before-play hook clears callbacks that arrive late after
+the previous disconnect before its player thread republishes initial volume.
+The engine defers the unrendered first AirPlay period until the controller
+acknowledges both the current session marker and callback inode after a
+successful audiod write and readback; failure never blocks system,
+announcement, or alarm playback. The engine reads the current PCM master for
+EQ and never writes or restores it. All four buses meet at the same EQ/MBCL
+before the PCM write. Source-priority ducking and volume-curve transitions
+still require real-device listening and waveform testing; the vendor
+compressor is an approximation, not stock-exact.
 
 The Avahi/D-Bus payload remains inside the fixed 16 MiB boot envelope by using
 the free range below the DT-reserved RAM console at `0x44400000`.

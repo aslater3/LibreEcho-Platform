@@ -22,6 +22,7 @@
 #define DEFAULT_MEDIA_FIFO "/run/libreecho-audio/media.pcm"
 #define DEFAULT_VOLUME_FILE "/run/libreecho-audio/media.volume"
 #define DEFAULT_AIRPLAY_VOLUME_FILE "/run/libreecho-audio/airplay.volume"
+#define DEFAULT_AIRPLAY_MASTER_FILE "/run/libreecho-audio/airplay.master"
 #define DEFAULT_AIRPLAY_ACTIVE_FILE "/run/libreecho-audio/airplay.active"
 #define BUFFER_SIZE 8192
 
@@ -82,12 +83,9 @@ static int set_volume(const char *path, const char *text)
 	int fd;
 	int length;
 
-	if (end == text || *end != '\0' || !isfinite(db))
+	if (end == text || *end != '\0' || !isfinite(db) ||
+	    (db != -144.0 && (db < -30.0 || db > 0.0)))
 		return 2;
-	if (db < -144.0)
-		db = -144.0;
-	if (db > 0.0)
-		db = 0.0;
 	length = snprintf(value, sizeof(value), "%.6f\n", db);
 	if (length < 0 || (size_t)length >= sizeof(value) ||
 	    snprintf(temporary, sizeof(temporary), "%s.tmp", path) < 0)
@@ -117,6 +115,8 @@ static int clear_session_state(void)
 	/* The volume file is session state.  Do not let a new connection
 	 * inherit the previous phone's volume before its first callback. */
 	if (unlink(DEFAULT_AIRPLAY_VOLUME_FILE) < 0 && errno != ENOENT)
+		result = 1;
+	if (unlink(DEFAULT_AIRPLAY_MASTER_FILE) < 0 && errno != ENOENT)
 		result = 1;
 	/* Old bridge versions also wrote the same callback to media.volume.
 	 * This bridge is its only writer; clear a legacy sender mute before a
@@ -198,13 +198,11 @@ int main(int argc, char **argv)
 
 	if (argc == 2 && (!strcmp(argv[1], "--start") ||
 			 !strcmp(argv[1], "--stop"))) {
-		/*
-		 * These hooks are retained for compatibility with older
-		 * Shairport configurations, but they must not publish session
-		 * state.  The hook runs before the first PCM bytes are available
-		 * and can therefore leave a stale marker behind.  The bridge owns
-		 * the marker and publishes it only after both FIFOs are connected.
-		 */
+		/* These sessioncontrol hooks only clear files; the bridge owns the
+		 * active marker after both PCM FIFOs connect. Shairport runs --start
+		 * before launching the player thread, which publishes its initial
+		 * volume callback. This discards any late callback left by the
+		 * preceding playback before its next initial volume is published. */
 		return set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 0);
 	}
 	if (argc == 3 && !strcmp(argv[1], "--set-volume"))
