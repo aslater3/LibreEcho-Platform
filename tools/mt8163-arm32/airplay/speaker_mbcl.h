@@ -4,10 +4,10 @@
 /*
  * Original, mono, 48 kHz approximation of Radar's stock MBCL configuration.
  * No proprietary coefficients or vendor filter/detector implementation are used.
- * Three sequential one-pole low-pass/residual splits form complementary bands:
- * their sample-wise sum is the input, even at crossover transients.  The
- * independent peak detectors use instantaneous attack and exponential release;
- * these are deliberately not claimed to reproduce the vendor's internals.
+ * The independently designed LR4/phase-aligned filterbank is measured against
+ * the stock four-band output for the configured 48-kHz path. Band summation
+ * has flat magnitude but is not a sample-wise identity. The compressor and
+ * limiter remain approximations and are not claimed to match stock dynamics.
  *
  * Input and output are wide PCM sample units (32768 units = 0 dBFS), never
  * S16-clamped here.  The -3 dBFS bus limiter precedes the caller's +3 dB trim.
@@ -27,13 +27,70 @@ struct speaker_mbcl_band {
     float lim_release;
 };
 
+/* Two independently designed Butterworth biquads form each LR4 branch. */
+struct speaker_mbcl_biquad {
+    double b0, b1, b2, a1, a2;
+    double x1, x2, y1, y2;
+};
+struct speaker_mbcl_pair {
+    struct speaker_mbcl_biquad low[2], high[2];
+};
 struct speaker_mbcl {
-    float lp[3];
-    float lp_alpha[3];
+    struct speaker_mbcl_pair split[3], phase_low1, phase_low2, phase_mid2;
+    float band_delay[SPEAKER_MBCL_BANDS][3];
+    unsigned int delay_cursor;
     struct speaker_mbcl_band band[SPEAKER_MBCL_BANDS];
     float full_gain;
     float full_release;
 };
+
+static inline void speaker_mbcl_design_biquad(struct speaker_mbcl_biquad *b,
+                                               double hz, int high)
+{
+    const double w = 6.2831853071795864769 * hz / SPEAKER_MBCL_RATE;
+    const double alpha = sin(w) / 1.4142135623730950488;
+    const double c = cos(w), a0 = 1.0 + alpha;
+    b->b0 = (high ? 1.0 + c : 1.0 - c) * 0.5 / a0;
+    b->b1 = (high ? -(1.0 + c) : 1.0 - c) / a0;
+    b->b2 = b->b0;
+    b->a1 = -2.0 * c / a0;
+    b->a2 = (1.0 - alpha) / a0;
+}
+
+static inline void speaker_mbcl_design_pair(struct speaker_mbcl_pair *p, double hz)
+{
+    int i;
+    for (i = 0; i < 2; ++i) {
+        speaker_mbcl_design_biquad(&p->low[i], hz, 0);
+        speaker_mbcl_design_biquad(&p->high[i], hz, 1);
+    }
+}
+
+static inline double speaker_mbcl_biquad_step(struct speaker_mbcl_biquad *b, double x)
+{
+    double y = b->b0*x + b->b1*b->x1 + b->b2*b->x2 - b->a1*b->y1 - b->a2*b->y2;
+    b->x2 = b->x1; b->x1 = x;
+    b->y2 = b->y1; b->y1 = y;
+    return y;
+}
+
+static inline void speaker_mbcl_pair_step(struct speaker_mbcl_pair *p, double x,
+                                           double *low, double *high)
+{
+    int i;
+    *low = *high = x;
+    for (i = 0; i < 2; ++i) {
+        *low = speaker_mbcl_biquad_step(&p->low[i], *low);
+        *high = speaker_mbcl_biquad_step(&p->high[i], *high);
+    }
+}
+
+static inline double speaker_mbcl_phase_step(struct speaker_mbcl_pair *p, double x)
+{
+    double low, high;
+    speaker_mbcl_pair_step(p, x, &low, &high);
+    return low + high;
+}
 
 /* Exponential one-pole: 1/e decay in the configured time interval. */
 static inline float speaker_mbcl_release(float milliseconds)
@@ -43,12 +100,15 @@ static inline float speaker_mbcl_release(float milliseconds)
 
 static inline void speaker_mbcl_init(struct speaker_mbcl *m)
 {
-    static const float fc[3] = {70.0f, 200.0f, 3250.0f};
+    static const double fc[3] = {70.0, 200.0, 3250.0};
     static const float release[4] = {200.0f, 80.0f, 20.0f, 20.0f};
     int i;
     memset(m, 0, sizeof(*m));
     for (i = 0; i < 3; ++i)
-        m->lp_alpha[i] = 1.0f - expf(-6.283185307179586f * fc[i] / SPEAKER_MBCL_RATE);
+        speaker_mbcl_design_pair(&m->split[i], fc[i]);
+    speaker_mbcl_design_pair(&m->phase_low1, fc[1]);
+    speaker_mbcl_design_pair(&m->phase_low2, fc[2]);
+    speaker_mbcl_design_pair(&m->phase_mid2, fc[2]);
     for (i = 0; i < SPEAKER_MBCL_BANDS; ++i) {
         m->band[i].lim_gain = 1.0f;
         m->band[i].lim_release = speaker_mbcl_release(release[i]);
@@ -58,16 +118,25 @@ static inline void speaker_mbcl_init(struct speaker_mbcl *m)
     m->full_release = speaker_mbcl_release(20.0f);
 }
 
-/* This independent crossover entry point also permits direct unity testing. */
+/* Four LR4 bands, later-crossover allpasses and measured three-frame delay. */
 static inline void speaker_mbcl_split(struct speaker_mbcl *m, float x, float out[4])
 {
+    double low0, high0, low1, high1, low2, high2;
+    double raw[4];
     int i;
-    for (i = 0; i < 3; ++i) {
-        m->lp[i] += m->lp_alpha[i] * (x - m->lp[i]);
-        out[i] = m->lp[i];
-        x -= out[i];
+    speaker_mbcl_pair_step(&m->split[0], x, &low0, &high0);
+    speaker_mbcl_pair_step(&m->split[1], high0, &low1, &high1);
+    speaker_mbcl_pair_step(&m->split[2], high1, &low2, &high2);
+    raw[0] = speaker_mbcl_phase_step(&m->phase_low2,
+             speaker_mbcl_phase_step(&m->phase_low1, low0));
+    raw[1] = speaker_mbcl_phase_step(&m->phase_mid2, low1);
+    raw[2] = low2;
+    raw[3] = high2;
+    for (i = 0; i < SPEAKER_MBCL_BANDS; ++i) {
+        out[i] = m->band_delay[i][m->delay_cursor];
+        m->band_delay[i][m->delay_cursor] = (float)raw[i];
     }
-    out[3] = x;
+    m->delay_cursor = (m->delay_cursor + 1u) % 3u;
 }
 
 /* Instantaneous attack, 1/e recovery of gain toward unity. */
