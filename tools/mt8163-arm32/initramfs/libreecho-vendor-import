@@ -1,12 +1,17 @@
 #!/bin/sh
 # Import the minimum MT8163 connectivity firmware from the owner's stock OS.
-# No vendor bytes are distributed or persisted by LibreEcho.
+# No vendor bytes are distributed or persisted by LibreEcho.  Unknown complete
+# owner-local sets may be explicitly enrolled by hash after structural checks;
+# only that hash/size manifest is persisted, never the vendor payload bytes.
 set -eu
 
 DATA_ROOT=${DATA_ROOT:-/data}
 TEST_MODE=${LIBREECHO_VENDOR_TEST_MODE:-0}
 BUNDLE_ID=mt8163-v181-stock-v1
-SPEC=${LIBREECHO_VENDOR_SPEC:-/etc/libreecho/vendor-assets/$BUNDLE_ID.tsv}
+SPEC_DIR=${LIBREECHO_VENDOR_SPEC_DIR:-/etc/libreecho/vendor-assets}
+SPEC_OVERRIDE=${LIBREECHO_VENDOR_SPEC:-}
+SPEC=${SPEC_OVERRIDE:-$SPEC_DIR/$BUNDLE_ID.tsv}
+ENROLLED_SPEC=${LIBREECHO_VENDOR_ENROLLED_SPEC:-$DATA_ROOT/libreecho/config/vendor-assets.tsv}
 FIRMWARE_ROOT=${LIBREECHO_VENDOR_FIRMWARE_ROOT:-/lib/firmware}
 SYSTEM_A_DEV=${LIBREECHO_VENDOR_SYSTEM_A_DEV:-/dev/mmcblk0p13}
 SYSTEM_A_SYSFS=${LIBREECHO_VENDOR_SYSTEM_A_SYSFS:-/sys/class/block/mmcblk0p13}
@@ -93,10 +98,15 @@ cleanup()
 }
 trap cleanup EXIT HUP INT TERM
 
-validate_spec()
+validate_spec_file()
 {
-    [ -f "$SPEC" ] && [ ! -L "$SPEC" ] || fail VENDOR_IMPORT_SPEC_MISSING
+    spec_path=$1
+    [ -f "$spec_path" ] && [ ! -L "$spec_path" ] || fail VENDOR_IMPORT_SPEC_MISSING
     count=0
+    saw_patch_0=0
+    saw_patch_1=0
+    saw_wifi=0
+    saw_wmt=0
     while IFS='|' read -r expected_hash expected_size source_name target_name; do
         [ -n "$expected_hash" ] || continue
         case "$expected_hash" in
@@ -106,18 +116,49 @@ validate_spec()
         case "$expected_size" in
             ''|*[!0-9]*) fail VENDOR_IMPORT_SPEC_SIZE_INVALID ;;
         esac
+        [ "$expected_size" -gt 0 ] || fail VENDOR_IMPORT_SPEC_SIZE_INVALID
         case "$source_name" in
             etc/firmware/*|vendor/firmware/*|system/vendor/firmware/*|system/etc/firmware/*) ;;
             *) fail VENDOR_IMPORT_SPEC_SOURCE_INVALID ;;
         esac
         case "$source_name" in *..*|*//*|*/./*) fail VENDOR_IMPORT_SPEC_SOURCE_INVALID ;; esac
         case "$target_name" in
-            ''|*[!A-Za-z0-9._-]*|*..*) fail VENDOR_IMPORT_SPEC_TARGET_INVALID ;;
+            ROMv2_lm_patch_1_0_hdr.bin)
+                [ "$saw_patch_0" -eq 0 ] || fail VENDOR_IMPORT_SPEC_TARGET_DUPLICATE
+                saw_patch_0=1
+                ;;
+            ROMv2_lm_patch_1_1_hdr.bin)
+                [ "$saw_patch_1" -eq 0 ] || fail VENDOR_IMPORT_SPEC_TARGET_DUPLICATE
+                saw_patch_1=1
+                ;;
+            WIFI_RAM_CODE_8163)
+                [ "$saw_wifi" -eq 0 ] || fail VENDOR_IMPORT_SPEC_TARGET_DUPLICATE
+                saw_wifi=1
+                ;;
+            WMT_SOC.cfg)
+                [ "$saw_wmt" -eq 0 ] || fail VENDOR_IMPORT_SPEC_TARGET_DUPLICATE
+                saw_wmt=1
+                ;;
+            *) fail VENDOR_IMPORT_SPEC_TARGET_INVALID ;;
         esac
         [ "${source_name##*/}" = "$target_name" ] || fail VENDOR_IMPORT_SPEC_SOURCE_TARGET_MISMATCH
         count=$((count + 1))
-    done < "$SPEC"
+    done < "$spec_path"
     [ "$count" -eq 4 ] || fail VENDOR_IMPORT_SPEC_COUNT_INVALID
+    [ "$saw_patch_0" -eq 1 ] && [ "$saw_patch_1" -eq 1 ] && \
+        [ "$saw_wifi" -eq 1 ] && [ "$saw_wmt" -eq 1 ] || \
+        fail VENDOR_IMPORT_SPEC_TARGET_SET_INVALID
+}
+
+validate_enrolled_spec()
+{
+    [ -e "$ENROLLED_SPEC" ] || [ -L "$ENROLLED_SPEC" ] || return 1
+    [ -f "$ENROLLED_SPEC" ] && [ ! -L "$ENROLLED_SPEC" ] || \
+        fail VENDOR_IMPORT_ENROLLED_SPEC_INVALID
+    [ "$(stat -c %a "$ENROLLED_SPEC")" = 600 ] || \
+        fail VENDOR_IMPORT_ENROLLED_SPEC_MODE_INVALID
+    validate_spec_file "$ENROLLED_SPEC"
+    return 0
 }
 
 layout_is_safe()
@@ -173,6 +214,7 @@ layout_matches()
 {
     candidate_layout=$1
     candidate_mode=$2
+    candidate_spec=$3
     while IFS='|' read -r expected_hash expected_size source_name target_name; do
         [ -n "$expected_hash" ] || continue
         candidate=$SOURCE_ROOT/$candidate_layout/$target_name
@@ -183,18 +225,58 @@ layout_matches()
         else
             forced_file_is_compatible "$candidate" "$target_name" || return 1
         fi
-    done < "$SPEC"
+    done < "$candidate_spec"
     return 0
+}
+
+try_shipped_specs()
+{
+    candidate_layout=$1
+    if [ -n "$SPEC_OVERRIDE" ]; then
+        if layout_matches "$candidate_layout" pinned "$SPEC"; then
+            ACTIVE_SPEC=$SPEC
+            VERIFICATION=hash-pinned
+            return 0
+        fi
+        return 1
+    fi
+
+    found_shipped=0
+    for candidate_spec in "$SPEC_DIR"/mt8163-v181-stock-v*.tsv; do
+        [ -e "$candidate_spec" ] || [ -L "$candidate_spec" ] || continue
+        found_shipped=1
+        validate_spec_file "$candidate_spec"
+        if layout_matches "$candidate_layout" pinned "$candidate_spec"; then
+            ACTIVE_SPEC=$candidate_spec
+            VERIFICATION=hash-pinned
+            return 0
+        fi
+    done
+    [ "$found_shipped" -eq 1 ] || fail VENDOR_IMPORT_SPEC_MISSING
+    return 1
 }
 
 select_source_layout()
 {
     saw_symlink=0
+    saw_safe_layout=0
+    enrolled_present=0
+    if validate_enrolled_spec; then
+        enrolled_present=1
+    fi
+
     for candidate_layout in $SOURCE_LAYOUTS; do
         if layout_is_safe "$candidate_layout"; then
-            if layout_matches "$candidate_layout" pinned; then
+            saw_safe_layout=1
+            if try_shipped_specs "$candidate_layout"; then
                 SELECTED_LAYOUT=$candidate_layout
-                VERIFICATION=hash-pinned
+                return 0
+            fi
+            if [ "$enrolled_present" -eq 1 ] && \
+                    layout_matches "$candidate_layout" pinned "$ENROLLED_SPEC"; then
+                ACTIVE_SPEC=$ENROLLED_SPEC
+                SELECTED_LAYOUT=$candidate_layout
+                VERIFICATION=owner-local-enrolled
                 return 0
             fi
         else
@@ -202,21 +284,45 @@ select_source_layout()
             [ "$layout_rc" -eq 2 ] && saw_symlink=1
         fi
     done
+
     if [ "$FORCE_REQUESTED" -eq 1 ]; then
         for candidate_layout in $SOURCE_LAYOUTS; do
             if layout_is_safe "$candidate_layout"; then
-                if layout_matches "$candidate_layout" forced; then
+                saw_safe_layout=1
+                if layout_matches "$candidate_layout" forced "$SPEC"; then
                     SELECTED_LAYOUT=$candidate_layout
+                    ACTIVE_SPEC=$SPEC
                     VERIFICATION=forced-unverified
                     return 0
                 fi
             fi
         done
     fi
-    [ "$saw_symlink" -eq 0 ] || fail VENDOR_IMPORT_SOURCE_PATH_SYMLINK
+
+    if [ "$saw_safe_layout" -eq 0 ] && [ "$saw_symlink" -eq 1 ]; then
+        fail VENDOR_IMPORT_SOURCE_PATH_SYMLINK
+    fi
     if [ "$FORCE_REQUESTED" -eq 1 ]; then
         fail VENDOR_IMPORT_FORCED_SET_INCOMPATIBLE
     fi
+    if [ "$enrolled_present" -eq 1 ]; then
+        fail VENDOR_IMPORT_ENROLLED_SET_MISMATCH
+    fi
+
+    # No globally approved or device-enrolled revision matched. Before calling
+    # this a generic hash miss, determine whether one safe stock layout contains
+    # the complete expected four-file MT8163 set and passes the same structural
+    # checks used by the explicit one-boot force path. This is discovery only:
+    # no bytes are copied and no local trust record is created until the owner
+    # explicitly opts in through the authenticated setup flow.
+    for candidate_layout in $SOURCE_LAYOUTS; do
+        if layout_is_safe "$candidate_layout" && \
+                layout_matches "$candidate_layout" forced "$SPEC"; then
+            SELECTED_LAYOUT=$candidate_layout
+            fail VENDOR_IMPORT_UNKNOWN_COMPATIBLE_SET
+        fi
+    done
+
     fail VENDOR_IMPORT_NO_HASH_PINNED_SET
 }
 
@@ -297,13 +403,38 @@ install_runtime_files()
     mv "$temp" "$alias"
 }
 
+enrol_for_future_boots()
+{
+    [ "$VERIFICATION" = forced-unverified ] || return 0
+    enrolled_parent=${ENROLLED_SPEC%/*}
+    [ "$enrolled_parent" != "$ENROLLED_SPEC" ] || fail VENDOR_IMPORT_ENROLLED_SPEC_PATH_INVALID
+    [ -d "$enrolled_parent" ] && [ ! -L "$enrolled_parent" ] || \
+        fail VENDOR_IMPORT_ENROLLED_SPEC_PARENT_INVALID
+    if [ -e "$ENROLLED_SPEC" ] || [ -L "$ENROLLED_SPEC" ]; then
+        [ -f "$ENROLLED_SPEC" ] && [ ! -L "$ENROLLED_SPEC" ] || \
+            fail VENDOR_IMPORT_ENROLLED_SPEC_INVALID
+        [ "$(stat -c %a "$ENROLLED_SPEC")" = 600 ] || \
+            fail VENDOR_IMPORT_ENROLLED_SPEC_MODE_INVALID
+    fi
+    enrolled_temp=$enrolled_parent/.vendor-assets.tsv.enrol.$$
+    [ ! -e "$enrolled_temp" ] && [ ! -L "$enrolled_temp" ] || \
+        fail VENDOR_IMPORT_ENROLLED_SPEC_COLLISION
+    cp "$STAGE/ASSETS.tsv" "$enrolled_temp"
+    chmod 0600 "$enrolled_temp"
+    validate_spec_file "$enrolled_temp"
+    mv "$enrolled_temp" "$ENROLLED_SPEC"
+}
+
 prepare_status_path || fail VENDOR_IMPORT_STATUS_PATH_UNSAFE
-validate_spec
+validate_spec_file "$SPEC"
 write_status
 
 [ -d "$DATA_ROOT" ] && [ ! -L "$DATA_ROOT" ] || fail VENDOR_IMPORT_DATA_ROOT_INVALID
 if [ "$TEST_MODE" != 1 ]; then
     [ "$DATA_ROOT" = /data ] || fail VENDOR_IMPORT_DATA_ROOT_REJECTED
+    [ "$SPEC_DIR" = /etc/libreecho/vendor-assets ] || fail VENDOR_IMPORT_SPEC_DIR_REJECTED
+    [ "$ENROLLED_SPEC" = /data/libreecho/config/vendor-assets.tsv ] || \
+        fail VENDOR_IMPORT_ENROLLED_SPEC_PATH_INVALID
     grep -q ' /data ' /proc/mounts 2>/dev/null || fail VENDOR_IMPORT_USERDATA_NOT_MOUNTED
     [ -b "$SYSTEM_A_DEV" ] || fail VENDOR_IMPORT_SYSTEM_A_DEVICE_MISSING
     [ -f "$SYSTEM_A_SYSFS/uevent" ] || fail VENDOR_IMPORT_SYSTEM_A_IDENTITY_MISSING
@@ -358,6 +489,7 @@ if [ "$VERIFICATION" = forced-unverified ]; then
         printf '%s|%s|%s/%s|%s\n' \
             "$actual_hash" "$actual_size" "$SELECTED_LAYOUT" "$target_name" "$target_name" >> "$ACTIVE_SPEC"
     done < "$SPEC"
+    validate_spec_file "$ACTIVE_SPEC"
 fi
 
 while IFS='|' read -r expected_hash expected_size source_name target_name; do
@@ -379,6 +511,7 @@ fi
 chmod 0600 "$STAGE/ASSETS.tsv"
 verify_assets "$STAGE" || fail VENDOR_IMPORT_STAGE_INVALID
 install_runtime_files
+enrol_for_future_boots
 sync
 STATUS_STATE=ready
 STATUS_ERROR=none
