@@ -12,6 +12,9 @@ import time
 from test_airplay_session_dsp import ENGINE_TEST, HERE
 from test_audio_period_buffer import MIXER_HEADER, PCM_HEADER
 
+A = "a" * 32
+B = "b" * 32
+
 ENGINE_DRIVER = ENGINE_TEST.split("static void put(")[0] + r'''
 int main(int argc, char **argv)
 {
@@ -79,12 +82,12 @@ def compile_fixture(root, fixed_nonce=False, pause_before_marker=False):
                     "-lm", "-o", str(root / "bridge")], check=True, timeout=60)
 
 
-def hook(root, arg, timeout=3):
-    return subprocess.run([str(root / "bridge"), arg], timeout=timeout).returncode
+def hook(root, arg, token=A, timeout=3):
+    return subprocess.run([str(root / "bridge"), arg, token], timeout=timeout).returncode
 
 
-def admit(root):
-    assert subprocess.run([str(root / "bridge"), "--set-volume", "-12"],
+def admit(root, token=A):
+    assert subprocess.run([str(root / "bridge"), "--set-volume", token, "-12"],
                           timeout=3).returncode == 0
     marker = (root / "airplay.active").stat()
     volume = (root / "airplay.volume").stat()
@@ -128,7 +131,7 @@ def run():
                 out = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
                 os.write(out, a)
                 os.close(out)
-                assert hook(root, "--start") == 0
+                assert hook(root, "--start", B) == 0
                 boundary = len(log.read_text().splitlines())
                 bridge.send_signal(signal.SIGCONT)
                 os.write(inp, b)  # marker and first PCM in same engine poll interval
@@ -137,9 +140,9 @@ def run():
                 # Callback attempted while a stop reset owns the lock must
                 # wait, then fail against the absent marker (not resurrect A).
                 engine.send_signal(signal.SIGSTOP)
-                stopping_hook = subprocess.Popen([str(root / "bridge"), "--stop"])
+                stopping_hook = subprocess.Popen([str(root / "bridge"), "--stop", B])
                 wait_for(lambda: (root / "airplay.reset").exists())
-                callback = subprocess.Popen([str(root / "bridge"), "--set-volume", "-12"])
+                callback = subprocess.Popen([str(root / "bridge"), "--set-volume", B, "-12"])
                 try:
                     assert callback.poll() is None
                 finally:
@@ -163,7 +166,7 @@ def run():
     with tempfile.TemporaryDirectory(prefix="le-fence-restart-") as temp:
         root = Path(temp)
         compile_fixture(root)
-        (root / "airplay.active").write_text("")
+        (root / "airplay.active").write_text(A + "\n")
         log = root / "observed"
         engine = subprocess.Popen([str(root / "engine"), str(root), str(log)])
         try:
@@ -204,7 +207,7 @@ def run():
         engine = subprocess.Popen([str(root / "engine"), str(root), str(log)])
         try:
             wait_for(lambda: (root / "airplay.reset-ack").stat().st_ino != old_ack)
-            (root / "airplay.active").write_text("")
+            (root / "airplay.active").write_text(A + "\n")
             os.write(out, fresh)
             wait_for(lambda: "2200" in log.read_text().splitlines())
             assert "1100" not in log.read_text().splitlines()
@@ -212,18 +215,19 @@ def run():
             engine.terminate(); engine.wait(timeout=2)
             os.close(out)
 
-    # A held lock must not leave an active marker or callback on --stop failure.
+    # A held lock cannot authorize revocation of an unverified session.
     with tempfile.TemporaryDirectory(prefix="le-fence-lock-") as temp:
         root = Path(temp)
         compile_fixture(root)
-        for name in ("airplay.active", "airplay.volume", "airplay.master"):
+        (root / "airplay.active").write_text(A + "\n")
+        for name in ("airplay.volume", "airplay.master"):
             (root / name).write_text("stale\n")
         lock = os.open(root / "airplay.lock", os.O_CREAT | os.O_RDWR, 0o640)
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             assert hook(root, "--stop") != 0
             for name in ("airplay.active", "airplay.volume", "airplay.master"):
-                assert not (root / name).exists(), name
+                assert (root / name).exists(), name
         finally:
             os.close(lock)
 
@@ -241,7 +245,7 @@ def run():
             fifo = root / "airplay-media.pcm"
             wait_for(fifo.exists)
             out = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
-            hook_process = subprocess.Popen([str(root / "bridge"), "--start"])
+            hook_process = subprocess.Popen([str(root / "bridge"), "--start", A])
             wait_for(lambda: Path(f"/proc/{hook_process.pid}/status").read_text()
                      .split("State:\t", 1)[1].lstrip().startswith("T"))
             old_ack = (root / "airplay.reset-ack").stat().st_ino
@@ -278,7 +282,7 @@ def run():
         (root / "airplay.reset-ack").write_text("0" * 32 + "\n")
         assert hook(root, "--start") != 0
         assert not (root / "airplay.active").exists()
-        assert subprocess.run([str(root / "bridge"), "--set-volume", "-12"], timeout=3).returncode != 0
+        assert subprocess.run([str(root / "bridge"), "--set-volume", A, "-12"], timeout=3).returncode != 0
         assert hook(root, "--stop") != 0
         assert not (root / "airplay.active").exists()
     print("compiled bridge/engine generation fence: PASS")

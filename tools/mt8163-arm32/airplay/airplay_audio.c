@@ -28,6 +28,7 @@
 #define DEFAULT_AIRPLAY_RESET_FILE "/run/libreecho-audio/airplay.reset"
 #define DEFAULT_AIRPLAY_RESET_ACK_FILE "/run/libreecho-audio/airplay.reset-ack"
 #define BUFFER_SIZE 8192
+#define SESSION_TOKEN_LENGTH 32
 
 static volatile sig_atomic_t stopping;
 
@@ -77,7 +78,41 @@ static int write_all(int fd, const unsigned char *buffer, size_t length)
 	return sent == length ? 0 : -1;
 }
 
-static int set_volume(const char *path, const char *text)
+/* Hook tokens are exactly 128-bit lowercase hexadecimal, not paths or flags. */
+static int valid_session_token(const char *token)
+{
+	size_t i;
+	if (!token || strnlen(token, SESSION_TOKEN_LENGTH + 1) != SESSION_TOKEN_LENGTH)
+		return 0;
+	for (i = 0; i < SESSION_TOKEN_LENGTH; ++i)
+		if (!((token[i] >= '0' && token[i] <= '9') ||
+		      (token[i] >= 'a' && token[i] <= 'f')))
+			return 0;
+	return 1;
+}
+
+/* Called with the hook lock held. No symlink, truncated or extended marker
+ * can authorize a command; the whole content must match the caller's token. */
+static int matching_session(const char *token)
+{
+	char content[SESSION_TOKEN_LENGTH + 2];
+	struct stat st;
+	int fd, n;
+	if (!valid_session_token(token)) return 0;
+	fd = open(DEFAULT_AIRPLAY_ACTIVE_FILE, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0) return 0;
+	n = fstat(fd, &st);
+	if (n == 0 && S_ISREG(st.st_mode) && st.st_size == SESSION_TOKEN_LENGTH + 1)
+		n = (int)read(fd, content, SESSION_TOKEN_LENGTH + 1);
+	else
+		n = -1;
+	close(fd);
+	return n == SESSION_TOKEN_LENGTH + 1 &&
+	       !memcmp(content, token, SESSION_TOKEN_LENGTH) &&
+	       content[SESSION_TOKEN_LENGTH] == '\n';
+}
+
+static int set_volume(const char *path, const char *token, const char *text)
 {
 	char *end;
 	double db = strtod(text, &end);
@@ -89,12 +124,7 @@ static int set_volume(const char *path, const char *text)
 	if (end == text || *end != '\0' || !isfinite(db) ||
 	    (db != -144.0 && (db < -30.0 || db > 0.0)))
 		return 2;
-	{
-		struct stat marker;
-		if (lstat(DEFAULT_AIRPLAY_ACTIVE_FILE, &marker) < 0 ||
-		    !S_ISREG(marker.st_mode))
-			return 2;
-	}
+	if (!matching_session(token)) return 2;
 	length = snprintf(value, sizeof(value), "%.6f\n", db);
 	if (length < 0 || (size_t)length >= sizeof(value) ||
 	    snprintf(temporary, sizeof(temporary), "%s.tmp", path) < 0)
@@ -130,8 +160,7 @@ static int clear_session_state(void)
 	return result;
 }
 
-/* Serialize hook processes across marker check, callback rename and stop.
- * Untagged commands still cannot prove which Shairport playback sent them. */
+/* Serialize hook processes across marker check, callback rename and stop. */
 static int lock_session(void)
 {
 	struct stat st;
@@ -155,26 +184,24 @@ static int lock_session(void)
 	return -1;
 }
 
-static int set_active(const char *path, int active)
+static int set_active(const char *path, const char *token)
 {
 	int fd;
 	char temporary[256];
 
-	if (!active)
-		return !strcmp(path, DEFAULT_AIRPLAY_ACTIVE_FILE)
-			? clear_session_state()
-			: (unlink(path) < 0 && errno != ENOENT ? 1 : 0);
 	if (snprintf(temporary, sizeof(temporary), "%s.tmp.XXXXXX", path) >=
 	    (int)sizeof(temporary))
 		return 1;
 	fd = mkstemp(temporary);
 	if (fd < 0)
 		return 1;
-	if (fchmod(fd, 0640) < 0 || close(fd) < 0) {
+	if (fchmod(fd, 0640) < 0 || write(fd, token, SESSION_TOKEN_LENGTH) != SESSION_TOKEN_LENGTH ||
+	    write(fd, "\n", 1) != 1) {
 		(void)close(fd);
 		(void)unlink(temporary);
 		return 1;
 	}
+	if (close(fd) < 0) { (void)unlink(temporary); return 1; }
 	if (rename(temporary, path) < 0) {
 		(void)unlink(temporary);
 		return 1;
@@ -333,15 +360,14 @@ int main(int argc, char **argv)
 	struct sigaction action;
 	int lock_fd, result;
 
-	if (argc == 2 && (!strcmp(argv[1], "--start") ||
+	if (argc >= 2 && (!strcmp(argv[1], "--start") ||
 			 !strcmp(argv[1], "--stop"))) {
+		if (argc != 3 || !valid_session_token(argv[2])) return 2;
 		lock_fd = lock_session();
-		if (lock_fd < 0) {
-			/* Stop must revoke admission even when a wedged lock holder
-			 * prevents the normal drain/reset handshake. Report failure. */
-			if (!strcmp(argv[1], "--stop"))
-				(void)clear_session_state();
-			return 1;
+		if (lock_fd < 0) return 1; /* Never revoke another session without a match. */
+		if (!strcmp(argv[1], "--stop") && !matching_session(argv[2])) {
+			close(lock_fd);
+			return 2;
 		}
 		result = clear_session_state();
 		if (!result)
@@ -349,15 +375,16 @@ int main(int argc, char **argv)
 		if (!result)
 			result = reset_engine();
 		if (!result && !strcmp(argv[1], "--start"))
-			result = set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 1);
+			result = set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, argv[2]);
 		close(lock_fd);
 		return result;
 	}
-	if (argc == 3 && !strcmp(argv[1], "--set-volume")) {
+	if (argc >= 2 && !strcmp(argv[1], "--set-volume")) {
+		if (argc != 4 || !valid_session_token(argv[2])) return 2;
 		lock_fd = lock_session();
 		if (lock_fd < 0)
 			return 1;
-		result = set_volume(DEFAULT_AIRPLAY_VOLUME_FILE, argv[2]);
+		result = set_volume(DEFAULT_AIRPLAY_VOLUME_FILE, argv[2], argv[3]);
 		close(lock_fd);
 		return result;
 	}

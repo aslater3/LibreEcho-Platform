@@ -1493,6 +1493,11 @@ class SourceTests(unittest.TestCase):
         subprocess.run([sys.executable, str(TOOLS_DIR / "airplay/test_airplay_volume_contract.py")],
                        check=True, timeout=90)
 
+    def test_airplay_shairport_hooks_reject_stale_sessions(self) -> None:
+        for name in ("test_airplay_hook_identity.py", "test_shairport_hook_patch.py"):
+            subprocess.run([sys.executable, str(TOOLS_DIR / "airplay" / name)],
+                           check=True, timeout=90)
+
     def test_puffin_speaker_profile_matches_stock_dump(self) -> None:
         kernel = TOOLS_DIR.parent.parent
         codec = (kernel / "sound/soc/codecs/tlv320aic32x4.c").read_text()

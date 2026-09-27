@@ -291,8 +291,9 @@ def main():
         src = root / "test.c"
         src.write_text(ENGINE_TEST)
         binary = root / "test"
-        subprocess.run([os.getenv("CC", "cc"), "-std=c99", "-Wall", "-Wextra", "-Werror", "-ffunction-sections", "-fdata-sections", "-I", str(root), "-I", str(HERE), str(src), "-Wl,--gc-sections", "-lm", "-o", str(binary)], check=True, timeout=60)
-        subprocess.run([str(binary)], check=True, timeout=30)
+        fixture_env = {**os.environ, "TMPDIR": str(root)}
+        subprocess.run([os.getenv("CC", "cc"), "-std=c99", "-Wall", "-Wextra", "-Werror", "-ffunction-sections", "-fdata-sections", "-I", str(root), "-I", str(HERE), str(src), "-Wl,--gc-sections", "-lm", "-o", str(binary)], check=True, timeout=60, env=fixture_env)
+        subprocess.run([str(binary)], check=True, timeout=30, env=fixture_env)
 
         # Hook/transport subprocess coverage lives in test_airplay_generation_fence.py.
 

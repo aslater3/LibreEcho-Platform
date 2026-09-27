@@ -26,29 +26,28 @@ The payload therefore uses Shairport's raw named-pipe backend. The
 `libreecho-airplay-audio` process is now only a producer: it forwards decoded
 S16_LE/48 kHz/stereo PCM to the dedicated `airplay-media.pcm` bus and never
 opens ALSA. The bridge's FIFO lifetime is not a playback session: Shairport's
-`--start` hook atomically creates a fresh regular `airplay.active` marker;
-`--stop` removes it and the callback/ack files. The bridge discards input
-while the marker is absent; bytes on the dedicated FIFO
-are never reclassified as generic media. Start and stop hold a bounded shared
-lock against the bridge's nonblocking read/write: they clear the marker and
-sender state, drain any predecessor bytes still in the Shairport input FIFO,
-then publish a fresh 128-bit reset token. The engine checks reset requests at
-most 20 ms apart even when idle, discards its buffered AirPlay periods and
-persistent dedicated FIFO, and atomically acknowledges the exact token before
-the hook publishes a new marker or returns from stop. A missing acknowledgement
-fails closed after about one second; priority buses remain independent. The
-bridge never holds the lock over an input wait or an unbounded output write.
-Only a marker following the completed reset admits its first PCM; a marker
-replacement without a reset is refused. Engine restart begins with AirPlay
-unarmed rather than trusting a surviving marker. This is a bridge/engine PCM
-fence, **not** provenance for dB-only callback commands: Shairport Sync 5.1
-(`d6ac53bf`) runs `command_start()` before player-thread creation and
-`command_stop()` after player-thread join, and `wait_for_completion = "yes"`
-waits for each hook process, but `player_stop` may be called from another
-connection thread. A late untagged callback executing after the next start
-cannot be attributed to its original playback. The release remains blocked on
-end-to-end callback provenance/ordering validation and real-device testing;
-pre-reset PCM already handed to ALSA cannot be retroactively unplayed.
+`--start <token>` hook atomically creates a fresh regular `airplay.active`
+marker containing that play's 128-bit lowercase hex token; `--stop <token>`
+removes it and the callback/ack files only when the token matches. The pinned
+Shairport 5.1 patch creates a fresh token for every play and passes it to
+start, stop and `--set-volume <token> <dB>`; pre-start volume is retained for
+the first playback callback. Untagged, malformed and stale stop/volume hooks
+fail closed. The bridge discards input while the marker is absent; bytes on
+the dedicated FIFO are never reclassified as generic media. Start and matching
+stop hold a bounded shared lock against the bridge's nonblocking read/write:
+they clear the marker and sender state, drain predecessor bytes still in the
+Shairport input FIFO, then publish a separate fresh 128-bit *engine reset*
+token. The engine checks reset requests at most 20 ms apart even when idle,
+discards its buffered AirPlay periods and persistent dedicated FIFO, and
+atomically acknowledges the exact reset token before the hook publishes a new
+marker or returns from stop. A missing acknowledgement fails closed after
+about one second; priority buses remain independent. The bridge never holds
+the lock over an input wait or an unbounded output write. Only a marker
+following the completed reset admits its first PCM; a marker replacement
+without a reset is refused. Engine restart begins with AirPlay unarmed rather
+than trusting a surviving marker. Host fixtures cover late A callbacks after
+B starts; real-device callback ordering and audio remain a release gate.
+Pre-reset PCM already handed to ALSA cannot be retroactively unplayed.
 `libreecho-audio-engine` is the sole playback PCM and amplifier owner;
 `audiod` alone writes the PCM Playback Volume control. The engine reads back
 both codec indices after prepare and again before unmute, refusing to play if
