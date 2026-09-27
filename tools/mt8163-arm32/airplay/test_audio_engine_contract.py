@@ -27,14 +27,15 @@ def main() -> None:
         "static int prepare_initial_period",
         "ready_activity_mask(sources)",
         "read_or_retain_sources",
-        "int poll_timeout = period_ready(sources) ? 20 : -1;",
+        "int poll_timeout = 20;",
         "power_output_controls(card)",
         "unmute_output_controls(card)",
         '#include "speaker_dsp.h"',
         "speaker_dsp_init(speaker, speaker_volume_percent(sources, master_volume));",
         "mixed = speaker_dsp_process(speaker, mixed);",
         "speaker_dsp_set_volume(&speaker,",
-        "speaker_volume_percent(sources, current_pcm_volume(card))",
+        "speaker_volume_percent(sources, master)",
+        "logical_master_gain(master)",
     )
     missing = [fragment for fragment in required if fragment not in text]
     if missing:
@@ -51,8 +52,9 @@ def main() -> None:
     # lives inside speaker_dsp_process, and the final PCM safety limiter must
     # remain after the common mixed-bus processing.
     tune_at = text.index("mixed = speaker_dsp_process(speaker, mixed);")
+    master_at = text.index("mixed = (int32_t)(((int64_t)mixed * *current_master_q15) >> 15);")
     trim_at = text.index("rendered = puffin_render_mono(dynamics, mixed);")
-    if tune_at > trim_at:
+    if not master_at < tune_at < trim_at:
         raise SystemExit("speaker tuning must run before the trim/limiter")
 
     # The tuned stage is only valid on the mono programme bus.

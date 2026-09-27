@@ -94,23 +94,6 @@ static int fail(const char *message)
     return 1;
 }
 
-static int ack_callback(const char *root)
-{
-    char marker[256], volume[256], ack[256];
-    struct stat m, v;
-    FILE *file;
-    if (snprintf(marker, sizeof(marker), "%s/airplay.active", root) >= (int)sizeof(marker) ||
-        snprintf(volume, sizeof(volume), "%s/airplay.volume", root) >= (int)sizeof(volume) ||
-        snprintf(ack, sizeof(ack), "%s/airplay.master", root) >= (int)sizeof(ack) ||
-        stat(marker, &m) || stat(volume, &v) || !(file = fopen(ack, "w"))) return -1;
-    fprintf(file, "%llu %llu %lld %ld %llu %llu %lld %ld\n",
-            (unsigned long long)m.st_dev, (unsigned long long)m.st_ino,
-            (long long)m.st_ctim.tv_sec, m.st_ctim.tv_nsec,
-            (unsigned long long)v.st_dev, (unsigned long long)v.st_ino,
-            (long long)v.st_ctim.tv_sec, v.st_ctim.tv_nsec);
-    return fclose(file);
-}
-
 int main(void)
 {
     struct source_bus sources[SOURCE_COUNT];
@@ -120,6 +103,7 @@ int main(void)
     int16_t half[PERIOD_SIZE * INPUT_CHANNELS / 2];
     int16_t output[PERIOD_SIZE * OUTPUT_CHANNELS];
     unsigned int activity_mask = 0;
+    int32_t master_gain = 32768;
     size_t period_bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
     size_t i;
 
@@ -162,7 +146,7 @@ int main(void)
 
     puffin_dynamics_init(&dynamics);
     speaker_dsp_init(&speaker, 100);
-    render_period(sources, output, &dynamics, &speaker);
+    render_period(sources, output, &dynamics, &speaker, 32768, &master_gain);
     /* A new LR4 filterbank has a measured three-frame startup delay. */
     for (i = 0; i < PERIOD_SIZE; ++i) {
         if (output[i * OUTPUT_CHANNELS] != output[i * OUTPUT_CHANNELS + 1] ||
@@ -221,7 +205,7 @@ int main(void)
         return fail("one-period startup write failed");
     if (read_sources(sources, "/tmp") < 0 ||
         prepare_initial_period(sources, "/tmp", output, &dynamics,
-                               &speaker, &activity_mask, 127) != 1 ||
+                               &speaker, &activity_mask, 100, &master_gain) != 1 ||
         activity_mask == 0)
         return fail("one complete period was not accepted at startup");
     for (i = 0; i < PERIOD_SIZE; ++i) {
@@ -249,9 +233,11 @@ int main(void)
                 sources[bus].samples[frame * INPUT_CHANNELS + 1] = value;
             }
             sources[bus].received = period_bytes;
+            sources[bus].airplay_volume_missing = 0;
+            master_gain = 32768;
             puffin_dynamics_init(&dynamics);
             speaker_dsp_init(&speaker, 60);
-            render_period(sources, output, &dynamics, &speaker);
+            render_period(sources, output, &dynamics, &speaker, 32768, &master_gain);
             if (bus == 0)
                 memcpy(reference, output, sizeof(reference));
             else if (memcmp(reference, output, sizeof(reference)) != 0)
@@ -259,179 +245,12 @@ int main(void)
         }
     }
 
-    /* AirPlay phone attenuation is media-only; the UI owns the codec mixer.
-     * Its callback must not change a priority bus or any physical master. */
-    {
-        char root[] = "/tmp/radar-volume-test-XXXXXX";
-        char path[256];
-        int fd;
-        if (!mkdtemp(root))
-            return fail("mkdtemp failed");
-        if (snprintf(path, sizeof(path), "%s/airplay.active", root) >= (int)sizeof(path))
-            return fail("marker path too long");
-        fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
-        if (fd < 0)
-            return fail("marker create failed");
-        close(fd);
-        if (snprintf(path, sizeof(path), "%s/airplay.volume", root) >= (int)sizeof(path))
-            return fail("volume path too long");
-        fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
-        if (fd < 0 || write(fd, "-20\n", 4) != 4)
-            return fail("volume write failed");
-        close(fd);
-        if (read_sources(sources, root) < 0 ||
-            !sources[SOURCE_MEDIA].airplay_volume_missing ||
-            sources[SOURCE_ANNOUNCEMENT].gain_q15 != 32768)
-            return fail("unacknowledged callback leaked into playback");
-        if (ack_callback(root) < 0 || read_sources(sources, root) < 0 ||
-            sources[SOURCE_MEDIA].airplay_volume_missing ||
-            sources[SOURCE_MEDIA].gain_q15 != 32768 ||
-            sources[SOURCE_ANNOUNCEMENT].gain_q15 != 32768)
-            return fail("acknowledged callback did not play at unity media gain");
-        unlink(path);
-        if (read_sources(sources, root) < 0 ||
-            sources[SOURCE_MEDIA].gain_q15 != 0 ||
-            sources[SOURCE_ANNOUNCEMENT].gain_q15 != 32768)
-            return fail("missing phone callback did not mute only media");
-        fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
-        if (fd < 0 || write(fd, "-144\n", 5) != 5) return fail("mute callback failed");
-        close(fd);
-        if (airplay_volume_to_mixer(root) >= 0) return fail("old ack accepted new callback");
-        if (ack_callback(root) < 0 || airplay_volume_to_mixer(root) != 0)
-            return fail("acknowledged sender mute lost");
-        if (snprintf(path, sizeof(path), "%s/airplay.master", root) >= (int)sizeof(path))
-            return fail("ack path too long");
-        unlink(path);
-        if (mkfifo(path, 0600) < 0 || airplay_volume_to_mixer(root) >= 0)
-            return fail("FIFO ack was accepted or blocked");
-        unlink(path);
-        fd = open(path, O_CREAT | O_WRONLY, 0600);
-        if (fd < 0) return fail("oversized ack create failed");
-        for (i = 0; i < 200; ++i)
-            if (write(fd, "1", 1) != 1) return fail("oversized ack write failed");
-        close(fd);
-        if (airplay_volume_to_mixer(root) >= 0)
-            return fail("oversized ack was accepted");
-        unlink(path);
-        if (snprintf(path, sizeof(path), "%s/airplay.volume", root) >= (int)sizeof(path))
-            return fail("callback path too long");
-        unlink(path);
-        if (snprintf(path, sizeof(path), "%s/airplay.active", root) >= (int)sizeof(path))
-            return fail("marker cleanup path too long");
-        unlink(path);
-        fd = open(path, O_CREAT | O_WRONLY, 0600);
-        if (fd < 0) return fail("reconnect marker failed");
-        close(fd);
-        if (airplay_volume_to_mixer(root) >= 0) return fail("old ack accepted reconnect");
-        unlink(path);
-        if (snprintf(path, sizeof(path), "%s/airplay.master", root) >= (int)sizeof(path))
-            return fail("ack cleanup path too long");
-        unlink(path);
-        rmdir(root);
-    }
-    /* A callback arriving after source read but before the first PCM write
-     * must not leave a rendered zero-gain first period. */
-    {
-        char root[] = "/tmp/radar-first-period-XXXXXX";
-        char marker[256], volume[256];
-        int fd;
-        unsigned int mask = 0;
-        if (!mkdtemp(root)) return fail("first-period mkdtemp failed");
-        if (snprintf(marker, sizeof(marker), "%s/airplay.active", root) >= (int)sizeof(marker) ||
-            snprintf(volume, sizeof(volume), "%s/airplay.volume", root) >= (int)sizeof(volume))
-            return fail("first-period path too long");
-        fd = open(marker, O_CREAT | O_WRONLY | O_TRUNC, 0600);
-        if (fd < 0) return fail("first-period marker create failed");
-        close(fd);
-        for (i = 0; i < SOURCE_COUNT; ++i) {
-            sources[i].idle_periods = 0;
-            sources[i].received = 0;
-        }
-        for (i = 0; i < PERIOD_SIZE * INPUT_CHANNELS; ++i)
-            sources[SOURCE_MEDIA].samples[i] = 8000;
-        sources[SOURCE_MEDIA].received = period_bytes;
-        sources[SOURCE_MEDIA].idle_periods = SOURCE_IDLE_PERIODS;
-        if (prepare_initial_period(sources, root, output, &dynamics,
-                                   &speaker, &mask, 127) != 2)
-            return fail("media rendered before the first phone callback");
-        for (i = 0; i < PERIOD_SIZE * INPUT_CHANNELS; ++i)
-            sources[SOURCE_ALARM].samples[i] = 1000;
-        sources[SOURCE_ALARM].received = period_bytes;
-        sources[SOURCE_ALARM].idle_periods = SOURCE_IDLE_PERIODS;
-        if (prepare_initial_period(sources, root, output, &dynamics,
-                                   &speaker, &mask, 127) != 1 ||
-            !(mask & PLAYBACK_BUS_ALARM) || output[3 * OUTPUT_CHANNELS] == 0)
-            return fail("missing callback blocked alarm playback");
-        consume_period(sources);
-        if (sources[SOURCE_MEDIA].received != period_bytes ||
-            sources[SOURCE_ALARM].received != 0)
-            return fail("priority alarm discarded buffered AirPlay media");
-        fd = open(volume, O_CREAT | O_WRONLY | O_TRUNC, 0600);
-        if (fd < 0 || write(fd, "-20\n", 4) != 4)
-            return fail("late phone callback write failed");
-        close(fd);
-        if (prepare_initial_period(sources, root, output, &dynamics,
-                                   &speaker, &mask, 127) != 2)
-            return fail("unacknowledged late callback played media");
-        if (ack_callback(root) < 0 ||
-            prepare_initial_period(sources, root, output, &dynamics,
-                                   &speaker, &mask, 127) != 1 ||
-            !(mask & PLAYBACK_BUS_MEDIA) || output[3 * OUTPUT_CHANNELS] == 0 ||
-            sources[SOURCE_MEDIA].gain_q15 != 32768)
-            return fail("acknowledged late callback left the first media period silent");
-        unlink(volume); unlink(marker);
-        if (snprintf(volume, sizeof(volume), "%s/airplay.master", root) >= (int)sizeof(volume))
-            return fail("ack cleanup path too long");
-        unlink(volume); rmdir(root);
-    }
-    /* A queued period from a muted sender must not become a full-level
-     * generic media period when that AirPlay session disconnects. */
-    {
-        char root[] = "/tmp/radar-disconnect-XXXXXX";
-        char marker[256], volume[256];
-        int fd;
-        if (!mkdtemp(root)) return fail("disconnect mkdtemp failed");
-        if (snprintf(marker, sizeof(marker), "%s/airplay.active", root) >= (int)sizeof(marker) ||
-            snprintf(volume, sizeof(volume), "%s/airplay.volume", root) >= (int)sizeof(volume))
-            return fail("disconnect path too long");
-        fd = open(marker, O_CREAT | O_WRONLY | O_TRUNC, 0600);
-        if (fd < 0) return fail("disconnect marker failed");
-        close(fd);
-        fd = open(volume, O_CREAT | O_WRONLY | O_TRUNC, 0600);
-        if (fd < 0 || write(fd, "-144\n", 5) != 5)
-            return fail("disconnect mute failed");
-        close(fd);
-        for (i = 0; i < SOURCE_COUNT; ++i) {
-            sources[i].received = 0;
-            sources[i].idle_periods = 0;
-        }
-        sources[SOURCE_MEDIA].received = period_bytes;
-        sources[SOURCE_MEDIA].idle_periods = SOURCE_IDLE_PERIODS;
-        if (read_sources(sources, root) < 0 || sources[SOURCE_MEDIA].gain_q15 != 0)
-            return fail("sender mute not applied to queued period");
-        for (i = 0; i < sizeof(half) / sizeof(half[0]); ++i)
-            half[i] = 16000;
-        if (write(pipes[SOURCE_MEDIA][1], half, sizeof(half)) != (ssize_t)sizeof(half))
-            return fail("queued sender bytes write failed");
-        unlink(marker); unlink(volume);
-        if (read_sources(sources, root) < 0 || sources[SOURCE_MEDIA].received != 0 ||
-            period_ready(sources) ||
-            read(pipes[SOURCE_MEDIA][0], half, sizeof(half)) != -1 ||
-            errno != EAGAIN)
-            return fail("sender mute became audible after disconnect");
-        rmdir(root);
-    }
-    if (speaker_volume_percent_for_mix(87, 32768, 0, 1) !=
-        speaker_volume_percent_for_mix(87, 3277, 0, 1) ||
-        speaker_volume_percent_for_mix(87, 32768, 1, 1) !=
-        speaker_volume_percent_for_mix(87, 3277, 1, 1))
-        return fail("priority EQ followed unrelated media volume");
-    if (speaker_volume_percent_for_mix(127, 3277, 1, 0) < 60 ||
-        speaker_volume_percent_for_mix(127, 3277, 1, 0) > 80)
-        return fail("media attenuation did not map to the volume boundary");
-    if (speaker_volume_percent_for_mix(87, 3277, 1, 0) >=
-        speaker_volume_percent_for_mix(87, 32768, 1, 0))
-        return fail("AirPlay media EQ ignored software attenuation");
+    /* AirPlay admission, invalid-ack, and two-session FIFO checks live in
+     * test_airplay_session_dsp.py; this fixture checks generic period continuity. */
+    if (speaker_volume_percent_for_mix(60, 3277, 1, 1) !=
+        speaker_volume_percent_for_mix(60, 32768, 1, 1) ||
+        speaker_volume_percent_for_mix(100, 3277, 1, 0) >= 100)
+        return fail("logical master preset followed wrong bus attenuation");
 
     for (i = 0; i < SOURCE_COUNT; ++i) {
         close(pipes[i][0]);
@@ -562,7 +381,7 @@ def main() -> None:
         raise SystemExit("audio engine must not zero-fill a short source period")
     run_start = engine.index("static int run_engine")
     run_engine = engine[run_start:]
-    if "int poll_timeout = period_ready(sources) ? 20 : -1;" not in run_engine:
+    if "int poll_timeout = 20;" not in run_engine:
         raise SystemExit("retained periods need a timed state recheck")
     if "if (read_or_retain_sources(sources, root) <= 0)" not in run_engine:
         raise SystemExit("retained periods must advance without a new FIFO read")

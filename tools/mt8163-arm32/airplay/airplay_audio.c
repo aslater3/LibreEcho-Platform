@@ -1,7 +1,7 @@
 /* LibreEcho AirPlay PCM producer.
  *
  * Shairport Sync writes decoded S16_LE/48 kHz/stereo PCM to its private FIFO.
- * This process forwards it to the shared LibreEcho media bus.  It never opens
+ * This process forwards it to the dedicated LibreEcho AirPlay bus. It never opens
  * ALSA or touches the codec/amplifier; libreecho-audio-engine is the sole
  * hardware owner for every playback source.
  */
@@ -15,15 +15,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #define DEFAULT_INPUT_FIFO "/run/libreecho/airplay.pcm"
-#define DEFAULT_MEDIA_FIFO "/run/libreecho-audio/media.pcm"
-#define DEFAULT_VOLUME_FILE "/run/libreecho-audio/media.volume"
+#define DEFAULT_MEDIA_FIFO "/run/libreecho-audio/airplay-media.pcm"
 #define DEFAULT_AIRPLAY_VOLUME_FILE "/run/libreecho-audio/airplay.volume"
 #define DEFAULT_AIRPLAY_MASTER_FILE "/run/libreecho-audio/airplay.master"
 #define DEFAULT_AIRPLAY_ACTIVE_FILE "/run/libreecho-audio/airplay.active"
+#define DEFAULT_AIRPLAY_LOCK_FILE "/run/libreecho-audio/airplay.lock"
+#define DEFAULT_AIRPLAY_RESET_FILE "/run/libreecho-audio/airplay.reset"
+#define DEFAULT_AIRPLAY_RESET_ACK_FILE "/run/libreecho-audio/airplay.reset-ack"
 #define BUFFER_SIZE 8192
 
 static volatile sig_atomic_t stopping;
@@ -86,6 +89,12 @@ static int set_volume(const char *path, const char *text)
 	if (end == text || *end != '\0' || !isfinite(db) ||
 	    (db != -144.0 && (db < -30.0 || db > 0.0)))
 		return 2;
+	{
+		struct stat marker;
+		if (lstat(DEFAULT_AIRPLAY_ACTIVE_FILE, &marker) < 0 ||
+		    !S_ISREG(marker.st_mode))
+			return 2;
+	}
 	length = snprintf(value, sizeof(value), "%.6f\n", db);
 	if (length < 0 || (size_t)length >= sizeof(value) ||
 	    snprintf(temporary, sizeof(temporary), "%s.tmp", path) < 0)
@@ -118,26 +127,135 @@ static int clear_session_state(void)
 		result = 1;
 	if (unlink(DEFAULT_AIRPLAY_MASTER_FILE) < 0 && errno != ENOENT)
 		result = 1;
-	/* Old bridge versions also wrote the same callback to media.volume.
-	 * This bridge is its only writer; clear a legacy sender mute before a
-	 * non-AirPlay media producer takes over the shared bus. */
-	if (unlink(DEFAULT_VOLUME_FILE) < 0 && errno != ENOENT)
-		result = 1;
 	return result;
+}
+
+/* Serialize hook processes across marker check, callback rename and stop.
+ * Untagged commands still cannot prove which Shairport playback sent them. */
+static int lock_session(void)
+{
+	struct stat st;
+	int fd = open(DEFAULT_AIRPLAY_LOCK_FILE,
+		      O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0640);
+	unsigned int attempt;
+	if (fd < 0)
+		return -1;
+	if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+		close(fd);
+		return -1;
+	}
+	for (attempt = 0; attempt < 100; ++attempt) {
+		if (flock(fd, LOCK_EX | LOCK_NB) == 0)
+			return fd;
+		if (errno != EWOULDBLOCK && errno != EINTR)
+			break;
+		usleep(10000);
+	}
+	close(fd);
+	return -1;
 }
 
 static int set_active(const char *path, int active)
 {
 	int fd;
+	char temporary[256];
 
 	if (!active)
 		return !strcmp(path, DEFAULT_AIRPLAY_ACTIVE_FILE)
 			? clear_session_state()
 			: (unlink(path) < 0 && errno != ENOENT ? 1 : 0);
-	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0640);
+	if (snprintf(temporary, sizeof(temporary), "%s.tmp.XXXXXX", path) >=
+	    (int)sizeof(temporary))
+		return 1;
+	fd = mkstemp(temporary);
 	if (fd < 0)
 		return 1;
-	return close(fd) < 0 ? 1 : 0;
+	if (fchmod(fd, 0640) < 0 || close(fd) < 0) {
+		(void)close(fd);
+		(void)unlink(temporary);
+		return 1;
+	}
+	if (rename(temporary, path) < 0) {
+		(void)unlink(temporary);
+		return 1;
+	}
+	return 0;
+}
+
+/* The bridge may not yet have read the predecessor's input bytes. Its read
+ * is serialized by the hook lock, so empty this FIFO before engine reset. */
+static int drain_input(void)
+{
+	unsigned char buffer[4096];
+	size_t total = 0;
+	int fd = open(DEFAULT_INPUT_FIFO, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0) return errno == ENOENT ? 0 : 1;
+	for (;;) {
+		ssize_t n = read(fd, buffer, sizeof(buffer));
+		if (n > 0) {
+			total += (size_t)n;
+			if (total > 262144) { close(fd); return 1; }
+			continue;
+		}
+		if (n < 0 && errno == EINTR) continue;
+		if (n == 0 || (n < 0 && errno == EAGAIN)) { close(fd); return 0; }
+		close(fd); return 1;
+	}
+}
+
+/* Called under the shared forwarding/hook lock. A unique request is published
+ * only after the marker is removed. The engine acknowledges after draining. */
+static int reset_engine(void)
+{
+	unsigned char nonce[16];
+	char token[34], temporary[256], ack[34];
+	static const char hex[] = "0123456789abcdef";
+	int fd, i, n, result = 1;
+	struct stat st;
+
+	fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+	if (fd < 0) return 1;
+	n = (int)read(fd, nonce, sizeof(nonce));
+	close(fd);
+	if (n != (int)sizeof(nonce)) return 1;
+	for (i = 0; i < 16; ++i) {
+		token[i * 2] = hex[nonce[i] >> 4];
+		token[i * 2 + 1] = hex[nonce[i] & 15];
+	}
+	token[32] = '\n'; token[33] = '\0';
+	/* A prior engine instance's on-disk reply is not evidence that the
+	 * currently running instance drained this generation. */
+	if (unlink(DEFAULT_AIRPLAY_RESET_ACK_FILE) < 0 && errno != ENOENT)
+		return 1;
+	if (snprintf(temporary, sizeof(temporary), "%s.tmp.XXXXXX", DEFAULT_AIRPLAY_RESET_FILE) >= (int)sizeof(temporary)) return 1;
+	fd = mkstemp(temporary);
+	if (fd < 0) return 1;
+	if (fchmod(fd, 0640) < 0 || write(fd, token, 33) != 33) {
+		close(fd); unlink(temporary); return 1;
+	}
+	if (close(fd) < 0 || rename(temporary, DEFAULT_AIRPLAY_RESET_FILE) < 0) {
+		unlink(temporary); return 1;
+	}
+	for (i = 0; i < 100; ++i) {
+		fd = open(DEFAULT_AIRPLAY_RESET_ACK_FILE,
+			  O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+		if (fd >= 0) {
+			n = fstat(fd, &st);
+			if (n == 0 && S_ISREG(st.st_mode) && st.st_size == 33) {
+				n = (int)read(fd, ack, 33);
+				if (n == 33 && !memcmp(ack, token, 33)) result = 0;
+			}
+			close(fd);
+			if (!result) break;
+		}
+		usleep(10000);
+	}
+	/* Retain a successful request for a replacement engine. If it restarts
+	 * between our acknowledgement and marker publication, it must re-drain
+	 * and arm this same session rather than treating the marker as foreign. */
+	if (result)
+		(void)unlink(DEFAULT_AIRPLAY_RESET_FILE);
+	return result;
 }
 
 static int forward_stream(const char *input_path, const char *output_path)
@@ -145,39 +263,59 @@ static int forward_stream(const char *input_path, const char *output_path)
 	unsigned char buffer[BUFFER_SIZE];
 	int input = -1;
 	int output = -1;
-	int active = 0;
 	int result = -1;
 
 	if (ensure_fifo(input_path) < 0)
 		return -1;
-	input = open(input_path, O_RDONLY | O_CLOEXEC);
+	/* Hold a local write end so poll does not spin on POLLHUP while
+	 * Shairport has no writer. Never write to this descriptor. */
+	input = open(input_path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
 	if (input < 0)
 		goto out;
-	output = open(output_path, O_WRONLY | O_CLOEXEC);
+	output = open(output_path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
 	if (output < 0)
 		goto out;
-	/* A producer process can outlive a real AirPlay connection.  Publish the
-	 * session only after both ends of the bridge are actually connected. */
-	if (set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 1) != 0)
-		goto out;
-	active = 1;
+	/* Poll outside the session lock. Reading and forwarding a chunk share
+	 * the hook lock, so stop/start can drain without an in-flight writer. */
 	while (!stopping) {
-		ssize_t n = read(input, buffer, sizeof(buffer));
-
-		if (n > 0) {
-			if (write_all(output, buffer, (size_t)n) < 0)
-				goto out;
-			continue;
-		}
-		if (n == 0) {
-			result = 0;
-			break;
-		}
-		if (errno != EINTR)
+		struct pollfd pfd = { input, POLLIN, 0 };
+		int lock_fd, attempts;
+		ssize_t n;
+		if (poll(&pfd, 1, 20) < 0) {
+			if (errno == EINTR) continue;
 			goto out;
+		}
+		if (!(pfd.revents & POLLIN)) continue;
+		lock_fd = lock_session();
+		if (lock_fd < 0) continue;
+		n = read(input, buffer, sizeof(buffer));
+		if (n > 0) {
+			struct stat marker;
+			if (lstat(DEFAULT_AIRPLAY_ACTIVE_FILE, &marker) == 0 &&
+			    S_ISREG(marker.st_mode)) {
+				size_t sent = 0;
+				/* A blocked engine cannot indefinitely own the hook lock. */
+				for (attempts = 0; sent < (size_t)n && attempts < 5; ++attempts) {
+					ssize_t wrote = write(output, buffer + sent, (size_t)n - sent);
+					if (wrote > 0) { sent += (size_t)wrote; continue; }
+					if (wrote < 0 && errno == EINTR) continue;
+					if (wrote < 0 && errno == EAGAIN) {
+						struct pollfd writable = { output, POLLOUT, 0 };
+						(void)poll(&writable, 1, 20);
+						continue;
+					}
+					break;
+				}
+				if (sent != (size_t)n) {
+					close(lock_fd);
+					goto out;
+				}
+			}
+		}
+		close(lock_fd);
+		if (n < 0 && errno != EAGAIN && errno != EINTR) goto out;
 	}
-	if (stopping)
-		result = 0;
+	result = 0;
 out:
 	/* Close the writer first: when the marker falls, the shared engine
 	 * can discard all remaining queued bytes from this session safely. */
@@ -185,8 +323,6 @@ out:
 		close(output);
 	if (input >= 0)
 		close(input);
-	if (active)
-		(void)set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 0);
 	return result;
 }
 
@@ -195,24 +331,42 @@ int main(int argc, char **argv)
 	const char *input_path = DEFAULT_INPUT_FIFO;
 	const char *output_path = DEFAULT_MEDIA_FIFO;
 	struct sigaction action;
+	int lock_fd, result;
 
 	if (argc == 2 && (!strcmp(argv[1], "--start") ||
 			 !strcmp(argv[1], "--stop"))) {
-		/* These sessioncontrol hooks only clear files; the bridge owns the
-		 * active marker after both PCM FIFOs connect. Shairport runs --start
-		 * before launching the player thread, which publishes its initial
-		 * volume callback. This discards any late callback left by the
-		 * preceding playback before its next initial volume is published. */
-		return set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 0);
+		lock_fd = lock_session();
+		if (lock_fd < 0) {
+			/* Stop must revoke admission even when a wedged lock holder
+			 * prevents the normal drain/reset handshake. Report failure. */
+			if (!strcmp(argv[1], "--stop"))
+				(void)clear_session_state();
+			return 1;
+		}
+		result = clear_session_state();
+		if (!result)
+			result = drain_input();
+		if (!result)
+			result = reset_engine();
+		if (!result && !strcmp(argv[1], "--start"))
+			result = set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 1);
+		close(lock_fd);
+		return result;
 	}
-	if (argc == 3 && !strcmp(argv[1], "--set-volume"))
-		return set_volume(DEFAULT_AIRPLAY_VOLUME_FILE, argv[2]);
+	if (argc == 3 && !strcmp(argv[1], "--set-volume")) {
+		lock_fd = lock_session();
+		if (lock_fd < 0)
+			return 1;
+		result = set_volume(DEFAULT_AIRPLAY_VOLUME_FILE, argv[2]);
+		close(lock_fd);
+		return result;
+	}
 	if (argc > 1)
 		input_path = argv[1];
 	if (argc > 2)
 		output_path = argv[2];
 	if (argc > 3) {
-		fprintf(stderr, "Usage: %s [input-fifo] [media-fifo]\n", argv[0]);
+		fprintf(stderr, "Usage: %s [input-fifo] [airplay-media-fifo]\n", argv[0]);
 		return 2;
 	}
 
@@ -223,12 +377,9 @@ int main(int argc, char **argv)
 	(void)sigaction(SIGINT, &action, NULL);
 	signal(SIGPIPE, SIG_IGN);
 
-	if (clear_session_state() != 0)
-		return 1;
 	while (!stopping) {
 		if (forward_stream(input_path, output_path) < 0 && !stopping)
 			usleep(250000);
 	}
-	(void)set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 0);
 	return 0;
 }

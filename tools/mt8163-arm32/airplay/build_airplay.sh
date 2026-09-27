@@ -24,6 +24,8 @@ RELINK_OUTPUT=${LIBREECHO_AIRPLAY_RELINK_OUTPUT:-}
 python3 "$SCRIPT_DIR/test_audio_engine_contract.py"
 python3 "$SCRIPT_DIR/test_audio_period_buffer.py"
 python3 "$SCRIPT_DIR/test_airplay_volume_contract.py"
+python3 "$SCRIPT_DIR/test_airplay_session_dsp.py"
+python3 "$SCRIPT_DIR/test_airplay_generation_fence.py"
 "$SCRIPT_DIR/test_speaker_dsp.sh"
 "$SCRIPT_DIR/test_speaker_mbcl.sh"
 

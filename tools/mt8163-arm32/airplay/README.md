@@ -24,9 +24,37 @@ The device's 3.18 ASoC driver is usable through TinyALSA but returns
 `ENOTTY` for the libasound probing ioctls used by Shairport's ALSA backend.
 The payload therefore uses Shairport's raw named-pipe backend. The
 `libreecho-airplay-audio` process is now only a producer: it forwards decoded
-S16_LE/48 kHz/stereo PCM to the shared media bus and never opens ALSA.
-`libreecho-audio-engine` is the sole TinyALSA/codec/amplifier owner. It mixes
-media, system, announcement, and alarm buses; ducks media by 12 dB under
+S16_LE/48 kHz/stereo PCM to the dedicated `airplay-media.pcm` bus and never
+opens ALSA. The bridge's FIFO lifetime is not a playback session: Shairport's
+`--start` hook atomically creates a fresh regular `airplay.active` marker;
+`--stop` removes it and the callback/ack files. The bridge discards input
+while the marker is absent; bytes on the dedicated FIFO
+are never reclassified as generic media. Start and stop hold a bounded shared
+lock against the bridge's nonblocking read/write: they clear the marker and
+sender state, drain any predecessor bytes still in the Shairport input FIFO,
+then publish a fresh 128-bit reset token. The engine checks reset requests at
+most 20 ms apart even when idle, discards its buffered AirPlay periods and
+persistent dedicated FIFO, and atomically acknowledges the exact token before
+the hook publishes a new marker or returns from stop. A missing acknowledgement
+fails closed after about one second; priority buses remain independent. The
+bridge never holds the lock over an input wait or an unbounded output write.
+Only a marker following the completed reset admits its first PCM; a marker
+replacement without a reset is refused. Engine restart begins with AirPlay
+unarmed rather than trusting a surviving marker. This is a bridge/engine PCM
+fence, **not** provenance for dB-only callback commands: Shairport Sync 5.1
+(`d6ac53bf`) runs `command_start()` before player-thread creation and
+`command_stop()` after player-thread join, and `wait_for_completion = "yes"`
+waits for each hook process, but `player_stop` may be called from another
+connection thread. A late untagged callback executing after the next start
+cannot be attributed to its original playback. The release remains blocked on
+end-to-end callback provenance/ordering validation and real-device testing;
+pre-reset PCM already handed to ALSA cannot be retroactively unplayed.
+`libreecho-audio-engine` is the sole playback PCM and amplifier owner;
+`audiod` alone writes the PCM Playback Volume control. The engine reads back
+both codec indices after prepare and again before unmute, refusing to play if
+either is not raw 127. It mixes
+generic media, AirPlay media, system, announcement, and alarm buses; ducks
+both media buses by 12 dB under
 higher-priority audio; and renders one mono programme sample with clipping-safe
 32-bit arithmetic. It then duplicates that sample into both channels of PCM
 `0,23` (`S16_LE`, 48 kHz, 2 channels), selects `Board Channel Config=Stereo`,
@@ -67,23 +95,20 @@ mode `0644`. It records only playback state (`idle`, `playing`, `system`,
 all four buses. The file is replaced only when that state changes and carries
 no track metadata.
 
-Shairport's pipe uses `ignore_volume_control = "yes"`: the callback is
-consumed outside the chroot by UI `airplayd`, which maps the standard
-`-30..0 dB` slider to audiod's `1..100` PCM master (and `-144 dB`
-to master mute, `0`). The same master is used by buttons and the API;
-button changes persist until another sender callback, without reverse
-synchronization to the sender. The engine plays non-muted AirPlay media at
-unity software gain, avoiding a second attenuation; explicit sender mute also
-zeros its media bus while the shared master mutes all output buses. Generic
-media still uses `media.volume`. The bridge removes session files at disconnect;
-Shairport's blocking before-play hook clears callbacks that arrive late after
-the previous disconnect before its player thread republishes initial volume.
-The engine defers the unrendered first AirPlay period until the controller
-acknowledges both the current session marker and callback inode after a
-successful audiod write and readback; failure never blocks system,
-announcement, or alarm playback. The engine reads the current PCM master for
-EQ and never writes or restores it. All four buses meet at the same EQ/MBCL
-before the PCM write. Source-priority ducking and volume-curve transitions
+Shairport's pipe uses `ignore_volume_control = "yes"`: UI `airplayd` consumes
+the callback outside the chroot and maps sender volume to audiod's logical
+`0..100` master. Button/API changes use that same logical master. Audiod must
+atomically publish a validated decimal percentage in
+`/run/libreecho-audio/master.volume`; the engine reads it every period,
+maps `1..100` to codec-equivalent indices `67..127` (`0` is mute), and
+smooths Q15 gain before the shared EQ/MBCL. The physical PCM codec control
+remains fixed at index `127` (0 dB) after prepare. Non-muted AirPlay is unity
+source gain, sender mute is zero, and generic media alone uses `media.volume`.
+The first AirPlay period waits for matching marker/callback/ack identity;
+replacement callbacks retain the last valid gain temporarily without
+re-holding audio, then fail closed on prolonged ack loss. Generic media and
+priority buses remain independently live. All five buses meet at the same
+EQ/MBCL before the PCM write. Source-priority ducking and volume transitions
 still require real-device listening and waveform testing; the vendor
 compressor is an approximation, not stock-exact.
 
