@@ -21,6 +21,8 @@ DRIVER = r'''
 #include <sys/wait.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <stdint.h>
+#include <pthread.h>
 static struct {
     const char *cmd_set_volume, *cmd_start, *cmd_stop;
     int cmd_blocking, cmd_start_returns_output;
@@ -72,11 +74,12 @@ int main(int argc, char **argv)
     assert(a.own_airplay_volume_set && a.own_airplay_volume == -20);
     assert(new_playback_session_token(a.playback_session_token) == 0);
     assert(new_playback_session_token(b.playback_session_token) == 0);
-    assert(strcmp(a.playback_session_token, b.playback_session_token));
+    assert(strcmp(a.playback_session_token, b.playback_session_token) < 0);
     command_start(a.playback_session_token);
     player_volume(a.own_airplay_volume, &a);
     command_stop(a.playback_session_token);
     command_start(b.playback_session_token);
+    command_start(a.playback_session_token); /* delayed A start cannot preempt B */
     command_set_volume(-6, a.playback_session_token); /* late A child */
     command_stop(a.playback_session_token);           /* late A stop */
     assert(snprintf(path, sizeof(path), "%s/airplay.active", argv[2]) < (int)sizeof(path));
@@ -98,12 +101,12 @@ def compiled_protocol(root):
     common = (root / "common.c").read_text()
     player = (root / "player.c").read_text()
     hooks = common[common.index("void command_set_volume("):common.index("// this is for reading an unsigned 32 bit number")]
-    nonce = player[player.index("static int new_playback_session_token("):player.index("int player_play(")]
+    nonce = player[player.index("/* A new ordered token"):player.index("int player_play(")]
     volume = player[player.index("void player_volume(double airplay_volume,"):player.index("void do_flush(")]
     # Definitions precede the exact player function under test.
     src = DRIVER + hooks + nonce + DRIVER_MAIN.replace("/* The preceding function is copied verbatim from the patched player.c. */", volume)
     (root / "protocol.c").write_text(src)
-    subprocess.run([os.environ.get("CC", "cc"), "-std=c99", "-Wall", "-Wextra", "-Werror",
+    subprocess.run([os.environ.get("CC", "cc"), "-std=c99", "-Wall", "-Wextra", "-Werror", "-pthread",
                     str(root / "protocol.c"), "-o", str(root / "protocol")], check=True, timeout=60)
     compile_fixture(root / "bridge-fixture")
     engine = subprocess.Popen([str(root / "bridge-fixture/engine"),

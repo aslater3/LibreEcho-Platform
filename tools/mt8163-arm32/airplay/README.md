@@ -27,12 +27,15 @@ The payload therefore uses Shairport's raw named-pipe backend. The
 S16_LE/48 kHz/stereo PCM to the dedicated `airplay-media.pcm` bus and never
 opens ALSA. The bridge's FIFO lifetime is not a playback session: Shairport's
 `--start <token>` hook atomically creates a fresh regular `airplay.active`
-marker containing that play's 128-bit lowercase hex token; `--stop <token>`
+marker containing that play's 32-digit lowercase hex token. Its first 16
+hex digits are a strictly increasing monotonic start tick; the remaining 16
+are random. A bounded runtime high-water mark rejects delayed or repeated
+start hooks even after a newer stop. `--stop <token>`
 removes it and the callback/ack files only when the token matches. The pinned
 Shairport 5.1 patch creates a fresh token for every play and passes it to
 start, stop and `--set-volume <token> <dB>`; pre-start volume is retained for
-the first playback callback. Untagged, malformed and stale stop/volume hooks
-fail closed. The bridge discards input while the marker is absent; bytes on
+the first playback callback. Untagged, malformed and stale start/stop/volume
+hooks fail closed. The bridge discards input while the marker is absent; bytes on
 the dedicated FIFO are never reclassified as generic media. Start and matching
 stop hold a bounded shared lock against the bridge's nonblocking read/write:
 they clear the marker and sender state, drain predecessor bytes still in the

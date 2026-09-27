@@ -53,22 +53,36 @@
 +    command_set_volume(airplay_volume, conn->playback_session_token);
 +  else
 +    conn->own_airplay_volume_set = 1; // retain a pre-start sender volume for the first callback
-@@ -5272,0 +5276,23 @@
-+/* A new token for every play, including replay on an existing RTSP connection.
-+ * Refuse to start rather than issue an untagged hook if entropy is unavailable. */
+@@ -5272,0 +5276,37 @@
++/* A new ordered token for each play, even with a persistent RTSP connection.
++ * The high half is a monotonic nanosecond tick, low half is random. Ordering
++ * fences delayed start hooks, while the random half avoids token reuse. */
++#include <time.h>
++static uint64_t last_playback_session_tick;
++static pthread_mutex_t playback_token_mutex = PTHREAD_MUTEX_INITIALIZER;
 +static int new_playback_session_token(char token[33]) {
 +  static const char hex[] = "0123456789abcdef";
 +  unsigned char bytes[16];
++  struct timespec now;
++  uint64_t tick;
 +  size_t offset = 0, i;
 +  int fd = open("/dev/urandom", O_RDONLY);
 +  if (fd < 0) return -1;
-+  while (offset < sizeof(bytes)) {
-+    ssize_t n = read(fd, bytes + offset, sizeof(bytes) - offset);
++  while (offset < 8) {
++    ssize_t n = read(fd, bytes + 8 + offset, 8 - offset);
 +    if (n < 0 && errno == EINTR) continue;
 +    if (n <= 0) { close(fd); return -1; }
 +    offset += (size_t)n;
 +  }
 +  close(fd);
++  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0) return -1;
++  tick = (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
++  if (pthread_mutex_lock(&playback_token_mutex)) return -1;
++  if (tick <= last_playback_session_tick) tick = last_playback_session_tick + 1;
++  if (!tick) { pthread_mutex_unlock(&playback_token_mutex); return -1; }
++  last_playback_session_tick = tick;
++  pthread_mutex_unlock(&playback_token_mutex);
++  for (i = 0; i < 8; i++) bytes[i] = (unsigned char)(tick >> (56 - 8 * i));
 +  for (i = 0; i < sizeof(bytes); i++) {
 +    token[2 * i] = hex[bytes[i] >> 4];
 +    token[2 * i + 1] = hex[bytes[i] & 15];

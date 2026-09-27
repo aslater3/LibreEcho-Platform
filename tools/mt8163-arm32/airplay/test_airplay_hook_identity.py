@@ -36,6 +36,9 @@ def run():
             assert hook("--stop", A) == 0
             assert hook("--start", B) == 0
             assert marker.read_text() == B + "\n"
+            # A delayed start must not replace an already-started B session.
+            assert hook("--start", A) != 0
+            assert marker.read_text() == B + "\n"
             # Callback forked by A before B's start, scheduled only afterwards.
             assert hook("--set-volume", A, "-6") != 0
             assert not volume.exists()
@@ -66,6 +69,9 @@ def run():
             assert marker.read_text() == B + "\n"
             assert hook("--stop", B) == 0
             assert not marker.exists() and not volume.exists()
+            assert hook("--start", A) != 0  # B stopped; old A must not resurrect.
+            assert hook("--start", B) != 0  # B's token cannot start twice.
+            assert not marker.exists()
         finally:
             engine.terminate()
             try:

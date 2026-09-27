@@ -24,6 +24,7 @@
 #define DEFAULT_AIRPLAY_VOLUME_FILE "/run/libreecho-audio/airplay.volume"
 #define DEFAULT_AIRPLAY_MASTER_FILE "/run/libreecho-audio/airplay.master"
 #define DEFAULT_AIRPLAY_ACTIVE_FILE "/run/libreecho-audio/airplay.active"
+#define DEFAULT_AIRPLAY_LAST_START_FILE "/run/libreecho-audio/airplay.last-start"
 #define DEFAULT_AIRPLAY_LOCK_FILE "/run/libreecho-audio/airplay.lock"
 #define DEFAULT_AIRPLAY_RESET_FILE "/run/libreecho-audio/airplay.reset"
 #define DEFAULT_AIRPLAY_RESET_ACK_FILE "/run/libreecho-audio/airplay.reset-ack"
@@ -110,6 +111,28 @@ static int matching_session(const char *token)
 	return n == SESSION_TOKEN_LENGTH + 1 &&
 	       !memcmp(content, token, SESSION_TOKEN_LENGTH) &&
 	       content[SESSION_TOKEN_LENGTH] == '\n';
+}
+
+/* The first 16 hex digits encode the strictly increasing source start tick.
+ * Keep its high-water mark through stops, so an old delayed start cannot
+ * resurrect a session after the newer one has already ended. Called locked. */
+static int newer_start(const char *token)
+{
+	char content[SESSION_TOKEN_LENGTH + 1];
+	struct stat st;
+	int fd, n;
+	fd = open(DEFAULT_AIRPLAY_LAST_START_FILE, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0) return errno == ENOENT ? 1 : -1;
+	n = fstat(fd, &st);
+	if (n == 0 && S_ISREG(st.st_mode) && st.st_size == SESSION_TOKEN_LENGTH + 1)
+		n = (int)read(fd, content, sizeof(content));
+	else
+		n = -1;
+	close(fd);
+	if (n != (int)sizeof(content) || content[SESSION_TOKEN_LENGTH] != '\n') return -1;
+	content[SESSION_TOKEN_LENGTH] = '\0';
+	if (!valid_session_token(content)) return -1;
+	return memcmp(token, content, 16) > 0 ? 1 : 0;
 }
 
 static int set_volume(const char *path, const char *token, const char *text)
@@ -365,6 +388,13 @@ int main(int argc, char **argv)
 		if (argc != 3 || !valid_session_token(argv[2])) return 2;
 		lock_fd = lock_session();
 		if (lock_fd < 0) return 1; /* Never revoke another session without a match. */
+		if (!strcmp(argv[1], "--start")) {
+			result = newer_start(argv[2]);
+			if (result <= 0) { close(lock_fd); return result == 0 ? 2 : 1; }
+			/* Reserve this source order before any reset can block or fail. */
+			result = set_active(DEFAULT_AIRPLAY_LAST_START_FILE, argv[2]);
+			if (result) { close(lock_fd); return result; }
+		}
 		if (!strcmp(argv[1], "--stop") && !matching_session(argv[2])) {
 			close(lock_fd);
 			return 2;
