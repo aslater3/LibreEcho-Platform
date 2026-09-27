@@ -24,6 +24,10 @@ RELINK_OUTPUT=${LIBREECHO_AIRPLAY_RELINK_OUTPUT:-}
 python3 "$SCRIPT_DIR/test_audio_engine_contract.py"
 python3 "$SCRIPT_DIR/test_audio_period_buffer.py"
 python3 "$SCRIPT_DIR/test_airplay_volume_contract.py"
+python3 "$SCRIPT_DIR/test_airplay_session_dsp.py"
+python3 "$SCRIPT_DIR/test_airplay_generation_fence.py"
+python3 "$SCRIPT_DIR/test_airplay_hook_identity.py"
+python3 "$SCRIPT_DIR/test_shairport_hook_patch.py"
 "$SCRIPT_DIR/test_speaker_dsp.sh"
 "$SCRIPT_DIR/test_speaker_mbcl.sh"
 
@@ -110,6 +114,17 @@ tinyalsa_source=$(find "$work" -mindepth 1 -maxdepth 1 -type d -name 'tinyalsa-*
     echo "ERROR: source archive layout is not recognised" >&2
     exit 1
 }
+# Refuse an upstream drift before applying the exact Shairport 5.1 hook patch.
+(
+    cd "$shairport_source"
+    printf '%s\n' \
+        '4561e4b6d7a5c4c24c22f246651bf36626eaeca2ed4b10afcbb090edd171b22a  common.c' \
+        'bb18c3c7c1a6e88569a54a685ddaf3a2c502e2deb864cc1f4f6c8164368f1eb3  common.h' \
+        'ecc08bf0d38554addf882af95e25e4f2f4dd862017487dcc05150efea62151e2  player.c' \
+        '51242bda9351bacfd2dcead44dbb5c1137b678c89d2fe969852b9a9235b6fd5b  player.h' |
+        sha256sum -c -
+    patch --batch --fuzz=0 -p1 -i "$SCRIPT_DIR/shairport-5.1-session-hooks.patch"
+)
 reproducible_path_flags="-ffile-prefix-map=$work=/usr/src/libreecho-airplay -fdebug-prefix-map=$work=/usr/src/libreecho-airplay"
 
 export CC="${CROSS_PREFIX}gcc"

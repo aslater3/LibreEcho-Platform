@@ -1434,10 +1434,10 @@ class SourceTests(unittest.TestCase):
         producer = (TOOLS_DIR / "airplay/airplay_audio.c").read_text()
         downmix = (TOOLS_DIR / "airplay/puffin_downmix.h").read_text()
 
-        self.assertIn('"media", "system", "announcement", "alarm"', engine)
+        self.assertIn('"media", "system", "announcement", "alarm", "airplay-media"', engine)
         self.assertIn("#define MEDIA_DUCK_Q15 8231", engine)
-        self.assertIn("source == SOURCE_MEDIA && alarm_active", engine)
-        self.assertIn("source == SOURCE_MEDIA && higher_priority", engine)
+        subprocess.run([sys.executable, str(TOOLS_DIR / "airplay/test_airplay_session_dsp.py")],
+                       check=True, timeout=90)
         self.assertIn("puffin_render_mono(dynamics, mixed)", engine)
         self.assertIn('#define LED_SOCKET "/run/libreecho/led.sock"', engine)
         self.assertIn('\\"owner\\":\\"announcement\\"', engine)
@@ -1477,7 +1477,7 @@ class SourceTests(unittest.TestCase):
         ).read_text()
         self.assertIn("AIRPLAY_RUNTIME_AUDIO_STATUS_MISSING", runtime_check)
         self.assertIn("AIRPLAY_RUNTIME_LED_SOCKET_NOT_BOUND", runtime_check)
-        self.assertIn('DEFAULT_MEDIA_FIFO "/run/libreecho-audio/media.pcm"', producer)
+        self.assertIn('DEFAULT_MEDIA_FIFO "/run/libreecho-audio/airplay-media.pcm"', producer)
         self.assertNotIn("pcm_open(", producer)
         self.assertIn("#define PUFFIN_OUTPUT_TRIM_Q15 46341", downmix)
         self.assertIn("#define PUFFIN_OUTPUT_CEILING 32767", downmix)
@@ -1490,30 +1490,13 @@ class SourceTests(unittest.TestCase):
         self.assertIn("samples[frame * 2 + 1] = mono", downmix)
 
     def test_airplay_media_waits_for_master_ack_and_uses_unity_gain(self) -> None:
-        engine = (TOOLS_DIR / "airplay/audio_engine.c").read_text()
-        producer = (TOOLS_DIR / "airplay/airplay_audio.c").read_text()
+        subprocess.run([sys.executable, str(TOOLS_DIR / "airplay/test_airplay_volume_contract.py")],
+                       check=True, timeout=90)
 
-        self.assertIn('#define AIRPLAY_ACTIVE_FILE "airplay.active"', engine)
-        self.assertIn('#define AIRPLAY_VOLUME_FILE "airplay.volume"', engine)
-        self.assertIn('#define AIRPLAY_MASTER_FILE "airplay.master"', engine)
-        self.assertIn("airplay_is_active(root)", engine)
-        self.assertIn("airplay_volume_to_mixer(root)", engine)
-        self.assertIn("? airplay_media_gain(phone) : read_media_gain(root)", engine)
-        self.assertIn("return raw <= 0 ? 0 : 32768;", engine)
-        self.assertIn("speaker_volume_percent(sources, current_pcm_volume(card))", engine)
-        self.assertNotIn("set_pcm_volume(", engine)
-        self.assertNotIn('"PCM Playback Volume", volume', engine)
-        self.assertIn("(void)disable_output_controls(card);", engine)
-        self.assertIn("DEFAULT_AIRPLAY_ACTIVE_FILE", producer)
-        self.assertIn("DEFAULT_AIRPLAY_MASTER_FILE", producer)
-        self.assertIn("unlink(DEFAULT_AIRPLAY_MASTER_FILE)", producer)
-        self.assertNotIn("set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, active)", producer)
-        self.assertIn("DEFAULT_AIRPLAY_VOLUME_FILE", producer)
-        self.assertIn("set_volume(DEFAULT_AIRPLAY_VOLUME_FILE, argv[2])", producer)
-        self.assertNotIn("set_volume(DEFAULT_VOLUME_FILE, argv[2])", producer)
-        self.assertIn("unlink(DEFAULT_VOLUME_FILE)", producer)
-        self.assertIn("set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 1)", producer)
-        self.assertIn("set_active(DEFAULT_AIRPLAY_ACTIVE_FILE, 0)", producer)
+    def test_airplay_shairport_hooks_reject_stale_sessions(self) -> None:
+        for name in ("test_airplay_hook_identity.py", "test_shairport_hook_patch.py"):
+            subprocess.run([sys.executable, str(TOOLS_DIR / "airplay" / name)],
+                           check=True, timeout=90)
 
     def test_puffin_speaker_profile_matches_stock_dump(self) -> None:
         kernel = TOOLS_DIR.parent.parent
