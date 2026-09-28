@@ -113,17 +113,81 @@ class OtaFailureEvidenceContracts(unittest.TestCase):
         )
 
     def test_health_failure_persists_evidence_before_reboot(self) -> None:
-        persist = self.init.index(
-            'persist_failure_log ota-health-confirm-failed "$last_check"'
-        )
-        marker = self.init.index("pmsg_marker ota-rebooting-after-health-failure")
-        # The reboot that matters is the one in the health-failure path, not any
-        # earlier reboot call elsewhere in init.
-        reboot = self.init.index("$BB reboot -f", marker)
+        worker = shell_function(self.init, "ota_health_confirm_worker")
+        self.assertIn('last_check=ota-confirm', worker)
+        self.assertIn('ota_confirm_error_token /tmp/ota-confirm.log', worker)
+        persist = worker.index("persist_failure_log ota-health-confirm-failed")
+        marker = worker.index("pmsg_marker ota-rebooting-after-health-failure")
+        reboot = worker.index("$BB reboot -f", marker)
+        self.assertLess(worker.index('ota_confirm_error_token /tmp/ota-confirm.log'), persist)
         self.assertLess(persist, marker)
         self.assertLess(marker, reboot)
-        # The restart record points at the detail record.
-        self.assertIn('echo "failure_log=${failure_log:-none}"', self.init)
+        self.assertIn('echo "failure_log=${failure_log:-none}"', worker)
+        self.assertNotIn('persist_failure_log ota-health-confirm-failed "$last_check"', worker)
+        self.assertNotIn("pmsg", shell_function(self.init, "ota_confirm_error_token"))
+
+    def test_failed_confirm_records_only_a_known_error_before_reboot(self) -> None:
+        """Exercise the shipped worker's failing branch and durable writer."""
+        busybox = shutil.which("busybox") or "busybox"
+        worker = shell_function(self.init, "ota_health_confirm_worker")
+        start = worker.index(
+            '    if [ "$passed" -eq 3 ] &&\n'
+            '       /usr/local/sbin/libreecho-update confirm'
+        )
+        end = worker.index("    # Issue #41", start)
+        self.assertLess(worker.index('persist_failure_log ota-health-confirm-failed', start),
+                        worker.index('$BB reboot -f', end))
+        functions = ["sanitize_failure_text", "persist_failure_log"]
+        if "\nota_confirm_error_token()\n" in self.init:
+            functions.append("ota_confirm_error_token")
+        for lines, expected in (
+            (["UNSAFE_MARKER", "ERROR:update_busy"], "ota-confirm:ERROR:update_busy"),
+            ([], "ota-confirm:ERROR:confirm-failed-no-detail"),
+            (["ERROR:unrecognised_private_value"], "ota-confirm:ERROR:confirm-failed-no-detail"),
+        ):
+            with self.subTest(lines=lines), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                out = root / "update"
+                out.mkdir()
+                (out / "pending").write_text("schema=2\nslot=a\ntransaction_id=txn-fixture\n")
+                cmdline = root / "cmdline"
+                cmdline.write_text("androidboot.slot_suffix=_a\n")
+                init_log = root / "init.log"
+                init_log.write_text("synthetic init evidence\n")
+                updater = root / "failed-confirm"
+                updater.write_text("#!/bin/sh\n" + "".join(
+                    f'printf "%s\\n" {shlex.quote(line)} >&2\n' for line in lines
+                ) + "exit 1\n")
+                updater.chmod(0o755)
+                branch = worker[start:end].replace(
+                    "/usr/local/sbin/libreecho-update", shlex.quote(str(updater))
+                ).replace("/tmp/ota-confirm.log", shlex.quote(str(root / "confirm.log")))
+                script = (
+                    f"BB={shlex.quote(busybox)}\n"
+                    f"FAILURE_LOG_DIR={shlex.quote(str(out))}\n"
+                    f"INIT_LOG={shlex.quote(str(init_log))}\n"
+                    f"LIBREECHO_CMDLINE_FILE={shlex.quote(str(cmdline))}\n"
+                    "log() { :; }\npmsg_marker() { :; }\n"
+                    + "".join(shell_function(self.init, name) + "\n" for name in functions)
+                    + "passed=3\nattempt=3\nlast_check=none\npending_slot=a\nselected_slot=a\n"
+                    + branch
+                    + 'printf "record=%s\\n" "$failure_log"\n'
+                )
+                result = subprocess.run(
+                    [busybox, "sh"], input=script, text=True, capture_output=True,
+                    timeout=25,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                records = list(out.glob("failure-*.log"))
+                self.assertEqual(len(records), 1)
+                record = records[0].read_text()
+                self.assertIn("reason=ota-health-confirm-failed", record)
+                self.assertIn("running_slot=a", record)
+                self.assertIn(expected, record)
+                self.assertNotIn("UNSAFE_MARKER", record)
+                self.assertNotIn("unrecognised_private_value", record)
+                self.assertEqual(records[0].stat().st_mode & 0o777, 0o600)
+                self.assertIn(records[0].name, result.stdout)
 
     def test_failure_log_scrubs_secrets_and_rotates(self) -> None:
         busybox = shutil.which("busybox") or ""
