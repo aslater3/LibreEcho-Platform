@@ -142,6 +142,11 @@ class OtaFailureEvidenceContracts(unittest.TestCase):
             functions.append("ota_confirm_error_token")
         for lines, expected in (
             (["UNSAFE_MARKER", "ERROR:update_busy"], "ota-confirm:ERROR:update_busy"),
+            (["ERROR:update_directory_failed"], "ota-confirm:ERROR:update_directory_failed"),
+            (["ERROR:boot_control_target"], "ota-confirm:ERROR:boot_control_target"),
+            (["ERROR:boot_target_identity"], "ota-confirm:ERROR:boot_target_identity"),
+            (["ERROR:state_write_failed"], "ota-confirm:ERROR:state_write_failed"),
+            (["ERROR:state_commit_failed"], "ota-confirm:ERROR:state_commit_failed"),
             ([], "ota-confirm:ERROR:confirm-failed-no-detail"),
             (["ERROR:unrecognised_private_value"], "ota-confirm:ERROR:confirm-failed-no-detail"),
         ):

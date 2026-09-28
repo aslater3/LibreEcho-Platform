@@ -215,7 +215,7 @@ persist_failure_log()
 ota_confirm_error_token()
 {
     confirm_token=$($BB grep -xE \
-        'ERROR:(update_busy|no_pending_update|pending_boot_hash|boot_control_running_readback|feature_runtime_not_ready|boot_control_confirm|boot_control_readback|boot_control_readback_ambiguous|feature_commit_pending|userdata_identity_or_mount_failed)' \
+        'ERROR:(update_busy|update_directory_failed|no_pending_update|boot_control_target|boot_target_identity|pending_boot_hash|boot_control_running_readback|feature_runtime_not_ready|boot_control_confirm|boot_control_readback|boot_control_readback_ambiguous|feature_commit_pending|state_write_failed|state_commit_failed|userdata_identity_or_mount_failed)' \
         "$1" 2>/dev/null | $BB head -n 1)
     printf '%s\n' "${confirm_token:-ERROR:confirm-failed-no-detail}"
 }
