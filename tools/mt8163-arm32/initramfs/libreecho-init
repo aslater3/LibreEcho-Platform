@@ -209,6 +209,17 @@ persist_failure_log()
     return 0
 }
 
+# The confirmer's output in /tmp is lost on the failure reboot. Persist only
+# known updater error codes, never unrestricted stderr (which can contain
+# signed URLs, configuration, or device identity).
+ota_confirm_error_token()
+{
+    confirm_token=$($BB grep -xE \
+        'ERROR:(update_busy|update_directory_failed|no_pending_update|boot_control_target|boot_target_identity|pending_boot_hash|boot_control_running_readback|feature_runtime_not_ready|boot_control_confirm|boot_control_readback|boot_control_readback_ambiguous|feature_commit_pending|state_write_failed|state_commit_failed|userdata_identity_or_mount_failed|pending_feature_policy|pending_update_channel|packaged_update_channel|pending_channel_preserve|current_service_profile_unavailable|preserve_identity_source|preserve_feature_(payload(_size)?_mismatch|manifest_mismatch|daemon_(not_running|unavailable|mismatch)))' \
+        "$1" 2>/dev/null | $BB head -n 1)
+    printf '%s\n' "${confirm_token:-ERROR:confirm-failed-no-detail}"
+}
+
 # The kernel already carries ramoops/pstore and pmsg support, but this reduced
 # userspace previously mounted neither pstore nor the dynamically allocated
 # pmsg character device. Materialise both without assuming a fixed major.
@@ -2626,9 +2637,15 @@ ota_health_confirm_worker()
         pmsg_marker ota-slot-confirmed
         return 0
     fi
+    confirm_detail=
+    if [ "$passed" -eq 3 ]; then
+        last_check=ota-confirm
+        confirm_detail=$(ota_confirm_error_token /tmp/ota-confirm.log)
+    fi
     log ota-health-confirm-failed-rebooting
     pmsg_marker "ota-confirm-failed-$last_check"
-    failure_log=$(persist_failure_log ota-health-confirm-failed "$last_check" 2>/dev/null) || failure_log=
+    failure_log=$(persist_failure_log ota-health-confirm-failed \
+        "$last_check${confirm_detail:+:$confirm_detail}" 2>/dev/null) || failure_log=
     # Issue #41: leave persistent evidence for why this worker restarted the
     # device.  The record lives on the persistent userdata filesystem (not
     # tmpfs), is written atomically and synced before the reboot, and is
