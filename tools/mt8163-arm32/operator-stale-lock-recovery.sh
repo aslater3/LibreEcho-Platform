@@ -68,6 +68,13 @@ case "$boot" in ''|*[!A-Za-z0-9-]*) refuse boot_id;; esac
 inode=$(lock_inode)
 [ -n "$inode" ] || refuse lock_stat
 if [ -e "$OWNER" ] || [ -L "$OWNER" ]; then
+    # Refuse untrusted file types before any content read: sed on a FIFO can
+    # block indefinitely while holding fetch.lock. Two links are allowed only
+    # for the verified interrupted claim handoff below.
+    [ -f "$OWNER" ] && [ ! -L "$OWNER" ] || refuse foreign_owner
+    owner_size=$($BB stat -c %s "$OWNER" 2>/dev/null)
+    case "$owner_size" in ''|*[!0-9]*) refuse foreign_owner;; esac
+    [ "$owner_size" -le 512 ] && [ "$($BB stat -c %a "$OWNER" 2>/dev/null)" = 600 ] || refuse foreign_owner
     # The candidate worker reclaims this exact owner spelling on the next boot.
     # Only our own tag from a different boot may be resumed; same-boot may
     # still have an active operator process. The boot-local fetch lock serializes

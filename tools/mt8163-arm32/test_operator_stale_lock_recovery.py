@@ -95,6 +95,38 @@ class OperatorRecovery(unittest.TestCase):
         self.assertTrue((self.lock / 'owner').exists())
         self.assertTrue((self.root / 'pending').exists())
 
+    def test_fifo_owner_is_refused_without_blocking(self):
+        os.mkfifo(self.lock / 'owner', 0o600)
+        p = subprocess.Popen([BB, 'sh', str(self.script), *self.args],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, start_new_session=True)
+        try:
+            try:
+                _, stderr = p.communicate(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.fail('foreign FIFO owner blocked the recovery while holding fetch.lock')
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn('RECOVERY_REFUSED:foreign_owner', stderr)
+            self.assertFalse((self.runroot / 'fetch.lock').exists())
+            self.assertTrue((self.root / 'pending').exists())
+        finally:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            if p.poll() is None:
+                p.communicate(timeout=5)
+
+    def test_oversized_owner_is_refused(self):
+        owner = self.lock / 'owner'
+        owner.write_text('boot_id=old\n' + 'X' * 513)
+        owner.chmod(0o600)
+        r = self.run_recovery()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('RECOVERY_REFUSED:foreign_owner', r.stderr)
+        self.assertTrue((self.root / 'pending').exists())
+        self.assertFalse((self.runroot / 'fetch.lock').exists())
+
     def test_changed_transaction_auth_refused(self):
         (self.root / 'staging/manifest').write_bytes(b'transaction_id=other\n')
         r = self.run_recovery()
