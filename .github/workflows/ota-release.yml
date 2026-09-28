@@ -62,6 +62,7 @@ jobs:
             test_issue_169_ota_health.py \
             test_early_control_plane.py \
             test_issue_157_ota_rollback_finalization.py \
+            test_operator_stale_lock_recovery.py \
             mdns/test_runtime.py \
             test_qualification.py \
             test_ssh_runtime.py \
@@ -91,6 +92,7 @@ jobs:
             tools/mt8163-arm32/feature_runtime/package_runtime.py \
             tools/mt8163-arm32/feature_runtime/verify_runtime.py \
             tools/mt8163-arm32/test_issue_169_ota_health.py \
+            tools/mt8163-arm32/test_operator_stale_lock_recovery.py \
             tools/mt8163-arm32/test_early_control_plane.py
           while IFS= read -r -d '' script; do
             bash -n "$script"
@@ -100,4 +102,5 @@ jobs:
           /bin/busybox sh -n tools/mt8163-arm32/initramfs/libreecho-feature-transaction
           /bin/busybox sh -n tools/mt8163-arm32/initramfs/libreecho-update
           /bin/busybox sh -n tools/mt8163-arm32/initramfs/libreecho-update-fetch
+          /bin/busybox sh -n tools/mt8163-arm32/operator-stale-lock-recovery.sh
           git diff --check
