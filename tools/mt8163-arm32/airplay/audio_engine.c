@@ -1008,11 +1008,14 @@ static void render_period(struct source_bus *sources, int16_t *output,
 	}
 }
 
-/* Shared codec-equivalent mapping: logical 1..100 spans -60..0 dB.
- * Logical zero remains mute in the callers, not raw-index attenuation. */
+/* Shared codec-equivalent mapping: logical 1..100 spans -60..0 dB on a
+ * concave taper, -60 * (1 - x)^1.3 dB.  Steps are ~5 dB at the bottom of the
+ * slider and ~1.5 dB at the top, so the upper half no longer carries most of
+ * the audible change.  Logical zero remains mute in the callers. */
 static int logical_master_raw(int percent)
 {
-	return 7 + (percent - 1) * 120 / 99;
+	double x = (double)(percent - 1) / 99.0;
+	return 127 - (int)floor(120.0 * pow(1.0 - x, 1.3) + 0.5);
 }
 
 /* All sources share the hardware master.  Index the equaliser using the
