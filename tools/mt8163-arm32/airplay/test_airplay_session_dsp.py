@@ -206,7 +206,9 @@ int main(void)
     assert(!source_period_ready(&sources[SOURCE_AIRPLAY]));
     consume_period(sources);
     /* Logical master, not fixed physical codec, drives pre-DSP amplitude. */
-    assert(speaker_volume_percent_for_mix(100, 32768, 1, 0) == 100);
+    /* Logical 100 is the -12 dB ceiling: raw 103, effective percent 81, which
+     * still selects the loudest (100) loudness preset. */
+    assert(speaker_volume_percent_for_mix(100, 32768, 1, 0) == 81);
     assert(speaker_volume_percent_for_mix(0, 32768, 1, 0) == 0);
     assert(speaker_volume_percent_for_mix(100, 3277, 1, 0) < 100);
     assert(speaker_volume_percent_for_mix(60, 3277, 1, 1) ==
@@ -234,12 +236,27 @@ int main(void)
     sources[SOURCE_AIRPLAY].gain_q15 = 0;
     assert(speaker_volume_percent(sources, 51) ==
            speaker_volume_percent_for_mix(51, 32768, 1, 0));
-    /* Logical -15 dB: raw 97, effective percent 76, preset 80. */
+    /* Taper: -12 - 48 * (1 - x)^1.3 dB.  Owner listening and on-device mic
+     * captures: logical 50 was uncomfortably loud and above ~65 both the
+     * limiter and the speaker distort, so full scale is kept out of reach
+     * (-12 dB ceiling).  Mute and the -60 dB floor are unchanged. */
+    assert(logical_master_raw(1) == 7);           /* -60 dB */
+    assert(logical_master_raw(2) == 8);           /* -59.5 dB */
+    assert(logical_master_raw(26) == 37);         /* -45 dB at a quarter */
+    assert(logical_master_raw(51) == 65);         /* -31 dB at half */
+    assert(logical_master_raw(76) == 88);         /* -19.5 dB at three quarters */
+    assert(logical_master_raw(100) == 103);       /* -12 dB ceiling */
+    for (i = 2; i <= 100; ++i)
+        assert(logical_master_raw(i) >= logical_master_raw(i - 1));
+    assert(10 * (logical_master_raw(51) - logical_master_raw(1)) >=
+           14 * (logical_master_raw(100) - logical_master_raw(51)));
+    assert(logical_master_raw(100) - logical_master_raw(94) >= 2);
+    /* Logical 51: raw 65 (-31 dB), effective percent 51, preset 60. */
     {
         float gains[SPEAKER_DSP_LOUDNESS_SECTIONS];
-        assert(speaker_volume_percent_for_mix(51, 32768, 1, 0) == 76);
-        speaker_dsp_loudness_gains(76.0f, gains);
-        assert(gains[0] == speaker_loudness_gain_db[3][0]);
+        assert(speaker_volume_percent_for_mix(51, 32768, 1, 0) == 51);
+        speaker_dsp_loudness_gains(51.0f, gains);
+        assert(gains[0] == speaker_loudness_gain_db[1][0]);
     }
     /* The per-source gain is multiplied once before the shared master. */
     sources[SOURCE_AIRPLAY].received = 0;

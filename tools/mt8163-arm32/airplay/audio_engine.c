@@ -1008,6 +1008,18 @@ static void render_period(struct source_bus *sources, int16_t *output,
 	}
 }
 
+/* Shared codec-equivalent mapping: logical 1..100 spans -60..-12 dB on a
+ * concave taper, -12 - 48 * (1 - x)^1.3 dB.  Owner listening put logical 50
+ * at "uncomfortable in the same room", and on-device microphone captures
+ * showed limiter and speaker distortion from about logical 65 of the 0 dB
+ * curve upward, so full-scale pre-DSP gain is no longer reachable.  Logical
+ * zero remains mute in the callers. */
+static int logical_master_raw(int percent)
+{
+	double x = (double)(percent - 1) / 99.0;
+	return 103 - (int)floor(96.0 * pow(1.0 - x, 1.3) + 0.5);
+}
+
 /* All sources share the hardware master.  Index the equaliser using the
  * currently audible bus, never a device-wide sender-volume override. */
 static int speaker_volume_percent_for_mix(int master, int32_t media_gain,
@@ -1018,7 +1030,7 @@ static int speaker_volume_percent_for_mix(int master, int32_t media_gain,
 
 	if (master <= 0 || master > 100)
 		return 0;
-	raw = 67 + (master - 1) * 60 / 99;
+	raw = logical_master_raw(master);
 	db = ((double)raw - 127.0) / 2.0;
 	if (media_ready && !priority_ready) {
 		if (media_gain <= 0)
@@ -1068,7 +1080,7 @@ static int32_t logical_master_gain(int percent)
 	int raw;
 	if (percent <= 0)
 		return 0;
-	raw = 67 + (percent - 1) * 60 / 99;
+	raw = logical_master_raw(percent);
 	return db_to_q15(((double)raw - 127.0) / 2.0);
 }
 

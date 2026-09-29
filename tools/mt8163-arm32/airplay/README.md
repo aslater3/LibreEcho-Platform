@@ -102,8 +102,13 @@ the callback outside the chroot and maps sender volume to audiod's logical
 `0..100` master. Button/API changes use that same logical master. Audiod must
 atomically publish a validated decimal percentage in
 `/run/libreecho-audio/master.volume`; the engine reads it every period,
-maps `1..100` to codec-equivalent indices `67..127` (`0` is mute), and
-smooths Q15 gain before the shared EQ/MBCL. The physical PCM codec control
+maps `1..100` to codec-equivalent indices `7..103` (`0` is mute), and
+smooths Q15 gain before the shared EQ/MBCL. The logical master uses
+`-12 - 48 * (1 - x)^1.3` dB, where `x = (percent - 1) / 99`, rounded to
+half-decibel codec-equivalent steps. This preserves a quiet -60 dB floor,
+tapers the upper slider travel, and caps pre-DSP gain at -12 dB. These are
+gain values, not acoustic sound-pressure limits; high-level speaker distortion
+has not been ruled out. The physical PCM codec control
 remains fixed at index `127` (0 dB) after prepare. Non-muted AirPlay is unity
 source gain, sender mute is zero, and generic media alone uses `media.volume`.
 The first AirPlay period waits for matching marker/callback/ack identity;

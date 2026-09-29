@@ -98,11 +98,17 @@ static const float speaker_loudness_gain_db[SPEAKER_DSP_STEP_COUNT][SPEAKER_DSP_
 };
 
 /*
- * Parametric EQ: the stock file's only two non-BYPASS entries.
+ * Parametric EQ: the stock file's only two non-BYPASS entries are a 150 Hz
+ * Q 0.9 +5 dB low shelf and an 80 Hz Q 0.9 +2 dB peak.  The stock designer's
+ * shelf convention differs from the RBJ cookbook, so a literal RBJ reading of
+ * those numbers places the shelf turnover too low (up to 1.2 dB short around
+ * 200 Hz).  These are the effective RBJ parameters fitted to an offline
+ * measurement of the stock stage; they are our own design inputs, not
+ * coefficients.
  */
 static const struct speaker_dsp_section speaker_parametric_eq[] = {
-	{ SPEAKER_SHAPE_LOWSHELF, 150.0f, 0.90f, +5.0f },
-	{ SPEAKER_SHAPE_PEAK,      80.0f, 0.90f, +2.0f }
+	{ SPEAKER_SHAPE_LOWSHELF, 177.0f, 0.72f, +4.8f },
+	{ SPEAKER_SHAPE_PEAK,      81.0f, 0.85f, +2.0f }
 };
 
 static inline void speaker_biquad_design(struct speaker_dsp_biquad *bq,
