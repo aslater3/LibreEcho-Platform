@@ -234,12 +234,12 @@ int main(void)
     sources[SOURCE_AIRPLAY].gain_q15 = 0;
     assert(speaker_volume_percent(sources, 51) ==
            speaker_volume_percent_for_mix(51, 32768, 1, 0));
-    /* Logical -15 dB: raw 97, effective percent 76, preset 80. */
+    /* Logical 51: raw 67 (-30 dB), effective percent 53, preset 60. */
     {
         float gains[SPEAKER_DSP_LOUDNESS_SECTIONS];
-        assert(speaker_volume_percent_for_mix(51, 32768, 1, 0) == 76);
-        speaker_dsp_loudness_gains(76.0f, gains);
-        assert(gains[0] == speaker_loudness_gain_db[3][0]);
+        assert(speaker_volume_percent_for_mix(51, 32768, 1, 0) == 53);
+        speaker_dsp_loudness_gains(53.0f, gains);
+        assert(gains[0] == speaker_loudness_gain_db[1][0]);
     }
     /* The per-source gain is multiplied once before the shared master. */
     sources[SOURCE_AIRPLAY].received = 0;

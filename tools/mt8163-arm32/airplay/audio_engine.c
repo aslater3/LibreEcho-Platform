@@ -1008,6 +1008,13 @@ static void render_period(struct source_bus *sources, int16_t *output,
 	}
 }
 
+/* Shared codec-equivalent mapping: logical 1..100 spans -60..0 dB.
+ * Logical zero remains mute in the callers, not raw-index attenuation. */
+static int logical_master_raw(int percent)
+{
+	return 7 + (percent - 1) * 120 / 99;
+}
+
 /* All sources share the hardware master.  Index the equaliser using the
  * currently audible bus, never a device-wide sender-volume override. */
 static int speaker_volume_percent_for_mix(int master, int32_t media_gain,
@@ -1018,7 +1025,7 @@ static int speaker_volume_percent_for_mix(int master, int32_t media_gain,
 
 	if (master <= 0 || master > 100)
 		return 0;
-	raw = 67 + (master - 1) * 60 / 99;
+	raw = logical_master_raw(master);
 	db = ((double)raw - 127.0) / 2.0;
 	if (media_ready && !priority_ready) {
 		if (media_gain <= 0)
@@ -1068,7 +1075,7 @@ static int32_t logical_master_gain(int percent)
 	int raw;
 	if (percent <= 0)
 		return 0;
-	raw = 67 + (percent - 1) * 60 / 99;
+	raw = logical_master_raw(percent);
 	return db_to_q15(((double)raw - 127.0) / 2.0);
 }
 
