@@ -234,12 +234,28 @@ int main(void)
     sources[SOURCE_AIRPLAY].gain_q15 = 0;
     assert(speaker_volume_percent(sources, 51) ==
            speaker_volume_percent_for_mix(51, 32768, 1, 0));
-    /* Logical 51: raw 67 (-30 dB), effective percent 53, preset 60. */
+    /* Taper: -60 * (1 - x)^1.3 dB.  Wider dB steps at the bottom of the
+     * slider, narrower at the top, so the upper half no longer dominates the
+     * perceived range.  Mute, -60 dB floor and 0 dB are unchanged. */
+    assert(logical_master_raw(1) == 7);           /* -60 dB */
+    assert(logical_master_raw(2) == 9);           /* -59 dB */
+    assert(logical_master_raw(26) == 45);         /* -41 dB at a quarter */
+    assert(logical_master_raw(51) == 79);         /* -24 dB at half */
+    assert(logical_master_raw(76) == 108);        /* -9.5 dB at three quarters */
+    assert(logical_master_raw(100) == 127);       /*   0 dB */
+    for (i = 2; i <= 100; ++i)
+        assert(logical_master_raw(i) >= logical_master_raw(i - 1));
+    /* Lower half spans at least 1.4x the dB of the upper half, and the top
+     * iPhone notch (logical 94 -> 100) still moves at least 1 dB. */
+    assert(10 * (logical_master_raw(51) - logical_master_raw(1)) >=
+           14 * (logical_master_raw(100) - logical_master_raw(51)));
+    assert(logical_master_raw(100) - logical_master_raw(94) >= 2);
+    /* Logical 51: raw 79 (-24 dB), effective percent 62, preset 70. */
     {
         float gains[SPEAKER_DSP_LOUDNESS_SECTIONS];
-        assert(speaker_volume_percent_for_mix(51, 32768, 1, 0) == 53);
-        speaker_dsp_loudness_gains(53.0f, gains);
-        assert(gains[0] == speaker_loudness_gain_db[1][0]);
+        assert(speaker_volume_percent_for_mix(51, 32768, 1, 0) == 62);
+        speaker_dsp_loudness_gains(62.0f, gains);
+        assert(gains[0] == speaker_loudness_gain_db[2][0]);
     }
     /* The per-source gain is multiplied once before the shared master. */
     sources[SOURCE_AIRPLAY].received = 0;
