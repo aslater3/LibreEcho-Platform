@@ -142,7 +142,7 @@ static void test_loudness_ladder(void)
 {
 	double bass50, bass100, treble50, treble100, mid50, mid100;
 
-	printf("loudness ladder direction (more lift at lower volume)\n");
+	printf("authored EQ26 anchor differences (not normalized loudness)\n");
 	bass50 = chain_gain_db(50, 120.0);
 	bass100 = chain_gain_db(100, 120.0);
 	treble50 = chain_gain_db(50, 9000.0);
@@ -150,12 +150,15 @@ static void test_loudness_ladder(void)
 	mid50 = chain_gain_db(50, 700.0);
 	mid100 = chain_gain_db(100, 700.0);
 
-	check(bass50 > bass100 + 1.5, "bass lift is greater at volume 50 than 100",
-	      bass50 - bass100, 0.0, 1e9);
-	check(treble50 > treble100 + 0.5, "treble lift is greater at volume 50 than 100",
-	      treble50 - treble100, 0.0, 1e9);
-	check(fabs(mid50 - mid100) < 1.5, "mid band is essentially volume independent",
-	      mid50 - mid100, 0.0, 1.5);
+	/* Independently calculated from the frozen authored Fc/Q/gain design.
+	 * Absolute anchor scalars mean neither treble lift nor mid-band unity
+	 * follows the previous normalized five-section approximation. */
+	check(fabs(bass50 - bass100 - 5.1185) < 0.15, "authored bass anchor difference",
+	      bass50 - bass100, 5.1185, 0.15);
+	check(fabs(treble50 - treble100 + 2.0911) < 0.15, "authored treble anchor difference",
+	      treble50 - treble100, -2.0911, 0.15);
+	check(fabs(mid50 - mid100 + 2.1105) < 0.15, "authored mid-band anchor difference",
+	      mid50 - mid100, -2.1105, 0.15);
 }
 
 static void test_upper_boundary_selection(void)
@@ -212,7 +215,7 @@ static void test_midband_shaping(void)
 	g = chain_gain_db(70, 80.0);
 	check(g > 3.0, "80 Hz region is lifted (parametric peak plus shelf)", g, 0.0, 1e9);
 	g = chain_gain_db(70, 150.0);
-	check(g > 2.0, "150 Hz region is lifted (parametric shelf)", g, 0.0, 1e9);
+	check(fabs(g - 1.8799) < 0.15, "150 Hz authored EQ plus parametric shelf", g, 1.8799, 0.15);
 	g = chain_gain_db(100, 12000.0);
 	check(g > -6.0 && g < 12.0, "12 kHz stays within a sane range", g, 0.0, 1e9);
 }
@@ -264,7 +267,9 @@ static void test_bass_boost_reaches_limiter_without_preclipping(void)
 	speaker_dsp_init(&protected, 50);
 	puffin_dynamics_init(&dynamics);
 	for (n = 0; n < (long)RATE / 2; ++n) {
-		int32_t input = (int32_t)lrint(4000.0 *
+		/* EQ26 has less 80 Hz boost; drive it harder to preserve the
+		 * same >S16 headroom assertion, not relax the protection gate. */
+		int32_t input = (int32_t)lrint(8000.0 *
 			sin(TEST_TWO_PI * 80.0 * (double)n / RATE));
 		int32_t wide = (int32_t)lrintf(speaker_dsp_equalize(&raw_eq, input));
 		int32_t protected_sample = speaker_dsp_process(&protected, input);

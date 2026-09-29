@@ -253,10 +253,15 @@ int main(void)
     assert(logical_master_raw(100) - logical_master_raw(94) >= 2);
     /* Logical 51: raw 65 (-31 dB), effective percent 51, preset 60. */
     {
-        float gains[SPEAKER_DSP_LOUDNESS_SECTIONS];
+        struct speaker_dsp selected, anchor;
         assert(speaker_volume_percent_for_mix(51, 32768, 1, 0) == 51);
-        speaker_dsp_loudness_gains(51.0f, gains);
-        assert(gains[0] == speaker_loudness_gain_db[1][0]);
+        speaker_dsp_init(&selected, 51);
+        speaker_dsp_init(&anchor, 60);
+        assert(memcmp(selected.sections, anchor.sections, sizeof(anchor.sections)) == 0);
+        /* Whole topology and scalar, not just the first section gain. */
+        for (i = 0; i < 200; ++i)
+            assert(speaker_dsp_equalize(&selected, 4000) ==
+                   speaker_dsp_equalize(&anchor, 4000));
     }
     /* The per-source gain is multiplied once before the shared master. */
     sources[SOURCE_AIRPLAY].received = 0;

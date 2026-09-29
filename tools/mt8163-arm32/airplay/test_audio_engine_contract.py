@@ -67,10 +67,16 @@ def main() -> None:
     dsp_code = re.sub(r"/\*.*?\*/", "", dsp, flags=re.S)
     dsp_code = re.sub(r"//[^\n]*", "", dsp_code)
 
-    # Provenance: the artifact ships parameters and our own design code, never a
-    # vendor coefficient table.  A pasted stock curve would add thousands of
-    # numeric literals; our own tables are a few dozen.
-    literals = re.findall(r"[-+]?\d+\.\d*f|[-+]?\d+f", dsp_code)
+    # Admit exactly the authored shape/Fc/Q/gain rows, not arbitrary extra
+    # coefficient/spectrum arrays. Keep the old 200-literal budget for all
+    # remaining code. Numerical tests independently check every section.
+    parameter_row = (r"\{\s*SPEAKER_SHAPE_(?:LOWSHELF|PEAK|HIGHSHELF)\s*,"
+                     r"\s*[-+]?\d+\.\d+f\s*,\s*[-+]?\d+\.\d+f\s*,"
+                     r"\s*[-+]?\d+\.\d+f\s*\}")
+    if len(re.findall(parameter_row, dsp_code)) != 132:  # five * 26 + two PEQ
+        raise SystemExit("speaker tuning must contain 130 authored EQ rows and two PEQ rows")
+    non_parameters = re.sub(parameter_row, "", dsp_code)
+    literals = re.findall(r"[-+]?\d+(?:\.\d*)?(?:[eE][-+]?\d+)?[fF]?", non_parameters)
     if len(literals) > 200:
         raise SystemExit(
             f"speaker_dsp.h carries {len(literals)} float literals; the tuning must "
