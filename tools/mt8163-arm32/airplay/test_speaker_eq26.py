@@ -172,10 +172,16 @@ class AuthoredEQ26(unittest.TestCase):
         for v, spec in FIT["anchors"].items():
             with self.subTest(anchor=v):
                 self.assertEqual(len(spec["sections"]), 26)
-                for actual, expected in zip(self.coefficients(int(v)),
-                                            map(design, spec["sections"] + PEQ)):
-                    for a, b in zip(actual, expected):
-                        self.assertAlmostEqual(a, b, delta=3e-7)
+                for actual, section in zip(self.coefficients(int(v)), spec["sections"] + PEQ):
+                    # Inputs and stored coefficients are float. Compare exactly
+                    # to the independently designed, float-rounded reference;
+                    # a raw-double absolute tolerance can be below half an ULP
+                    # (e.g. the 15.646578... coefficient). Response gates below
+                    # still compare against the unquantized authored design.
+                    rounded = {k: ctypes.c_float(x).value if k != "shape" else x
+                               for k, x in section.items()}
+                    expected = tuple(ctypes.c_float(x).value for x in design(rounded))
+                    self.assertEqual(actual, expected)
 
     def test_anchor_scalar_is_applied(self):
         for v, spec in FIT["anchors"].items():

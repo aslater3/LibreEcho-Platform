@@ -1,10 +1,9 @@
 /*
  * Unit tests for the Radar-Puffin speaker tuning stage (speaker_dsp.h).
  *
- * These assert behaviour, not snapshots: filter shapes respond where they
- * should, the loudness ladder runs in the physically correct direction, volume
- * clamping matches the stock boundary selection, and the stage is bit
- * transparent when inactive.
+ * These assert filter shapes, the frozen authored anchor differences, volume
+ * boundary selection, wide-bus/output safety and transparent inactive EQ.
+ * test_speaker_eq26.py checks every authored section and numerical response.
  */
 #define _POSIX_C_SOURCE 200809L
 
