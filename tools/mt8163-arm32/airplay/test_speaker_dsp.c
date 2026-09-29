@@ -217,6 +217,40 @@ static void test_midband_shaping(void)
 	check(g > -6.0 && g < 12.0, "12 kHz stays within a sane range", g, 0.0, 1e9);
 }
 
+/* Gain of the two parametric sections alone, as designed at init. */
+static double parametric_gain_db(double f)
+{
+	struct speaker_dsp dsp;
+	int i;
+	double g = 0.0;
+
+	speaker_dsp_init(&dsp, 70);
+	for (i = SPEAKER_DSP_LOUDNESS_SECTIONS; i < SPEAKER_DSP_SECTIONS; ++i)
+		g += biquad_gain_db(&dsp.sections[i], f);
+	return g;
+}
+
+/*
+ * The stock designer does not interpret the configured shelf Fc/Q the way the
+ * RBJ cookbook does: an offline whole-chain measurement puts its effective
+ * turnover well above 150 Hz.  Checkpoints are aggregate magnitudes of that
+ * measured stage (held-out anchor 70, 0.03 dB rms after this fix).
+ */
+static void test_parametric_matches_measured_stage(void)
+{
+	double g;
+
+	printf("parametric EQ matches the measured stock stage\n");
+	g = parametric_gain_db(20.0);
+	check(fabs(g - 5.0) < 0.3, "parametric gain at 20 Hz", g, 5.0, 0.3);
+	g = parametric_gain_db(150.0);
+	check(fabs(g - 4.1) < 0.3, "parametric gain at 150 Hz", g, 4.1, 0.3);
+	g = parametric_gain_db(200.0);
+	check(fabs(g - 2.3) < 0.3, "parametric gain at 200 Hz", g, 2.3, 0.3);
+	g = parametric_gain_db(300.0);
+	check(fabs(g - 0.7) < 0.3, "parametric gain at 300 Hz", g, 0.7, 0.3);
+}
+
 static void test_bass_boost_reaches_limiter_without_preclipping(void)
 {
 	struct speaker_dsp raw_eq, protected;
@@ -368,6 +402,7 @@ int main(void)
 	test_volume_clamping();
 	test_inactive_is_transparent();
 	test_midband_shaping();
+	test_parametric_matches_measured_stage();
 	test_bass_boost_reaches_limiter_without_preclipping();
 	test_bass_band_protection_keeps_full_bus_limiter_idle();
 	test_live_volume_change_updates_loudness_without_stream_restart();
