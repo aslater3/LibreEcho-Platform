@@ -32,6 +32,10 @@ class Issue195ExpdbSafetyTests(unittest.TestCase):
         self.assertNotIn("$EXPDB", init)
         self.assertNotIn("printf FASTBOOT_PLEASE", init)
         self.assertIn("reboot-request-fastboot-rejected-expdb-protected", init)
+        # Removing the marker must not remove block-node creation: userdata
+        # and the A/B slots are opened through these /dev/mmcblk0pN nodes.
+        self.assertIn('$BB mknod "/dev/$name" b "$major" "$minor"', init)
+        self.assertLess(init.index('mknod "/dev/$name" b'), init.index("userdata_mount()"))
         self.assertNotIn("FASTBOOT_PLEASE", update)
         self.assertNotIn("EXPDB_DEVICE", update)
         self.assertNotIn("clear_exact_development_marker", update)

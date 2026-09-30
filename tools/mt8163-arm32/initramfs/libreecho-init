@@ -686,6 +686,26 @@ else
     pmsg_marker adb-tcp-not-configured
 fi
 
+# The reduced ramdisk does not mount devtmpfs, so create the eMMC block nodes
+# from sysfs rather than assuming MMC minor numbers.  Userdata and the A/B
+# slots depend on these nodes.  Creating a node never writes to a partition.
+i=0
+while [ "$i" -lt 10 ] && [ ! -r /sys/class/block/mmcblk0p16/dev ]; do
+    $BB sleep 1
+    i=$((i + 1))
+done
+for sys_block in /sys/class/block/mmcblk0 /sys/class/block/mmcblk0p*; do
+    [ -r "$sys_block/dev" ] || continue
+    name=${sys_block##*/}
+    devno=$($BB cat "$sys_block/dev" 2>/dev/null)
+    major=${devno%:*}
+    minor=${devno#*:}
+    if [ -z "$major" ] || [ -z "$minor" ]; then
+        continue
+    fi
+    [ -b "/dev/$name" ] || $BB mknod "/dev/$name" b "$major" "$minor" 2>/dev/null
+done
+
 # Mount only the verified userdata partition.  The AirPlay payload and other
 # optional assets live here, while persist/IDME remains untouched because it
 # carries board identity, MAC addresses, and calibration data.  Do not
