@@ -54,7 +54,7 @@ class BundleBuilderTests(unittest.TestCase):
         # The signed manifest and its detached signature, as the OTA bundle ships
         # them. boot_sha256 must match the boot image actually being shipped.
         (directory / "manifest").write_text(
-            "version=0.14.0\n"
+            "board=radar_puffin\nversion=0.14.0\n"
             f"boot_sha256={builder.sha256_file(boot)}\n"
             "feature_ids=tts\n")
         (directory / "manifest.sig").write_bytes(b"signature")
@@ -312,6 +312,7 @@ class ReleaseLayoutTests(unittest.TestCase):
             tar.add(install_path, arcname=builder.INSTALL_MANIFEST_NAME)
 
         signed = {
+            "board": "radar_puffin",
             "format": "libreecho-ota-v2",
             "version": self.release,
             "boot_sha256": builder.sha256_file(boot),

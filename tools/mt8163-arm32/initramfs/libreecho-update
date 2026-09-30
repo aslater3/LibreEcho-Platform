@@ -51,6 +51,30 @@ TRANSACTION_BCB_FILE=$STAGING/bootctl.readback
 FEATURE_DIR=
 OTA_FORMAT=v1
 
+# Immutable image identity, not a caller environment or bootloader product.
+# Keep this bounded loader inline: no extra staged runtime file is required.
+load_image_target()
+{
+    local target_file=/etc/libreecho/target target_count
+    TARGET_ID=
+    TARGET_SLUG=
+    if [ ! -e "$target_file" ] && [ ! -L "$target_file" ]; then
+        TARGET_ID=radar_puffin
+        TARGET_SLUG=radar-puffin
+        printf '%s\n' 'target-file=missing fallback=radar_puffin' >&2
+        return 0
+    fi
+    [ -f "$target_file" ] && [ ! -L "$target_file" ] && [ -r "$target_file" ] || return 1
+    target_count=$($BB grep -c '^target_id=' "$target_file")
+    [ "$target_count" = 1 ] || return 1
+    TARGET_ID=$($BB sed -n 's/^target_id=//p' "$target_file")
+    case "$TARGET_ID" in
+        radar_puffin) TARGET_SLUG=radar-puffin ;;
+        biscuit) TARGET_SLUG=biscuit ;;
+        *) TARGET_ID=; return 1 ;;
+    esac
+}
+
 abort_v2_before_activation()
 {
     [ "$OTA_FORMAT" = v2 ] || return 0
@@ -308,7 +332,8 @@ verify_v2_manifest()
     OTA_FORMAT=v2
     [ "$(manifest_value transaction_type)" = system ] || die v2_transaction_type
     [ "$(manifest_value manifest_version)" = 1 ] || die v2_manifest_version
-    [ "$(manifest_value board)" = radar_puffin ] || die v2_board
+    load_image_target || die image_target
+    [ "$(manifest_value board)" = "$TARGET_ID" ] || die v2_board
     [ "$(manifest_value soc)" = mt8163 ] || die v2_soc
     [ "$(manifest_value architecture)" = armv7 ] || die v2_architecture
     [ "$(manifest_value image_profile)" = ota ] || die v2_image_profile
@@ -361,7 +386,7 @@ verify_v2_manifest()
                 done
                 valid_v2_hash "$(manifest_value "feature_${feature}_sha256")" || die v2_asset_field
                 valid_v2_hash "$(manifest_value "feature_${feature}_manifest_sha256")" || die v2_asset_field
-                prefix=libreecho-radar-puffin-$(manifest_value "feature_${feature}_release")-$feature
+                prefix=libreecho-$TARGET_SLUG-$(manifest_value "feature_${feature}_release")-$feature
                 case "$action:$asset:$manifest_asset" in
                     runtime:"$prefix.runtime.squashfs":"$prefix.runtime-manifest.json"|replace:"$prefix.payload.squashfs":"$prefix.manifest.json") ;;
                     *) die v2_asset_identity;;
@@ -463,7 +488,8 @@ verify_manifest()
     [ "$(manifest_value manifest_version)" = 1 ] ||
         [ "$(manifest_value manifest_version)" = 2 ] ||
         die manifest_version
-    [ "$(manifest_value board)" = radar_puffin ] || die manifest_board
+    load_image_target || die image_target
+    [ "$(manifest_value board)" = "$TARGET_ID" ] || die manifest_board
     [ "$(manifest_value soc)" = mt8163 ] || die manifest_soc
     [ "$(manifest_value architecture)" = armv7 ] ||
         die manifest_architecture

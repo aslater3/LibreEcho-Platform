@@ -13,6 +13,9 @@ from pathlib import Path
 from nacl.signing import SigningKey
 
 from feature_manifest import build_control_tar as build_v2_control_tar
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from target_registry import add_target_arguments, validate_target_arguments, get_target
 
 
 BOOT_SIZE = 16 * 1024 * 1024
@@ -94,7 +97,7 @@ def v2_manifest(args: argparse.Namespace, boot_digest: str, build_manifest: dict
         raise SystemExit("ERROR: feature plan must contain a features list")
     transaction_id = "txn-" + hashlib.sha256((args.version + boot_digest + json.dumps(records, sort_keys=True, separators=(",", ":"))).encode()).hexdigest()[:24]
     result = {
-        "format": "libreecho-ota-v2", "manifest_version": 1, "board": "radar_puffin",
+        "format": "libreecho-ota-v2", "manifest_version": 1, "board": args.target,
         "soc": "mt8163", "architecture": "armv7", "image_profile": "ota",
         "transaction_type": "system", "transaction_id": transaction_id, "version": args.version,
         "update_channel": args.update_channel, "service_profile": args.service_profile,
@@ -145,7 +148,9 @@ def main() -> None:
     parser.add_argument("--update-channel", choices=("dev", "stable"),
                         required=True)
     parser.add_argument("--output", type=Path, required=True)
+    add_target_arguments(parser)
     args = parser.parse_args()
+    validate_target_arguments(parser, args)
 
     if not VALUE_RE.fullmatch(args.version):
         raise SystemExit("ERROR: version contains unsupported characters")
@@ -176,6 +181,14 @@ def main() -> None:
             output_record.get("sha256") != digest or
             output_record.get("size") != len(boot)):
         raise SystemExit("ERROR: boot image does not match build manifest")
+    # Old Radar build manifests carried board only in the OTA subsection.
+    board = build_manifest.get("board", build_manifest.get("ota", {}).get("board", "radar_puffin"))
+    if board != args.target:
+        raise SystemExit("ERROR: target does not match build manifest board")
+    get_target(board)
+    if (args.target_descriptor_sha256 is not None and
+            build_manifest.get("target_descriptor_sha256") != args.target_descriptor_sha256):
+        raise SystemExit("ERROR: target descriptor digest does not match build manifest")
     if build_manifest.get("image_profile") != "ota":
         raise SystemExit("ERROR: build manifest is not an OTA image")
     if build_manifest.get("service_profile") != args.service_profile:
@@ -196,7 +209,7 @@ def main() -> None:
     manifest = (
         "format=libreecho-ota-v1\n"
         "manifest_version=" + ("2" if args.feature_policy == "preserve" else "1") + "\n"
-        "board=radar_puffin\n"
+        f"board={args.target}\n"
         "soc=mt8163\n"
         "architecture=armv7\n"
         f"version={args.version}\n"
