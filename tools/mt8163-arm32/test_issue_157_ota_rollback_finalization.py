@@ -484,7 +484,7 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
         # keeps the worker from opening one sits ahead of that transaction.
         self.assertLess(
             self.worker.index(marker),
-            self.worker.index('if [ ! -r "$FIRST_INSTALL_MARKER" ]'),
+            self.worker.index('if ! first_install_marker_matches; then'),
         )
         # Both gates sit behind the rollback detection and finalization.
         for earlier in (

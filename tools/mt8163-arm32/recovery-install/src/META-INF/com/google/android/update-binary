@@ -106,6 +106,81 @@ receipt_reset() {
     fi
 }
 
+# --- target identity ---------------------------------------------------------
+# Boot-chain tokens differ only in case between sources: fastboot/LK reports
+# RADAR/BISCUIT, while the Amonet TWRP builds set ro.product.device and
+# ro.build.product to radar/biscuit. Compare case-insensitively against the
+# target's fastboot products; also accept the exact target id.
+product_matches() {
+    pm_upper=$(printf '%s' "$1" | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')
+    case ",$FASTBOOT_PRODUCTS," in *",$pm_upper,"*) return 0 ;; esac
+    [ "$1" = "$TARGET" ]
+}
+
+check_target() {
+    TARGET=$(sed -n 's/^target=//p' "$BUNDLE_MANIFEST")
+    bundle_device=$(sed -n 's/^device=//p' "$BUNDLE_MANIFEST")
+    FASTBOOT_PRODUCTS=$(sed -n 's/^fastboot_products=//p' "$BUNDLE_MANIFEST")
+    # Older Radar bundles predate the additive identity lines.
+    if [ -z "$TARGET" ] && [ "$bundle_device" = radar_puffin ]; then
+        TARGET=radar_puffin
+        FASTBOOT_PRODUCTS=RADAR
+        ui_print "target-line=missing fallback=radar_puffin"
+    fi
+    receipt_set "target=$TARGET"
+    [ "$bundle_device" = "$TARGET" ] || die "bundle target/device mismatch"
+    case "$TARGET:$FASTBOOT_PRODUCTS" in
+        radar_puffin:RADAR|biscuit:BISCUIT) ;;
+        *) die "unknown target or fastboot product contract: $TARGET:$FASTBOOT_PRODUCTS" ;;
+    esac
+    # An OS identity is normally unavailable in TWRP. Never infer the installed
+    # target from TWRP's default properties or try to mount a current boot slot.
+    if [ -e /etc/libreecho/target ] || [ -L /etc/libreecho/target ]; then
+        [ -f /etc/libreecho/target ] && [ ! -L /etc/libreecho/target ] || die "running target is not regular"
+        running_target=$(sed -n 's/^target_id=//p' /etc/libreecho/target)
+        ui_print "running-image-target=$running_target"
+        [ "$running_target" = "$TARGET" ] || die "running image target mismatch"
+    fi
+    product_found=0
+    product_mismatch=0
+    for product_prop in ro.boot.product ro.product.device ro.build.product; do
+        product_value=$(getprop "$product_prop" 2>/dev/null)
+        ui_print "target-product-source=$product_prop value=${product_value:-<empty>}"
+        [ -n "$product_value" ] || continue
+        product_found=1
+        product_matches "$product_value" || product_mismatch=1
+    done
+    # Only product/device fields are board tokens. androidboot.hardware is a
+    # SoC (mt8163), and serial/slot fields are not product identities.
+    for product_field in $(cat /proc/cmdline 2>/dev/null); do
+        case "$product_field" in
+            androidboot.product=*|androidboot.product.device=*|androidboot.build.product=*|androidboot.device=*)
+                product_value=${product_field#*=}
+                ui_print "target-product-source=${product_field%%=*} value=${product_value:-<empty>}"
+                [ -n "$product_value" ] || continue
+                product_found=1
+                product_matches "$product_value" || product_mismatch=1
+                ;;
+        esac
+    done
+    TARGET_CHECK=match
+    if [ "$product_found" = 0 ]; then
+        TARGET_CHECK=unknown
+        ui_print "target-check=unknown"
+    elif [ "$product_mismatch" = 1 ]; then
+        if [ -e /cache/libreecho-allow-cross-target ]; then
+            TARGET_CHECK=override
+            ui_print "WARNING: CROSS-TARGET OPERATOR OVERRIDE; boot-chain identity differs from target $TARGET"
+            receipt_set "target_override=1" "target_override_marker=/cache/libreecho-allow-cross-target"
+        else
+            receipt_set "target_check=mismatch"
+            die "boot-chain product does not match $TARGET; explicit /cache/libreecho-allow-cross-target required"
+        fi
+    fi
+    receipt_set "target_check=$TARGET_CHECK"
+    ui_print "target-check=$TARGET_CHECK target=$TARGET"
+}
+
 # --- partition helpers ------------------------------------------------------
 # /dev/block/by-name exists in recovery but NOT in the installed OS, which
 # resolves partitions through sysfs PARTNAME. Resolve by PARTNAME first so the
@@ -181,7 +256,8 @@ verify_pair() {
     vp_want=$2
     vp_label=$3
     vp_path="$BUNDLE_DIR/$vp_file"
-    [ -f "$vp_path" ] || die "$vp_label missing: $vp_file"
+    case "$vp_file" in ''|.*|*[!A-Za-z0-9._+-]*) die "unsafe $vp_label filename: $vp_file" ;; esac
+    [ -f "$vp_path" ] && [ ! -L "$vp_path" ] || die "$vp_label missing or not regular: $vp_file"
     vp_got=$(sha256_of "$vp_path")
     if [ "$vp_got" != "$vp_want" ]; then
         die "$vp_label digest mismatch: $vp_file (got $vp_got want $vp_want)"
@@ -197,7 +273,7 @@ field() {
 check_payloads() {
     ui_print "Verifying payloads against the manifest"
     [ -n "$BUNDLE_DIR" ] || die "bundle directory not set"
-    [ -f "$BUNDLE_DIR/bundle.manifest" ] || die "bundle.manifest not found in $BUNDLE_DIR"
+    [ -f "$BUNDLE_MANIFEST" ] || die "bundle.manifest not found in $BUNDLE_DIR"
     count=0
     LOCAL_PACKAGE_FILE=
     LOCAL_PACKAGE_SHA=
@@ -228,9 +304,81 @@ check_payloads() {
                 verify_pair "$(field 4 "$value")" "$(field 5 "$value")" "$sname manifest"
                 ;;
         esac
-    done < "$BUNDLE_DIR/bundle.manifest"
+    done < "$BUNDLE_MANIFEST"
     [ "$count" -gt 0 ] || die "manifest lists no payloads"
     ui_print "  $count payloads verified"
+}
+
+index_feature_assets() {
+    # Find release aliases by verified bytes, never by a guessed build name.
+    digest_map=$(for candidate in "$BUNDLE_DIR"/*; do
+        [ -f "$candidate" ] && [ ! -L "$candidate" ] || continue
+        case "${candidate##*/}" in
+            manifest|manifest.sig|bundle.manifest|SHA256SUMS|bundle.json) continue ;;
+        esac
+        printf '%s %s\n' "$(sha256_of "$candidate")" "${candidate##*/}"
+    done)
+}
+
+lookup_digest() {
+    echo "$digest_map" | awk -v w="$1" '$1 == w { print $2; exit }'
+}
+
+preflight_features() {
+    # Every file required by the signed transaction MUST be available before
+    # format, GPT reshape, or either boot-slot write. bundle.manifest alone is
+    # insufficient: a preserve record can pin different bytes than its staging
+    # lines (the bb79646 failure). Cryptographic adoption still belongs to the
+    # OS updater, using the embedded trusted key; do not bypass it here.
+    ota_manifest=$BUNDLE_DIR/manifest
+    [ -f "$ota_manifest" ] && [ ! -L "$ota_manifest" ] || die "signed manifest missing"
+    [ -f "$BUNDLE_DIR/manifest.sig" ] && [ ! -L "$BUNDLE_DIR/manifest.sig" ] || die "manifest signature missing"
+    signed_board=$(sed -n 's/^board=//p' "$ota_manifest")
+    [ "$signed_board" = "$TARGET" ] || die "signed manifest target mismatch"
+    feature_ids=$(sed -n 's/^feature_ids=//p' "$ota_manifest")
+    case "$feature_ids" in ''|,*|*,|*,,*|*[!a-z0-9_,]*) die "invalid signed feature set" ;; esac
+    index_feature_assets
+    preflight_seen=
+    for preflight_feature in $(echo "$feature_ids" | tr ',' ' '); do
+        case "$preflight_feature" in airplay2|tts|wakeword|stt|assistant) ;; *) die "unknown signed feature: $preflight_feature" ;; esac
+        case " $preflight_seen " in *" $preflight_feature "*) die "duplicate signed feature" ;; esac
+        preflight_seen="$preflight_seen $preflight_feature"
+        preflight_action=$(sed -n "s/^feature_${preflight_feature}_action=//p" "$ota_manifest")
+        case "$preflight_action" in
+            preserve)
+                preflight_want=$(sed -n "s/^feature_${preflight_feature}_base_payload_sha256=//p" "$ota_manifest")
+                preflight_mwant=$(sed -n "s/^feature_${preflight_feature}_base_manifest_sha256=//p" "$ota_manifest")
+                ;;
+            replace)
+                preflight_want=$(sed -n "s/^feature_${preflight_feature}_sha256=//p" "$ota_manifest")
+                preflight_mwant=$(sed -n "s/^feature_${preflight_feature}_manifest_sha256=//p" "$ota_manifest")
+                preflight_asset=$(sed -n "s/^feature_${preflight_feature}_asset=//p" "$ota_manifest")
+                preflight_masset=$(sed -n "s/^feature_${preflight_feature}_manifest_asset=//p" "$ota_manifest")
+                for preflight_name in "$preflight_asset" "$preflight_masset"; do
+                    case "$preflight_name" in ''|.*|*[!A-Za-z0-9._+-]*) die "unsafe signed feature filename" ;; esac
+                done
+                ;;
+            *) die "unsupported action for $preflight_feature: ${preflight_action:-none}" ;;
+        esac
+        for preflight_hash in "$preflight_want" "$preflight_mwant"; do
+            [ "${#preflight_hash}" = 64 ] || die "invalid signed feature digest"
+            case "$preflight_hash" in *[!0-9a-f]*) die "invalid signed feature digest" ;; esac
+        done
+        preflight_pname=$(lookup_digest "$preflight_want")
+        preflight_mname=$(lookup_digest "$preflight_mwant")
+        [ -n "$preflight_pname" ] || die "no bundled payload matches $preflight_feature ($preflight_want)"
+        [ -n "$preflight_mname" ] || die "no bundled manifest matches $preflight_feature ($preflight_mwant)"
+        verify_pair "$preflight_pname" "$preflight_want" "$preflight_feature signed payload"
+        verify_pair "$preflight_mname" "$preflight_mwant" "$preflight_feature signed manifest"
+        if [ "$preflight_action" = replace ]; then
+            preflight_size=$(sed -n "s/^feature_${preflight_feature}_size=//p" "$ota_manifest")
+            preflight_msize=$(sed -n "s/^feature_${preflight_feature}_manifest_size=//p" "$ota_manifest")
+            [ "$(wc -c < "$BUNDLE_DIR/$preflight_pname" | tr -d ' ')" = "$preflight_size" ] || die "signed payload size mismatch"
+            [ "$(wc -c < "$BUNDLE_DIR/$preflight_mname" | tr -d ' ')" = "$preflight_msize" ] || die "signed manifest size mismatch"
+        fi
+        ui_print "  $preflight_feature: signed payload and manifest preflight verified"
+    done
+    receipt_set "feature_preflight=verified"
 }
 
 fingerprint_ok() {
@@ -454,16 +602,7 @@ stage_features() {
     # One hashing pass over the bundle, so a payload is found by its digest
     # rather than by assuming the release's build name matches the manifest's
     # asset name. They do not: the same bytes ship under both schemes.
-    digest_map=$(for candidate in "$BUNDLE_DIR"/*; do
-        [ -f "$candidate" ] || continue
-        case "${candidate##*/}" in
-            manifest|manifest.sig|bundle.manifest|SHA256SUMS|bundle.json) continue ;;
-        esac
-        printf '%s %s\n' "$(sha256_of "$candidate")" "${candidate##*/}"
-    done)
-    lookup_digest() {
-        echo "$digest_map" | awk -v w="$1" '$1 == w { print $2; exit }'
-    }
+    index_feature_assets
 
     mkdir -p "$LIVE_FEATURES" || die "cannot create $LIVE_FEATURES"
     live_created=0
@@ -510,10 +649,13 @@ stage_features() {
                 pname=$(lookup_digest "$want")
                 mname=$(lookup_digest "$mwant")
                 [ -n "$pname" ] || die "no bundled payload matches preserved $fname ($want)"
+                [ -n "$mname" ] || die "no bundled manifest matches preserved $fname ($mwant)"
                 dest=$LIVE_FEATURES/$fname
                 mkdir -p "$dest" || die "cannot create $dest"
                 cp "$BUNDLE_DIR/$pname" "$dest/payload.squashfs" || die "cannot place $fname payload"
-                [ -n "$mname" ] && cp "$BUNDLE_DIR/$mname" "$dest/manifest.json"
+                cp "$BUNDLE_DIR/$mname" "$dest/manifest.json" || die "cannot place $fname manifest"
+                got=$(sha256_of "$dest/manifest.json")
+                [ "$got" = "$mwant" ] || die "$fname preserved manifest digest mismatch"
                 got=$(sha256_of "$dest/payload.squashfs")
                 [ "$got" = "$want" ] || die "$fname preserved payload digest mismatch"
                 ui_print "  $fname: preserve satisfied in the live tree"
@@ -565,23 +707,32 @@ main() {
     ZIPFILE=${3:-}
     BUNDLE_DIR=$(dirname "$ZIPFILE")
     [ -d "$BUNDLE_DIR" ] || die "cannot determine the bundle directory"
+    # Select the manifest bound to the invoked ZIP, not Radar's legacy alias
+    # (both targets can coexist in a combined release directory).
+    case "${ZIPFILE##*/}" in
+        libreecho-radar-puffin-install.zip) BUNDLE_MANIFEST=$BUNDLE_DIR/libreecho-radar-puffin-bundle.manifest ;;
+        libreecho-biscuit-install.zip) BUNDLE_MANIFEST=$BUNDLE_DIR/libreecho-biscuit-bundle.manifest ;;
+        *) BUNDLE_MANIFEST=$BUNDLE_DIR/bundle.manifest ;;
+    esac
 
     receipt_reset
     ui_print "LibreEcho initial-install"
     ui_print "  bundle: $BUNDLE_DIR"
 
-    if [ -f "$BUNDLE_DIR/bundle.manifest" ]; then
+    if [ -f "$BUNDLE_MANIFEST" ]; then
         while IFS='=' read -r key value; do
             case "$key" in
                 release) ui_print "  release: $value" ;;
                 device)  ui_print "  device:  $value" ;;
             esac
-        done < "$BUNDLE_DIR/bundle.manifest"
+        done < "$BUNDLE_MANIFEST"
     fi
 
     DISK=/dev/block/mmcblk0
     check_device
     check_payloads
+    check_target
+    preflight_features
 
     if fingerprint_ok; then
         node=$(partition_node userdata)
@@ -593,7 +744,7 @@ main() {
         else
             ensure_userdata_mounted
         fi
-        write_boot_slots "$(sed -n 's/^boot_image=//p' "$BUNDLE_DIR/bundle.manifest")"
+        write_boot_slots "$(sed -n 's/^boot_image=//p' "$BUNDLE_MANIFEST")"
         stage_features
         stage_local_package
         tidy_userdata_root
