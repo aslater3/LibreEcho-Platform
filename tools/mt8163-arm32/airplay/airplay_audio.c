@@ -26,6 +26,7 @@
 #define DEFAULT_AIRPLAY_ACTIVE_FILE "/run/libreecho-audio/airplay.active"
 #define DEFAULT_AIRPLAY_LAST_START_FILE "/run/libreecho-audio/airplay.last-start"
 #define DEFAULT_AIRPLAY_LOCK_FILE "/run/libreecho-audio/airplay.lock"
+#define DEFAULT_AIRPLAY_WAITERS_FILE "/run/libreecho-audio/airplay.waiters"
 #define DEFAULT_AIRPLAY_RESET_FILE "/run/libreecho-audio/airplay.reset"
 #define DEFAULT_AIRPLAY_RESET_ACK_FILE "/run/libreecho-audio/airplay.reset-ack"
 #define BUFFER_SIZE 8192
@@ -183,12 +184,19 @@ static int clear_session_state(void)
 	return result;
 }
 
-/* Serialize hook processes across marker check, callback rename and stop. */
-static int lock_session(void)
+/* Hooks register shared waiter locks before contending for the session lock.
+ * The bridge must pass an exclusive admission gate, held only for a single
+ * nonblocking session-lock attempt, never across PCM I/O or a retry sleep.
+ * Thus a registered hook prevents the next PCM chunk from barging ahead.
+ * Process death releases registration automatically; no stale waiter counter.
+ * The session lock still covers the complete read/write/reset/token operation.
+ */
+static int lock_session_mode(int forwarding)
 {
 	struct stat st;
 	int fd = open(DEFAULT_AIRPLAY_LOCK_FILE,
 		      O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0640);
+	int waiters;
 	unsigned int attempt;
 	if (fd < 0)
 		return -1;
@@ -196,15 +204,39 @@ static int lock_session(void)
 		close(fd);
 		return -1;
 	}
+	waiters = open(DEFAULT_AIRPLAY_WAITERS_FILE,
+		       O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0640);
+	if (waiters < 0) { close(fd); return -1; }
+	if (fstat(waiters, &st) < 0 || !S_ISREG(st.st_mode)) {
+		close(waiters); close(fd); return -1;
+	}
 	for (attempt = 0; attempt < 100; ++attempt) {
-		if (flock(fd, LOCK_EX | LOCK_NB) == 0)
-			return fd;
+		if (flock(waiters, (forwarding ? LOCK_EX : LOCK_SH) | LOCK_NB) == 0) {
+			if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+				close(waiters);
+				return fd;
+			}
+			/* Hooks retain shared registration while waiting. The bridge
+			 * must release admission before sleeping, even when a hook
+			 * has already acquired the session lock and left the gate. */
+			if (forwarding) {
+				int saved = errno;
+				(void)flock(waiters, LOCK_UN);
+				errno = saved;
+			}
+		}
 		if (errno != EWOULDBLOCK && errno != EINTR)
 			break;
 		usleep(10000);
 	}
+	close(waiters);
 	close(fd);
 	return -1;
+}
+
+static int lock_session(void)
+{
+	return lock_session_mode(0);
 }
 
 static int set_active(const char *path, const char *token)
@@ -336,7 +368,7 @@ static int forward_stream(const char *input_path, const char *output_path)
 			goto out;
 		}
 		if (!(pfd.revents & POLLIN)) continue;
-		lock_fd = lock_session();
+		lock_fd = lock_session_mode(1);
 		if (lock_fd < 0) continue;
 		n = read(input, buffer, sizeof(buffer));
 		if (n > 0) {
