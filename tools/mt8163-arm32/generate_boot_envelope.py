@@ -12,6 +12,8 @@ import hashlib
 import struct
 from pathlib import Path
 
+from libreecho_platform_targets import add_target_arguments, get_target, validate_target_arguments
+
 ANDROID_MAGIC = b"ANDROID!"
 IMAGE_SIZE = 0x1000000
 PAGE_SIZE = 0x800
@@ -38,14 +40,21 @@ def generate() -> bytes:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    add_target_arguments(parser)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    validate_target_arguments(parser, args)
+    # Every registered MT8163 target shares the reviewed Android-v0 16 MiB
+    # envelope (descriptor "mtk-android-v0-16m"); the builder and verifier
+    # compare against generate() byte-for-byte, so the bytes stay target-free.
+    get_target(args.target)
     output = args.output.resolve()
     if output.exists():
         raise SystemExit(f"ERROR: refusing to overwrite {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
     data = generate()
     output.write_bytes(data)
+    print(f"target={args.target}")
     print(f"boot_envelope={output}")
     print(f"boot_envelope_sha256={hashlib.sha256(data).hexdigest()}")
     print(f"boot_envelope_size={len(data)}")
