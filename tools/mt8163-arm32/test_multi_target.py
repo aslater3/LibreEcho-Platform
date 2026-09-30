@@ -109,6 +109,27 @@ class TargetCLITests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 verifier.validate_target_identity({}, metadata, target, 'a' * 64)
 
+    def test_verifier_board_name_is_not_shadowed_inside_validate_initramfs(self):
+        # A symlink loop reused `target`, so default.prop checking saw
+        # b"../../bin/busybox" instead of the board and the hosted verifier
+        # crashed on every image after #211. Board uses in the function must
+        # read the board string, never a loop variable.
+        import ast
+        tree = ast.parse((TOOLS / 'verify_recovery_image.py').read_text())
+        function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'validate_initramfs')
+        rebinds = []
+        for node in ast.walk(function):
+            targets = []
+            if isinstance(node, (ast.For, ast.comprehension)):
+                targets = [node.target]
+            elif isinstance(node, ast.Assign):
+                targets = node.targets
+            for t in targets:
+                for name in ast.walk(t):
+                    if isinstance(name, ast.Name) and name.id == 'target':
+                        rebinds.append(getattr(node, 'lineno', getattr(t, 'lineno', 0)))
+        self.assertEqual(len(rebinds), 1, f'`target` must be bound once (the board): lines {rebinds}')
+
     def test_init_rc_launch_path_is_byte_identical_to_pid1(self):
         # init.rc still launches /libreecho-init and validate_stage scans that
         # path. It must be the same target-aware script as /init; a stale
