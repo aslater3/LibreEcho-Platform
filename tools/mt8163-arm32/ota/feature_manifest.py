@@ -7,6 +7,12 @@ import io
 import re
 import tarfile
 from typing import Any
+from pathlib import Path
+import sys
+
+# This directory is also imported directly by Product signing tools.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from libreecho_platform_targets import TARGETS, get_target
 
 from nacl.signing import SigningKey, VerifyKey
 
@@ -63,11 +69,12 @@ def _asset(value: Any, label: str, suffix: str) -> None:
     _need("/" not in value and "\\" not in value and value.endswith(suffix), f"invalid {label}")
 
 
-def _feature_prefix(record: dict[str, Any]) -> str:
-    return f"libreecho-radar-puffin-{record['release']}-{record['feature_id']}"
+def _feature_prefix(record: dict[str, Any], board: str) -> str:
+    slug = get_target(board)["release_slug"]
+    return f"libreecho-{slug}-{record['release']}-{record['feature_id']}"
 
 
-def _validate_record(record: Any) -> None:
+def _validate_record(record: Any, board: str) -> None:
     _need(isinstance(record, dict), "feature record must be an object")
     required = {"feature_id", "action", "activation", "base_payload_sha256", "base_manifest_sha256", "daemon_path", "daemon_sha256", "release", "source_commit"}
     _need(set(record).issuperset(required), "feature fields missing")
@@ -92,8 +99,8 @@ def _validate_record(record: Any) -> None:
     manifest_suffix = ".runtime-manifest.json" if action == "runtime" else ".manifest.json"
     _asset(record["asset"], "payload asset", suffix)
     _asset(record["manifest_asset"], "feature manifest asset", manifest_suffix)
-    _need(record["asset"] == _feature_prefix(record) + suffix, "payload asset identity mismatch")
-    _need(record["manifest_asset"] == _feature_prefix(record) + manifest_suffix, "manifest asset identity mismatch")
+    _need(record["asset"] == _feature_prefix(record, board) + suffix, "payload asset identity mismatch")
+    _need(record["manifest_asset"] == _feature_prefix(record, board) + manifest_suffix, "manifest asset identity mismatch")
     _size(record["size"], "payload size")
     _size(record["manifest_size"], "manifest size")
     _hash(record["sha256"], "payload hash")
@@ -105,7 +112,7 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
     _need(set(manifest).issuperset(set(TOP) | {"features"}), "manifest fields missing")
     _need(manifest["format"] == "libreecho-ota-v2", "invalid manifest format")
     _need(manifest["manifest_version"] == 1 and isinstance(manifest["manifest_version"], int), "unsupported manifest version")
-    _need(manifest["board"] == "radar_puffin" and manifest["soc"] == "mt8163" and manifest["architecture"] == "armv7", "invalid target")
+    _need(manifest["board"] in TARGETS and manifest["soc"] == "mt8163" and manifest["architecture"] == "armv7", "invalid target")
     _need(manifest["image_profile"] == "ota", "invalid image profile")
     _need(manifest["transaction_type"] == "system", "v2 only supports system transactions")
     for key in ("transaction_id", "version", "update_channel", "service_profile", "feature_policy", "feature_asset_base", "commit_policy"):
@@ -131,7 +138,7 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
     _need(len(ids) == len(set(ids)) and ids == sorted(ids, key=FEATURE_ORDER.index), "feature records are not canonical")
     _need(ids == list(FEATURE_ORDER), "feature set is incomplete")
     for record in records:
-        _validate_record(record)
+        _validate_record(record, manifest["board"])
 
 
 def _pairs(manifest: dict[str, Any]) -> list[tuple[str, str]]:

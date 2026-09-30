@@ -95,6 +95,39 @@ log()
 	printf '%s\n' "$msg" > /dev/console 2>/dev/null
 }
 
+# Immutable image identity, not a caller environment or bootloader product.
+# Keep this bounded loader inline: no extra staged runtime file is required.
+load_image_target()
+{
+    local target_file=/etc/libreecho/target target_count
+    TARGET_ID=
+    TARGET_SLUG=
+    if [ ! -e "$target_file" ] && [ ! -L "$target_file" ]; then
+        TARGET_ID=radar_puffin
+        TARGET_SLUG=radar-puffin
+        log 'target-file=missing fallback=radar_puffin'
+        return 0
+    fi
+    [ -f "$target_file" ] && [ ! -L "$target_file" ] && [ -r "$target_file" ] || return 1
+    target_count=$($BB grep -c '^target_id=' "$target_file")
+    [ "$target_count" = 1 ] || return 1
+    TARGET_ID=$($BB sed -n 's/^target_id=//p' "$target_file")
+    case "$TARGET_ID" in
+        radar_puffin) TARGET_SLUG=radar-puffin ;;
+        biscuit) TARGET_SLUG=biscuit ;;
+        *) TARGET_ID=; return 1 ;;
+    esac
+}
+
+first_install_marker_matches()
+{
+    load_image_target || return 1
+    [ -r "$FIRST_INSTALL_MARKER" ] &&
+        [ "$($BB sed -n 's/^schema=//p' "$FIRST_INSTALL_MARKER")" = 1 ] &&
+        [ "$($BB sed -n 's/^mode=//p' "$FIRST_INSTALL_MARKER")" = first-install ] &&
+        [ "$($BB sed -n 's/^board=//p' "$FIRST_INSTALL_MARKER")" = "$TARGET_ID" ]
+}
+
 # pmsg is the only userspace pstore input that survives a forced reboot. Keep
 # the record deliberately tiny and token-only: arbitrary logs can contain
 # credentials, URLs or board identity and must never be mirrored wholesale.
@@ -2134,10 +2167,7 @@ ota_health_confirm_worker()
             log ota-health-confirmation-skipped-non-production-profile
             return 0
         }
-        if [ ! -r "$FIRST_INSTALL_MARKER" ] ||
-           [ "$($BB sed -n 's/^schema=//p' "$FIRST_INSTALL_MARKER")" != 1 ] ||
-           [ "$($BB sed -n 's/^mode=//p' "$FIRST_INSTALL_MARKER")" != first-install ] ||
-           [ "$($BB sed -n 's/^board=//p' "$FIRST_INSTALL_MARKER")" != radar_puffin ]; then
+        if ! first_install_marker_matches; then
             log first-install-marker-absent-or-invalid
             return 0
         fi

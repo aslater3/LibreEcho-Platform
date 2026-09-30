@@ -39,6 +39,9 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from libreecho_platform_targets import add_target_arguments, validate_target_arguments, get_target, DEFAULT_TARGET
+
 SCHEMA = 1
 ZIP_NAME = "libreecho-install.zip"
 MANIFEST_NAME = "bundle.manifest"
@@ -268,7 +271,7 @@ def _checked_local_package(package: Path, boot_image: Path) -> Path:
     return package
 
 
-def discover(assets: Path) -> dict:
+def discover(assets: Path, target: str = DEFAULT_TARGET) -> dict:
     """Classify the assets, driven by the install manifest.
 
     The manifest is checked against the files on disk rather than believed: a
@@ -279,6 +282,9 @@ def discover(assets: Path) -> dict:
     if not manifest_path.is_file():
         raise BuildError(f"{INSTALL_MANIFEST_NAME} not found in {assets}")
     manifest = read_install_manifest(manifest_path)
+    get_target(target)
+    if manifest["board"] != target:
+        raise BuildError("target does not match install manifest board")
 
     boot_image = _checked_asset(manifest["boot"], assets, "boot image")
     expected = BOOT_SLOT_SECTORS * 512
@@ -295,6 +301,8 @@ def discover(assets: Path) -> dict:
     if not ota_manifest.is_file() or not ota_signature.is_file():
         raise BuildError(f"the OTA manifest is required: manifest + manifest.sig in {assets}")
     ota = read_ota_manifest(ota_manifest)
+    if ota.get("board") != target:
+        raise BuildError("target does not match signed OTA manifest board")
 
     declared_boot = ota.get("boot_sha256")
     if declared_boot and declared_boot != sha256_file(boot_image):
@@ -324,6 +332,10 @@ def discover(assets: Path) -> dict:
             assets, ota.get(f"feature_{name}_manifest_asset", ""),
             ota.get(f"feature_{name}_manifest_sha256", ""),
             record["manifest"], f"{name} manifest", seen)
+        if ota.get(f"feature_{name}_action") == "preserve":
+            if (sha256_file(payload) != ota.get(f"feature_{name}_base_payload_sha256") or
+                    sha256_file(feature_manifest) != ota.get(f"feature_{name}_base_manifest_sha256")):
+                raise BuildError(f"preserved {name} payload/manifest disagrees with signed OTA identity")
         features.append({
             "name": name,
             "payload": payload,
@@ -369,6 +381,8 @@ def render_manifest(roles: dict, userdata_sectors: int) -> str:
         f"schema={SCHEMA}",
         f"release={data['release']}",
         f"device={data['board']}",
+        f"target={data['board']}",
+        f"fastboot_products={','.join(get_target(data['board'])['fastboot_products'])}",
         f"soc={data['soc']}",
         f"image_profile={data['image_profile']}",
         f"service_profile={data['service_profile']}",
@@ -420,14 +434,17 @@ def build_zip(src: Path, out_zip: Path) -> None:
 
 
 def assemble(assets_dir: Path, out_dir: Path, src_dir: Path, release: str,
-             userdata_sectors: int) -> dict:
+             userdata_sectors: int, target: str = DEFAULT_TARGET) -> dict:
     """Build the bundle. Returns a summary dict."""
     if not src_dir.is_dir():
         raise BuildError(f"installer source directory not found: {src_dir}")
+    record = get_target(target)
+    zip_name = f"libreecho-{record['release_slug']}-install.zip"
+    manifest_name = f"libreecho-{record['release_slug']}-bundle.manifest"
     out_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as work:
         source = _extract_assets(assets_dir, Path(work))
-        roles = discover(source)
+        roles = discover(source, target)
         # --release is a cross-check against the manifest, not the source of it:
         # a bundle whose stated release disagrees with its own manifest is
         # exactly the mismatch that should never reach a device.
@@ -436,7 +453,9 @@ def assemble(assets_dir: Path, out_dir: Path, src_dir: Path, release: str,
                 f"--release {release} does not match the install manifest's "
                 f"{roles['manifest_data']['release']}")
         render_manifest(roles, userdata_sectors)  # render once so faults surface early
-        (out_dir / MANIFEST_NAME).write_text(render_manifest(roles, userdata_sectors))
+        (out_dir / manifest_name).write_text(render_manifest(roles, userdata_sectors))
+        if target == DEFAULT_TARGET:
+            shutil.copyfile(out_dir / manifest_name, out_dir / MANIFEST_NAME)
         copied = []
         shippable: list[tuple[Path, str]] = [
             (roles["install_manifest"], roles["install_manifest"].name),
@@ -453,10 +472,12 @@ def assemble(assets_dir: Path, out_dir: Path, src_dir: Path, release: str,
         for path, name in shippable:
             shutil.copyfile(path, out_dir / name)
             copied.append(name)
-    zip_path = out_dir / ZIP_NAME
+    zip_path = out_dir / zip_name
     build_zip(src_dir, zip_path)
+    if target == DEFAULT_TARGET:
+        shutil.copyfile(zip_path, out_dir / ZIP_NAME)
 
-    problems = check_bundle(out_dir)
+    problems = check_bundle(out_dir, target)
     if problems:
         raise BuildError("bundle failed self-check: " + "; ".join(problems))
     return {
@@ -469,7 +490,7 @@ def assemble(assets_dir: Path, out_dir: Path, src_dir: Path, release: str,
         "zip_size": zip_path.stat().st_size,
         "payload_files": sorted(copied),
         "local_package": roles["local_package"].name if roles["local_package"] else "",
-        "manifest_sha256": sha256_file(out_dir / MANIFEST_NAME),
+        "manifest_sha256": sha256_file(out_dir / manifest_name),
     }
 
 
@@ -486,14 +507,24 @@ def _declared_assets(line: str) -> list[tuple[str, str]]:
     return []
 
 
-def check_bundle(out_dir: Path) -> list[str]:
+def check_bundle(out_dir: Path, target: str = DEFAULT_TARGET) -> list[str]:
     """Re-verify a bundle from its own manifest. Returns a list of problems."""
     problems: list[str] = []
-    manifest = out_dir / MANIFEST_NAME
+    record = get_target(target)
+    manifest_name = f"libreecho-{record['release_slug']}-bundle.manifest"
+    zip_name = f"libreecho-{record['release_slug']}-install.zip"
+    manifest = out_dir / manifest_name
     if not manifest.is_file():
-        return [f"{MANIFEST_NAME} missing"]
-    if not (out_dir / ZIP_NAME).is_file():
-        problems.append(f"{ZIP_NAME} missing")
+        return [f"{manifest_name} missing"]
+    if not (out_dir / zip_name).is_file():
+        problems.append(f"{zip_name} missing")
+    values = dict(line.split("=", 1) for line in manifest.read_text().splitlines() if "=" in line)
+    if values.get("target") != target or values.get("device") != target or values.get("fastboot_products") != ",".join(record["fastboot_products"]):
+        problems.append("bundle target identity mismatch")
+    if target == DEFAULT_TARGET:
+        for name, alias in ((zip_name, ZIP_NAME), (manifest_name, MANIFEST_NAME)):
+            if not (out_dir / alias).is_file() or sha256_file(out_dir / alias) != sha256_file(out_dir / name):
+                problems.append(f"{alias} is not a byte-copy alias")
     declared: dict[str, str] = {}
     for line in manifest.read_text().splitlines():
         if not line or "=" not in line:
@@ -509,7 +540,10 @@ def check_bundle(out_dir: Path) -> list[str]:
             continue
         if sha256_file(path) != digest:
             problems.append(f"{name} digest mismatch")
-    exempt = {MANIFEST_NAME, ZIP_NAME, "SHA256SUMS", "bundle.json"}
+    exempt = {manifest_name, zip_name, "SHA256SUMS", "bundle.json"}
+    if target == DEFAULT_TARGET:
+        exempt.update((MANIFEST_NAME, ZIP_NAME))
+    exempt.update(p.name for p in out_dir.glob(f"*-{record['release_slug']}-TWRPINSTALL-SHA256SUMS"))
     for extra in sorted(out_dir.iterdir()):
         if extra.is_file() and extra.name not in declared and extra.name not in exempt:
             problems.append(f"{extra.name} present but not declared")
@@ -531,10 +565,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="userdata size the OS contract accepts")
     parser.add_argument("--check", action="store_true",
                         help="only verify an existing bundle in --out")
+    add_target_arguments(parser)
     args = parser.parse_args(argv)
+    validate_target_arguments(parser, args)
 
     if args.check:
-        problems = check_bundle(args.out)
+        problems = check_bundle(args.out, args.target)
         for problem in problems:
             print(f"  PROBLEM: {problem}")
         print("bundle: OK" if not problems else f"bundle: {len(problems)} problem(s)")
@@ -542,7 +578,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         summary = assemble(args.assets, args.out, args.src, args.release,
-                           args.userdata_sectors)
+                           args.userdata_sectors, args.target)
     except BuildError as error:
         print(f"refusing to build: {error}", file=sys.stderr)
         return 1
@@ -552,6 +588,13 @@ def main(argv: list[str] | None = None) -> int:
         for path in sorted(args.out.iterdir()):
             if path.is_file() and path.name not in ("SHA256SUMS", "bundle.json"):
                 handle.write(f"{sha256_file(path)}  {path.name}\n")
+    slug = get_target(args.target)["release_slug"]
+    prefix = f"libreecho-{summary['release']}"
+    qualified = [f"libreecho-{slug}-install.zip", f"libreecho-{slug}-bundle.manifest"]
+    if args.target == DEFAULT_TARGET:
+        qualified.extend((ZIP_NAME, MANIFEST_NAME))
+    (args.out / f"{prefix}-{slug}-TWRPINSTALL-SHA256SUMS").write_text(
+        "".join(f"{sha256_file(args.out / name)}  {name}\n" for name in qualified))
     (args.out / "bundle.json").write_text(json.dumps(
         {**summary, "userdata_sectors": args.userdata_sectors,
          "schema": SCHEMA, "files": sorted(p.name for p in args.out.iterdir() if p.is_file())},

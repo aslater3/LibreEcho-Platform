@@ -20,6 +20,8 @@ from pathlib import Path
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 from generate_boot_envelope import generate as generate_boot_envelope
+from libreecho_platform_targets import add_target_arguments, validate_target_arguments, identity_bytes, get_target
+from verify_target_dtb import verify_target_dtb
 
 
 def _load_mdns_contract_module():
@@ -55,7 +57,7 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "36e3b80526175d92d659a50d08c29149550c0396fdde4315797d37972381afb7"
+RECOVERY_INIT_SHA256 = "b470ad375673f1eff4f9071d4782f79afc45264f1f86af1169edc62e84ed4b85"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
@@ -553,9 +555,30 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
     manifest["busybox_applets"] = {"count": len(applets), "names": applets}
 
 
+def add_target_identity(stage: Path, manifest: dict[str, object],
+                        target: str = "radar_puffin", digest: str | None = None) -> None:
+    data = identity_bytes(target, digest)
+    identity = stage / "etc/libreecho/target"
+    identity.parent.mkdir(parents=True, exist_ok=True)
+    identity.write_bytes(data)
+    identity.chmod(0o644)
+    manifest["board"] = target
+    if digest is not None:
+        manifest["target_descriptor_sha256"] = digest
+    props = stage / "default.prop"
+    if target != "radar_puffin" and props.is_file():
+        data = props.read_bytes().replace(b"=radar_puffin\n", b"=" + target.encode("ascii") + b"\n")
+        props.write_bytes(data)
+        overlay = manifest.get("overlay")
+        if isinstance(overlay, dict):
+            overlay["default.prop"] = {"sha256": sha256(data), "size": len(data), "mode": "0644"}
+
+
 def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
                   image_profile: str, service_profile: str, feature_policy: str,
-                  update_channel: str, manifest: dict[str, object]) -> None:
+                  update_channel: str, manifest: dict[str, object],
+                  target: str = "radar_puffin", descriptor_sha256: str | None = None) -> None:
+    add_target_identity(stage, manifest, target, descriptor_sha256)
     sources = (
         ("bootctl", bootctl, "usr/local/sbin/libreecho-bootctl",
          "/lib/ld-musl-armhf.so.1", ("libc.musl-armv7.so.1",), True),
@@ -567,16 +590,16 @@ def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
         if source.is_symlink() or not source.is_file():
             raise SystemExit(f"ERROR: OTA {name} is not a regular file: {source}")
         data = read(source)
-        target = stage / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-        target.chmod(0o755)
+        destination = stage / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+        destination.chmod(0o755)
         records[name] = {
             "sha256": sha256(data),
             "size": len(data),
             "path": "/" + relative,
             "elf": require_elf_contract(
-                target, 0x05000400, interpreter, needed, dynamic,
+                destination, 0x05000400, interpreter, needed, dynamic,
             ),
         }
 
@@ -602,7 +625,7 @@ def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
     update_channel_target.chmod(0o644)
     first_install_target = stage / "etc/libreecho/first-install-confirm"
     first_install_target.write_text(
-        "schema=1\nmode=first-install\nboard=radar_puffin\n"
+        f"schema=1\nmode=first-install\nboard={target}\n"
     )
     first_install_target.chmod(0o644)
     ota_source = stage / "etc/libreecho/ota-source.conf"
@@ -631,7 +654,7 @@ def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
     manifest["ota"] = {
         "enabled": True,
         "format": "libreecho-ota-v1",
-        "board": "radar_puffin",
+        "board": target,
         "payload_slots": {"a": "mmcblk0p10", "b": "mmcblk0p11"},
         "wrapper_partitions": ["mmcblk0p17", "mmcblk0p18"],
         "bcb": {"partition": "mmcblk0p8", "offset": 0x360, "record_size": 7},
@@ -2414,7 +2437,9 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--ramdisk-output", type=Path)
     parser.add_argument("--manifest", type=Path)
+    add_target_arguments(parser)
     args = parser.parse_args()
+    validate_target_arguments(parser, args)
 
     connectivity_options = {
         "wmt_config_helper": args.wmt_config_helper,
@@ -2634,6 +2659,7 @@ def main() -> None:
     system_map = read(args.system_map)
     require_hash("ARM32 System.map", system_map, args.expected_system_map_sha256)
     raw_dtb, dtb_origin = extract_or_read_dtb(envelope, args.dtb, args.expected_dtb_sha256)
+    verify_target_dtb(args.target, args.dtb)
     qemu_arm = shutil.which(args.qemu_arm)
     if qemu_arm is None:
         raise SystemExit(f"ERROR: ARM user-mode emulator not found: {args.qemu_arm}")
@@ -2763,6 +2789,7 @@ def main() -> None:
             stage, args.bootctl.resolve(), args.update_verifier.resolve(),
             args.ota_public_key.resolve(), args.image_profile,
             args.service_profile, args.feature_policy, args.update_channel, manifest,
+            args.target, args.target_descriptor_sha256,
         )
         if args.audio_probe is not None:
             add_audio_probe(stage, args.audio_probe.resolve(), manifest)

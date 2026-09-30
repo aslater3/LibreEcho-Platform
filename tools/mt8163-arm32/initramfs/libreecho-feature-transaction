@@ -40,6 +40,30 @@ VERIFY=/usr/local/libexec/libreecho-update-verify
 PUBLIC_KEY=/etc/libreecho/ota-public-key.hex
 TRANSACTION_SLOT_FILE=$ROOT/transaction-slot
 
+# Immutable image identity, not a caller environment or bootloader product.
+# Keep this bounded loader inline: no extra staged runtime file is required.
+load_image_target()
+{
+    local target_file=/etc/libreecho/target target_count
+    TARGET_ID=
+    TARGET_SLUG=
+    if [ ! -e "$target_file" ] && [ ! -L "$target_file" ]; then
+        TARGET_ID=radar_puffin
+        TARGET_SLUG=radar-puffin
+        printf '%s\n' 'target-file=missing fallback=radar_puffin' >&2
+        return 0
+    fi
+    [ -f "$target_file" ] && [ ! -L "$target_file" ] && [ -r "$target_file" ] || return 1
+    target_count=$($BB grep -c '^target_id=' "$target_file")
+    [ "$target_count" = 1 ] || return 1
+    TARGET_ID=$($BB sed -n 's/^target_id=//p' "$target_file")
+    case "$TARGET_ID" in
+        radar_puffin) TARGET_SLUG=radar-puffin ;;
+        biscuit) TARGET_SLUG=biscuit ;;
+        *) TARGET_ID=; return 1 ;;
+    esac
+}
+
 fail() { printf 'ERROR:%s\n' "$1" >&2; exit 1; }
 value() { $BB sed -n "s/^$1=//p" "$2" 2>/dev/null | $BB head -n 1; }
 valid_hash() { [ "${#1}" -eq 64 ] || return 1; case "$1" in *[!0-9a-f]*|'') return 1;; esac; }
@@ -154,7 +178,8 @@ check_manifest() {
     done
     [ "$(value format "$manifest")" = libreecho-ota-v2 ] || fail manifest-format
     [ "$(value manifest_version "$manifest")" = 1 ] || fail manifest-version
-    [ "$(value board "$manifest")" = radar_puffin ] || fail manifest-board
+    load_image_target || fail image-target
+    [ "$(value board "$manifest")" = "$TARGET_ID" ] || fail manifest-board
     [ "$(value soc "$manifest")" = mt8163 ] || fail manifest-soc
     [ "$(value architecture "$manifest")" = armv7 ] || fail manifest-architecture
     [ "$(value image_profile "$manifest")" = ota ] || fail manifest-image-profile
@@ -201,7 +226,7 @@ check_manifest() {
                 valid_asset "$asset" || fail feature-asset-name; valid_asset "$manifest_asset" || fail feature-manifest-name
                 valid_uint "$(value "feature_${feature}_size" "$manifest")" || fail feature-size; valid_uint "$(value "feature_${feature}_manifest_size" "$manifest")" || fail feature-manifest-size
                 valid_hash "$(value "feature_${feature}_sha256" "$manifest")" || fail feature-hash; valid_hash "$(value "feature_${feature}_manifest_sha256" "$manifest")" || fail feature-manifest-hash
-                prefix=libreecho-radar-puffin-$(value "feature_${feature}_release" "$manifest")-$feature
+                prefix=libreecho-$TARGET_SLUG-$(value "feature_${feature}_release" "$manifest")-$feature
                 case "$action:$asset:$manifest_asset" in runtime:"$prefix.runtime.squashfs":"$prefix.runtime-manifest.json"|replace:"$prefix.payload.squashfs":"$prefix.manifest.json") ;; *) fail feature-asset-identity;; esac
                 expected_keys="$expected_keys feature_${feature}_asset feature_${feature}_size feature_${feature}_sha256 feature_${feature}_manifest_asset feature_${feature}_manifest_size feature_${feature}_manifest_sha256";;
             *) fail feature-action;;
