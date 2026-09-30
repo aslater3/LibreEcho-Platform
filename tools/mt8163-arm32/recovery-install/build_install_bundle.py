@@ -40,7 +40,7 @@ import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from target_registry import add_target_arguments, validate_target_arguments, get_target, DEFAULT_TARGET
+from libreecho_platform_targets import add_target_arguments, validate_target_arguments, get_target, DEFAULT_TARGET
 
 SCHEMA = 1
 ZIP_NAME = "libreecho-install.zip"

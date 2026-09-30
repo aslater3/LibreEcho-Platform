@@ -20,7 +20,7 @@ from pathlib import Path
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 from generate_boot_envelope import generate as generate_boot_envelope
-from target_registry import add_target_arguments, validate_target_arguments, identity_bytes, get_target
+from libreecho_platform_targets import add_target_arguments, validate_target_arguments, identity_bytes, get_target
 from verify_target_dtb import verify_target_dtb
 
 

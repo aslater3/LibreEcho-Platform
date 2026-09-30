@@ -12,7 +12,7 @@ import sys
 
 # This directory is also imported directly by Product signing tools.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from target_registry import TARGETS, get_target
+from libreecho_platform_targets import TARGETS, get_target
 
 from nacl.signing import SigningKey, VerifyKey
 

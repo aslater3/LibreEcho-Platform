@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from target_registry import add_target_arguments, validate_target_arguments, get_target
+from libreecho_platform_targets import add_target_arguments, validate_target_arguments, get_target
 from verify_radar_puffin_dtb import ContractError, verify_dtb
 
 DTB_VERIFIERS = {'radar_puffin': verify_dtb}

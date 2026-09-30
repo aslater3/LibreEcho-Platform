@@ -74,11 +74,11 @@ class TargetCLITests(unittest.TestCase):
             feature_manifest.serialize_manifest(data)
 
     def test_dtb_registry_uses_existing_semantics_for_both_targets(self):
-        import target_registry
+        import libreecho_platform_targets
         for target in ('radar_puffin', 'biscuit'):
-            self.assertEqual(target_registry.get_target(target)['dtb_verifier'], 'radar_puffin')
+            self.assertEqual(libreecho_platform_targets.get_target(target)['dtb_verifier'], 'radar_puffin')
         with self.assertRaises(ValueError):
-            target_registry.get_target('unknown')
+            libreecho_platform_targets.get_target('unknown')
 
     def test_real_target_dtb_cli_preserves_radar_validation_for_both_targets(self):
         from test_verify_radar_puffin_dtb import VALID_DTS
@@ -95,11 +95,11 @@ class TargetCLITests(unittest.TestCase):
 
     def test_image_verifier_requires_matching_identity_and_descriptor(self):
         import stat
-        import target_registry
+        import libreecho_platform_targets
         for target in ('radar_puffin', 'biscuit'):
             metadata = {'board': target, 'ota': {'board': target}, 'target_descriptor_sha256': 'a' * 64}
             entries = {'etc/libreecho/target': verifier.Entry('etc/libreecho/target', stat.S_IFREG | 0o644, 0, 0, 0,
-                        target_registry.identity_bytes(target, 'a' * 64))}
+                        libreecho_platform_targets.identity_bytes(target, 'a' * 64))}
             verifier.validate_target_identity(entries, metadata, target, 'a' * 64)
             for other in ('unknown', 'radar_puffin' if target == 'biscuit' else 'biscuit'):
                 with self.assertRaises((SystemExit, ValueError)):

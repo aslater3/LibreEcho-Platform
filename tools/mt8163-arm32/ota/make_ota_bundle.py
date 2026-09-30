@@ -15,7 +15,7 @@ from nacl.signing import SigningKey
 from feature_manifest import build_control_tar as build_v2_control_tar
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from target_registry import add_target_arguments, validate_target_arguments, get_target
+from libreecho_platform_targets import add_target_arguments, validate_target_arguments, get_target
 
 
 BOOT_SIZE = 16 * 1024 * 1024
