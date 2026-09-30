@@ -66,6 +66,21 @@ abort_v2_before_activation()
     "$FEATURE_TRANSACTION" abort-before-activation >/dev/null 2>&1 || true
 }
 
+cleanup_refused_install_artifacts()
+{
+    # A prepared v2 transaction owns its staged manifest, boot image, and
+    # feature journal as rollback evidence. Only discard transient working data
+    # when no durable transaction record exists.
+    if [ -e "$UPDATE_ROOT/feature-commit" ] || [ -e "$PENDING" ]; then
+        return 0
+    fi
+    $BB rm -rf "$STAGING" 2>/dev/null || return 1
+    case "${package:-}" in
+        "$INCOMING"/*) $BB rm -f "$package" 2>/dev/null || return 1 ;;
+    esac
+    return 0
+}
+
 die()
 {
     echo "ERROR:$1" >&2
@@ -85,6 +100,7 @@ die()
             $BB mv "$STATE.tmp" "$STATE" 2>/dev/null || $BB rm -f "$STATE.tmp" 2>/dev/null
         $BB sync 2>/dev/null || true
     fi
+    cleanup_refused_install_artifacts || true
     exit 1
 }
 

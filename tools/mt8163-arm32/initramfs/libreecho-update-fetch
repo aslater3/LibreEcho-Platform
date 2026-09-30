@@ -1152,6 +1152,21 @@ download_feature_assets()
         esac
     done
 }
+
+cleanup_refused_install_artifacts()
+{
+    # Once a v2 journal or pending intent exists, the staged manifest, boot
+    # image, and feature records are authoritative rollback/diagnostic
+    # evidence. Leave that transaction untouched; its recovery path owns it.
+    if [ -e "$ROOT/feature-commit" ] || [ -e "$PENDING" ]; then
+        return 0
+    fi
+    $BB rm -rf "$FEATURE_STAGE" 2>/dev/null || return 1
+    $BB rm -f "$PACKAGE" "$PART" "$ROOT"/.control-* \
+        "$ROOT"/quarantine-*.bad "$CURL_HEADERS" "$CURL_STDERR" 2>/dev/null || return 1
+    return 0
+}
+
 candidate_matches_record()
 {
     # Stable SemVer behavior stays unchanged. Dev revisions can share a version.
@@ -1224,11 +1239,13 @@ check_or_install()
     fi
     if [ "$(check_value_from_file "$ROOT/staging/manifest" format)" = libreecho-ota-v2 ]; then
         "$UPDATE" install "$PACKAGE" --feature-dir "$FEATURE_STAGE" || {
+            cleanup_refused_install_artifacts || true
             check_status_write error "$version" install_failed true
             return 1
         }
     else
         "$UPDATE" install "$PACKAGE" || {
+            cleanup_refused_install_artifacts || true
             check_status_write error "$version" install_failed true
             return 1
         }
