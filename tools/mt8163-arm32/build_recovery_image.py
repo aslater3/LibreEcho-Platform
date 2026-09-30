@@ -55,7 +55,7 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "91938a0c41355d5e02ea81085dae06d5ecfba94aa92ea0ad6667d9710b3b9cd5"
+RECOVERY_INIT_SHA256 = "615a76c162f7651645d11435db889bcf11eecd330b4cb3a21c7da967358cff10"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
@@ -2060,12 +2060,16 @@ def validate_stage(stage: Path) -> None:
 
     init_script = read(stage / "libreecho-init")
     for marker in (
-        b"FASTBOOT_PLEASE", b"/run/libreecho-control/runme", b"functionfs", b"/dev/stpwmt", b"/dev/stpbt",
-        b"PARTNAME=expdb", b"/sys/class/block/mmcblk0p7", b"20480", b"bs=15 count=1",
-        b"stat -c '%t:%T'",
+        b"/run/libreecho-control/runme", b"functionfs", b"/dev/stpwmt", b"/dev/stpbt",
     ):
         if marker not in init_script:
             raise SystemExit(f"ERROR: recovery control script lacks {marker!r}")
+    for forbidden in (
+        b"FASTBOOT_PLEASE", b"PARTNAME=expdb", b"/sys/class/block/mmcblk0p7",
+        b"printf FASTBOOT_PLEASE", b"expdb-sector",
+    ):
+        if forbidden in init_script:
+            raise SystemExit(f"ERROR: recovery control script contains forbidden expdb marker path {forbidden!r}")
     adbd_launches = tuple(
         line.strip() for line in init_script.splitlines()
         if line.lstrip().startswith(b"/sbin/adbd ")

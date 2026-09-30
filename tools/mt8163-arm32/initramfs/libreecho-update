@@ -44,8 +44,6 @@ FEATURE_TRANSACTION=/usr/local/sbin/libreecho-feature-transaction
 USERDATA_DEVICE=/dev/mmcblk0p16
 USERDATA_SYS=/sys/class/block/mmcblk0p16
 MOUNTS_FILE=/proc/mounts
-EXPDB_DEVICE=/dev/mmcblk0p7
-EXPDB_SYS=/sys/class/block/mmcblk0p7
 BOOT_DEVICE_ROOT=/dev
 BOOT_SYS_ROOT=/sys/class/block
 TRANSACTION_SLOT_FILE=$UPDATE_ROOT/transaction-slot
@@ -750,30 +748,6 @@ verify_preserved_feature_identity()
     done
 }
 
-clear_exact_development_marker()
-{
-    expdb=$EXPDB_DEVICE
-    expdb_sys=$EXPDB_SYS
-    [ -b "$expdb" ] &&
-        $BB grep -qx 'PARTNAME=expdb' "$expdb_sys/uevent" 2>/dev/null &&
-        [ "$($BB cat "$expdb_sys/size" 2>/dev/null)" = 20480 ] ||
-        die expdb_identity
-    marker=$($BB dd if="$expdb" bs=15 count=1 2>/dev/null)
-    [ "$marker" = FASTBOOT_PLEASE ] || return 0
-    $BB dd if="$expdb" of="$STAGING/expdb-sector.before" bs=512 count=1 \
-        2>/dev/null || die expdb_read
-    $BB cp "$STAGING/expdb-sector.before" "$STAGING/expdb-sector.after" ||
-        die expdb_copy
-    $BB dd if=/dev/zero of="$STAGING/expdb-sector.after" bs=15 count=1 \
-        conv=notrunc 2>/dev/null || die expdb_marker_clear_prepare
-    $BB dd if="$STAGING/expdb-sector.after" of="$expdb" bs=512 count=1 \
-        conv=fsync 2>/dev/null || die expdb_marker_clear_write
-    $BB dd if="$expdb" of="$STAGING/expdb-sector.readback" bs=512 count=1 \
-        2>/dev/null || die expdb_marker_clear_read
-    $BB cmp "$STAGING/expdb-sector.after" "$STAGING/expdb-sector.readback" ||
-        die expdb_marker_clear_readback
-}
-
 install_package()
 {
     package=$1
@@ -822,9 +796,6 @@ install_package()
         $BB sync
     fi
 
-    # Old development images leave this marker armed. Clear only its exact
-    # prefix before the BCB commit; OTA-profile kernels do not recreate it.
-    clear_exact_development_marker
     state_write activating 90 "$target"
     ACTIVATION_STARTED=1
     "$BOOTCTL" activate "$target" > "$STAGING/bootctl.activate" ||

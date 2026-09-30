@@ -686,28 +686,6 @@ else
     pmsg_marker adb-tcp-not-configured
 fi
 
-# The GPT used by Biscuit exposes expdb as Linux partition 7.  Wait for the
-# kernel's block identity, then create direct aliases from sysfs rather than
-# assuming MMC minor numbers.
-EXPDB=/dev/mmcblk0p7
-EXPDB_SYS=/sys/class/block/mmcblk0p7
-i=0
-while [ "$i" -lt 10 ] && [ ! -r "$EXPDB_SYS/dev" ]; do
-    $BB sleep 1
-    i=$((i + 1))
-done
-for sys_block in /sys/class/block/mmcblk0 /sys/class/block/mmcblk0p*; do
-    [ -r "$sys_block/dev" ] || continue
-    name=${sys_block##*/}
-    devno=$($BB cat "$sys_block/dev" 2>/dev/null)
-    major=${devno%:*}
-    minor=${devno#*:}
-    if [ -z "$major" ] || [ -z "$minor" ]; then
-        continue
-    fi
-    [ -b "/dev/$name" ] || $BB mknod "/dev/$name" b "$major" "$minor" 2>/dev/null
-done
-
 # Mount only the verified userdata partition.  The AirPlay payload and other
 # optional assets live here, while persist/IDME remains untouched because it
 # carries board identity, MAC addresses, and calibration data.  Do not
@@ -791,43 +769,13 @@ if [ -x /etc/init.d/libreecho-ssh.init ]; then
     fi
 fi
 
-expdb_devno=$($BB cat "$EXPDB_SYS/dev" 2>/dev/null)
-expdb_major=${expdb_devno%:*}
-expdb_minor=${expdb_devno#*:}
-expected_rdev=
-case "$expdb_devno" in
-    *:*) expected_rdev=$($BB printf '%x:%x' "$expdb_major" "$expdb_minor") ;;
-esac
-
 IMAGE_PROFILE=$($BB cat /etc/libreecho/image-profile 2>/dev/null)
 case "$IMAGE_PROFILE" in
     development)
-        # Development images arm the next-reset fastboot escape. OTA images
-        # must not do this because A/B retry and rollback require normal boots.
-        marker_written=0
-        marker_attempt=0
-        while [ "$marker_written" -eq 0 ]; do
-            marker_attempt=$((marker_attempt + 1))
-            if [ -b "$EXPDB" ] && [ -n "$expected_rdev" ] &&
-               [ "$($BB stat -c '%t:%T' "$EXPDB" 2>/dev/null)" = "$expected_rdev" ] &&
-               $BB grep -qx 'PARTNAME=expdb' "$EXPDB_SYS/uevent" 2>/dev/null &&
-               [ "$($BB cat "$EXPDB_SYS/size" 2>/dev/null)" = 20480 ]; then
-                if printf FASTBOOT_PLEASE > "$EXPDB" 2>/tmp/expdb-marker.err; then
-                    $BB sync
-                    marker=$($BB dd if="$EXPDB" bs=15 count=1 2>/dev/null)
-                    [ "$marker" = FASTBOOT_PLEASE ] && marker_written=1
-                fi
-            elif [ $((marker_attempt % 10)) -eq 1 ]; then
-                log expdb-identity-rejected
-            fi
-            if [ "$marker_written" -eq 0 ]; then
-                if [ $((marker_attempt % 10)) -eq 0 ]; then
-                    log fastboot-please-retry
-                fi
-                $BB sleep 1
-            fi
-        done
-        log fastboot-please-written
+        # amonet v2.0.0 stores the LK-stage kaeru payload in expdb.  The
+        # development image must not arm a marker there; the fastboot escape
+        # request is rejected below rather than silently corrupting expdb.
+        log automatic-fastboot-marker-disabled
         ;;
     ota)
         log automatic-fastboot-marker-disabled
@@ -849,19 +797,7 @@ reboot_request_loop()
             $BB rm -f /tmp/reboot.request
             case "$request" in
                 fastboot)
-                    log reboot-request-fastboot-accepted
-                    if printf FASTBOOT_PLEASE > "$EXPDB" 2>/tmp/reboot-marker.err; then
-                        $BB sync
-                        marker=$($BB dd if="$EXPDB" bs=15 count=1 2>/dev/null)
-                        if [ "$marker" = FASTBOOT_PLEASE ]; then
-                            log reboot-request-marker-verified
-                            $BB reboot -f
-                        else
-                            log reboot-request-marker-readback-failed
-                        fi
-                    else
-                        log reboot-request-marker-write-failed
-                    fi
+                    log reboot-request-fastboot-rejected-expdb-protected
                     ;;
                 reboot)
                     log reboot-request-reboot-accepted

@@ -131,12 +131,12 @@ source "drivers/misc/mediatek/m4u/Kconfig"
 source "drivers/misc/mediatek/i2c/Kconfig"
 source "drivers/misc/mediatek/leds/Kconfig"
 config LIBREECHO_DEV_RECOVERY_MARKER
-	bool "LibreEcho development fastboot and BCB recovery marker"
+	bool "LibreEcho development BCB retry reset"
 	default n
 	help
-	  Write FASTBOOT_PLEASE to expdb and reset both Amazon BCB slots early
-	  during development-image boot. This defeats normal A/B retry and
-	  rollback semantics and must remain disabled in OTA/release images.
+	  Reset both Amazon BCB slots to seven tries early during development-image
+	  boot. This option never writes or erases expdb; amonet v2.0.0 stores the
+	  LK-stage kaeru payload there, so the expdb fastboot marker is forbidden.
 
 source "drivers/misc/mediatek/vibrator/Kconfig"
 source "drivers/misc/mediatek/jpeg/Kconfig"

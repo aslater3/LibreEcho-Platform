@@ -3824,7 +3824,7 @@ start_feature_service_if_enabled
             confirm,
         )
         self.assertIn("verify_preserved_feature_identity pending", confirm)
-        verify = updater[updater.index("verify_preserved_feature_identity()"):updater.index("clear_exact_development_marker()")]
+        verify = updater[updater.index("verify_preserved_feature_identity()") :]
         self.assertIn("preserved_identity_value", verify)
         self.assertIn("preserve_feature_payload_mismatch", verify)
         self.assertIn("preserve_feature_manifest_mismatch", verify)
