@@ -53,7 +53,7 @@ WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-INIT_SHA256 = "f845a7b2070e5960f71cd777a5fdf47e7408598f5dc8564185d13feae0fb8d55"
+INIT_SHA256 = "638bb6730914d90de9c3b6d6041f374dbb5cef562e57a4553a203a859b09b301"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -61,6 +61,9 @@ OVERLAY_FILES = {
     "init.rc": 0o644,
     "init.recovery.mt8163.rc": 0o644,
     "libreecho-init": 0o755,
+    "libreecho-recovery-button": 0o755,
+    "libreecho-recovery-ap-probe": 0o755,
+    "libreecho-recovery-ap-ready": 0o755,
     "libreecho-mdnsd": 0o755,
     "libreecho-reconcile-features": 0o755,
     "libreecho-data-cleanup": 0o755,
@@ -78,6 +81,9 @@ OVERLAY_FILES = {
 OVERLAY_TARGETS = {
     "profile": "etc/profile",
     "libreecho-mdnsd": "etc/init.d/libreecho-mdnsd.init",
+    "libreecho-recovery-button": "usr/local/sbin/libreecho-recovery-button",
+    "libreecho-recovery-ap-probe": "usr/local/sbin/libreecho-recovery-ap-probe",
+    "libreecho-recovery-ap-ready": "usr/local/sbin/libreecho-recovery-ap-ready",
     "libreecho-reconcile-features": "usr/local/sbin/libreecho-reconcile-features",
     "libreecho-data-cleanup": "usr/local/sbin/libreecho-data-cleanup",
     "libreecho-vendor-import": "usr/local/sbin/libreecho-vendor-import",

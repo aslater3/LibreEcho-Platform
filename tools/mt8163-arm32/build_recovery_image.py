@@ -55,7 +55,7 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "f845a7b2070e5960f71cd777a5fdf47e7408598f5dc8564185d13feae0fb8d55"
+RECOVERY_INIT_SHA256 = "638bb6730914d90de9c3b6d6041f374dbb5cef562e57a4553a203a859b09b301"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
@@ -122,6 +122,16 @@ CONNECTIVITY_HELPERS = {
 
 CONNECTIVITY_RUNTIME_SYMLINKS = {
     "etc/firmware": "../lib/firmware",
+}
+
+# Pinned static recovery-AP dependencies (issue #96).  The compiled hostapd,
+# dnsmasq and iw binaries are staged with their hashes checked against the
+# caller's metadata so an unverified artifact can never enter an image; the
+# shell probes and detector ship through the overlay below.
+RECOVERY_AP_BINARIES = {
+    "hostapd": "usr/local/sbin/hostapd",
+    "dnsmasq": "usr/local/sbin/dnsmasq",
+    "iw": "usr/local/sbin/iw",
 }
 
 
@@ -418,6 +428,76 @@ def add_connectivity_bundle(stage: Path, helpers: dict[str, Path],
     }
 
 
+def add_recovery_ap_bundle(stage: Path, binaries: dict[str, Path],
+                           metadata_path: Path, manifest: dict[str, object]) -> None:
+    """Stage the pinned recovery-AP dependencies, hash-checked against metadata.
+
+    The caller supplies the compiled hostapd/dnsmasq/iw artifacts and a JSON
+    metadata file of their expected SHA-256 values.  Every artifact must be a
+    regular file whose bytes match the recorded hash; nothing is staged on a
+    mismatch, so an unverified binary can never reach an image.
+    """
+    metadata_data = read(metadata_path)
+    try:
+        metadata = json.loads(metadata_data.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise SystemExit(f"ERROR: recovery-AP metadata is not valid JSON: {exc}") from exc
+    records = metadata.get("binaries")
+    if not isinstance(records, dict):
+        raise SystemExit("ERROR: recovery-AP metadata lacks a binaries map")
+
+    staged: dict[str, object] = {}
+    for name, target_relative in RECOVERY_AP_BINARIES.items():
+        if name not in binaries or name not in records:
+            raise SystemExit(f"ERROR: recovery-AP component not supplied: {name}")
+        source = binaries[name]
+        if source.is_symlink() or not source.is_file():
+            raise SystemExit(f"ERROR: recovery-AP component is not a regular file: {source}")
+        data = read(source)
+        expected = records[name].get("sha256") if isinstance(records[name], dict) else None
+        if not isinstance(expected, str) or len(expected) != 64 or sha256(data) != expected:
+            actual = sha256(data)
+            raise SystemExit(
+                f"ERROR: recovery-AP component {name} SHA-256 mismatch\n"
+                f"expected={expected}\nactual={actual}"
+            )
+        target = stage / target_relative
+        if target.exists() or target.is_symlink():
+            raise SystemExit(f"ERROR: recovery-AP component collides with {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        target.chmod(0o755)
+        staged[name] = {
+            "path": f"/{target_relative}",
+            "sha256": expected,
+            "size": len(data),
+            "mode": "0755",
+            "elf": require_elf_contract(target, 0x05000400, None, (), False),
+        }
+
+    metadata_target = stage / "etc/libreecho/recovery-ap-binaries.json"
+    metadata_target.parent.mkdir(parents=True, exist_ok=True)
+    metadata_target.write_bytes(metadata_data)
+    metadata_target.chmod(0o644)
+    manifest["recovery_ap"] = {
+        "enabled": True,
+        "ap_probe": "/usr/local/sbin/libreecho-recovery-ap-probe",
+        "ready_probe": "/usr/local/sbin/libreecho-recovery-ap-ready",
+        "button_detector": "/usr/local/sbin/libreecho-recovery-button",
+        "marker": "/run/libreecho/recovery-mode",
+        "hostapd": "/usr/local/sbin/hostapd",
+        "dhcp": "/usr/local/sbin/dnsmasq",
+        "iw": "/usr/local/sbin/iw",
+        "components": staged,
+        "metadata": {
+            "path": "/etc/libreecho/recovery-ap-binaries.json",
+            "sha256": sha256(metadata_data),
+            "size": len(metadata_data),
+            "mode": "0644",
+        },
+    }
+
+
 def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
                 expected_busybox_sha256: str, expected_loader_sha256: str,
                 qemu_arm: str,
@@ -437,6 +517,15 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         "init.rc": ("init.rc", 0o644),
         "init.recovery.mt8163.rc": ("init.recovery.mt8163.rc", 0o644),
         "libreecho-init": ("libreecho-init", 0o755),
+        "libreecho-recovery-button": (
+            "usr/local/sbin/libreecho-recovery-button", 0o755,
+        ),
+        "libreecho-recovery-ap-probe": (
+            "usr/local/sbin/libreecho-recovery-ap-probe", 0o755,
+        ),
+        "libreecho-recovery-ap-ready": (
+            "usr/local/sbin/libreecho-recovery-ap-ready", 0o755,
+        ),
         "libreecho-mdnsd": ("etc/init.d/libreecho-mdnsd.init", 0o755),
         "libreecho-reconcile-features": (
             "usr/local/sbin/libreecho-reconcile-features", 0o755,
@@ -2371,6 +2460,10 @@ def main() -> None:
                         help="proven ARM32 stock-compatible configure-only helper")
     parser.add_argument("--wmt-launcher", type=Path,
                         help="proven ARM32 one-shot WMT command responder")
+    parser.add_argument("--recovery-ap-binaries", type=Path,
+                        help="directory of built static recovery-AP binaries (hostapd/dnsmasq/iw)")
+    parser.add_argument("--recovery-ap-metadata", type=Path,
+                        help="JSON metadata with the pinned SHA-256 of each recovery-AP binary")
     parser.add_argument("--wpa-supplicant", type=Path,
                         help="static ARM32 wpa_supplicant 2.10 client")
     parser.add_argument("--wpa-source-metadata", type=Path,
@@ -2408,6 +2501,11 @@ def main() -> None:
         raise SystemExit(f"ERROR: connectivity bundle is all-or-nothing; missing {missing}")
     if connectivity_enabled and not CONNECTIVITY_HELPERS:
         raise SystemExit("ERROR: connectivity helper identities have not been pinned")
+    if (args.recovery_ap_binaries is None) != (args.recovery_ap_metadata is None):
+        raise SystemExit(
+            "ERROR: recovery-AP staging is all-or-nothing; supply "
+            "--recovery-ap-binaries and --recovery-ap-metadata together"
+        )
     network_options = {
         "wpa_supplicant": args.wpa_supplicant,
         "wpa_source_metadata": args.wpa_source_metadata,
@@ -2808,6 +2906,16 @@ def main() -> None:
                     "wmt_stock_compat": args.wmt_stock_compat.absolute(),
                     "wmt_launcher": args.wmt_launcher.absolute(),
                 },
+                manifest,
+            )
+        if args.recovery_ap_binaries is not None and args.recovery_ap_metadata is not None:
+            add_recovery_ap_bundle(
+                stage,
+                {
+                    name: (args.recovery_ap_binaries / name).resolve()
+                    for name in RECOVERY_AP_BINARIES
+                },
+                args.recovery_ap_metadata.resolve(),
                 manifest,
             )
         if network_enabled:

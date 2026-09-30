@@ -32,4 +32,4 @@ jobs:
           tools/mt8163-arm32/verify_radar_puffin_dtb.py
       - name: Run recovery packaging and real-DTB fixture contracts
         working-directory: tools/mt8163-arm32
-        run: python3 -m unittest -v test_recovery_image_tools test_build_wifi_dtb test_verify_radar_puffin_dtb
+        run: python3 -m unittest -v test_recovery_image_tools test_build_wifi_dtb test_verify_radar_puffin_dtb test_recovery_ap

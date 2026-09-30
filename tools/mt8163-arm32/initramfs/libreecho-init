@@ -1046,6 +1046,67 @@ else
     log loopback-config-failed
 fi
 
+# Physical recovery detector (issue #96).  A ~5 s hold of the action button
+# (KEY_HELP, its own gpio-keys node) arms the recovery access point by dropping
+# a boot-scoped tmpfs marker that networkd validates.  It is bounded end to end:
+# with no held button the helper returns after its short press window, and a
+# missing helper or input node leaves the boot completely unaffected.  The
+# helper never reboots, writes persistent storage or touches a partition.
+PHYSICAL_RECOVERY_HELPER=${PHYSICAL_RECOVERY_HELPER:-/usr/local/sbin/libreecho-recovery-button}
+PHYSICAL_RECOVERY_MARKER=${PHYSICAL_RECOVERY_MARKER:-/run/libreecho/recovery-mode}
+PHYSICAL_RECOVERY_TIMEOUT=${PHYSICAL_RECOVERY_TIMEOUT:-9}
+physical_recovery_probe()
+{
+    [ -x "$PHYSICAL_RECOVERY_HELPER" ] || {
+        log physical-recovery-helper-absent
+        return 0
+    }
+    node=
+    i=0
+    while [ -z "$node" ] && [ "$i" -lt 5 ]; do
+        # The action button is a dedicated evdev node; prefer it by its sysfs
+        # name and only fall back to the first evdev node when names are
+        # unavailable.  Never guess from a key code, which the helper filters.
+        for sys_name in /sys/class/input/event*/device/name; do
+            [ -r "$sys_name" ] || continue
+            event=${sys_name#/sys/class/input/}
+            event=${event%%/*}
+            case "$($BB cat "$sys_name" 2>/dev/null)" in
+                *[Aa]ction*) node=/dev/input/$event ;;
+            esac
+            [ -n "$node" ] && break
+        done
+        if [ -z "$node" ]; then
+            for candidate in /dev/input/event*; do
+                [ -c "$candidate" ] && { node=$candidate; break; }
+            done
+        fi
+        [ -n "$node" ] && break
+        $BB sleep 1
+        i=$((i + 1))
+    done
+    if [ -z "$node" ]; then
+        log physical-recovery-no-input-node
+        return 0
+    fi
+    $BB mkdir -p /run/libreecho 2>/dev/null
+    $BB chmod 0700 /run/libreecho 2>/dev/null
+    if $BB timeout -k 1 "$PHYSICAL_RECOVERY_TIMEOUT" \
+            "$PHYSICAL_RECOVERY_HELPER" --device "$node" \
+            --marker "$PHYSICAL_RECOVERY_MARKER"; then
+        if [ -f "$PHYSICAL_RECOVERY_MARKER" ]; then
+            log physical-recovery-armed
+            pmsg_marker physical-recovery-armed
+        else
+            log physical-recovery-not-requested
+        fi
+    else
+        log physical-recovery-probe-timeout
+    fi
+    return 0
+}
+physical_recovery_probe
+
 # Connectivity comes up on the boot path, not at the end of init: reachability
 # (OTA, AirPlay, and the OTA health probes that need the network) must not
 # depend on the service graph having started.  This is the single automatic

@@ -280,5 +280,59 @@ class DependencyPinTests(unittest.TestCase):
             self.assertIn("no archive", result.stderr)
 
 
+def load_tool(name: str):
+    import importlib.util
+    import sys
+
+    path = TOOLS_DIR / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"mt8163_{name}", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot import {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class ImageIntegrationTests(unittest.TestCase):
+    """The overlay/pin integration the recovery-AP helpers depend on."""
+
+    def setUp(self) -> None:
+        self.builder = load_tool("build_recovery_image")
+        self.verifier = load_tool("verify_recovery_image")
+        self.init = (INITRAMFS / "libreecho-init").read_text()
+
+    def test_init_hash_pins_match_the_source(self) -> None:
+        digest = hashlib.sha256((INITRAMFS / "libreecho-init").read_bytes()).hexdigest()
+        self.assertEqual(self.builder.RECOVERY_INIT_SHA256, digest)
+        self.assertEqual(self.verifier.INIT_SHA256, digest)
+
+    def test_overlay_stages_helpers_at_expected_targets(self) -> None:
+        expected = {
+            "libreecho-recovery-button": "usr/local/sbin/libreecho-recovery-button",
+            "libreecho-recovery-ap-probe": "usr/local/sbin/libreecho-recovery-ap-probe",
+            "libreecho-recovery-ap-ready": "usr/local/sbin/libreecho-recovery-ap-ready",
+        }
+        for name, target in expected.items():
+            with self.subTest(name=name):
+                self.assertEqual(self.verifier.OVERLAY_TARGETS.get(name), target)
+                self.assertIn(name, self.verifier.OVERLAY_FILES)
+                # The builder and verifier must agree the helper ships via the
+                # overlay, i.e. the file exists under the overlay source root.
+                self.assertTrue((INITRAMFS / name).is_file())
+
+    def test_init_detects_before_network_startup(self) -> None:
+        self.assertIn("physical_recovery_probe", self.init)
+        probe_call = self.init.index("physical_recovery_probe\n")
+        network_start = self.init.index(
+            "# Connectivity comes up on the boot path, not at the end of init"
+        )
+        self.assertLess(probe_call, network_start)
+        self.assertIn("/usr/local/sbin/libreecho-recovery-button", self.init)
+        self.assertIn("/run/libreecho/recovery-mode", self.init)
+        # Bounded so a boot without a held button cannot stall on the helper.
+        self.assertIn('timeout -k 1 "$PHYSICAL_RECOVERY_TIMEOUT"', self.init)
+
+
 if __name__ == "__main__":
     unittest.main()

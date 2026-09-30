@@ -25,8 +25,23 @@ set -u
 
 MODE=supported
 IFACE=${RECOVERY_AP_INTERFACE:-wlan0}
-IW=${RECOVERY_AP_IW:-iw}
-IP=${RECOVERY_AP_IP:-ip}
+# Prefer the packaged helper binaries the image stages under /usr/local/sbin;
+# fall back to PATH so a development image without them still fails closed
+# instead of crashing.
+if [ -n "${RECOVERY_AP_IW:-}" ]; then
+    IW=$RECOVERY_AP_IW
+elif [ -x /usr/local/sbin/iw ]; then
+    IW=/usr/local/sbin/iw
+else
+    IW=iw
+fi
+if [ -n "${RECOVERY_AP_IP:-}" ]; then
+    IP=$RECOVERY_AP_IP
+elif [ -x /usr/local/sbin/ip ]; then
+    IP=/usr/local/sbin/ip
+else
+    IP=ip
+fi
 CTRL=${RECOVERY_AP_CTRL:-/run/libreecho/hostapd}
 DHCP_PID=${RECOVERY_AP_DHCP_PID:-/run/libreecho/recovery-dhcp.pid}
 
