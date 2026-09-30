@@ -1,0 +1,165 @@
+#!/bin/busybox sh
+# shellcheck shell=dash
+#
+# Physical boot-recovery detector (issue #96, Platform side).
+#
+# A ~5 s hold of the radar_puffin action button (KEY_HELP, its own gpio-keys
+# evdev node) at boot arms the recovery access point by writing a strict,
+# root-owned, mode-0600 tmpfs marker that networkd reads on start.  This helper
+# never reboots, never writes a persistent filesystem, and never touches a
+# partition: the only side effect is the boot-scoped tmpfs marker.
+#
+# Detection is event-stream based.  A press starts the hold, a release before
+# the threshold cancels it, and EV_KEY value 2 (autorepeat) is still-held.  The
+# hold is measured from the kernel input records' monotonic timestamps; a
+# release at or after the threshold arms the marker.  A coarse wall-clock
+# fallback arms the marker if the button is observed held past the threshold
+# without a release event.
+#
+# Input records are 16-byte little-endian struct input_event values (32-bit
+# ARM: tv_sec, tv_usec, type, code, value).  The device argument may be a
+# character device (live) or a regular file (host fixtures); a regular file
+# that reaches EOF without a qualifying hold exits without writing a marker.
+
+set -u
+
+TAG=libreecho-recovery-v1
+HOLD_MS=5000
+KEY_CODE=138          # KEY_HELP: the action button
+DEVICE=
+MARKER=/run/libreecho/recovery-mode
+PRESS_WINDOW_MS=2000  # how long to wait for the press to appear
+MAX_MS=12000          # absolute upper bound on observation
+
+usage() {
+    printf '%s\n' \
+        'usage: libreecho-recovery-button --device FILE [--marker PATH]' \
+        '       [--hold-ms MS] [--key-code N] [--press-window-ms MS] [--max-ms MS]' >&2
+}
+
+die() { printf 'libreecho-recovery-button: %s\n' "$1" >&2; exit 2; }
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --device) [ "$#" -ge 2 ] || die "missing --device value"; DEVICE=$2; shift 2 ;;
+        --marker) [ "$#" -ge 2 ] || die "missing --marker value"; MARKER=$2; shift 2 ;;
+        --hold-ms) [ "$#" -ge 2 ] || die "missing --hold-ms value"; HOLD_MS=$2; shift 2 ;;
+        --key-code) [ "$#" -ge 2 ] || die "missing --key-code value"; KEY_CODE=$2; shift 2 ;;
+        --press-window-ms) [ "$#" -ge 2 ] || die "missing --press-window-ms value"; PRESS_WINDOW_MS=$2; shift 2 ;;
+        --max-ms) [ "$#" -ge 2 ] || die "missing --max-ms value"; MAX_MS=$2; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage; exit 2 ;;
+    esac
+done
+
+[ -n "$DEVICE" ] || { usage; exit 2; }
+for value in "$HOLD_MS" "$KEY_CODE" "$PRESS_WINDOW_MS" "$MAX_MS"; do
+    case "$value" in
+        ''|*[!0-9]*) die "numeric option required" ;;
+    esac
+done
+
+# The marker is a boot-scoped tmpfs handoff.  Refuse any path that is not under
+# a /run/ component: the detector must never write a persistent file or escape
+# into another filesystem the way a fastboot/expdb escape would.
+case "$MARKER" in
+    */run/*) ;;
+    *) die "refusing non-tmpfs marker path: $MARKER" ;;
+esac
+
+now_seconds() { date +%s; }
+
+write_marker() {
+    dir=${MARKER%/*}
+    [ -n "$dir" ] || dir=/
+    mkdir -p "$dir" 2>/dev/null || return 1
+    tmp=$MARKER.tmp.$$
+    printf '%s\nhold_ms=%s\n' "$TAG" "$HOLD_MS" > "$tmp" 2>/dev/null || return 1
+    chmod 0600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    if [ "$(id -u 2>/dev/null)" = 0 ]; then
+        chown 0:0 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    fi
+    mv -f "$tmp" "$MARKER" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    return 0
+}
+
+# Decode one complete 16-byte record from the chunk file at record index $1.
+# Prints "sec usec type code value"; returns 1 on a short/partial record.
+parse_record() {
+    index=$1
+    # shellcheck disable=SC2046
+    set -- $(dd if="$chunk" bs=16 count=1 skip="$index" 2>/dev/null |
+        od -An -v -tx1 | tr -s ' \n' '\n')
+    [ "$#" -eq 16 ] || return 1
+    sec=$((0x$1 + (0x$2 * 256) + (0x$3 * 65536) + (0x$4 * 16777216)))
+    usec=$((0x$5 + (0x$6 * 256) + (0x$7 * 65536)))
+    type=$((0x$9 + (0x${10} * 256)))
+    code=$((0x${11} + (0x${12} * 256)))
+    value=$((0x${13} + (0x${14} * 256)))
+    printf '%s %s %s %s %s\n' "$sec" "$usec" "$type" "$code" "$value"
+    return 0
+}
+
+chunk=/tmp/.libreecho-recovery-button.$$
+trap 'rm -f "$chunk"' EXIT HUP INT TERM
+start_s=$(now_seconds)
+window_s=$(((PRESS_WINDOW_MS + 999) / 1000))
+max_s=$(((MAX_MS + 999) / 1000))
+press_ms=
+result=0
+
+while :; do
+    timeout 1 dd if="$DEVICE" bs=4096 count=1 of="$chunk" 2>/dev/null
+    rc=$?
+    size=$(wc -c <"$chunk" 2>/dev/null || printf '0')
+    case "$size" in ''|*[!0-9]*) size=0 ;; esac
+
+    if [ "$size" -ge 16 ]; then
+        records=$((size / 16))
+        index=0
+        while [ "$index" -lt "$records" ]; do
+            record=$(parse_record "$index") || break
+            set -- $record
+            r_sec=$1; r_usec=$2; r_type=$3; r_code=$4; r_value=$5
+            if [ "$r_type" -eq 1 ] && [ "$r_code" -eq "$KEY_CODE" ]; then
+                event_ms=$((r_sec * 1000 + r_usec / 1000))
+                case "$r_value" in
+                    1) [ -n "$press_ms" ] || press_ms=$event_ms ;;
+                    0)
+                        if [ -n "$press_ms" ]; then
+                            held=$((event_ms - press_ms))
+                            if [ "$held" -ge "$HOLD_MS" ]; then
+                                write_marker && exit 0
+                                exit 1
+                            fi
+                            press_ms=
+                        fi
+                        ;;
+                    2) : ;;  # autorepeat: still held
+                esac
+            fi
+            index=$((index + 1))
+        done
+    elif [ "$rc" -eq 0 ] && [ "$size" -eq 0 ]; then
+        break  # EOF on a regular-file fixture: no further events
+    fi
+
+    now_s=$(now_seconds)
+    elapsed_s=$((now_s - start_s))
+    if [ "$elapsed_s" -ge "$max_s" ]; then
+        break
+    fi
+    if [ -z "$press_ms" ]; then
+        [ "$elapsed_s" -lt "$window_s" ] || break
+    else
+        # Continuous hold observed past the threshold without a release event.
+        if [ $((now_s * 1000 - press_ms)) -ge "$HOLD_MS" ]; then
+            write_marker && exit 0
+            result=1
+            break
+        fi
+    fi
+done
+
+# No qualifying hold: leave the boot completely unaffected.
+exit "$result"

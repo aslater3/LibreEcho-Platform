@@ -1,0 +1,37 @@
+{
+  "name": "libreecho-recovery-ap",
+  "description": "Pinned static dependencies for the MT8163 recovery access point.",
+  "components": {
+    "hostapd": {
+      "version": "2.10",
+      "license": "BSD-3-Clause",
+      "source_url": "https://w1.fi/releases/hostapd-2.10.tar.gz",
+      "source_sha256": "206e7c799b678572c2e3d12030238784bc4a9f82323b0156b4c9466f1498915d",
+      "source_license": "COPYING",
+      "artifact": "hostapd"
+    },
+    "dnsmasq": {
+      "version": "2.90",
+      "license": "GPL-2.0-or-3.0",
+      "source_url": "https://thekelleys.org.uk/dnsmasq/dnsmasq-2.90.tar.xz",
+      "source_sha256": "8e50309bd837bfec9649a812e066c09b6988b73d749b7d293c06c57d46a109e4",
+      "source_license": "COPYING",
+      "source_license_secondary": "COPYING-v3",
+      "artifact": "dnsmasq"
+    },
+    "iw": {
+      "version": "5.19",
+      "license": "ISC",
+      "source_url": "https://mirrors.edge.kernel.org/pub/software/network/iw/iw-5.19.tar.gz",
+      "source_sha256": "2a44676d28a87bbc232903d5d573e7618e4fae0cea3a1aff067a26fa66652b75",
+      "source_license": "COPYING",
+      "artifact": "iw"
+    }
+  },
+  "notes": [
+    "Hashes were computed from the real upstream archives at the pinned URLs; the builder re-verifies them and fails closed on any mismatch or missing artifact.",
+    "hostapd is dual BSD-3-Clause/GPL-2.0; LibreEcho uses the BSD-3-Clause terms.",
+    "dnsmasq ships both GPL-2.0 (COPYING) and GPL-3.0 (COPYING-v3) texts; it is distributed under either.",
+    "iw depends on libnl for its netlink transport, which Platform already pins for wpa_supplicant (libnl 3.11.0)."
+  ]
+}

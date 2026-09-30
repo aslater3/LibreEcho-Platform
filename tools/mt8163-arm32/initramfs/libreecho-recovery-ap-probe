@@ -1,0 +1,96 @@
+#!/bin/busybox sh
+# shellcheck shell=dash
+#
+# Strict recovery access-point capability and readiness probe (issue #96,
+# Platform side).  networkd runs this as its AP-capability probe
+# (--recovery-ap-probe, default /usr/local/sbin/libreecho-recovery-ap-probe)
+# once a physical recovery marker has been validated.  The probe fails closed:
+# a missing binary, a missing interface, an interface that does not advertise
+# AP mode over nl80211, or an unraised readiness surface all return non-zero so
+# the daemon reports an actionable "unavailable" reason instead of claiming an
+# AP it cannot serve.
+#
+# Subcommand (default "supported"):
+#   supported  interface exists and its phy advertises nl80211 AP mode.
+#   ready      the AP is actually serving: interface is in AP mode, hostapd
+#              control surface exists, and the DHCP/DNS side owns the AP
+#              address.  This is the readiness check; it never accepts "binary
+#              exists" as proof.
+#
+# Layout note: networkd passes a single probe path with no arguments, so the
+# interface defaults to wlan0 (the daemon's interface default) and is
+# overridable with RECOVERY_AP_INTERFACE.
+
+set -u
+
+MODE=supported
+IFACE=${RECOVERY_AP_INTERFACE:-wlan0}
+IW=${RECOVERY_AP_IW:-iw}
+IP=${RECOVERY_AP_IP:-ip}
+CTRL=${RECOVERY_AP_CTRL:-/run/libreecho/hostapd}
+DHCP_PID=${RECOVERY_AP_DHCP_PID:-/run/libreecho/recovery-dhcp.pid}
+
+case "${1:-}" in
+    supported|ready) MODE=$1; [ "$#" -le 1 ] || { printf 'unexpected arguments\n' >&2; exit 2; } ;;
+    '') ;;
+    -h|--help) printf 'usage: %s [supported|ready]\n' "$0"; exit 0 ;;
+    *) printf 'usage: %s [supported|ready]\n' "$0" >&2; exit 2 ;;
+esac
+
+command -v "$IW" >/dev/null 2>&1 || { printf 'unavailable: missing-iw\n' >&2; exit 1; }
+
+# Resolve the phy behind the interface; a missing interface is NOT AP-capable.
+dev_info=$("$IW" dev "$IFACE" info 2>/dev/null) || {
+    printf 'unavailable: interface-absent:%s\n' "$IFACE" >&2
+    exit 1
+}
+phy=$(printf '%s\n' "$dev_info" |
+    sed -n 's/^[[:space:]]*wiphy[[:space:]]\+\([0-9][0-9]*\).*/\1/p' | head -n 1)
+if [ -z "$phy" ]; then
+    printf 'unavailable: no-phy:%s\n' "$IFACE" >&2
+    exit 1
+fi
+
+# nl80211: the phy must actually advertise AP in its supported interface modes.
+phy_info=$("$IW" phy "phy$phy" info 2>/dev/null) || {
+    printf 'unavailable: phy-info-failed:%s\n' "$IFACE" >&2
+    exit 1
+}
+if ! printf '%s\n' "$phy_info" |
+        sed -n '/Supported interface modes:/,/^[[:space:]]*$/p' |
+        grep -q '^[[:space:]]*\*[[:space:]]*AP[[:space:]]*$'; then
+    printf 'unavailable: ap-mode-unsupported:%s\n' "$IFACE" >&2
+    exit 1
+fi
+
+if [ "$MODE" = supported ]; then
+    printf 'available: ap-supported:%s\n' "$IFACE"
+    exit 0
+fi
+
+# --- readiness ---
+# The interface must currently be in AP mode, not merely AP-capable.
+if ! printf '%s\n' "$dev_info" |
+        sed -n 's/^[[:space:]]*type[[:space:]]\+\(.*\)$/\1/p' |
+        grep -qi '^AP$'; then
+    printf 'unavailable: interface-not-ap:%s\n' "$IFACE" >&2
+    exit 1
+fi
+# hostapd must have published its control surface (proof it is running).
+if [ ! -d "$CTRL" ] && [ ! -S "$CTRL" ]; then
+    printf 'unavailable: hostapd-control-absent:%s\n' "$CTRL" >&2
+    exit 1
+fi
+# The DHCP/DNS side must own a live incarnation.
+if [ ! -s "$DHCP_PID" ]; then
+    printf 'unavailable: dhcp-not-running:%s\n' "$DHCP_PID" >&2
+    exit 1
+fi
+# ...and the interface must actually carry the AP address.
+if ! "$IP" addr show dev "$IFACE" 2>/dev/null | grep -q '192\.168\.4\.1'; then
+    printf 'unavailable: interface-address-missing:%s\n' "$IFACE" >&2
+    exit 1
+fi
+
+printf 'available: ap-ready:%s\n' "$IFACE"
+exit 0
