@@ -258,7 +258,18 @@ void audio_visualizer_process(struct audio_visualizer *visualizer,
 			      size_t stride,
 			      uint8_t levels[AUDIO_VISUALIZER_BANDS])
 {
+	audio_visualizer_process_features(visualizer, samples, frames, stride,
+					  levels, NULL);
+}
+
+void audio_visualizer_process_features(struct audio_visualizer *visualizer,
+				       const int16_t *samples, size_t frames,
+				       size_t stride,
+				       uint8_t levels[AUDIO_VISUALIZER_BANDS],
+				       struct music_features *features)
+{
 	uint64_t sums[AUDIO_VISUALIZER_BANDS] = { 0 };
+	uint8_t raw[AUDIO_VISUALIZER_BANDS];
 	size_t frame;
 	unsigned int band;
 
@@ -295,8 +306,20 @@ void audio_visualizer_process(struct audio_visualizer *visualizer,
 		uint32_t magnitude = (uint32_t)(
 			(sums[band] / frames) >> FILTER_INPUT_SHIFT);
 
-		levels[band] = normalize_level(&visualizer->bands[band],
-					      magnitude);
+		raw[band] = normalize_level(&visualizer->bands[band],
+					    magnitude);
 	}
+
+	/*
+	 * The perceptual features consume the unshaped normalized band levels,
+	 * so their absolute loudness and balance do not inherit the display
+	 * AGC applied by shape_display_levels().
+	 */
+	if (features)
+		music_features_update(&visualizer->features, raw, frames,
+				      AUDIO_VISUALIZER_RATE, features);
+
+	for (band = 0; band < AUDIO_VISUALIZER_BANDS; ++band)
+		levels[band] = raw[band];
 	shape_display_levels(visualizer, levels);
 }

@@ -89,7 +89,11 @@ visualizer frames to the LED daemon at about 11.7 frames/second. System,
 announcement, or alarm activity immediately releases the `music` LED owner so
 the higher-priority indication wins; media visualization resumes only after
 those buses become idle. LED socket work is zero-wait and best-effort, so a
-missing or busy LED daemon cannot delay PCM.
+missing or busy LED daemon cannot delay PCM. Each frame carries the version-2
+perceptual feature contract documented in `music-features.md` (loudness and
+balance axes, differentiated low/mid/high onsets, a tempo hypothesis with
+decaying confidence, and cooldown-gated build/drop/re-entry/section events);
+`LIBREECHO_AUDIO_VISUALIZER_VERSION=1` selects the legacy twelve-level frame.
 
 The engine also atomically publishes `/run/libreecho-audio/status.json` with
 mode `0644`. It records only playback state (`idle`, `playing`, `system`,
