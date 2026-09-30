@@ -107,6 +107,16 @@ receipt_reset() {
 }
 
 # --- target identity ---------------------------------------------------------
+# Boot-chain tokens differ only in case between sources: fastboot/LK reports
+# RADAR/BISCUIT, while the Amonet TWRP builds set ro.product.device and
+# ro.build.product to radar/biscuit. Compare case-insensitively against the
+# target's fastboot products; also accept the exact target id.
+product_matches() {
+    pm_upper=$(printf '%s' "$1" | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')
+    case ",$FASTBOOT_PRODUCTS," in *",$pm_upper,"*) return 0 ;; esac
+    [ "$1" = "$TARGET" ]
+}
+
 check_target() {
     TARGET=$(sed -n 's/^target=//p' "$BUNDLE_MANIFEST")
     bundle_device=$(sed -n 's/^device=//p' "$BUNDLE_MANIFEST")
@@ -138,10 +148,7 @@ check_target() {
         ui_print "target-product-source=$product_prop value=${product_value:-<empty>}"
         [ -n "$product_value" ] || continue
         product_found=1
-        case ",$FASTBOOT_PRODUCTS," in
-            *",$product_value,"*) ;;
-            *) product_mismatch=1 ;;
-        esac
+        product_matches "$product_value" || product_mismatch=1
     done
     # Only product/device fields are board tokens. androidboot.hardware is a
     # SoC (mt8163), and serial/slot fields are not product identities.
@@ -152,10 +159,7 @@ check_target() {
                 ui_print "target-product-source=${product_field%%=*} value=${product_value:-<empty>}"
                 [ -n "$product_value" ] || continue
                 product_found=1
-                case ",$FASTBOOT_PRODUCTS," in
-                    *",$product_value,"*) ;;
-                    *) product_mismatch=1 ;;
-                esac
+                product_matches "$product_value" || product_mismatch=1
                 ;;
         esac
     done

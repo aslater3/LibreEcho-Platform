@@ -667,6 +667,25 @@ class RecoveryPreflightTests(unittest.TestCase):
                     self.assertEqual(a, b'previous-a')
                     self.assertEqual(b, b'previous-b')
 
+    def test_real_amonet_twrp_lowercase_properties_match_own_target_only(self):
+        # Extracted from the shipped Amonet TWRP ramdisks: amonet-radar v1.0.0
+        # sets ro.product.device/ro.build.product=radar, amonet-biscuit v2.0.0
+        # sets them to biscuit. Fastboot/LK use RADAR/BISCUIT.
+        radar_twrp = {'ro.product.device': 'radar', 'ro.build.product': 'radar'}
+        biscuit_twrp = {'ro.product.device': 'biscuit', 'ro.build.product': 'biscuit'}
+        for target, props, accepted in [('radar_puffin', radar_twrp, True), ('biscuit', biscuit_twrp, True),
+                                        ('radar_puffin', biscuit_twrp, False), ('biscuit', radar_twrp, False)]:
+            with self.subTest(target=target, props=props), tempfile.TemporaryDirectory() as tmp:
+                result, a, b, receipt, log = self.harness(Path(tmp), target=target, signed_board=target,
+                                                          props=props, qualified=True)
+                self.assertEqual(result.returncode == 0, accepted, result.stderr + log)
+                if accepted:
+                    self.assertIn('target_check=match', receipt)
+                else:
+                    self.assertEqual(a, b'previous-a')
+                    self.assertEqual(b, b'previous-b')
+                    self.assertIn('target_check=mismatch', receipt)
+
     def test_missing_or_corrupt_feature_fails_before_any_slot_or_format_write(self):
         for missing in ('payload', 'manifest', 'corrupt-manifest', 'corrupt-payload'):
             for action in ('preserve', 'replace'):
