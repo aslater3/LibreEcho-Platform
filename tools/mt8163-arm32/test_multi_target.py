@@ -458,9 +458,7 @@ class RadarTreeDiffTests(unittest.TestCase):
             elif path.is_file():
                 result[name] = {'kind': 'file', 'mode': stat.S_IMODE(path.stat().st_mode),
                                 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
-            # Added identity parent directory is implicit; all pre-existing
-            # directories must retain their permission bits.
-            elif path.is_dir() and name != 'etc/libreecho':
+            elif path.is_dir():
                 result[name] = {'kind': 'directory', 'mode': stat.S_IMODE(path.stat().st_mode)}
         return result
 
