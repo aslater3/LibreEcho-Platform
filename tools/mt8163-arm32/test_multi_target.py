@@ -109,12 +109,24 @@ class TargetCLITests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 verifier.validate_target_identity({}, metadata, target, 'a' * 64)
 
-    def test_legacy_mirror_pin_refuses_unrelated_source_changes(self):
-        raw = (TOOLS / 'initramfs/libreecho-init').read_bytes()
-        self.assertEqual(image.sha256(image.legacy_init_mirror(raw)),
-                         'f845a7b2070e5960f71cd777a5fdf47e7408598f5dc8564185d13feae0fb8d55')
-        with self.assertRaises(SystemExit):
-            image.legacy_init_mirror(raw + b'# unrelated change\n')
+    def test_init_rc_launch_path_is_byte_identical_to_pid1(self):
+        # init.rc still launches /libreecho-init and validate_stage scans that
+        # path. It must be the same target-aware script as /init; a stale
+        # radar-only copy broke the hosted image build after #211 merged.
+        self.assertIn('/bin/busybox sh /libreecho-init', (TOOLS / 'initramfs/init.rc').read_text())
+        self.assertFalse(hasattr(image, 'legacy_init_mirror'))
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = Path(tmp) / 'stage'; stage.mkdir()
+            loader = Path(tmp) / 'loader'; loader.write_bytes(b'loader')
+            emulator = Path(tmp) / 'applets'
+            emulator.write_text('#!/bin/sh\n/bin/busybox --list | while read -r name; do [ "$name" = busybox ] || printf "%s\\n" "$name"; done\n'); emulator.chmod(0o755)
+            metadata = {}
+            image.add_overlay(stage, TOOLS / 'initramfs', Path('/bin/busybox'), loader,
+                              image.sha256(Path('/bin/busybox').read_bytes()), image.sha256(loader.read_bytes()),
+                              str(emulator), metadata)
+            self.assertEqual((stage / 'init').read_bytes(), (stage / 'libreecho-init').read_bytes())
+            self.assertIn(b'first_install_marker_matches', (stage / 'libreecho-init').read_bytes())
+            self.assertEqual(metadata['overlay']['libreecho-init']['sha256'], metadata['overlay']['init']['sha256'])
 
     def test_image_target_identity_and_radar_props(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -444,7 +456,7 @@ class RadarTreeDiffTests(unittest.TestCase):
     """
     BASE = '2715c573c15f982555b6b48264d75d468cf3af08'
     ALLOWED = {'etc/libreecho/target', 'usr/local/sbin/libreecho-update',
-               'usr/local/sbin/libreecho-feature-transaction', 'init',
+               'usr/local/sbin/libreecho-feature-transaction', 'init', 'libreecho-init',
                'usr/local/sbin/libreecho-bootctl'}
 
     @staticmethod

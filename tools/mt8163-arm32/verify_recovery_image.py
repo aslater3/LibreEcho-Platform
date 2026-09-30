@@ -1898,10 +1898,6 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     verified_overlay: dict[str, Entry] = {}
     for name, mode in OVERLAY_FILES.items():
         expected = read(overlay_dir / name)
-        if name == "libreecho-init":
-            # Historical mirror is NOT PID 1. v1.1 allows only /init to change.
-            expected = require_member(entries, name,
-                "f845a7b2070e5960f71cd777a5fdf47e7408598f5dc8564185d13feae0fb8d55", mode).data
         if name == "default.prop" and target != "radar_puffin":
             expected = expected.replace(b"=radar_puffin\n", b"=" + target.encode("ascii") + b"\n")
         if name == "ota-source.conf":
