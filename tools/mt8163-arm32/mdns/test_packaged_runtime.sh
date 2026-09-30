@@ -11,7 +11,7 @@ test ! -e /var/lib/dbus/machine-id
 /bin/busybox ip link set eth0 multicast on
 /bin/busybox ip link set eth0 up
 /bin/busybox ip addr show eth0
-printf '<service-group><name replace-wildcards="yes">LibreEcho %%h</name><service><type>_wyoming._tcp</type><port>21000</port></service></service-group>\n' >"$root/etc/avahi/services/wyoming-1.service"
+printf '<service-group><name replace-wildcards="yes">LibreEcho %%h</name><service><type>_esphomelib._tcp</type><port>6053</port><txt-record>version=0.14.0</txt-record><txt-record>mac=020000000001</txt-record><txt-record>board=radar_puffin</txt-record><txt-record>platform=LibreEcho</txt-record></service></service-group>\n' >"$root/etc/avahi/services/esphome-1.service"
 trap '"$init" stop >/dev/null 2>&1 || true' EXIT
 if ! "$init" start; then
  /bin/busybox cat /tmp/libreecho-mdnsd.log
@@ -26,7 +26,7 @@ if ! /bin/busybox chroot "$root" /lib/ld-linux-armhf.so.3 --library-path /usr/li
  /bin/busybox cat /tmp/libreecho-mdnsd.log
  exit 1
 fi
-/bin/busybox chroot "$root" /lib/ld-linux-armhf.so.3 --library-path /usr/lib:/lib /usr/bin/avahi-browse --resolve --terminate --parsable _wyoming._tcp
+/bin/busybox chroot "$root" /lib/ld-linux-armhf.so.3 --library-path /usr/lib:/lib /usr/bin/avahi-browse --resolve --terminate --parsable _esphomelib._tcp
 "$init" stop
 if "$init" status; then
  echo 'mDNS wrapper still reports running after stop' >&2

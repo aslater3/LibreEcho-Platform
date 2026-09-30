@@ -2433,6 +2433,16 @@ class PolicyTests(unittest.TestCase):
             )
 
             actions.write_text("")
+            saved_config = '{"integrations":4,"voice_pipeline_mode":"custom"}\n'
+            (data / "libreecho/config/web-config.json").write_text(saved_config)
+            for feature in ("stt", "tts"):
+                (data / f"libreecho/features/{feature}/payload.squashfs").unlink()
+            custom = subprocess.run(["sh", str(helper)], env=env, timeout=10)
+            self.assertEqual(custom.returncode, 0)
+            self.assertEqual((data / "libreecho/config/web-config.json").read_text(), saved_config)
+            for feature in ("stt", "tts"):
+                (data / f"libreecho/features/{feature}/payload.squashfs").write_bytes(b"verified-fixture")
+            actions.write_text("")
             (data / "libreecho/config/web-config.json").write_text('{"integrations":4}\n')
             subprocess.run(["sh", str(helper)], env=env, check=True)
             disabled_actions = actions.read_text().splitlines()
@@ -2557,6 +2567,25 @@ class PolicyTests(unittest.TestCase):
                     "libreecho-airplayd.init:start",
                 ],
             )
+            # HA-off restores the saved Custom graph and never rewrites the
+            # owner's selection; remote clients need no local STT/TTS model.
+            actions.write_text("")
+            saved_custom = '{"integrations":4,"voice_pipeline_mode":"custom"}\n'
+            (data / "libreecho/config/web-config.json").write_text(saved_custom)
+            for service in ("sttd", "ttsd", "agentd"):
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                listener.bind(str(socket_paths[service]))
+                listener.listen(1)
+                self.addCleanup(listener.close)
+                sockets.append(listener)
+            subprocess.run(["sh", str(helper)], env=env, check=True, timeout=10)
+            self.assertEqual(actions.read_text().splitlines(), [
+                "libreecho-esphomed.init:stop", "libreecho-waked.init:start",
+                "libreecho-sttd.init:start", "libreecho-airplayd.init:start",
+                "libreecho-ttsd.init:start", "libreecho-agentd.init:start"])
+            self.assertEqual((data / "libreecho/config/web-config.json").read_text(), saved_custom)
+            self.assertFalse((states / "esphomed").exists())
+            (data / "libreecho/config/web-config.json").write_text('{"integrations":21}\n')
             (etc / "libreecho/feature-policy").write_text("redistributable\n")
             unsupported_ha = subprocess.run(["sh", str(helper)], env=env)
             self.assertNotEqual(unsupported_ha.returncode, 0)
@@ -3385,7 +3414,7 @@ start_feature_service_if_enabled
         """
         init_source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
         extracted = {}
-        for name in ("apply_timezone", "start_ui_services"):
+        for name in ("apply_timezone", "stop_ui_voice_owners", "start_ui_services"):
             match = re.search(rf"(?ms)^{name}\(\)\n.*?^}}\n", init_source)
             if match is None:
                 self.fail(f"{name}() is not extractable from libreecho-init")
@@ -3454,7 +3483,9 @@ start_feature_service_if_enabled
                         "s = socket.socket(socket.AF_UNIX); "
                         's.bind(sys.argv[1]); s.close()" "$timer_socket"'
                     )
-                lines += ["        ;;", "esac", "exit 0", ""]
+                lines += ["        ;;", "    stop) rm -f \"$marker\" ;;",
+                          "    status) test -f \"$marker\"; exit $? ;;",
+                          "esac", "exit 0", ""]
                 stub.write_text("\n".join(lines))
                 stub.chmod(0o755)
 
@@ -4355,6 +4386,120 @@ class EsphomeShippingTests(unittest.TestCase):
                       "MBEDTLS_CHACHAPOLY_C", "MBEDTLS_SHA256_C", "MBEDTLS_MD_C"):
             self.assertIn(macro, (TOOLS_DIR / "ui/verify_ui_tls.sh").read_text())
 
+    @staticmethod
+    def fixture_elf(dynamic: bool = False) -> bytes:
+        # Synthetic ARM ELF identity only, never a runnable target executable.
+        import struct
+        data = bytearray(512)
+        data[:7] = b"\x7fELF\x01\x01\x01"
+        struct.pack_into("<H", data, 18, 40)
+        struct.pack_into("<I", data, 36, 0x05000400)
+        if dynamic:
+            interpreter = b"/lib/ld-musl-armhf.so.1\0"
+            needed = b"libc.musl-armv7.so.1\0"
+            data[128:128+len(interpreter)] = interpreter
+            data[160:160+len(needed)] = needed
+            struct.pack_into("<II", data, 28, 52, 256)
+            struct.pack_into("<HHHH", data, 42, 32, 2, 40, 2)
+            struct.pack_into("<II", data, 52, 3, 128)
+            struct.pack_into("<I", data, 68, len(interpreter))
+            struct.pack_into("<II", data, 84, 2, 192)
+            struct.pack_into("<II", data, 192, 1, 0)
+            struct.pack_into("<I", data, 260, 6)
+            struct.pack_into("<III", data, 272, 192, 16, 1)
+            struct.pack_into("<I", data, 292, 8)
+            struct.pack_into("<I", data, 300, 3)
+            struct.pack_into("<III", data, 312, 160, len(needed), 0)
+        return bytes(data)
+
+    def test_builder_inventory_roundtrips_independent_verifier(self) -> None:
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bundle, stage, source = (root / name for name in ("bundle", "stage", "source"))
+            source.mkdir()
+            # Expected set is explicit: neither silently removing the new
+            # satellite nor dropping preserved clients may make this test green.
+            self.assertIn("usr/local/sbin/libreecho-esphomed", verifier.UI_FIXED_NAMES)
+            self.assertIn("usr/local/sbin/libreecho-watchdogd", verifier.UI_FIXED_NAMES)
+            names = verifier.UI_FIXED_NAMES | {"usr/local/share/libreecho/web/index.html"}
+            lines = ["schema=1", "source_commit=" + "a"*40, "source_diff_sha256=" + "b"*64]
+            for name in sorted(names - {"usr/local/share/libreecho/ui-manifest.txt"}):
+                relative = name.removeprefix("usr/local/")
+                path = bundle / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                content = (self.fixture_elf(name.endswith(("sttd-wyoming", "ttsd-wyoming")))
+                           if name in verifier.UI_BINARY_NAMES else b"fixture\n")
+                path.write_bytes(content)
+                lines.append(f"file={relative} sha256={hashlib.sha256(content).hexdigest()}")
+            ui_manifest = bundle / "share/libreecho/ui-manifest.txt"
+            ui_manifest.write_text("\n".join(lines) + "\n")
+            # Startup behavior and real ELF ABI checks have their own gates.
+            # Here only external readelf/startup are stubbed: the real staging
+            # inventory, mode/hash records and independent ELF parser execute.
+            manifest = {}
+            with mock.patch.object(builder, "validate_ui_startup_contract"), \
+                 mock.patch.object(builder, "require_elf_contract", return_value={}):
+                builder.add_ui_bundle(stage, bundle, source, "a"*40, "b"*64, manifest)
+            entries = {path.relative_to(stage).as_posix(): verifier.Entry(
+                path.relative_to(stage).as_posix(), path.stat().st_mode, 0, 0, 0, path.read_bytes())
+                for path in stage.rglob("*") if path.is_file()}
+            self.assertEqual(set(entries), names)
+            digest = hashlib.sha256(ui_manifest.read_bytes()).hexdigest()
+            self.assertTrue(verifier.validate_ui(entries, manifest, digest, "a"*40, "b"*64))
+            for missing in ("usr/local/sbin/libreecho-esphomed",
+                            "etc/init.d/libreecho-esphomed.init",
+                            "usr/local/sbin/libreecho-watchdogd",
+                            "usr/local/sbin/libreecho-sttd-wyoming",
+                            "etc/libreecho/avahi-services/esphome.service"):
+                with self.subTest(missing=missing), self.assertRaises(SystemExit):
+                    verifier.validate_ui({k:v for k,v in entries.items() if k != missing},
+                                         manifest, digest, "a"*40, "b"*64)
+            wrong = "usr/local/sbin/libreecho-esphomed"
+            original = entries[wrong]
+            entries[wrong] = verifier.Entry(wrong, stat.S_IFREG | 0o644, 0, 0, 0, original.data)
+            with self.assertRaisesRegex(SystemExit, "wrong mode/type"):
+                verifier.validate_ui(entries, manifest, digest, "a"*40, "b"*64)
+            entries[wrong] = original
+            for name in ("usr/local/sbin/libreecho-wyomingd", "etc/init.d/libreecho-wyomingd.init",
+                         "etc/libreecho/avahi-services/wyoming.service", "etc/libreecho/esphome-key"):
+                with self.subTest(stray=name), self.assertRaises(SystemExit):
+                    verifier.validate_ui({**entries, name: verifier.Entry(
+                        name, stat.S_IFREG | 0o755, 0, 0, 0, b"forbidden")},
+                        manifest, digest, "a"*40, "b"*64)
+
+    def test_reference_discovery_template_rejects_private_identity(self) -> None:
+        script = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        start = script.index('esphome_service="$UI_SOURCE/config/esphome.service"')
+        end = script.index("for sound in ", start)
+        guard = script[start:end]
+        reference = ('<service-group><service><type>_esphomelib._tcp</type>'
+                     '<port>6053</port><txt-record>version=@VERSION@</txt-record>'
+                     '<txt-record>mac=@MAC@</txt-record><txt-record>platform=LibreEcho</txt-record>'
+                     '<txt-record>board=radar-puffin</txt-record></service></service-group>')
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            (root / "out/etc/libreecho/avahi-services").mkdir(parents=True)
+            xml = root / "config/esphome.service"
+            for content, accepted in ((reference, True),
+                    (reference.replace("@MAC@", "020000000001"), False),
+                    (reference.replace("</service>", "<txt-record>noise_psk=fixture-secret</txt-record></service>"), False),
+                    (reference.replace("_esphomelib._tcp", "_wyoming._tcp"), False),
+                    (reference.replace("6053", "10700"), False)):
+                xml.write_text(content)
+                result = subprocess.run(["bash", "-c", 'set -euo pipefail\n' + guard],
+                    env={**os.environ, "UI_SOURCE": str(root), "OUTPUT": str(root / "out")},
+                    text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+            xml.unlink()
+            xml.symlink_to(root / "outside.xml")
+            (root / "outside.xml").write_text(reference)
+            result = subprocess.run(["bash", "-c", 'set -euo pipefail\n' + guard],
+                env={**os.environ, "UI_SOURCE": str(root), "OUTPUT": str(root / "out")},
+                capture_output=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+
     def test_builder_refuses_extra_manifested_satellite_or_secret(self) -> None:
         for extra in ("sbin/libreecho-wyomingd", "etc/init.d/libreecho-wyomingd.init",
                       "etc/libreecho/avahi-services/wyoming.service",
@@ -4376,11 +4521,18 @@ class EsphomeShippingTests(unittest.TestCase):
                     builder.add_ui_bundle(root / "stage", bundle, source,
                                           "a"*40, "b"*64, {})
 
+    def test_verifier_rejects_renamed_wyoming_discovery_record(self) -> None:
+        name = "usr/local/lib/libreecho-mdns/root/etc/avahi/services/legacy.service"
+        entries = {name: verifier.Entry(name, stat.S_IFREG | 0o644, 0, 0, 0,
+                                       b"<service><type>_wyoming._tcp</type></service>")}
+        with self.assertRaisesRegex(SystemExit, "obsolete satellite"):
+            verifier.validate_ui(entries, {"ui": {"enabled": False}}, None, None, None)
+
     def test_verifier_rejects_stray_satellite_even_with_ui_disabled(self) -> None:
         for name in ("usr/local/sbin/libreecho-wyomingd",
                      "etc/init.d/libreecho-wyomingd.init",
                      "etc/libreecho/avahi-services/wyoming.service",
-                     "usr/local/sbin/libreecho-rogue",
+                     "usr/local/sbin/libreecho-esphomed.old",
                      "etc/libreecho/esphome-key"):
             with self.subTest(name=name), self.assertRaises(SystemExit):
                 entries = {name: verifier.Entry(name, stat.S_IFREG | 0o755, 0, 0, 0, b"fixture")}
@@ -4809,7 +4961,10 @@ class UiTlsPackagingTests(unittest.TestCase):
         (prefix / "include/psa/crypto.h").write_text("/* fixture */\n")
         (prefix / "include/mbedtls/build_info.h").write_text(
             '#define MBEDTLS_VERSION_STRING         "%s"\n'
-            % (version or lock["version"])
+            % (version or lock["version"]) +
+            "".join(f"#define {macro}\n" for macro in (
+                "MBEDTLS_ECDH_C", "MBEDTLS_ECP_DP_CURVE25519_ENABLED",
+                "MBEDTLS_CHACHAPOLY_C", "MBEDTLS_SHA256_C", "MBEDTLS_MD_C"))
         )
         digests = {}
         for archive in ("libmbedcrypto.a", "libmbedx509.a", "libmbedtls.a"):
@@ -4898,6 +5053,30 @@ class UiTlsPackagingTests(unittest.TestCase):
             env=environment, text=True, cwd=tmp,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
+
+    def test_noise_prefix_requires_all_five_effective_primitives(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for missing in (None, "MBEDTLS_ECDH_C", "MBEDTLS_ECP_DP_CURVE25519_ENABLED",
+                            "MBEDTLS_CHACHAPOLY_C", "MBEDTLS_SHA256_C", "MBEDTLS_MD_C"):
+                prefix = root / (missing or "complete")
+                self.write_mbedtls_prefix(prefix)
+                if missing:
+                    header = prefix / "include/mbedtls/build_info.h"
+                    header.write_text(header.read_text().replace(f"#define {missing}\n", ""))
+                    provenance = prefix / "mbedtls-source.json"
+                    document = json.loads(provenance.read_text())
+                    document["include_sha256"] = hashlib.sha256(header.read_bytes()).hexdigest()
+                    document["include_tree_sha256"] = self.include_tree_digest(prefix / "include")
+                    provenance.write_text(json.dumps(document, indent=2) + "\n")
+                result = subprocess.run(["bash", str(self.verifier), "--noise-prefix", str(prefix)],
+                                        text=True, capture_output=True, timeout=10)
+                if missing:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(missing, result.stderr)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("esphome_noise_prefix=ok", result.stdout)
 
     def test_ui_bundle_binds_the_link_to_the_verified_prefix(self) -> None:
         """Codex review: the linked archives must be the verified ones.

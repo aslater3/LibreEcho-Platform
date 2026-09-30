@@ -66,6 +66,7 @@ command -v "$MAKE_BIN" >/dev/null 2>&1 || {
     exit 1
 }
 "$VERIFY_TLS" --prefix "$MBEDTLS_ROOT"
+"$VERIFY_TLS" --noise-prefix "$MBEDTLS_ROOT"
 
 # Bind the linkage to the prefix that was just verified.  The archives are named
 # by absolute path rather than through a library search path, and the list is not
@@ -113,6 +114,7 @@ export CPPFLAGS="-I$MBEDTLS_ROOT/include${CPPFLAGS:+ $CPPFLAGS}"
     CROSS_COMPILE="$CROSS_COMPILE" CC="$CC_BIN" \
     GC_LDFLAGS="$GC_LDFLAGS -L$MBEDTLS_ROOT/lib" \
     WEB_TLS_LIBS="$TLS_LIBS" RADIOD_TLS_LIBS="$TLS_LIBS" \
+    ESPHOMED_NOISE=1 ESPHOMED_TLS_LIBS="$TLS_LIBS" \
     release
 
 # A build that selected src/tls_stub.c (LE_TLS_AVAILABLE=0) or that failed to
@@ -134,10 +136,10 @@ env LD_LIBRARY_PATH="$MUSL_NATIVE_LIB" \
 
 for binary in \
     libreecho-web libreecho-logd libreecho-networkd libreecho-timed \
-    libreecho-timerd \
+    libreecho-timerd libreecho-watchdogd \
     libreecho-audiod libreecho-micd libreecho-ledd libreecho-buttond \
     libreecho-radiod libreecho-btd \
-    libreecho-airplayd libreecho-wyomingd libreecho-mdnsd
+    libreecho-airplayd libreecho-esphomed libreecho-mdnsd
 do
     path="$UI_SOURCE/build/$binary"
     [[ -f "$path" && ! -L "$path" ]] || {
@@ -186,10 +188,10 @@ mkdir -p "$OUTPUT/sbin" "$OUTPUT/share/libreecho/web" \
 
 for binary in \
     libreecho-web libreecho-logd libreecho-networkd libreecho-timed \
-    libreecho-timerd \
+    libreecho-timerd libreecho-watchdogd \
     libreecho-audiod libreecho-micd libreecho-ledd libreecho-buttond \
     libreecho-radiod libreecho-btd \
-    libreecho-airplayd libreecho-wyomingd \
+    libreecho-airplayd libreecho-esphomed \
     libreecho-sttd-wyoming libreecho-ttsd-wyoming libreecho-mdnsd
 do
     install -m 0755 "$UI_SOURCE/build/$binary" "$OUTPUT/sbin/$binary"
@@ -204,12 +206,12 @@ done
 
 for script in \
     libreecho-web.init libreecho-logd.init libreecho-networkd.init libreecho-timed.init \
-    libreecho-timerd.init \
+    libreecho-timerd.init libreecho-watchdogd.init \
     libreecho-audiod.init libreecho-micd.init libreecho-ledd.init \
     libreecho-buttond.init libreecho-radiod.init libreecho-btd.init \
     libreecho-airplayd.init libreecho-ttsd.init \
     libreecho-waked.init libreecho-sttd.init libreecho-agentd.init \
-    libreecho-wyomingd.init
+    libreecho-esphomed.init
 do
     install -m 0755 "$UI_SOURCE/init/$script" "$OUTPUT/etc/init.d/$script"
 done
@@ -221,21 +223,37 @@ install -m 0644 "$UI_SOURCE/config/airplay2.conf" \
     "$OUTPUT/etc/libreecho/airplay2.conf"
 install -m 0644 "$UI_SOURCE/config/ntp.conf" \
     "$OUTPUT/etc/libreecho/ntp.conf"
-wyoming_service="$UI_SOURCE/config/wyoming.service"
-[[ -f "$wyoming_service" && ! -L "$wyoming_service" && -s "$wyoming_service" ]] || {
-    echo "ERROR: missing or empty Wyoming service definition: $wyoming_service" >&2
+esphome_service="$UI_SOURCE/config/esphome.service"
+[[ -f "$esphome_service" && ! -L "$esphome_service" && -s "$esphome_service" ]] || {
+    echo "ERROR: missing or empty ESPHome service definition: $esphome_service" >&2
     exit 1
 }
-grep -Fq '<type>_wyoming._tcp</type>' "$wyoming_service" || {
-    echo "ERROR: Wyoming service definition has no _wyoming._tcp entry" >&2
+grep -Fq '<type>_esphomelib._tcp</type>' "$esphome_service" || {
+    echo "ERROR: ESPHome service definition has no _esphomelib._tcp entry" >&2
     exit 1
 }
-grep -Fq '<port>10700</port>' "$wyoming_service" || {
-    echo "ERROR: Wyoming service definition has no port 10700" >&2
+grep -Fq '<port>6053</port>' "$esphome_service" || {
+    echo "ERROR: ESPHome service definition has no port 6053" >&2
     exit 1
 }
-install -m 0644 "$wyoming_service" \
-    "$OUTPUT/etc/libreecho/avahi-services/wyoming.service"
+python3 - "$esphome_service" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+service = ET.parse(sys.argv[1]).getroot()
+records = service.findall("service")
+if len(records) != 1 or records[0].findtext("type") != "_esphomelib._tcp" or records[0].findtext("port") != "6053":
+    raise SystemExit("ERROR: ESPHome service definition has invalid type/port")
+txt = dict(item.text.split("=", 1) for item in records[0].findall("txt-record") if item.text and "=" in item.text)
+if not all(txt.get(key) for key in ("version", "board", "platform")):
+    raise SystemExit("ERROR: ESPHome service definition has no TXT identity")
+# Reference schema only, outside the runtime Avahi services directory. Device
+# identity is supplied by esphomed's readiness-bound lease, never this template.
+if (txt.get("mac") not in (None, "@MAC@") or
+        any(key in txt for key in ("key", "noise_psk", "api_key"))):
+    raise SystemExit("ERROR: ESPHome service definition embeds private identity")
+PY
+install -m 0644 "$esphome_service" \
+    "$OUTPUT/etc/libreecho/avahi-services/esphome.service"
 for sound in action-1.raw action-2.raw action-3.raw; do
     path="$UI_SOURCE/sounds/$sound"
     [[ -f "$path" && ! -L "$path" && -s "$path" ]] || {

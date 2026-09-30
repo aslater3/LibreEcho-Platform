@@ -55,7 +55,7 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "f845a7b2070e5960f71cd777a5fdf47e7408598f5dc8564185d13feae0fb8d55"
+RECOVERY_INIT_SHA256 = "36e3b80526175d92d659a50d08c29149550c0396fdde4315797d37972381afb7"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
@@ -1047,6 +1047,30 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
     )
     if actual_bundle_files != sorted(bundled_files):
         raise SystemExit("ERROR: UI file manifest does not cover the complete bundle")
+    allowed_binaries = {
+        "libreecho-web", "libreecho-logd", "libreecho-networkd",
+        "libreecho-timed", "libreecho-timerd", "libreecho-watchdogd",
+        "libreecho-audiod", "libreecho-micd", "libreecho-ledd", "libreecho-buttond",
+        "libreecho-radiod", "libreecho-btd", "libreecho-airplayd",
+        "libreecho-esphomed", "libreecho-mdnsd",
+        "libreecho-sttd-wyoming", "libreecho-ttsd-wyoming",
+    }
+    allowed_inits = (allowed_binaries - {"libreecho-mdnsd", "libreecho-sttd-wyoming",
+                                       "libreecho-ttsd-wyoming"}) | {
+        "libreecho-sttd", "libreecho-ttsd", "libreecho-agentd", "libreecho-waked",
+    }
+    allowed_fixed = {f"sbin/{name}" for name in allowed_binaries} | {
+        f"etc/init.d/{name}.init" for name in allowed_inits
+    } | {
+        "etc/libreecho/web-config.json", "etc/libreecho/airplay2.conf",
+        "etc/libreecho/ntp.conf", "etc/libreecho/users",
+        "etc/libreecho/avahi-services/esphome.service",
+        "share/libreecho/sounds/action-1.raw", "share/libreecho/sounds/action-2.raw",
+        "share/libreecho/sounds/action-3.raw",
+    }
+    for relative in bundled_files:
+        if relative not in allowed_fixed and not relative.startswith("share/libreecho/web/"):
+            raise SystemExit(f"ERROR: UI bundle has unexpected/forbidden file: {relative}")
     validate_ui_startup_contract(bundle)
 
     files: dict[str, object] = {}
@@ -1082,10 +1106,10 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
 
     for binary in (
         "libreecho-web", "libreecho-logd", "libreecho-networkd",
-        "libreecho-timed", "libreecho-timerd",
+        "libreecho-timed", "libreecho-timerd", "libreecho-watchdogd",
         "libreecho-audiod", "libreecho-micd",
         "libreecho-ledd", "libreecho-buttond", "libreecho-radiod", "libreecho-btd",
-        "libreecho-airplayd", "libreecho-wyomingd",
+        "libreecho-airplayd", "libreecho-esphomed",
         "libreecho-sttd-wyoming", "libreecho-ttsd-wyoming",
         # The shared discovery supervisor: the 0.14 mDNS re-arch moved
         # responder ownership here, and without the binary the init falls back
@@ -1098,19 +1122,19 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
         copy_file(f"sbin/{binary}", f"usr/local/sbin/{binary}", 0o755, True)
     for script in (
         "libreecho-web.init", "libreecho-logd.init", "libreecho-networkd.init",
-        "libreecho-timed.init", "libreecho-timerd.init", "libreecho-audiod.init",
+        "libreecho-timed.init", "libreecho-timerd.init", "libreecho-watchdogd.init", "libreecho-audiod.init",
         "libreecho-micd.init", "libreecho-ledd.init", "libreecho-buttond.init",
         "libreecho-radiod.init", "libreecho-btd.init",
         "libreecho-airplayd.init", "libreecho-ttsd.init", "libreecho-waked.init",
-        "libreecho-sttd.init", "libreecho-agentd.init", "libreecho-wyomingd.init",
+        "libreecho-sttd.init", "libreecho-agentd.init", "libreecho-esphomed.init",
     ):
         copy_file(f"etc/init.d/{script}", f"etc/init.d/{script}", 0o755)
     copy_file("etc/libreecho/web-config.json", "etc/libreecho/web-config.json", 0o600)
     copy_file("etc/libreecho/airplay2.conf", "etc/libreecho/airplay2.conf", 0o644)
     copy_file("etc/libreecho/ntp.conf", "etc/libreecho/ntp.conf", 0o644)
     copy_file(
-        "etc/libreecho/avahi-services/wyoming.service",
-        "etc/libreecho/avahi-services/wyoming.service", 0o644,
+        "etc/libreecho/avahi-services/esphome.service",
+        "etc/libreecho/avahi-services/esphome.service", 0o644,
     )
     if "etc/libreecho/users" in bundled_files:
         users_file = pinned_source(bundle, "etc/libreecho/users", "UI users file")

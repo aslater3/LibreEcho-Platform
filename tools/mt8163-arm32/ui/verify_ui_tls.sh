@@ -13,15 +13,17 @@
 set -euo pipefail
 
 usage() {
-  printf '%s\n' 'usage: verify_ui_tls.sh --prefix DIR | --binary FILE [--objects DIR] [--label NAME]'
+  printf '%s\n' 'usage: verify_ui_tls.sh --prefix DIR | --noise-prefix DIR | --binary FILE [--objects DIR] [--label NAME]'
 }
 
 PREFIX=
+NOISE_PREFIX=
 BINARY=
 OBJECTS=
 LABEL=
 while (($#)); do
   case "$1" in
+    --noise-prefix) shift; (($#)) || { usage >&2; exit 2; }; PREFIX=$1; NOISE_PREFIX=1 ;;
     --prefix) shift; (($#)) || { usage >&2; exit 2; }; PREFIX=$1 ;;
     --binary) shift; (($#)) || { usage >&2; exit 2; }; BINARY=$1 ;;
     --objects) shift; (($#)) || { usage >&2; exit 2; }; OBJECTS=$1 ;;
@@ -249,6 +251,25 @@ verify_prefix() {
     "$version" "$members"
 }
 
+verify_noise_prefix() {
+  local prefix=$1 macros primitive
+  # Check the effective upstream configuration, not a grep that would also
+  # match commented-out #defines. These primitives are target-independent;
+  # only preprocessing is required, no host or device binary is run.
+  macros=$(cc -I"$prefix/include" -dM -E -x c -include mbedtls/build_info.h /dev/null) || {
+    printf 'ERROR: cannot preprocess pinned mbedTLS Noise configuration\n' >&2
+    exit 1
+  }
+  for primitive in MBEDTLS_ECDH_C MBEDTLS_ECP_DP_CURVE25519_ENABLED \
+      MBEDTLS_CHACHAPOLY_C MBEDTLS_SHA256_C MBEDTLS_MD_C; do
+    grep -Eq "^#define $primitive([[:space:]]|$)" <<<"$macros" || {
+      printf 'ERROR: ESPHome Noise requires %s in the pinned mbedTLS configuration\n' "$primitive" >&2
+      exit 1
+    }
+  done
+  printf 'esphome_noise_prefix=ok primitives=5\n'
+}
+
 verify_binary() {
   local binary=$1
   local label=${2:-$binary}
@@ -285,4 +306,5 @@ verify_binary() {
 }
 
 [[ -z "$PREFIX" ]] || verify_prefix "$PREFIX"
+[[ -z "$NOISE_PREFIX" ]] || verify_noise_prefix "$PREFIX"
 [[ -z "$BINARY" ]] || verify_binary "$BINARY" "$LABEL"
