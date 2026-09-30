@@ -1870,9 +1870,9 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         "sbin/watchdogd": b"../init",
         "system/bin/sh": b"../../bin/busybox",
     }
-    for name, target in symlinks.items():
+    for name, link_target in symlinks.items():
         entry = entries.get(name)
-        if entry is None or not stat.S_ISLNK(entry.mode) or entry.data != target:
+        if entry is None or not stat.S_ISLNK(entry.mode) or entry.data != link_target:
             fail(f"symlink contract mismatch for {name}")
 
     required_applets = (
