@@ -39,13 +39,35 @@ def run(command, **kwargs):
 
 class TargetCLITests(unittest.TestCase):
     def test_all_product_tools_advertise_target_and_descriptor(self):
-        for tool in ('build_recovery_image.py', 'verify_recovery_image.py',
+        # Every tool Product probes before building (build.sh frontier).
+        for tool in ('generate_boot_envelope.py', 'build_recovery_image.py', 'verify_recovery_image.py',
                      'ota/make_ota_bundle.py', 'recovery-install/build_install_bundle.py'):
             with self.subTest(tool=tool):
                 result = run([sys.executable, str(TOOLS / tool), '--help'])
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn('--target ', result.stdout)
                 self.assertIn('--target-descriptor-sha256', result.stdout)
+
+    def test_boot_envelope_is_target_parity_and_rejects_unknown(self):
+        import generate_boot_envelope as envelope
+        with tempfile.TemporaryDirectory() as tmp:
+            digests = {}
+            for target in ('radar_puffin', 'biscuit'):
+                out = Path(tmp) / f'{target}.bin'
+                result = run([sys.executable, str(TOOLS / 'generate_boot_envelope.py'),
+                              '--target', target, '--output', str(out)])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'target={target}\n', result.stdout)
+                self.assertEqual(out.read_bytes(), envelope.generate())
+                digests[target] = hashlib.sha256(out.read_bytes()).hexdigest()
+            self.assertEqual(digests['biscuit'], digests['radar_puffin'])
+            self.assertEqual(digests['radar_puffin'], verifier.BOOT_ENVELOPE_SHA256)
+            bad = Path(tmp) / 'unknown.bin'
+            result = run([sys.executable, str(TOOLS / 'generate_boot_envelope.py'),
+                          '--target', 'unknown', '--output', str(bad)])
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('unknown target', result.stderr)
+            self.assertFalse(bad.exists())
 
     def test_cli_unknown_target_fails_before_inputs(self):
         result = run([sys.executable, str(TOOLS / 'recovery-install/build_install_bundle.py'),
