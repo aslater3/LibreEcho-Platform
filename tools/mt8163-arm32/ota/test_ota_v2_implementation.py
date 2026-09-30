@@ -157,8 +157,6 @@ def updater_fixture(root: Path, env: dict[str, str], transaction: Path) -> Path:
         "USERDATA_DEVICE=/dev/mmcblk0p16": f"USERDATA_DEVICE={shlex.quote(str(device / 'mmcblk0p16'))}",
         "USERDATA_SYS=/sys/class/block/mmcblk0p16": f"USERDATA_SYS={shlex.quote(str(sys_block / 'mmcblk0p16'))}",
         "MOUNTS_FILE=/proc/mounts": f"MOUNTS_FILE={shlex.quote(str(mounts))}",
-        "EXPDB_DEVICE=/dev/mmcblk0p7": f"EXPDB_DEVICE={shlex.quote(str(device / 'mmcblk0p7'))}",
-        "EXPDB_SYS=/sys/class/block/mmcblk0p7": f"EXPDB_SYS={shlex.quote(str(sys_block / 'mmcblk0p7'))}",
         "TRANSACTION_BCB_FILE=$STAGING/bootctl.readback": f"TRANSACTION_BCB_FILE={shlex.quote(str(update / 'staging/bootctl.readback'))}",
         "BOOT_DEVICE_ROOT=/dev": f"BOOT_DEVICE_ROOT={shlex.quote(str(parts))}",
         "BOOT_SYS_ROOT=/sys/class/block": f"BOOT_SYS_ROOT={shlex.quote(str(sys_block))}",
