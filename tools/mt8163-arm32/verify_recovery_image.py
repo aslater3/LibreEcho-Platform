@@ -53,7 +53,7 @@ WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-INIT_SHA256 = "91938a0c41355d5e02ea81085dae06d5ecfba94aa92ea0ad6667d9710b3b9cd5"
+INIT_SHA256 = "f845a7b2070e5960f71cd777a5fdf47e7408598f5dc8564185d13feae0fb8d55"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -1964,15 +1964,19 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         expected_service_profile,
     )
     for marker in (
-        b"FASTBOOT_PLEASE", b"/run/libreecho-control/runme", b"functionfs", b"/dev/stpwmt", b"/dev/stpbt",
-        b"PARTNAME=expdb", b"/sys/class/block/mmcblk0p7", b"20480", b"bs=15 count=1",
-        b"stat -c '%t:%T'",
+        b"/run/libreecho-control/runme", b"functionfs", b"/dev/stpwmt", b"/dev/stpbt",
         b"for role_sx in /sys/class/usb_role/*/role; do",
         b'printf device > "$role_sx"', b"usb-role-pinned-device:",
         b"usb-role-pin-failed:",
     ):
         if marker not in control.data:
             fail(f"libreecho-init lacks {marker!r}")
+    for forbidden in (
+        b"FASTBOOT_PLEASE", b"PARTNAME=expdb", b"/sys/class/block/mmcblk0p7",
+        b"printf FASTBOOT_PLEASE", b"expdb-sector",
+    ):
+        if forbidden in control.data:
+            fail(f"libreecho-init contains forbidden expdb marker path {forbidden!r}")
     adbd_launches = tuple(
         line.strip() for line in control.data.splitlines()
         if line.lstrip().startswith(b"/sbin/adbd ")

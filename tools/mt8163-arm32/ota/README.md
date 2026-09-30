@@ -66,12 +66,9 @@ the eMMC boot areas. User configuration remains under
 `/data/libreecho/config`; IDME, calibration, MAC addresses, and identity remain
 in `persist` and the eMMC boot areas.
 
-There is one bounded migration exception for an installation launched from an
-old development image. If, and only if, `expdb` has its exact expected
-partition identity and begins with `FASTBOOT_PLEASE`, the installer preserves
-the first sector, clears those 15 marker bytes, syncs, and verifies the complete
-sector. No other `expdb` content is changed. OTA-profile images do not write
-the marker again.
+The installer never writes or erases `expdb`. Older development images may have
+left a legacy marker there, but this release does not attempt to clear it because
+amonet v2.0.0 uses the partition for the LK-stage kaeru payload.
 
 ## Repeated v2 fallback history
 
@@ -448,9 +445,8 @@ is not part of this repository.
 
 ## Development marker
 
-The current development image writes `FASTBOOT_PLEASE` to `expdb` and resets
-the BCB to seven tries on every boot. Both behaviors defeat OTA selection and
-rollback. They remain available only in an explicit development build profile.
-A release/OTA image does not write `expdb` automatically and does not reset the
-BCB. An explicit operator request to reboot to fastboot may still write the
-marker after validating the `expdb` identity.
+Development and OTA images never write or erase `expdb`. On amonet v2.0.0,
+`expdb` contains the LK-stage kaeru payload, so `FASTBOOT_PLEASE` is not a
+valid marker there. The development kernel may still reset the Amazon BCB retry
+counters in `misc` at offset `0x360`; the separate expdb fastboot escape and
+its updater cleanup path are disabled.

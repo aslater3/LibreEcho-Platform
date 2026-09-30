@@ -28,9 +28,11 @@ class EarlyControlPlaneContracts(unittest.TestCase):
     # ---------------------------------------------------------------- adbd
     def test_adb_gadget_precedes_the_storage_waits(self) -> None:
         adb = self.init.index("# Linux 6.1 has no Android android_usb class.")
-        expdb = self.init.index("EXPDB_SYS=/sys/class/block/mmcblk0p7")
+        # The eMMC block-node wait (formerly the expdb wait, removed for
+        # Platform #195) is the first storage wait and must follow adbd.
+        storage = self.init.index("[ ! -r /sys/class/block/mmcblk0p16/dev ]")
         userdata = self.init.index("if userdata_mount; then")
-        self.assertLess(adb, expdb)
+        self.assertLess(adb, storage)
         self.assertLess(adb, userdata)
 
     def test_adbd_setup_precedes_the_service_graph(self) -> None:
