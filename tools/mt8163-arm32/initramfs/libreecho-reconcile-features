@@ -16,6 +16,7 @@ RUN_ROOT=${FEATURE_RECONCILE_RUN_ROOT:-/run}
 VAR_RUN_ROOT=${FEATURE_RECONCILE_VAR_RUN_ROOT:-/var/run}
 INIT_ROOT=${FEATURE_RECONCILE_INIT_ROOT:-/etc/init.d}
 PROC_NET_UNIX=${FEATURE_RECONCILE_PROC_NET_UNIX:-/proc/net/unix}
+PROC_ROOT=${FEATURE_RECONCILE_PROC_ROOT:-/proc}
 LOG_FILE=${FEATURE_RECONCILE_LOG_FILE:-/tmp/init.log}
 KMSG=${FEATURE_RECONCILE_KMSG:-/dev/kmsg}
 CONSOLE=${FEATURE_RECONCILE_CONSOLE:-/dev/console}
@@ -114,8 +115,13 @@ read_policy()
 select_topology()
 {
     ha_enabled=0
+    voice_mode=local
     config=$DATA_ROOT/libreecho/config/web-config.json
     if [ -r "$config" ]; then
+        saved_mode=$($BB sed -n \
+            's/.*"voice_pipeline_mode"[[:space:]]*:[[:space:]]*"\([a-z_-]*\)".*/\1/p' \
+            "$config" 2>/dev/null | $BB head -n 1)
+        [ "$saved_mode" != custom ] || voice_mode=custom
         integrations=$($BB sed -n \
             's/.*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
             "$config" 2>/dev/null | $BB head -n 1)
@@ -150,9 +156,35 @@ select_topology()
     fi
 }
 
+esphome_service_ready()
+{
+    [ -x "$INIT_ROOT/libreecho-esphomed.init" ] || return 1
+    "$INIT_ROOT/libreecho-esphomed.init" status >/dev/null 2>&1 || return 1
+    esp_pidfile=$VAR_RUN_ROOT/libreecho-esphomed.pid
+    [ -s "$esp_pidfile" ] || return 1
+    esp_pid=$($BB sed -n '1p' "$esp_pidfile" 2>/dev/null)
+    case "$esp_pid" in ''|*[!0-9]*|0|1) return 1 ;; esac
+    $BB kill -0 "$esp_pid" 2>/dev/null || return 1
+    [ "$($BB readlink "$PROC_ROOT/$esp_pid/exe" 2>/dev/null)" = /usr/local/sbin/libreecho-esphomed ] || return 1
+    # A listener belonging to a different process must not confirm this slot.
+    for esp_table in "$PROC_ROOT/net/tcp" "$PROC_ROOT/net/tcp6"; do
+        [ -r "$esp_table" ] || continue
+        esp_inodes=$($BB awk -v port=17A5 \
+            '$4 == "0A" && $2 ~ (":" port "$") && $10 != "0" { print $10 }' \
+            "$esp_table" 2>/dev/null) || return 1
+        for esp_inode in $esp_inodes; do
+            for esp_fd in "$PROC_ROOT/$esp_pid/fd/"*; do
+                [ "$($BB readlink "$esp_fd" 2>/dev/null)" = "socket:[$esp_inode]" ] && return 0
+            done
+        done
+    done
+    return 1
+}
+
 daemon_service_ready()
 {
     service=$1
+    if [ "$service" = esphomed ]; then esphome_service_ready; return $?; fi
     script=$INIT_ROOT/libreecho-$service.init
     pidfile=$VAR_RUN_ROOT/libreecho-$service.pid
     [ -x "$script" ] || return 1
@@ -253,13 +285,19 @@ shared_discovery_active()
 
 reconcile_topology()
 {
+    # Transitional residue is stopped before either new topology. An absent
+    # obsolete satellite is normal; an orphan pidfile fails closed.
+    if [ -x "$INIT_ROOT/libreecho-wyomingd.init" ] ||
+       [ -e "$VAR_RUN_ROOT/libreecho-wyomingd.pid" ]; then
+        stop_service wyomingd || return 1
+    fi
     if [ "$ha_enabled" -eq 1 ]; then
         stop_service agentd "$RUN_ROOT/libreecho/agent.sock" || return 1
         stop_service sttd "$RUN_ROOT/libreecho/stt.sock" || return 1
         stop_service ttsd "$RUN_ROOT/libreecho/tts.sock" || return 1
-        start_daemon_service wyomingd || return 1
+        start_daemon_service esphomed || return 1
     else
-        stop_service wyomingd || return 1
+        stop_service esphomed || return 1
     fi
     return 0
 }
@@ -285,16 +323,23 @@ start_feature()
         # suppresses only the AirPlay protocol processes.
         log feature-reconcile-airplay-protocol-disabled
     fi
-    payload=$DATA_ROOT/libreecho/features/$feature/payload.squashfs
-    if [ ! -f "$payload" ]; then
-        log "feature-reconcile-payload-missing:$feature"
-        return 1
-    fi
-    feature_root=${payload%/payload.squashfs}
-    if [ -d "$feature_root/staging" ]; then
-        log "feature-reconcile-staging-present:$feature"
-        return 1
-    fi
+    # The Custom STT/TTS clients are boot-contained, not local model payloads.
+    # Their init wrappers select the saved endpoints without rewriting config.
+    case "$voice_mode:$feature" in
+        custom:stt|custom:tts) ;;
+        *)
+            payload=$DATA_ROOT/libreecho/features/$feature/payload.squashfs
+            if [ ! -f "$payload" ]; then
+                log "feature-reconcile-payload-missing:$feature"
+                return 1
+            fi
+            feature_root=${payload%/payload.squashfs}
+            if [ -d "$feature_root/staging" ]; then
+                log "feature-reconcile-staging-present:$feature"
+                return 1
+            fi
+            ;;
+    esac
 
     script=$INIT_ROOT/libreecho-$service.init
     if [ ! -x "$script" ]; then

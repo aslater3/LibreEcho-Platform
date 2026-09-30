@@ -54,7 +54,7 @@ WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-INIT_SHA256 = "397b8b00e805db606ddba2b6f9b2ba5da312da5af288ae0a37546947667e8c31"
+INIT_SHA256 = "b470ad375673f1eff4f9071d4782f79afc45264f1f86af1169edc62e84ed4b85"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -108,6 +108,7 @@ UI_BINARY_NAMES = {
     "usr/local/sbin/libreecho-networkd",
     "usr/local/sbin/libreecho-timed",
     "usr/local/sbin/libreecho-timerd",
+    "usr/local/sbin/libreecho-watchdogd",
     "usr/local/sbin/libreecho-audiod",
     "usr/local/sbin/libreecho-micd",
     "usr/local/sbin/libreecho-ledd",
@@ -115,7 +116,7 @@ UI_BINARY_NAMES = {
     "usr/local/sbin/libreecho-radiod",
     "usr/local/sbin/libreecho-btd",
     "usr/local/sbin/libreecho-airplayd",
-    "usr/local/sbin/libreecho-wyomingd",
+    "usr/local/sbin/libreecho-esphomed",
     "usr/local/sbin/libreecho-sttd-wyoming",
     "usr/local/sbin/libreecho-ttsd-wyoming",
     "usr/local/sbin/libreecho-mdnsd",
@@ -126,6 +127,7 @@ UI_INIT_NAMES = {
     "etc/init.d/libreecho-networkd.init",
     "etc/init.d/libreecho-timed.init",
     "etc/init.d/libreecho-timerd.init",
+    "etc/init.d/libreecho-watchdogd.init",
     "etc/init.d/libreecho-audiod.init",
     "etc/init.d/libreecho-micd.init",
     "etc/init.d/libreecho-ledd.init",
@@ -137,13 +139,13 @@ UI_INIT_NAMES = {
     "etc/init.d/libreecho-waked.init",
     "etc/init.d/libreecho-sttd.init",
     "etc/init.d/libreecho-agentd.init",
-    "etc/init.d/libreecho-wyomingd.init",
+    "etc/init.d/libreecho-esphomed.init",
 }
 UI_FIXED_NAMES = UI_BINARY_NAMES | UI_INIT_NAMES | {
     "etc/libreecho/web-config.json",
     "etc/libreecho/airplay2.conf",
     "etc/libreecho/ntp.conf",
-    "etc/libreecho/avahi-services/wyoming.service",
+    "etc/libreecho/avahi-services/esphome.service",
     "usr/local/share/libreecho/ui-manifest.txt",
     "usr/local/share/libreecho/sounds/action-1.raw",
     "usr/local/share/libreecho/sounds/action-2.raw",
@@ -764,6 +766,15 @@ def validate_ui(entries: dict[str, Entry], manifest: dict[str, object],
                 expected_manifest_sha256: str | None,
                 expected_commit: str | None,
                 expected_diff_sha256: str | None) -> bool:
+    for name, entry in entries.items():
+        if ((name.endswith(".service") and b"_wyoming._tcp" in entry.data) or
+                name.startswith("usr/local/sbin/libreecho-wyomingd") or
+                name.startswith("etc/init.d/libreecho-wyomingd") or
+                name.endswith("/wyoming.service") or
+                name.startswith("etc/libreecho/esphome-") or
+                (name.startswith("usr/local/sbin/libreecho-esphomed") and
+                 name != "usr/local/sbin/libreecho-esphomed")):
+            fail(f"forbidden obsolete satellite or private ESPHome file: {name}")
     raw_ui = manifest.get("ui", {"enabled": False})
     if not isinstance(raw_ui, dict) or not isinstance(raw_ui.get("enabled"), bool):
         fail("UI manifest record is malformed")
@@ -808,6 +819,9 @@ def validate_ui(entries: dict[str, Entry], manifest: dict[str, object],
     if not isinstance(raw_files, dict):
         fail("UI file manifest record is missing")
     files = cast(dict[str, object], raw_files)
+    if any(name not in UI_FIXED_NAMES | UI_OPTIONAL_NAMES and
+           not name.startswith("usr/local/share/libreecho/web/") for name in files):
+        fail("UI file set has unexpected members")
     if set(files) != actual_ui_files or not UI_FIXED_NAMES.issubset(files):
         fail("UI file set changed")
     if not any(name.startswith("usr/local/share/libreecho/web/") for name in files):

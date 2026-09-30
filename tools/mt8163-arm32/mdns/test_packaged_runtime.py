@@ -9,11 +9,24 @@ This is production-startup evidence, not LAN/hardware acceptance.
 """
 import argparse
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 from verify_runtime import verify
+
+
+def validate_observed_runtime(output):
+    """Require a resolved ESPHome advertisement, not just an Avahi process."""
+    if 'int32 2' not in output:
+        raise ValueError('runtime did not confirm Avahi server RUNNING')
+    resolved = [line for line in output.splitlines()
+                if line.startswith('=;') and ';_esphomelib._tcp;' in line and ';6053;' in line]
+    if not any(all(re.search(r'"' + key + r'=[^"\s]+"', line)
+                   for key in ('version', 'board', 'platform')) and
+               re.search(r'mac=[0-9a-fA-F]{12}(?:["\s]|$)', line) for line in resolved):
+        raise ValueError('runtime did not resolve ESPHome port 6053 with valid TXT identity')
 
 
 def main():
@@ -113,9 +126,11 @@ def main():
         print(completed.stderr, end='')
         if completed.returncode:
             raise SystemExit(completed.returncode)
-        if 'int32 2' not in completed.stdout or ';21000;' not in completed.stdout:
-            raise SystemExit('runtime did not confirm server RUNNING and resolve the selected port')
-        print('Packaged ARM runtime: private bus, Avahi RUNNING, local Wyoming port 21000: PASS')
+        try:
+            validate_observed_runtime(completed.stdout)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        print('Packaged ARM runtime: private bus, Avahi RUNNING, ESPHome port 6053 + TXT: PASS')
 
 if __name__ == '__main__':
     main()

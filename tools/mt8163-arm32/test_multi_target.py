@@ -479,6 +479,11 @@ class RadarTreeDiffTests(unittest.TestCase):
     ALLOWED = {'etc/libreecho/target', 'usr/local/sbin/libreecho-update',
                'usr/local/sbin/libreecho-feature-transaction', 'init', 'libreecho-init',
                'usr/local/sbin/libreecho-bootctl'}
+    # Separately reviewed ESPHome satellite change (Platform #212), pinned to
+    # its exact reviewed bytes rather than widening the multi-target allowlist.
+    ESPHOME_COMMIT = '37de1c11109453194ce6170f360450f887a615d4'
+    ESPHOME_BASE = '2715c573c15f982555b6b48264d75d468cf3af08'  # ESPHome branch point'
+    ESPHOME_PINNED = {'usr/local/sbin/libreecho-reconcile-features': 'initramfs/libreecho-reconcile-features'}
 
     @staticmethod
     def tree(stage):
@@ -561,6 +566,12 @@ class RadarTreeDiffTests(unittest.TestCase):
                              b'schema=1\nmode=first-install\nboard=radar_puffin\n')
             left, right = self.tree(before), self.tree(after)
             changes = {name for name in left.keys() | right.keys() if left.get(name) != right.get(name)}
+            for staged, source in self.ESPHOME_PINNED.items():
+                if staged in changes:
+                    reviewed = subprocess.run(['git', '-C', str(TOOLS), 'show', f'{self.ESPHOME_COMMIT}:tools/mt8163-arm32/{source}'],
+                                              check=True, capture_output=True).stdout
+                    self.assertEqual(right[staged]['sha256'], hashlib.sha256(reviewed).hexdigest(), staged)
+                    changes.discard(staged)
             self.assertEqual(changes - self.ALLOWED, set(), f'unenumerated Radar paths: {sorted(changes - self.ALLOWED)}')
             self.assertEqual((before / 'default.prop').read_bytes(), (after / 'default.prop').read_bytes())
             # Every unchanged build function and overlay input is also pinned to
@@ -570,8 +581,19 @@ class RadarTreeDiffTests(unittest.TestCase):
                 raw = path.read_text()
                 return {n.name: ast.get_source_segment(raw, n) for n in ast.parse(raw).body if isinstance(n, ast.FunctionDef)}
             old_functions, new_functions = functions(base_tools / 'build_recovery_image.py'), functions(TOOLS / 'build_recovery_image.py')
+            # Functions the separately reviewed ESPHome change edited must equal
+            # that reviewed commit's source exactly, never merely be exempted.
+            esphome_raw = subprocess.run(['git', '-C', str(TOOLS), 'show', f'{self.ESPHOME_COMMIT}:tools/mt8163-arm32/build_recovery_image.py'],
+                                         check=True, capture_output=True, text=True).stdout
+            esphome_base = subprocess.run(['git', '-C', str(TOOLS), 'show', f'{self.ESPHOME_BASE}:tools/mt8163-arm32/build_recovery_image.py'],
+                                          check=True, capture_output=True, text=True).stdout
+            parse = lambda raw: {n.name: ast.get_source_segment(raw, n) for n in ast.parse(raw).body if isinstance(n, ast.FunctionDef)}
+            esphome_functions, esphome_base_functions = parse(esphome_raw), parse(esphome_base)
+            esphome_changed = {n for n in esphome_functions if esphome_functions[n] != esphome_base_functions.get(n)}
+            self.assertEqual(esphome_changed, {'add_ui_bundle'})
             for name in old_functions.keys() & new_functions.keys() - {'main', 'add_overlay', 'add_ota_tools'}:
-                self.assertEqual(old_functions[name], new_functions[name], name)
+                expected = esphome_functions[name] if name in esphome_changed else old_functions[name]
+                self.assertEqual(expected, new_functions[name], name)
             summary = {'base': self.BASE, 'evidence_class': 'unit_staging_not_ARM_image',
                        'allowed_exclusions': sorted(self.ALLOWED), 'changed_paths': sorted(changes),
                        'unchanged_entries': sum(left.get(k) == right.get(k) for k in left.keys() | right.keys()),

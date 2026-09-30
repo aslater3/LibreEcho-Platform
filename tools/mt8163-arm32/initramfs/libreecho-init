@@ -1467,6 +1467,34 @@ activate_feature_transaction()
     return 1
 }
 
+stop_ui_voice_owners()
+{
+    # No protocol selector: integration bit 1 selects only ESPHome. Do not
+    # rewrite voice_pipeline_mode; the saved Local/Custom selection survives.
+    stop_owners=wyomingd
+    if [ "${ha_enabled:-0}" -eq 1 ]; then
+        stop_owners="$stop_owners agentd sttd ttsd"
+    else
+        stop_owners="$stop_owners esphomed"
+    fi
+    for stop_owner in $stop_owners; do
+        stop_script=/etc/init.d/libreecho-$stop_owner.init
+        stop_pidfile=/var/run/libreecho-$stop_owner.pid
+        if [ -x "$stop_script" ]; then
+            "$stop_script" stop >/tmp/libreecho-"$stop_owner".stop.log 2>&1 || return 1
+            if "$stop_script" status >/dev/null 2>&1; then
+                log "ui-conflicting-owner-still-running:$stop_owner"
+                return 1
+            fi
+        fi
+        [ ! -e "$stop_pidfile" ] || {
+            log "ui-conflicting-owner-pid-present:$stop_owner"
+            return 1
+        }
+    done
+    return 0
+}
+
 start_ui_services()
 {
     [ -x /usr/local/sbin/libreecho-web ] || {
@@ -1506,11 +1534,11 @@ start_ui_services()
             [ "$FEATURE_POLICY" = community-noncommercial ]; then
         if [ "$ha_enabled" -eq 1 ]; then
             log ui-home-assistant-mode-enabled
-            services="logd networkd timed audiod micd waked ledd buttond btd timerd"
-            services="$services airplayd radiod wyomingd web"
+            services="logd networkd timed audiod micd waked ledd buttond btd timerd watchdogd"
+            services="$services airplayd radiod esphomed web"
         else
             services="logd networkd timed audiod micd waked"
-            services="$services ledd buttond btd timerd"
+            services="$services ledd buttond btd timerd watchdogd"
             services="$services airplayd radiod ttsd web"
         fi
         if [ "$FEATURE_POLICY" = community-noncommercial ]; then
@@ -1518,11 +1546,11 @@ start_ui_services()
         fi
     else
         if [ "$ha_enabled" -eq 1 ]; then
-            services="logd networkd timed audiod micd waked ledd buttond btd timerd"
-            services="$services airplayd radiod wyomingd web"
+            services="logd networkd timed audiod micd waked ledd buttond btd timerd watchdogd"
+            services="$services airplayd radiod esphomed web"
         else
             services="logd networkd timed audiod micd waked"
-            services="$services ledd buttond btd timerd"
+            services="$services ledd buttond btd timerd watchdogd"
             services="$services airplayd radiod ttsd web"
         fi
         log ui-services-redistributable-without-wakeword
@@ -1531,7 +1559,8 @@ start_ui_services()
     # Deferred-contract snapshots are retained for the payload reconciler and
     # its host contract checks:
     # services="logd networkd timed audiod micd ledd buttond btd web"
-    # services="logd networkd timed audiod micd ledd buttond btd wyomingd web"
+    # services="logd networkd timed audiod micd ledd buttond btd esphomed web"
+    stop_ui_voice_owners || return 1
     start_shared_discovery_runtime
     log feature-services-deferred-until-staged
     for service in $services; do
@@ -2418,6 +2447,31 @@ ota_health_confirm_worker()
         esac
     }
 
+    esphome_service_ready()
+    {
+        [ -x /etc/init.d/libreecho-esphomed.init ] || return 1
+        /etc/init.d/libreecho-esphomed.init status >/dev/null 2>&1 || return 1
+        esp_pidfile=/var/run/libreecho-esphomed.pid
+        [ -s "$esp_pidfile" ] || return 1
+        esp_pid=$($BB sed -n '1p' "$esp_pidfile" 2>/dev/null)
+        case "$esp_pid" in ''|*[!0-9]*|0|1) return 1 ;; esac
+        $BB kill -0 "$esp_pid" 2>/dev/null || return 1
+        [ "$($BB readlink "/proc/$esp_pid/exe" 2>/dev/null)" = /usr/local/sbin/libreecho-esphomed ] || return 1
+        # A listener belonging to a different process must not confirm this slot.
+        for esp_table in "/proc/net/tcp" "/proc/net/tcp6"; do
+            [ -r "$esp_table" ] || continue
+            esp_inodes=$($BB awk -v port=17A5 \
+                '$4 == "0A" && $2 ~ (":" port "$") && $10 != "0" { print $10 }' \
+                "$esp_table" 2>/dev/null) || return 1
+            for esp_inode in $esp_inodes; do
+                for esp_fd in "/proc/$esp_pid/fd/"*; do
+                    [ "$($BB readlink "$esp_fd" 2>/dev/null)" = "socket:[$esp_inode]" ] && return 0
+                done
+            done
+        done
+        return 1
+    }
+
     ota_health_services_ready()
     {
         [ "$SERVICE_PROFILE" = production ] || return 0
@@ -2479,23 +2533,10 @@ ota_health_confirm_worker()
         fi
         led_handoff_ready || return 1
         if home_assistant_integration_enabled; then
-            wyoming_pidfile=/var/run/libreecho-wyomingd.pid
-            [ -s "$wyoming_pidfile" ] || {
-                log ota-health-services-not-ready:wyomingd
+            esphome_service_ready || {
+                log ota-health-services-not-ready:esphomed
                 return 1
             }
-            wyoming_pid=$($BB sed -n '1p' "$wyoming_pidfile" 2>/dev/null)
-            case "$wyoming_pid" in ''|*[!0-9]*) return 1 ;; esac
-            $BB kill -0 "$wyoming_pid" 2>/dev/null || {
-                log ota-health-services-not-ready:wyomingd
-                return 1
-            }
-            $BB awk -v port=29CC \
-                '$4 == "0A" && $2 ~ (":" port "$") { found=1 } END { exit found ? 0 : 1 }' \
-                /proc/net/tcp 2>/dev/null || {
-                    log ota-health-services-not-ready:wyomingd
-                    return 1
-                }
             return 0
         fi
         if [ -S /run/libreecho/stt.sock ] &&
