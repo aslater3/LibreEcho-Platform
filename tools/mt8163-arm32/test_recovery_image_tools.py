@@ -1494,7 +1494,8 @@ class SourceTests(unittest.TestCase):
                        check=True, timeout=90)
 
     def test_airplay_shairport_hooks_reject_stale_sessions(self) -> None:
-        for name in ("test_airplay_hook_identity.py", "test_shairport_hook_patch.py"):
+        for name in ("test_airplay_hook_identity.py", "test_airplay_hook_lock_priority.py",
+                     "test_shairport_hook_patch.py"):
             subprocess.run([sys.executable, str(TOOLS_DIR / "airplay" / name)],
                            check=True, timeout=90)
 
