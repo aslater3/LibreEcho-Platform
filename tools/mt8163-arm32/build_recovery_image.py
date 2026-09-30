@@ -420,28 +420,6 @@ def add_connectivity_bundle(stage: Path, helpers: dict[str, Path],
     }
 
 
-def legacy_init_mirror(data: bytes) -> bytes:
-    """Keep the unused /libreecho-init mirror byte-identical to release/0.14.0.
-
-    PID 1 runs /init, not this historical overlay copy. The v1.1 allowlist
-    permits /init to change but not the redundant copy; strip only the new
-    target block/guard and fail closed unless the exact baseline pin matches.
-    """
-    start = data.index(b'# Immutable image identity, not a caller environment or bootloader product.\n')
-    end = data.index(b'# pmsg is the only userspace pstore input', start)
-    result = data[:start] + data[end:]
-    result = result.replace(
-        b'        if ! first_install_marker_matches; then\n',
-        b'        if [ ! -r "$FIRST_INSTALL_MARKER" ] ||\n'
-        b'           [ "$($BB sed -n \'s/^schema=//p\' "$FIRST_INSTALL_MARKER")" != 1 ] ||\n'
-        b'           [ "$($BB sed -n \'s/^mode=//p\' "$FIRST_INSTALL_MARKER")" != first-install ] ||\n'
-        b'           [ "$($BB sed -n \'s/^board=//p\' "$FIRST_INSTALL_MARKER")" != radar_puffin ]; then\n',
-    )
-    require_hash('legacy unused /libreecho-init mirror', result,
-                 'f845a7b2070e5960f71cd777a5fdf47e7408598f5dc8564185d13feae0fb8d55')
-    return result
-
-
 def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
                 expected_busybox_sha256: str, expected_loader_sha256: str,
                 qemu_arm: str,
@@ -497,8 +475,6 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
     overlay_manifest: dict[str, object] = {}
     for relative, (target_relative, mode) in overlay_files.items():
         data = read(overlay / relative)
-        if relative == 'libreecho-init':
-            data = legacy_init_mirror(data)
         target = stage / target_relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
