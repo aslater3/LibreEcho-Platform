@@ -281,3 +281,36 @@ unrelated feature does not prevent fetching a repair. A corrupt assistant fails
 files. Otherwise it fails `https_transport_unavailable`. Images without this
 optional boot client require recovery/local install to repair the transport;
 no new bootstrap client is implied.
+
+### Downgrade and replay policy
+
+Operator-authorized downgrade/reinstall is permitted only through explicit
+`libreecho-update install PACKAGE` or `libreecho-update-fetch install`. Signature,
+target, and whole-generation checks still apply; there is no monotonic sequence.
+`check` and watcher-only `auto-install` suppress a candidate whose signed
+`release` equals the authenticated current or previous target's release, or whose
+`transaction_id` equals the retained schema-3 `rolled-back` marker. Rollback
+suppression survives deletion of its generation; it is not conditioned on
+feature health. The marker retains the most recent rollback, not an unbounded
+history of every rejected release. There is no claim of global anti-replay or
+ordering among other signed releases. Explicit install bypasses these discovery
+suppression rules, never signature verification.
+
+### Generation lifecycle and companion packaging
+
+Assembly publishes `generations/<transaction_id>.pin` under `generation.lock`.
+GC snapshots pins before current/previous/pending and preserves every pinned
+target. The installer clears its pin only after durable pending publication or
+an ordinary abort; SIGKILL retains it for recovery/operator cleanup. Commit and
+rollback invoke GC while still holding the generation lock. Standalone GC
+refuses an active install lock. GC removes only whole obsolete generation trees.
+
+Tests select the sparse pinned companion through `LIBREECHO_OTA_UI_SOURCE`;
+CI pins LibreEcho-UI commit `17604803f4682826f3fdb6f0af0c52bb064dd853`.
+That sparse checkout originally lacked `init/`; captured real review scripts are
+checked in as host regression fixtures when absent. Production gets its full UI
+checkout as `build_ui_bundle.sh` argument 1 or `LIBREECHO_UI_SRC`, adapts a private
+snapshot, and guards the actual packaged scripts against legacy feature paths.
+Feature init scripts consume Platform-owned read-only generation mounts and do
+not unmount their roots. Upstream UI should adopt this ownership model eventually;
+no upstream change is required for the Platform build-time adapter.

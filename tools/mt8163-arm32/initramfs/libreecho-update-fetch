@@ -1104,6 +1104,36 @@ check_status_write_candidate()
     fi
 }
 
+# Suppression metadata never authorizes bytes. The candidate has already passed
+# signed inspect; retained rollback identity must work even after candidate GC.
+automatic_replay_status()
+{
+    local candidate_id candidate_release pointer id directory old_release
+    candidate_id=$(check_value_from_file "$ROOT/staging/manifest" transaction_id)
+    if [ -n "$candidate_id" ] && [ "$(check_value_from_file "$ROOT/rolled-back" schema)" = 3 ] &&
+        [ "$candidate_id" = "$(check_value_from_file "$ROOT/rolled-back" transaction_id)" ]; then
+        printf '%s\n' update-held-after-rollback
+        return 0
+    fi
+    candidate_release=$(check_value_from_file "$ROOT/staging/manifest" release)
+    [ -n "$candidate_release" ] || return 1
+    for pointer in current previous; do
+        [ -f "$ROOT/$pointer" ] && [ ! -L "$ROOT/$pointer" ] || continue
+        id=$($BB cat "$ROOT/$pointer")
+        case "$id" in ''|.|..|*[!A-Za-z0-9._+~:-]*) return 1;; esac
+        [ "${#id}" -le 96 ] || return 1
+        directory=${GENERATIONS:-/data/libreecho/generations}/$id
+        "${TARGET_MANIFEST:-/usr/local/sbin/libreecho-target-manifest}" check "$directory/target.manifest" "$directory/target.manifest.sig" >/dev/null 2>&1 || continue
+        old_release=$(check_value_from_file "$directory/target.manifest" release)
+        if [ "$candidate_release" = "$old_release" ]; then
+            if [ "$pointer" = current ]; then printf '%s\n' up-to-date
+            else printf '%s\n' update-held-after-rollback; fi
+            return 0
+        fi
+    done
+    return 1
+}
+
 check_or_install()
 {
     requested_action=$1
@@ -1120,18 +1150,21 @@ check_or_install()
         [ "$(sha256sum "$PACKAGE" | $BB awk '{print $1}')" = "$DEV_OTA_SHA256" ] || { quarantine_file "$PACKAGE"; die dev_control_identity; }
         [ "$(check_value_from_file "$ROOT/staging/manifest" update_channel)" = dev ] || die dev_control_channel
     fi
+    if [ "$requested_action" != install ]; then
+        replay_status=$(automatic_replay_status)
+        if [ -n "$replay_status" ]; then
+            check_status_write_candidate "$replay_status" "$version"
+            echo "UPDATE_HELD version=$version"
+            return 0
+        fi
+    fi
     installed=$($BB sed -n 's/^version=//p' "$ROOT/installed" 2>/dev/null)
     installed_channel=$(record_channel "$ROOT/installed")
     rolled_back=$($BB sed -n 's/^version=//p' "$ROOT/rolled-back" 2>/dev/null)
     rolled_back_channel=$(record_channel "$ROOT/rolled-back")
-    if [ "$version" = "$installed" ] && [ "$channel" = "$installed_channel" ] && candidate_matches_record "$ROOT/installed"; then
+    if [ "$requested_action" != install ] && [ "$version" = "$installed" ] && [ "$channel" = "$installed_channel" ] && candidate_matches_record "$ROOT/installed"; then
         check_status_write_candidate up-to-date "$version"
         echo "UPDATE_CURRENT version=$version"
-        return 0
-    fi
-    if [ -n "$rolled_back" ] && [ "$version" = "$rolled_back" ] && [ "$channel" = "$rolled_back_channel" ] && candidate_matches_record "$ROOT/rolled-back"; then
-        check_status_write_candidate update-held-after-rollback "$version"
-        echo "UPDATE_HELD version=$version"
         return 0
     fi
     download_feature_assets
@@ -1162,7 +1195,7 @@ watch_updates()
             if "$0" check >/tmp/ota-check.log 2>&1 &&
                 automatic_updates_enabled &&
                 [ "$(check_value status)" = update-available ]; then
-                "$0" install >/tmp/ota-fetch.log 2>&1 || true
+                "$0" auto-install >/tmp/ota-fetch.log 2>&1 || true
             fi
         fi
         $BB sleep "$interval"
@@ -1170,7 +1203,7 @@ watch_updates()
 }
 
 case "${1:-}" in
-    check|install)
+    check|install|auto-install)
         [ "$#" -eq 1 ] || die usage
         check_or_install "$1"
         ;;

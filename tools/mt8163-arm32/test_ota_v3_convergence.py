@@ -113,6 +113,37 @@ print('206' if start else '200', end='')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('generation-identity', result.stderr)
 
+    def test_automatic_fetch_refuses_collected_rolled_back_transaction(self):
+        self.assert_target(10)
+        staging = self.control / 'staging'; staging.mkdir()
+        (staging / 'manifest').write_bytes(self.p.read_bytes())
+        (staging / 'manifest.sig').write_bytes(self.s.read_bytes())
+        (self.control / 'rolled-back').write_text('schema=3\ntransaction_id=test-target\n')
+        import shutil
+        for directory in (self.generations / 'test-target').rglob('*'):
+            if directory.is_dir(): directory.chmod(0o700)
+        (self.generations / 'test-target').chmod(0o700)
+        shutil.rmtree(self.generations / 'test-target')
+        source = FETCH.read_text()
+        source = source[:source.rfind('case "${1:-}" in')]
+        source += '\nROOT=' + str(self.control) + '\nautomatic_replay_status\n'
+        result = subprocess.run(['/bin/busybox', 'sh'], input=source, env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'update-held-after-rollback')
+
+    def test_automatic_fetch_refuses_current_and_previous_release(self):
+        self.assert_target(10)
+        staging = self.control / 'staging'; staging.mkdir()
+        (staging / 'manifest').write_text(self.p.read_text().replace('transaction_id=test-target', 'transaction_id=other-target'))
+        source = FETCH.read_text(); source = source[:source.rfind('case "${1:-}" in')]
+        source += '\nROOT=' + str(self.control) + '\nautomatic_replay_status\n'
+        for pointer in ('current', 'previous'):
+            (self.control / pointer).write_text('test-target\n')
+            result = subprocess.run(['/bin/busybox', 'sh'], input=source, env=self.env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), 'up-to-date' if pointer == 'current' else 'update-held-after-rollback')
+            (self.control / pointer).unlink()
+
     def test_stale_installed_record_cannot_claim_current_target(self):
         self.assert_target(10)
         (self.control / 'current').write_text('test-target\n')
