@@ -121,7 +121,15 @@ static int validate_partition(const struct partition_contract *contract)
         return -1;
     }
     snprintf(expected, sizeof(expected), "PARTNAME=%s", contract->name);
-    if (!strstr(text, expected)) {
+    /* Match one complete uevent line, never a prefix or a different key. */
+    char *line = strtok(text, "\n");
+    int name_match = 0;
+    while (line) {
+        if (!strcmp(line, expected))
+            name_match = 1;
+        line = strtok(NULL, "\n");
+    }
+    if (!name_match) {
         if (contract_reporting)
             fprintf(stderr, "ERROR: %s PARTNAME contract failed\n", contract->name);
         return -1;

@@ -87,6 +87,22 @@ def build_fixture(directory, omit=()):
 
 
 class ContractTests(unittest.TestCase):
+    def test_packaged_runtime_checks_native_port_and_txt_identity(self):
+        runtime = load_module('mdns_packaged_acceptance', HERE / 'test_packaged_runtime.py')
+        self.assertTrue(hasattr(runtime, 'validate_observed_runtime'))
+        observed = ('int32 2\n=;eth0;IPv4;LibreEcho;_esphomelib._tcp;local;'
+                    'libreecho.local;192.0.2.1;6053;"version=0.14.0" '
+                    '"mac=020000000001" "board=radar_puffin" "platform=LibreEcho"\n')
+        runtime.validate_observed_runtime(observed)
+        for bad in (observed.replace(';6053;', ';21000;'),
+                    observed.replace('_esphomelib._tcp', '_wyoming._tcp'),
+                    observed.replace('mac=020000000001', 'mac=invalid'),
+                    observed.replace('version=0.14.0', 'version='),
+                    observed.replace('board=radar_puffin', 'unrelated=value'),
+                    observed.replace('int32 2', 'int32 1')):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                runtime.validate_observed_runtime(bad)
+
     def test_fallback_prepares_machine_id_at_dbus_standard_path(self):
         init = (HERE.parent / 'initramfs/libreecho-mdnsd').read_text()
         self.assertIn('STATE_ROOT=${MDNS_STATE_ROOT:-$RUNTIME_ROOT/var/lib/dbus}', init)

@@ -78,7 +78,13 @@ tools/mt8163-arm32/mbedtls/build_mbedtls.sh \
 `build_ui_bundle.sh` verifies that prefix against `SOURCE.lock` and its
 `mbedtls-source.json`, normalises it to an absolute path, exports
 `CPPFLAGS=-I<prefix>/include`, and passes the three verified archives to
-`WEB_TLS_LIBS` and `RADIOD_TLS_LIBS` by absolute filename. Callers cannot
+`WEB_TLS_LIBS`, `RADIOD_TLS_LIBS` and `ESPHOMED_TLS_LIBS` by absolute filename.
+The ESPHome-only satellite is built with `ESPHOMED_NOISE=1`. Before that build,
+`ui/verify_ui_tls.sh --noise-prefix` preprocesses the verified upstream headers
+and requires `MBEDTLS_ECDH_C`, `MBEDTLS_ECP_DP_CURVE25519_ENABLED`,
+`MBEDTLS_CHACHAPOLY_C`, `MBEDTLS_SHA256_C` and `MBEDTLS_MD_C`; the dependency
+builder uses the pinned release's default configuration without guessed feature
+patches. Callers cannot
 substitute a library search path or alternate mbedTLS archives while retaining
 the pinned provenance. `ui/verify_ui_tls.sh` then fails the build unless the
 compiled and stripped, staged binaries contain the real TLS implementation and

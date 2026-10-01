@@ -18,6 +18,7 @@ from typing import Any, cast
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 from generate_boot_envelope import generate as generate_boot_envelope
+from libreecho_platform_targets import add_target_arguments, validate_target_arguments, identity_bytes, get_target
 
 
 ANDROID_MAGIC = b"ANDROID!"
@@ -53,7 +54,7 @@ WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-INIT_SHA256 = "1cb351cf8c43d06a9216fa2a772295ee84f7a35b3475b878e8adf10baf770449"
+INIT_SHA256 = "31671bbbd903090905d46dfb68a440c11d65a021d8e9a819ec7effdac3bc011a"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -135,6 +136,7 @@ UI_BINARY_NAMES = {
     "usr/local/sbin/libreecho-networkd",
     "usr/local/sbin/libreecho-timed",
     "usr/local/sbin/libreecho-timerd",
+    "usr/local/sbin/libreecho-watchdogd",
     "usr/local/sbin/libreecho-audiod",
     "usr/local/sbin/libreecho-micd",
     "usr/local/sbin/libreecho-ledd",
@@ -142,7 +144,7 @@ UI_BINARY_NAMES = {
     "usr/local/sbin/libreecho-radiod",
     "usr/local/sbin/libreecho-btd",
     "usr/local/sbin/libreecho-airplayd",
-    "usr/local/sbin/libreecho-wyomingd",
+    "usr/local/sbin/libreecho-esphomed",
     "usr/local/sbin/libreecho-sttd-wyoming",
     "usr/local/sbin/libreecho-ttsd-wyoming",
     "usr/local/sbin/libreecho-mdnsd",
@@ -153,6 +155,7 @@ UI_INIT_NAMES = {
     "etc/init.d/libreecho-networkd.init",
     "etc/init.d/libreecho-timed.init",
     "etc/init.d/libreecho-timerd.init",
+    "etc/init.d/libreecho-watchdogd.init",
     "etc/init.d/libreecho-audiod.init",
     "etc/init.d/libreecho-micd.init",
     "etc/init.d/libreecho-ledd.init",
@@ -164,13 +167,13 @@ UI_INIT_NAMES = {
     "etc/init.d/libreecho-waked.init",
     "etc/init.d/libreecho-sttd.init",
     "etc/init.d/libreecho-agentd.init",
-    "etc/init.d/libreecho-wyomingd.init",
+    "etc/init.d/libreecho-esphomed.init",
 }
 UI_FIXED_NAMES = UI_BINARY_NAMES | UI_INIT_NAMES | {
     "etc/libreecho/web-config.json",
     "etc/libreecho/airplay2.conf",
     "etc/libreecho/ntp.conf",
-    "etc/libreecho/avahi-services/wyoming.service",
+    "etc/libreecho/avahi-services/esphome.service",
     "usr/local/share/libreecho/ui-manifest.txt",
     "usr/local/share/libreecho/sounds/action-1.raw",
     "usr/local/share/libreecho/sounds/action-2.raw",
@@ -791,6 +794,15 @@ def validate_ui(entries: dict[str, Entry], manifest: dict[str, object],
                 expected_manifest_sha256: str | None,
                 expected_commit: str | None,
                 expected_diff_sha256: str | None) -> bool:
+    for name, entry in entries.items():
+        if ((name.endswith(".service") and b"_wyoming._tcp" in entry.data) or
+                name.startswith("usr/local/sbin/libreecho-wyomingd") or
+                name.startswith("etc/init.d/libreecho-wyomingd") or
+                name.endswith("/wyoming.service") or
+                name.startswith("etc/libreecho/esphome-") or
+                (name.startswith("usr/local/sbin/libreecho-esphomed") and
+                 name != "usr/local/sbin/libreecho-esphomed")):
+            fail(f"forbidden obsolete satellite or private ESPHome file: {name}")
     raw_ui = manifest.get("ui", {"enabled": False})
     if not isinstance(raw_ui, dict) or not isinstance(raw_ui.get("enabled"), bool):
         fail("UI manifest record is malformed")
@@ -835,6 +847,9 @@ def validate_ui(entries: dict[str, Entry], manifest: dict[str, object],
     if not isinstance(raw_files, dict):
         fail("UI file manifest record is missing")
     files = cast(dict[str, object], raw_files)
+    if any(name not in UI_FIXED_NAMES | UI_OPTIONAL_NAMES and
+           not name.startswith("usr/local/share/libreecho/web/") for name in files):
+        fail("UI file set has unexpected members")
     if set(files) != actual_ui_files or not UI_FIXED_NAMES.issubset(files):
         fail("UI file set changed")
     if not any(name.startswith("usr/local/share/libreecho/web/") for name in files):
@@ -1150,6 +1165,20 @@ def validate_connectivity(entries: dict[str, Entry], manifest: dict[str, object]
     return True
 
 
+def validate_target_identity(entries: dict[str, Entry], manifest: dict[str, object],
+                             target: str, digest: str | None = None) -> None:
+    get_target(target)
+    if manifest.get("board") != target or manifest.get("ota", {}).get("board") != target:
+        fail("image target manifest mismatch")
+    recorded_digest = manifest.get("target_descriptor_sha256")
+    if digest is not None and recorded_digest != digest:
+        fail("image target descriptor digest mismatch")
+    # Validate a descriptor supplied by Product as a canonical digest even when
+    # the caller did not request one; it must agree bytewise with the image.
+    require_member(entries, "etc/libreecho/target",
+                   sha256(identity_bytes(target, recorded_digest)), 0o644)
+
+
 def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                        schema_version: int,
                        expected_image_profile: str,
@@ -1188,7 +1217,9 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                        expected_avahi_daemon_sha256: str | None,
                        expected_dbus_daemon_sha256: str | None,
                        expected_wpa_supplicant_sha256: str | None = None,
-                       expected_mdns_runtime_manifest_sha256: str | None = None) -> bool:
+                       expected_mdns_runtime_manifest_sha256: str | None = None,
+                       expected_target: str | None = None,
+                       target_descriptor_sha256: str | None = None) -> bool:
     if ramdisk[:4] != b"\x1f\x8b\x08\x00":
         fail("ramdisk gzip header is not deterministic")
     try:
@@ -1199,6 +1230,9 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     validate_archive_tree(entries)
     validate_symlinks(entries)
     validate_no_connectivity_autostart(entries)
+    if expected_target is not None:
+        validate_target_identity(entries, manifest, expected_target, target_descriptor_sha256)
+    target = expected_target or "radar_puffin"
     if manifest.get("image_profile") != expected_image_profile:
         fail("image profile manifest mismatch")
     if manifest.get("service_profile") != expected_service_profile:
@@ -1225,7 +1259,7 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     )
     require_member(
         entries, "etc/libreecho/first-install-confirm",
-        sha256(b"schema=1\nmode=first-install\nboard=radar_puffin\n"), 0o644,
+        sha256(f"schema=1\nmode=first-install\nboard={target}\n".encode()), 0o644,
     )
     ota = manifest.get("ota")
     if not isinstance(ota, dict) or ota.get("format") != "libreecho-ota-v1":
@@ -1878,9 +1912,9 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         "sbin/watchdogd": b"../init",
         "system/bin/sh": b"../../bin/busybox",
     }
-    for name, target in symlinks.items():
+    for name, link_target in symlinks.items():
         entry = entries.get(name)
-        if entry is None or not stat.S_ISLNK(entry.mode) or entry.data != target:
+        if entry is None or not stat.S_ISLNK(entry.mode) or entry.data != link_target:
             fail(f"symlink contract mismatch for {name}")
 
     required_applets = (
@@ -1906,6 +1940,8 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     verified_overlay: dict[str, Entry] = {}
     for name, mode in OVERLAY_FILES.items():
         expected = read(overlay_dir / name)
+        if name == "default.prop" and target != "radar_puffin":
+            expected = expected.replace(b"=radar_puffin\n", b"=" + target.encode("ascii") + b"\n")
         if name == "ota-source.conf":
             source_text = expected.decode()
             source_text = re.sub(
@@ -1939,8 +1975,8 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         if record != {"sha256": sha256(expected), "size": len(expected), "mode": "0644"}:
             fail(f"core license overlay manifest mismatch for {name}")
 
-    control = verified_overlay["libreecho-init"]
-    if init.data != control.data:
+    control = init
+    if init.data != read(overlay_dir / "libreecho-init"):
         fail("runtime /init is not byte-identical to audited libreecho-init")
     init_record = overlay_manifest.get("init", {})
     if init_record != {
@@ -2312,7 +2348,9 @@ def main() -> None:
         default="none",
         help="require the initramfs to contain exactly this opt-in connectivity bundle",
     )
+    add_target_arguments(parser)
     args = parser.parse_args()
+    validate_target_arguments(parser, args)
 
     envelope, zimage, system_map, ramdisk, boot = map(
         read, (args.boot_envelope, args.zimage, args.system_map, args.ramdisk, args.boot_image)
@@ -2439,6 +2477,8 @@ def main() -> None:
         args.expected_avahi_daemon_sha256, args.expected_dbus_daemon_sha256,
         args.expected_wpa_supplicant_sha256,
         args.expected_mdns_runtime_manifest_sha256,
+        expected_target=args.target,
+        target_descriptor_sha256=args.target_descriptor_sha256,
     )
     expected_connectivity = args.expected_connectivity_bundle != "none"
     if connectivity_enabled != expected_connectivity:

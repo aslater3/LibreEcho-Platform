@@ -87,7 +87,7 @@ python3 build_install_bundle.py \
     --assets /path/to/release-assets \
     --out    /path/to/bundle \
     --release 0.14.0-dev-4a5859f \
-    --device  mt8163
+    --target  radar_puffin
 ```
 
 `--assets` takes either a release assets directory or a directory holding the
@@ -103,6 +103,34 @@ release's `*-initial-install.tar`, which is unpacked for you. The output is:
     <feature payloads>        *.squashfs and their *.manifest.json
     <ota-public-key.hex>
 ```
+
+Both `--target` and `LIBREECHO_TARGET` select `radar_puffin` (default) or
+`biscuit`; the explicit flag wins and unknown targets fail closed. The install
+manifest and signed OTA board must agree with that target. The builder also
+accepts `--target-descriptor-sha256` for the common Product interface; recovery
+identity itself is bound by the manifest's board, not that optional digest.
+
+Target-qualified outputs are `libreecho-<slug>-install.zip`,
+`libreecho-<slug>-bundle.manifest`, and
+`libreecho-<release>-<slug>-TWRPINSTALL-SHA256SUMS`. Radar alone also carries the
+legacy names above as byte copies. Run a ZIP under its shipped name so it selects
+its own manifest. Keep the two targets' payload sets separate when staging the
+recovery install; generic `manifest` and `manifest.sig` refer to one target.
+
+Before formatting, reshaping userdata or writing either boot slot, recovery
+validates the bundle digests and every signed feature's payload **and manifest**,
+including both preserved base digests. Missing/corrupt preserved manifests are
+fatal, and their copied digest is rechecked. The OS retains mandatory signature
+verification with the trusted key when adopting/committing the staged transaction;
+this recovery hash preflight is not an authenticity or hardware-acceptance claim.
+
+Recovery logs all product values from `getprop` and product-related
+`androidboot.*` fields. A known mismatch refuses the install unless the operator
+has created `/cache/libreecho-allow-cross-target`; that cross-flashed-LK override
+is logged loudly and recorded in the receipt. No product value means
+`target-check=unknown` and preserves the existing flow. Receipts carry `target`
+and `target_check` (`match`, `override`, `unknown`, or `mismatch` on refusal).
+An available running-image identity must also agree and is not overridden.
 
 Payloads sit *beside* the zip rather than inside it: the feature set is ~240 MB
 and TWRP's `/tmp` is a ramdisk. The manifest pins all of them either way.

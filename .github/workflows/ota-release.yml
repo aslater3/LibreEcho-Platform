@@ -29,6 +29,7 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           persist-credentials: false
+          fetch-depth: 0  # immutable release-base staging diff
 
       - name: Check out pinned companion UI sleep generator
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
@@ -131,6 +132,7 @@ jobs:
           python -m unittest -q tools/mt8163-arm32/feature_runtime/test_runtime_package.py
           cd tools/mt8163-arm32
           python -m unittest -q \
+            test_multi_target.py \
             test_build_wifi_dtb.py \
             test_verify_radar_puffin_dtb.py \
             test_recovery_image_tools.py \

@@ -2276,7 +2276,7 @@ class PolicyTests(unittest.TestCase):
             init_script,
         )
         self.assertIn(
-            'services="logd networkd timed audiod micd ledd buttond btd wyomingd web"',
+            'services="logd networkd timed audiod micd ledd buttond btd esphomed web"',
             init_script,
         )
         self.assertIn("feature-services-deferred-until-staged", init_script)
@@ -2363,6 +2363,7 @@ class PolicyTests(unittest.TestCase):
                 "ttsd": ("tts", "tts.sock"),
                 "agentd": ("assistant", "agent.sock"),
                 "wyomingd": (None, None),
+                "esphomed": (None, None),
             }
             proc_lines = []
             socket_paths = {}
@@ -2378,6 +2379,7 @@ class PolicyTests(unittest.TestCase):
                     listener.bind(str(socket_path))
                     listener.listen(1)
                     sockets.append(listener)
+                    self.addCleanup(listener.close)
                     proc_lines.append(f"00000000: 00000002 00000000 00010000 0001 01 1 {socket_path}\n")
                 pidfile = var_run / f"libreecho-{service}.pid"
                 pidfile.write_text(f"{os.getpid()}\n")
@@ -2398,6 +2400,14 @@ class PolicyTests(unittest.TestCase):
                     '  *) exit 2 ;;\nesac\n'
                 )
                 script.chmod(0o755)
+            proc_root = root / "proc"
+            fd_root = proc_root / str(os.getpid()) / "fd"
+            fd_root.mkdir(parents=True)
+            (fd_root.parent / "exe").symlink_to("/usr/local/sbin/libreecho-esphomed")
+            (fd_root / "3").symlink_to("socket:[12345]")
+            (proc_root / "net").mkdir()
+            (proc_root / "net/tcp").write_text(
+                "0: 00000000:17A5 00000000:0000 0A 0 0 0 0 0 12345\n")
             proc_unix = root / "proc-net-unix"
             proc_unix.write_text("".join(proc_lines))
             env = {
@@ -2409,6 +2419,7 @@ class PolicyTests(unittest.TestCase):
                 "FEATURE_RECONCILE_VAR_RUN_ROOT": str(var_run),
                 "FEATURE_RECONCILE_INIT_ROOT": str(init),
                 "FEATURE_RECONCILE_PROC_NET_UNIX": str(proc_unix),
+                "FEATURE_RECONCILE_PROC_ROOT": str(proc_root),
                 "FEATURE_RECONCILE_LOG_FILE": str(root / "reconcile.log"),
                 "FEATURE_RECONCILE_KMSG": "/dev/null",
                 "FEATURE_RECONCILE_CONSOLE": "/dev/null",
@@ -2421,12 +2432,23 @@ class PolicyTests(unittest.TestCase):
                 actions.read_text().splitlines(),
                 [
                     "libreecho-wyomingd.init:stop",
+                    "libreecho-esphomed.init:stop",
                     "libreecho-waked.init:start", "libreecho-sttd.init:start",
                     "libreecho-airplayd.init:start", "libreecho-ttsd.init:start",
                     "libreecho-agentd.init:start",
                 ],
             )
 
+            actions.write_text("")
+            saved_config = '{"integrations":4,"voice_pipeline_mode":"custom"}\n'
+            (data / "libreecho/config/web-config.json").write_text(saved_config)
+            for feature in ("stt", "tts"):
+                (data / f"libreecho/features/{feature}/payload.squashfs").unlink()
+            custom = subprocess.run(["sh", str(helper)], env=env, timeout=10)
+            self.assertEqual(custom.returncode, 0)
+            self.assertEqual((data / "libreecho/config/web-config.json").read_text(), saved_config)
+            for feature in ("stt", "tts"):
+                (data / f"libreecho/features/{feature}/payload.squashfs").write_bytes(b"verified-fixture")
             actions.write_text("")
             (data / "libreecho/config/web-config.json").write_text('{"integrations":4}\n')
             subprocess.run(["sh", str(helper)], env=env, check=True)
@@ -2437,6 +2459,7 @@ class PolicyTests(unittest.TestCase):
                 disabled_actions,
                 [
                     "libreecho-wyomingd.init:stop",
+                    "libreecho-esphomed.init:stop",
                     "libreecho-waked.init:start", "libreecho-sttd.init:start",
                     "libreecho-airplayd.init:start", "libreecho-ttsd.init:start",
                     "libreecho-agentd.init:start",
@@ -2502,6 +2525,9 @@ class PolicyTests(unittest.TestCase):
             (data / "libreecho/config/web-config.json").write_text(
                 '{"integrations":5}\n'
             )
+            # New images never require the obsolete satellite executable/init.
+            (init / "libreecho-wyomingd.init").unlink()
+            (var_run / "libreecho-wyomingd.pid").unlink(missing_ok=True)
             subprocess.run(["sh", str(helper)], env=env, check=True)
             home_assistant_only_actions = actions.read_text().splitlines()
             # HA changes the voice topology, not shared playback ownership.
@@ -2511,7 +2537,7 @@ class PolicyTests(unittest.TestCase):
                     "libreecho-agentd.init:stop",
                     "libreecho-sttd.init:stop",
                     "libreecho-ttsd.init:stop",
-                    "libreecho-wyomingd.init:start",
+                    "libreecho-esphomed.init:start",
                     "libreecho-waked.init:start",
                     "libreecho-airplayd.init:start",
                 ],
@@ -2543,11 +2569,30 @@ class PolicyTests(unittest.TestCase):
                     "libreecho-agentd.init:stop",
                     "libreecho-sttd.init:stop",
                     "libreecho-ttsd.init:stop",
-                    "libreecho-wyomingd.init:start",
+                    "libreecho-esphomed.init:start",
                     "libreecho-waked.init:start",
                     "libreecho-airplayd.init:start",
                 ],
             )
+            # HA-off restores the saved Custom graph and never rewrites the
+            # owner's selection; remote clients need no local STT/TTS model.
+            actions.write_text("")
+            saved_custom = '{"integrations":4,"voice_pipeline_mode":"custom"}\n'
+            (data / "libreecho/config/web-config.json").write_text(saved_custom)
+            for service in ("sttd", "ttsd", "agentd"):
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                listener.bind(str(socket_paths[service]))
+                listener.listen(1)
+                self.addCleanup(listener.close)
+                sockets.append(listener)
+            subprocess.run(["sh", str(helper)], env=env, check=True, timeout=10)
+            self.assertEqual(actions.read_text().splitlines(), [
+                "libreecho-esphomed.init:stop", "libreecho-waked.init:start",
+                "libreecho-sttd.init:start", "libreecho-airplayd.init:start",
+                "libreecho-ttsd.init:start", "libreecho-agentd.init:start"])
+            self.assertEqual((data / "libreecho/config/web-config.json").read_text(), saved_custom)
+            self.assertFalse((states / "esphomed").exists())
+            (data / "libreecho/config/web-config.json").write_text('{"integrations":21}\n')
             (etc / "libreecho/feature-policy").write_text("redistributable\n")
             unsupported_ha = subprocess.run(["sh", str(helper)], env=env)
             self.assertNotEqual(unsupported_ha.returncode, 0)
@@ -2597,7 +2642,7 @@ class PolicyTests(unittest.TestCase):
             init,
         )
         self.assertNotIn("wyomingd /run/libreecho/wyoming.sock", init)
-        self.assertIn("$BB awk -v port=29CC", init)
+        self.assertIn("$BB awk -v port=17A5", init)
         self.assertIn("LOCK_TIMEOUT_MAX_SECONDS=300", helper)
         self.assertIn("READY_TIMEOUT_MAX_SECONDS=120", helper)
         self.assertIn("feature-reconcile-invalid-timeout", helper)
@@ -2630,9 +2675,10 @@ release_lock
                 self.assertNotEqual(ownership_lost.returncode, 0)
                 self.assertTrue(lock.is_dir())
 
-    def test_ota_health_requires_selected_wyoming_listener(self) -> None:
+    def test_ota_health_requires_selected_esphome_listener(self) -> None:
         init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
         self.assertIn("home_assistant_integration_enabled()", init)
+        self.assertIn("esphome_service_ready()", init)
 
         def shell_function(name: str) -> str:
             start = init.index(f"{name}()\n")
@@ -2641,15 +2687,22 @@ release_lock
 
         with tempfile.TemporaryDirectory() as td:
             config = Path(td) / "web-config.json"
-            pidfile = Path(td) / "wyomingd.pid"
+            pidfile = Path(td) / "esphomed.pid"
             proc_tcp = Path(td) / "tcp"
             config.write_text('{"integrations":1}\n')
             pidfile.write_text(f"{os.getpid()}\n")
             proc_tcp.write_text("")
+            proc_root = Path(td) / "proc"
+            fd_root = proc_root / str(os.getpid()) / "fd"
+            fd_root.mkdir(parents=True)
+            executable = fd_root.parent / "exe"
+            executable.symlink_to("/usr/local/sbin/libreecho-esphomed")
+            (fd_root / "3").symlink_to("socket:[12345]")
             functions = "\n".join(
                 shell_function(name)
                 for name in (
                     "home_assistant_integration_enabled",
+                    "esphome_service_ready",
                     "shared_discovery_ready",
                     "ota_health_services_ready",
                 )
@@ -2661,16 +2714,22 @@ release_lock
             mdns_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             mdns_listener.bind(str(mdns_socket))
             mdns_listener.listen(1)
+            self.addCleanup(mdns_listener.close)
             busybox = shutil.which("busybox")
             functions = functions.replace(
                 "/data/libreecho/config/web-config.json", str(config)
             ).replace(
-                "/var/run/libreecho-wyomingd.pid", str(pidfile)
+                "/var/run/libreecho-esphomed.pid", str(pidfile)
             ).replace("/proc/net/tcp", str(proc_tcp)).replace(
                 "/etc/init.d/libreecho-mdnsd.init", str(mdns_init)
             ).replace(
                 "$MDNS_RUNTIME_ROOT/run/dbus/system_bus_socket", str(mdns_socket)
             )
+            functions = functions.replace("/proc/$esp_pid", f"{proc_root}/$esp_pid")
+            esp_init = Path(td) / "esphomed.init"
+            esp_init.write_text('#!/bin/sh\n[ "${1:-}" = status ]\n')
+            esp_init.chmod(0o755)
+            functions = functions.replace("/etc/init.d/libreecho-esphomed.init", str(esp_init))
             if busybox is None:
                 self.skipTest("busybox is required for the OTA health fixture")
             harness = f"""
@@ -2687,11 +2746,28 @@ ota_health_services_ready
             missing = subprocess.run(["sh", "-c", harness])
             self.assertNotEqual(missing.returncode, 0)
             proc_tcp.write_text(
-                "  0: 00000000:29CC 00000000:0000 0A 00000000:00000000 "
-                "00:00000000 00000000 0 0 0 1 0000000000000000 100 0 0 10 0\n"
+                "  0: 00000000:17A5 00000000:0000 0A 00000000:00000000 "
+                "00:00000000 00000000 0 0 12345 1 0000000000000000 100 0 0 10 0\n"
             )
             ready = subprocess.run(["sh", "-c", harness])
             self.assertEqual(ready.returncode, 0)
+            # A stale pidfile, another executable or another process's socket
+            # must never satisfy the HA health gate.
+            good_tcp = proc_tcp.read_text()
+            for bad_tcp in (good_tcp.replace(":17A5", ":29CC"),
+                            good_tcp.replace(" 0A ", " 01 "),
+                            good_tcp.replace("12345", "67890")):
+                proc_tcp.write_text(bad_tcp)
+                self.assertNotEqual(subprocess.run(["sh", "-c", harness]).returncode, 0)
+            proc_tcp.write_text(good_tcp)
+            executable.unlink()
+            executable.symlink_to("/usr/local/sbin/libreecho-wyomingd")
+            self.assertNotEqual(subprocess.run(["sh", "-c", harness]).returncode, 0)
+            executable.unlink()
+            executable.symlink_to("/usr/local/sbin/libreecho-esphomed")
+            pidfile.write_text("999999999\n")
+            self.assertNotEqual(subprocess.run(["sh", "-c", harness]).returncode, 0)
+            pidfile.write_text(f"{os.getpid()}\n")
 
             airplay_harness = f"""
 BB={busybox}
@@ -2716,8 +2792,8 @@ ota_health_services_ready
             config.write_text('{"integrations":1}\n')
             pidfile.write_text(f"{os.getpid()}\n")
             proc_tcp.write_text(
-                "  0: 00000000:29CC 00000000:0000 0A 00000000:00000000 "
-                "00:00000000 00000000 0 0 0 1 0000000000000000 100 0 0 10 0\n"
+                "  0: 00000000:17A5 00000000:0000 0A 00000000:00000000 "
+                "00:00000000 00000000 0 0 12345 1 0000000000000000 100 0 0 10 0\n"
             )
             subprocess.run(["sh", "-c", harness])
             self.assertEqual(subprocess.run(["sh", "-c", harness]).returncode, 0)
@@ -2873,13 +2949,13 @@ start_feature_service_if_enabled
         ui_builder = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
         image_builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
         image_verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
-        service = "etc/libreecho/avahi-services/wyoming.service"
-        self.assertIn("config/wyoming.service", ui_builder)
+        service = "etc/libreecho/avahi-services/esphome.service"
+        self.assertIn("config/esphome.service", ui_builder)
         self.assertIn(service, ui_builder)
         self.assertIn(service, image_builder)
         self.assertIn(service, image_verifier)
-        self.assertIn("<type>_wyoming._tcp</type>", ui_builder)
-        self.assertIn("<port>10700</port>", ui_builder)
+        self.assertIn("<type>_esphomelib._tcp</type>", ui_builder)
+        self.assertIn("<port>6053</port>", ui_builder)
 
     def test_first_install_confirmation_requires_startup_ready_and_led_handoff(self) -> None:
         init_script = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
@@ -3345,7 +3421,7 @@ start_feature_service_if_enabled
         """
         init_source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
         extracted = {}
-        for name in ("apply_timezone", "start_ui_services"):
+        for name in ("apply_timezone", "stop_ui_voice_owners", "start_ui_services"):
             match = re.search(rf"(?ms)^{name}\(\)\n.*?^}}\n", init_source)
             if match is None:
                 self.fail(f"{name}() is not extractable from libreecho-init")
@@ -3414,7 +3490,9 @@ start_feature_service_if_enabled
                         "s = socket.socket(socket.AF_UNIX); "
                         's.bind(sys.argv[1]); s.close()" "$timer_socket"'
                     )
-                lines += ["        ;;", "esac", "exit 0", ""]
+                lines += ["        ;;", "    stop) rm -f \"$marker\" ;;",
+                          "    status) test -f \"$marker\"; exit $? ;;",
+                          "esac", "exit 0", ""]
                 stub.write_text("\n".join(lines))
                 stub.chmod(0o755)
 
@@ -4296,6 +4374,193 @@ start_feature_service_if_enabled
             verifier.manifest_schema({"schema_version": True})
 
 
+class EsphomeShippingTests(unittest.TestCase):
+    def test_shipping_inventory_and_noise_link_contract(self) -> None:
+        bundle = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        image = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        for name in ("libreecho-esphomed", "libreecho-watchdogd"):
+            self.assertIn(name, bundle)
+            self.assertIn(name, image)
+            self.assertIn(f"usr/local/sbin/{name}", verifier.UI_BINARY_NAMES)
+            self.assertIn(f"etc/init.d/{name}.init", verifier.UI_INIT_NAMES)
+        for name in ("libreecho-sttd-wyoming", "libreecho-ttsd-wyoming"):
+            self.assertIn(name, bundle)
+            self.assertIn(f"usr/local/sbin/{name}", verifier.UI_BINARY_NAMES)
+        self.assertNotIn("usr/local/sbin/libreecho-wyomingd", verifier.UI_BINARY_NAMES)
+        self.assertIn('ESPHOMED_NOISE=1 ESPHOMED_TLS_LIBS="$TLS_LIBS"', bundle)
+        self.assertIn('"$VERIFY_TLS" --noise-prefix "$MBEDTLS_ROOT"', bundle)
+        for macro in ("MBEDTLS_ECDH_C", "MBEDTLS_ECP_DP_CURVE25519_ENABLED",
+                      "MBEDTLS_CHACHAPOLY_C", "MBEDTLS_SHA256_C", "MBEDTLS_MD_C"):
+            self.assertIn(macro, (TOOLS_DIR / "ui/verify_ui_tls.sh").read_text())
+
+    @staticmethod
+    def fixture_elf(dynamic: bool = False) -> bytes:
+        # Synthetic ARM ELF identity only, never a runnable target executable.
+        import struct
+        data = bytearray(512)
+        data[:7] = b"\x7fELF\x01\x01\x01"
+        struct.pack_into("<H", data, 18, 40)
+        struct.pack_into("<I", data, 36, 0x05000400)
+        if dynamic:
+            interpreter = b"/lib/ld-musl-armhf.so.1\0"
+            needed = b"libc.musl-armv7.so.1\0"
+            data[128:128+len(interpreter)] = interpreter
+            data[160:160+len(needed)] = needed
+            struct.pack_into("<II", data, 28, 52, 256)
+            struct.pack_into("<HHHH", data, 42, 32, 2, 40, 2)
+            struct.pack_into("<II", data, 52, 3, 128)
+            struct.pack_into("<I", data, 68, len(interpreter))
+            struct.pack_into("<II", data, 84, 2, 192)
+            struct.pack_into("<II", data, 192, 1, 0)
+            struct.pack_into("<I", data, 260, 6)
+            struct.pack_into("<III", data, 272, 192, 16, 1)
+            struct.pack_into("<I", data, 292, 8)
+            struct.pack_into("<I", data, 300, 3)
+            struct.pack_into("<III", data, 312, 160, len(needed), 0)
+        return bytes(data)
+
+    def test_builder_inventory_roundtrips_independent_verifier(self) -> None:
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bundle, stage, source = (root / name for name in ("bundle", "stage", "source"))
+            source.mkdir()
+            # Expected set is explicit: neither silently removing the new
+            # satellite nor dropping preserved clients may make this test green.
+            self.assertIn("usr/local/sbin/libreecho-esphomed", verifier.UI_FIXED_NAMES)
+            self.assertIn("usr/local/sbin/libreecho-watchdogd", verifier.UI_FIXED_NAMES)
+            names = verifier.UI_FIXED_NAMES | {"usr/local/share/libreecho/web/index.html"}
+            lines = ["schema=1", "source_commit=" + "a"*40, "source_diff_sha256=" + "b"*64]
+            for name in sorted(names - {"usr/local/share/libreecho/ui-manifest.txt"}):
+                relative = name.removeprefix("usr/local/")
+                path = bundle / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                content = (self.fixture_elf(name.endswith(("sttd-wyoming", "ttsd-wyoming")))
+                           if name in verifier.UI_BINARY_NAMES else b"fixture\n")
+                path.write_bytes(content)
+                lines.append(f"file={relative} sha256={hashlib.sha256(content).hexdigest()}")
+            ui_manifest = bundle / "share/libreecho/ui-manifest.txt"
+            ui_manifest.write_text("\n".join(lines) + "\n")
+            # Startup behavior and real ELF ABI checks have their own gates.
+            # Here only external readelf/startup are stubbed: the real staging
+            # inventory, mode/hash records and independent ELF parser execute.
+            manifest = {}
+            with mock.patch.object(builder, "validate_ui_startup_contract"), \
+                 mock.patch.object(builder, "require_elf_contract", return_value={}):
+                builder.add_ui_bundle(stage, bundle, source, "a"*40, "b"*64, manifest)
+            entries = {path.relative_to(stage).as_posix(): verifier.Entry(
+                path.relative_to(stage).as_posix(), path.stat().st_mode, 0, 0, 0, path.read_bytes())
+                for path in stage.rglob("*") if path.is_file()}
+            self.assertEqual(set(entries), names)
+            digest = hashlib.sha256(ui_manifest.read_bytes()).hexdigest()
+            self.assertTrue(verifier.validate_ui(entries, manifest, digest, "a"*40, "b"*64))
+            for missing in ("usr/local/sbin/libreecho-esphomed",
+                            "etc/init.d/libreecho-esphomed.init",
+                            "usr/local/sbin/libreecho-watchdogd",
+                            "usr/local/sbin/libreecho-sttd-wyoming",
+                            "etc/libreecho/avahi-services/esphome.service"):
+                with self.subTest(missing=missing), self.assertRaises(SystemExit):
+                    verifier.validate_ui({k:v for k,v in entries.items() if k != missing},
+                                         manifest, digest, "a"*40, "b"*64)
+            wrong = "usr/local/sbin/libreecho-esphomed"
+            original = entries[wrong]
+            entries[wrong] = verifier.Entry(wrong, stat.S_IFREG | 0o644, 0, 0, 0, original.data)
+            with self.assertRaisesRegex(SystemExit, "wrong mode/type"):
+                verifier.validate_ui(entries, manifest, digest, "a"*40, "b"*64)
+            entries[wrong] = original
+            for name in ("usr/local/sbin/libreecho-wyomingd", "etc/init.d/libreecho-wyomingd.init",
+                         "etc/libreecho/avahi-services/wyoming.service", "etc/libreecho/esphome-key"):
+                with self.subTest(stray=name), self.assertRaises(SystemExit):
+                    verifier.validate_ui({**entries, name: verifier.Entry(
+                        name, stat.S_IFREG | 0o755, 0, 0, 0, b"forbidden")},
+                        manifest, digest, "a"*40, "b"*64)
+
+    def test_reference_discovery_template_rejects_private_identity(self) -> None:
+        script = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        start = script.index('esphome_service="$UI_SOURCE/config/esphome.service"')
+        end = script.index("for sound in ", start)
+        guard = script[start:end]
+        reference = ('<service-group><service><type>_esphomelib._tcp</type>'
+                     '<port>6053</port><txt-record>version=@VERSION@</txt-record>'
+                     '<txt-record>mac=@MAC@</txt-record><txt-record>platform=LibreEcho</txt-record>'
+                     '<txt-record>board=radar-puffin</txt-record></service></service-group>')
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "config").mkdir()
+            (root / "out/etc/libreecho/avahi-services").mkdir(parents=True)
+            xml = root / "config/esphome.service"
+            for content, accepted in ((reference, True),
+                    (reference.replace("@MAC@", "020000000001"), False),
+                    (reference.replace("</service>", "<txt-record>noise_psk=fixture-secret</txt-record></service>"), False),
+                    (reference.replace("_esphomelib._tcp", "_wyoming._tcp"), False),
+                    (reference.replace("6053", "10700"), False)):
+                xml.write_text(content)
+                result = subprocess.run(["bash", "-c", 'set -euo pipefail\n' + guard],
+                    env={**os.environ, "UI_SOURCE": str(root), "OUTPUT": str(root / "out")},
+                    text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+            xml.unlink()
+            xml.symlink_to(root / "outside.xml")
+            (root / "outside.xml").write_text(reference)
+            result = subprocess.run(["bash", "-c", 'set -euo pipefail\n' + guard],
+                env={**os.environ, "UI_SOURCE": str(root), "OUTPUT": str(root / "out")},
+                capture_output=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_builder_refuses_extra_manifested_satellite_or_secret(self) -> None:
+        for extra in ("sbin/libreecho-wyomingd", "etc/init.d/libreecho-wyomingd.init",
+                      "etc/libreecho/avahi-services/wyoming.service",
+                      "etc/libreecho/esphome-key", "sbin/rogue"):
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                bundle = root / "bundle"
+                source = root / "source"
+                source.mkdir()
+                path = bundle / extra
+                path.parent.mkdir(parents=True)
+                path.write_bytes(b"forbidden fixture")
+                manifest = bundle / "share/libreecho/ui-manifest.txt"
+                manifest.parent.mkdir(parents=True)
+                manifest.write_text("schema=1\nsource_commit=" + "a"*40 +
+                    "\nsource_diff_sha256=" + "b"*64 + "\nfile=" + extra +
+                    " sha256=" + hashlib.sha256(path.read_bytes()).hexdigest() + "\n")
+                with self.assertRaisesRegex(SystemExit, "UI bundle.*(unexpected|forbidden)"):
+                    builder.add_ui_bundle(root / "stage", bundle, source,
+                                          "a"*40, "b"*64, {})
+
+    def test_verifier_rejects_renamed_wyoming_discovery_record(self) -> None:
+        name = "usr/local/lib/libreecho-mdns/root/etc/avahi/services/legacy.service"
+        entries = {name: verifier.Entry(name, stat.S_IFREG | 0o644, 0, 0, 0,
+                                       b"<service><type>_wyoming._tcp</type></service>")}
+        with self.assertRaisesRegex(SystemExit, "obsolete satellite"):
+            verifier.validate_ui(entries, {"ui": {"enabled": False}}, None, None, None)
+
+    def test_verifier_rejects_stray_satellite_even_with_ui_disabled(self) -> None:
+        for name in ("usr/local/sbin/libreecho-wyomingd",
+                     "etc/init.d/libreecho-wyomingd.init",
+                     "etc/libreecho/avahi-services/wyoming.service",
+                     "usr/local/sbin/libreecho-esphomed.old",
+                     "etc/libreecho/esphome-key"):
+            with self.subTest(name=name), self.assertRaises(SystemExit):
+                entries = {name: verifier.Entry(name, stat.S_IFREG | 0o755, 0, 0, 0, b"fixture")}
+                verifier.validate_ui(entries, {"ui": {"enabled": False}}, None, None, None)
+
+    def test_boot_stops_conflicting_owners_before_satellite_start(self) -> None:
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        start = init.index("start_ui_services()\n")
+        end = init.index("\nstart_ui_services &", start)
+        body = init[start:end]
+        self.assertNotIn("radiod wyomingd", body)
+        self.assertIn("radiod esphomed", body)
+        self.assertLess(body.index("stop_ui_voice_owners"), body.index("for service in $services"))
+        self.assertIn("watchdogd", body)
+        mdns = (TOOLS_DIR / "mdns/test_packaged_runtime.sh").read_text()
+        self.assertIn("_esphomelib._tcp", mdns)
+        self.assertNotIn("_wyoming._tcp", mdns)
+        for txt in ("version=", "mac=", "board=", "platform="):
+            self.assertIn(txt, mdns)
+
+
 class MkimgHeaderTests(unittest.TestCase):
     """Regression: LK rejects a KERNEL header whose name lacks a NUL byte."""
 
@@ -4703,7 +4968,10 @@ class UiTlsPackagingTests(unittest.TestCase):
         (prefix / "include/psa/crypto.h").write_text("/* fixture */\n")
         (prefix / "include/mbedtls/build_info.h").write_text(
             '#define MBEDTLS_VERSION_STRING         "%s"\n'
-            % (version or lock["version"])
+            % (version or lock["version"]) +
+            "".join(f"#define {macro}\n" for macro in (
+                "MBEDTLS_ECDH_C", "MBEDTLS_ECP_DP_CURVE25519_ENABLED",
+                "MBEDTLS_CHACHAPOLY_C", "MBEDTLS_SHA256_C", "MBEDTLS_MD_C"))
         )
         digests = {}
         for archive in ("libmbedcrypto.a", "libmbedx509.a", "libmbedtls.a"):
@@ -4807,6 +5075,30 @@ class UiTlsPackagingTests(unittest.TestCase):
             env=environment, text=True, cwd=tmp,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
+
+    def test_noise_prefix_requires_all_five_effective_primitives(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for missing in (None, "MBEDTLS_ECDH_C", "MBEDTLS_ECP_DP_CURVE25519_ENABLED",
+                            "MBEDTLS_CHACHAPOLY_C", "MBEDTLS_SHA256_C", "MBEDTLS_MD_C"):
+                prefix = root / (missing or "complete")
+                self.write_mbedtls_prefix(prefix)
+                if missing:
+                    header = prefix / "include/mbedtls/build_info.h"
+                    header.write_text(header.read_text().replace(f"#define {missing}\n", ""))
+                    provenance = prefix / "mbedtls-source.json"
+                    document = json.loads(provenance.read_text())
+                    document["include_sha256"] = hashlib.sha256(header.read_bytes()).hexdigest()
+                    document["include_tree_sha256"] = self.include_tree_digest(prefix / "include")
+                    provenance.write_text(json.dumps(document, indent=2) + "\n")
+                result = subprocess.run(["bash", str(self.verifier), "--noise-prefix", str(prefix)],
+                                        text=True, capture_output=True, timeout=10)
+                if missing:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(missing, result.stderr)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("esphome_noise_prefix=ok", result.stdout)
 
     def test_ui_bundle_binds_the_link_to_the_verified_prefix(self) -> None:
         """Codex review: the linked archives must be the verified ones.
