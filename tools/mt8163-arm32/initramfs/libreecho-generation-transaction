@@ -195,7 +195,8 @@ read_bcb() {
     SUCCESS=$(printf '%s\n' "$bcb" | $BB sed -n "s/^slot_${SELECTED}_success=//p")
     case "$SUCCESS" in 0|1) ;; *) fail bcb-success;; esac
     running=$($BB tr ' ' '\n' < "$CMDLINE_FILE" | $BB sed -n 's/^androidboot.slot_suffix=_//p')
-    case "$running" in a|b) ;; *) fail running-slot;; esac
+    # Measured Biscuit LK emits an empty suffix; absence has the same BCB fallback.
+    case "$running" in '') running=$SELECTED;; a|b) ;; *) fail running-slot;; esac
     [ "$running" = "$SELECTED" ] || fail running-selected-mismatch
 }
 verify_boot() {

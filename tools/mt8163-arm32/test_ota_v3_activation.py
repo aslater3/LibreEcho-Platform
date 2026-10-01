@@ -109,6 +109,13 @@ for daemon in ('libreecho-audio-engine','libreecho-ttsd','libreecho-waked','libr
         self.assertEqual(self.verb('activate').returncode, 0)
         self.assertEqual(len(self.mount_log.read_text().splitlines()), 5)
 
+    def test_empty_or_missing_slot_suffix_uses_validated_bcb(self):
+        self.prepared()
+        for cmdline in ('androidboot.slot_suffix=_\n', 'console=ttyS0\n'):
+            self.cmdline.write_text(cmdline)
+            result = self.verb('activate')
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_activate_refuses_wrong_slot(self):
         self.prepared()
         self.cmdline.write_text('androidboot.slot_suffix=_a\n')
