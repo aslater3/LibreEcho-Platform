@@ -574,6 +574,7 @@ printf '%s WIFI_CONF=%s\\n' "$*" "${{WIFI_CONF:-}}" >> "{self.wpa_log}"
 count_file="{self.root}/stopcount"
 case "$1" in
     stop)
+        if [ -f "{self.root}/stop_fail" ]; then exit 1; fi
         n=$(cat "$count_file" 2>/dev/null || printf 0)
         n=$((n + 1))
         printf '%s' "$n" > "$count_file"
@@ -679,6 +680,58 @@ exit 0
             exiting.wait()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("net-up: wlan0 192.168.4.1/24", result.stdout)
+
+    def test_net_up_fails_closed_when_the_client_stop_fails(self) -> None:
+        # A client service is present but its stop call fails on the first
+        # handover: the radio may still be owned by the client plane, so the
+        # call must fail closed, restore the client, and claim no ownership
+        # rather than bring up the portal and let a still-running supplicant
+        # fight hostapd.
+        (self.root / "stop_fail").touch()
+        result = self.up()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("net-up: ", result.stdout)
+        self.assertIn("did not stop", result.stderr)
+        self.assertIn("start", self.wpa_log_text())
+        self.assertFalse((self.state_dir / "recovery-net.state").exists())
+
+    def test_net_up_fails_closed_when_a_captured_client_cannot_be_stopped(self) -> None:
+        # The stop fails and a client process was captured, but no helper is
+        # installed: the captured client is still unverified, so this must fail
+        # closed too (it may not claim the radio released).
+        (self.root / "stop_fail").touch()
+        env = self.env()
+        env["RECOVERY_AP_WPA_SERVICE"] = str(self.root / "absent-wifi-service")
+        linger = subprocess.Popen(["sleep", "30"])
+        try:
+            self.add_client_pid("wpa_supplicant", linger.pid)
+            result = subprocess.run(
+                ["sh", str(NET_UP), "--interface", "wlan0",
+                 "--address", "192.168.4.1/24", "--state-dir", str(self.state_dir)],
+                text=True, env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, timeout=60)
+        finally:
+            linger.terminate()
+            linger.wait()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("net-up: ", result.stdout)
+        self.assertIn("did not stop", result.stderr)
+        self.assertFalse((self.state_dir / "recovery-net.state").exists())
+
+    def test_net_up_proceeds_when_no_client_service_exists(self) -> None:
+        # No helper and no captured client process: there is genuinely nothing
+        # to stop, so the handover proceeds and records stopped=0.
+        env = self.env()
+        env["RECOVERY_AP_WPA_SERVICE"] = str(self.root / "absent-wifi-service")
+        result = subprocess.run(
+            ["sh", str(NET_UP), "--interface", "wlan0",
+             "--address", "192.168.4.1/24", "--state-dir", str(self.state_dir)],
+            text=True, env=env, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("net-up: wlan0 192.168.4.1/24", result.stdout)
+        state = (self.state_dir / "recovery-net.state").read_text()
+        self.assertIn("stopped=0", state)
 
     def test_net_up_is_idempotent(self) -> None:
         self.assertEqual(self.up().returncode, 0)
@@ -1103,19 +1156,21 @@ class DependencyPinTests(unittest.TestCase):
         }
 
     @staticmethod
-    def libnl_record() -> dict:
+    def libnl_record(source_sha256: str = "b" * 64,
+                     source_license: str = "COPYING") -> dict:
         return {
             "version": "3.11.0",
             "license": "LGPL-2.1-only",
             "source_url": "https://example.invalid/libnl-3.11.0.tar.gz",
-            "source_sha256": "b" * 64,
-            "source_license": "COPYING",
+            "source_sha256": source_sha256,
+            "source_license": source_license,
         }
 
     def write_lock(self, root: Path, component: dict, *,
-                   source_offer: dict | None = None) -> Path:
+                   source_offer: dict | None = None,
+                   libnl: dict | None = None) -> Path:
         lock = {"components": {"hostapd": component},
-                "build_dependencies": {"libnl": self.libnl_record()}}
+                "build_dependencies": {"libnl": libnl or self.libnl_record()}}
         if source_offer is not None:
             lock["source_offer"] = source_offer
         path = root / "lock.json"
@@ -1169,17 +1224,51 @@ class DependencyPinTests(unittest.TestCase):
                 handle.addfile(info, io.BytesIO(payload))
         return archive
 
+    @staticmethod
+    def write_libnl_archive(root: Path, members=None) -> Path:
+        """A real gzip tarball for the pinned libnl build dependency.
+
+        libnl is a required pinned input in verify mode as well, and the builder
+        hash-checks the archive and requires its declared licence text, so a
+        bare path is not sufficient.
+        """
+        if members is None:
+            members = {"libnl-3.11.0/COPYING": b"lgpl text\n"}
+        archive = root / "libnl-3.11.0.tar.gz"
+        with tarfile.open(archive, "w:gz") as handle:
+            for member, payload in members.items():
+                info = tarfile.TarInfo(member)
+                info.size = len(payload)
+                handle.addfile(info, io.BytesIO(payload))
+        return archive
+
+    def verified_pair(self, root: Path, *, license_: str = "BSD-3-Clause",
+                      libnl_members=None, libnl_license: str = "COPYING"):
+        """A component archive and a libnl archive bound to one lock.
+
+        Both archives are real tarballs carrying their declared licence files,
+        and the lock pins the exact bytes, matching a --verify that must check
+        both the staged components and the libnl build dependency.
+        """
+        archive = self.write_archive(root)
+        libnl = self.write_libnl_archive(root, libnl_members)
+        component = self.component(license_)
+        component["source_sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+        record = self.libnl_record(hashlib.sha256(libnl.read_bytes()).hexdigest(),
+                                   libnl_license)
+        lock = self.write_lock(root, component, libnl=record)
+        return archive, libnl, lock
+
     def test_builder_accepts_matching_archive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            archive = self.write_archive(root)
-            component = self.component()
-            component["source_sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
-            lock = self.write_lock(root, component)
+            archive, libnl, lock = self.verified_pair(root)
             result = self.run_builder("--verify", "--lock", str(lock),
-                                      "--archive", f"hostapd={archive}")
+                                      "--archive", f"hostapd={archive}",
+                                      "--libnl-archive", str(libnl))
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("verified hostapd 2.10", result.stdout)
+            self.assertIn("verified libnl 3.11.0", result.stdout)
 
     def test_builder_refuses_wrong_hash(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1248,12 +1337,11 @@ class DependencyPinTests(unittest.TestCase):
     def test_builder_requires_a_source_offer_for_gpl_components(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            archive = self.write_archive(root)
-            component = self.component("GPL-2.0-or-3.0")
-            component["source_sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
-            lock = self.write_lock(root, component)
+            archive, libnl, lock = self.verified_pair(root,
+                                                      license_="GPL-2.0-or-3.0")
             result = self.run_builder("--verify", "--lock", str(lock),
-                                      "--archive", f"hostapd={archive}")
+                                      "--archive", f"hostapd={archive}",
+                                      "--libnl-archive", str(libnl))
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("corresponding-source offer", result.stderr)
 
@@ -1261,14 +1349,82 @@ class DependencyPinTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             archive = self.write_archive(root)
+            libnl = self.write_libnl_archive(root)
             component = self.component("GPL-2.0-or-3.0")
             component["source_sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+            record = self.libnl_record(hashlib.sha256(libnl.read_bytes()).hexdigest())
             lock = self.write_lock(root, component,
-                                   source_offer={"components": ["hostapd"]})
+                                   source_offer={"components": ["hostapd"]},
+                                   libnl=record)
             result = self.run_builder("--verify", "--lock", str(lock),
-                                      "--archive", f"hostapd={archive}")
+                                      "--archive", f"hostapd={archive}",
+                                      "--libnl-archive", str(libnl))
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("source-offer hostapd", result.stdout)
+
+    def test_verify_requires_the_libnl_archive(self) -> None:
+        # --verify must perform the libnl existence/hash/licence checks, not
+        # skip them when no archive can be resolved: libnl is a required pinned
+        # input, and a verify that silently skipped it could report success
+        # while the pinned archive is absent.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = self.write_archive(root)
+            component = self.component()
+            component["source_sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+            lock = self.write_lock(root, component)
+            result = self.run_builder("--verify", "--lock", str(lock),
+                                      "--archive", f"hostapd={archive}")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("libnl archive is required", result.stderr)
+
+    def test_verify_resolves_the_libnl_archive_from_the_cache(self) -> None:
+        # --libnl-cache is an accepted alternative to --libnl-archive; a cache
+        # that holds the pinned archive must satisfy the requirement.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = self.write_archive(root)
+            cache = root / "cache"
+            cache.mkdir()
+            libnl = self.write_libnl_archive(cache)
+            component = self.component()
+            component["source_sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+            record = self.libnl_record(hashlib.sha256(libnl.read_bytes()).hexdigest())
+            lock = self.write_lock(root, component, libnl=record)
+            result = self.run_builder("--verify", "--lock", str(lock),
+                                      "--archive", f"hostapd={archive}",
+                                      "--libnl-cache", str(cache))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("verified libnl 3.11.0", result.stdout)
+
+    def test_verify_fails_closed_on_a_mismatched_libnl_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = self.write_archive(root)
+            libnl = self.write_libnl_archive(root)
+            component = self.component()
+            component["source_sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+            # The archive is real but the lock pins different bytes.
+            record = self.libnl_record("c" * 64)
+            lock = self.write_lock(root, component, libnl=record)
+            result = self.run_builder("--verify", "--lock", str(lock),
+                                      "--archive", f"hostapd={archive}",
+                                      "--libnl-archive", str(libnl))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("libnl SHA-256 mismatch", result.stderr)
+
+    def test_verify_fails_closed_on_a_missing_libnl_licence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive, libnl, lock = self.verified_pair(
+                root, libnl_members={"libnl-3.11.0/README": b"no licence\n"})
+            result = self.run_builder("--verify", "--lock", str(lock),
+                                      "--archive", f"hostapd={archive}",
+                                      "--libnl-archive", str(libnl))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("libnl", result.stderr)
+            self.assertIn("COPYING", result.stderr)
+            self.assertIn("missing from the source tree", result.stderr)
 
 
 def load_tool(name: str):

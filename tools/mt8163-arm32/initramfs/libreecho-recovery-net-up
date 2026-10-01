@@ -304,7 +304,24 @@ stopped=0
 if stop_client_service; then
     stopped=1
 elif [ "$prior_stopped" = 1 ]; then
+    # A previous net-up already released the plane for this interface/address
+    # and recorded it; the service is already stopped, so its stop call failing
+    # now is expected and the recorded ownership (and the restore it still
+    # owes) is preserved.
     stopped=1
+elif [ -x "$WPA_SERVICE" ] || [ -n "$client_pids" ]; then
+    # The stop did not succeed on a first handover and a client service exists
+    # (or a client process was captured): the radio may still be owned by the
+    # client plane, so fail closed exactly like the lingering-process path
+    # below.  Restore the client and claim no ownership, rather than bringing
+    # up the portal and letting a still-running supplicant fight hostapd.  The
+    # only case allowed to proceed without stopping is genuinely nothing to
+    # stop: no helper and no captured client process.
+    if ! restore_client_service "$WPA_SERVICE" "$wifi_conf"; then
+        die "client service did not stop and cannot restore $WPA_SERVICE"
+    fi
+    rm -f "$STATE_FILE"
+    die "client service did not stop"
 fi
 
 # The service reported the client released, but a captured supplicant/DHCP

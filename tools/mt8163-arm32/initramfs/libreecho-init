@@ -934,6 +934,31 @@ recovery_owns_radio()
     [ -f "${PHYSICAL_RECOVERY_MARKER:-/run/libreecho/recovery-mode}" ]
 }
 
+# Issue #96 recovery-boot service ordering.  While the recovery marker is
+# present the access point owns the single radio, and the boot-path Wi-Fi worker
+# (start_wifi_network_sequence) is still loading WMT and waiting for wlan0 when
+# the UI service graph starts.  networkd's AP capability probe runs as it starts
+# and, if wlan0 does not exist yet, reports the interface absent and the portal
+# stays unavailable for the whole boot.  The worker therefore records a
+# boot-scoped marker once wlan0 exists, and the service graph waits for it --
+# bounded -- before starting networkd.  An ordinary boot has no recovery marker,
+# so recovery_owns_radio is false and this is a no-op: the service ordering on
+# an ordinary boot is unchanged.
+RECOVERY_WLAN0_MARKER=${RECOVERY_WLAN0_MARKER:-/run/libreecho/wlan0-ready}
+RECOVERY_RADIO_WAIT=${RECOVERY_RADIO_WAIT:-30}
+recovery_radio_ready_wait()
+{
+    recovery_owns_radio || return 0
+    waited=0
+    while [ "$waited" -lt "$RECOVERY_RADIO_WAIT" ]; do
+        [ -f "$RECOVERY_WLAN0_MARKER" ] && return 0
+        $BB sleep 1
+        waited=$((waited + 1))
+    done
+    log recovery-radio-ready-timeout
+    return 0
+}
+
 start_wifi_network_sequence()
 {
     packaged_wifi=/etc/wifi/wpa_supplicant.conf
@@ -1041,6 +1066,15 @@ start_wifi_network_sequence()
         i=$((i + 1))
     done
     [ -e /sys/class/net/wlan0 ] || { log wlan0-registration-timeout; return 1; }
+    # wlan0 now exists: record the boot-scoped radio-ready marker the recovery
+    # service graph waits on before it starts networkd (see
+    # recovery_radio_ready_wait).  Harmless on an ordinary boot.
+    if $BB mkdir -p /run/libreecho 2>/dev/null &&
+        : > "$RECOVERY_WLAN0_MARKER" 2>/dev/null; then
+        log wlan0-ready-recorded
+    else
+        log wlan0-ready-record-failed
+    fi
     # Recovery boot: the driver is up and wlan0 exists for the AP probe and
     # hostapd, but the portal owns the radio, so never start the client
     # supplicant here (see recovery_owns_radio above).
@@ -1744,6 +1778,14 @@ start_ui_services()
     start_shared_discovery_runtime
     log feature-services-deferred-until-staged
     for service in $services; do
+        # On a recovery boot the boot-path Wi-Fi worker may still be creating
+        # wlan0 when this graph starts.  Wait (bounded) for its radio-ready
+        # marker before starting networkd so networkd's AP capability probe
+        # finds wlan0 instead of reporting the interface absent.  This is a
+        # no-op on an ordinary boot (see recovery_radio_ready_wait).
+        if [ "$service" = networkd ]; then
+            recovery_radio_ready_wait
+        fi
         script="/etc/init.d/libreecho-$service.init"
         if [ -x "$script" ]; then
             if [ "$service" = web ] && [ "$SERVICE_PROFILE" = production ]; then

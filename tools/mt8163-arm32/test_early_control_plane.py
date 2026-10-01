@@ -8,6 +8,7 @@ and the network had come up, and because adbd sat behind the expdb and userdata
 waits.
 """
 from pathlib import Path
+import os
 import re
 import shlex
 import shutil
@@ -306,6 +307,95 @@ class EarlyControlPlaneContracts(unittest.TestCase):
         self.assertLess(record, client)
         self.assertIn(
             "printf '%s\\n' \"$wifi_profile\" > \"$WIFI_PROFILE_STATE\"", self.init)
+
+    # ---------------------------------------- recovery-boot radio ordering
+    def test_recovery_boot_waits_for_the_radio_before_networkd(self) -> None:
+        """A recovery boot's service graph must not probe the radio too early.
+
+        The boot-path Wi-Fi worker records a boot-scoped radio-ready marker once
+        wlan0 exists, and the graph waits (bounded) for it before starting
+        networkd -- whose AP capability probe would otherwise report the
+        interface absent during the WMT load / wlan0 wait and leave the portal
+        unavailable for the whole boot.  An ordinary boot has no recovery
+        marker, so the wait is a no-op and the ordering is unchanged.
+        """
+        # The marker can only be recorded after the bounded wlan0 wait, so it
+        # implies the interface exists.
+        wlan0_wait = self.init.index("while [ \"$i\" -lt 30 ] && [ ! -e /sys/class/net/wlan0 ]")
+        marker_default = self.init.index("RECOVERY_WLAN0_MARKER=")
+        recorded = self.init.index("log wlan0-ready-recorded")
+        self.assertLess(wlan0_wait, recorded)
+        self.assertLess(marker_default, recorded)
+        # networkd's start is gated on the wait...
+        ui = self.init.index("start_ui_services()")
+        ui_body = self.init[ui:self.init.index("\n}\n", ui)]
+        gate = ui_body.index('if [ "$service" = networkd ]; then')
+        self.assertIn("recovery_radio_ready_wait", ui_body[gate:])
+        # ...and the wait itself is recovery-gated: an ordinary boot returns
+        # without touching the marker or sleeping.
+        helper = self.init.index("recovery_radio_ready_wait()")
+        helper_body = self.init[helper:self.init.index("\n}\n", helper)]
+        self.assertIn("recovery_owns_radio || return 0", helper_body)
+        self.assertIn("RECOVERY_RADIO_WAIT", helper_body)
+
+    def test_recovery_radio_ready_wait_is_bounded_and_recovery_gated(self) -> None:
+        start = self.init.index("recovery_owns_radio()")
+        owns = self.init[start:self.init.index("\n}\n", start) + len("\n}\n")]
+        helper_start = self.init.index("recovery_radio_ready_wait()")
+        helper = self.init[
+            helper_start:self.init.index("\n}\n", helper_start) + len("\n}\n")]
+
+        def run_case(recovery_marker: bool, ready_marker: bool):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                recovery = root / "recovery-mode"
+                ready = root / "wlan0-ready"
+                sleep_log = root / "sleeps"
+                busybox = root / "busybox"
+                busybox.write_text(
+                    "#!/bin/sh\n"
+                    "if [ \"$1\" = sleep ]; then\n"
+                    "  n=$(cat \"$SLEEP_LOG\" 2>/dev/null || printf 0)\n"
+                    "  n=$((n + 1))\n"
+                    "  printf '%s' \"$n\" > \"$SLEEP_LOG\"\n"
+                    "fi\n"
+                    "exit 0\n")
+                busybox.chmod(0o755)
+                if recovery_marker:
+                    recovery.write_text("libreecho-recovery-v1\n")
+                if ready_marker:
+                    ready.touch()
+                script = (
+                    "PHYSICAL_RECOVERY_MARKER=%s\n"
+                    "RECOVERY_WLAN0_MARKER=%s\n"
+                    "RECOVERY_RADIO_WAIT=3\n"
+                    "BB=%s\n"
+                    "log() { printf 'log:%%s\\n' \"$1\"; }\n"
+                    % (shlex.quote(str(recovery)), shlex.quote(str(ready)),
+                       shlex.quote(str(busybox)))
+                    + owns + helper
+                    + "\nrecovery_radio_ready_wait; echo rc=$?\n")
+                env = dict(os.environ)
+                env["SLEEP_LOG"] = str(sleep_log)
+                result = subprocess.run(["sh", "-c", script], env=env,
+                                        capture_output=True, text=True)
+                sleeps = int(sleep_log.read_text()) if sleep_log.exists() else 0
+                return result, sleeps
+
+        # Ordinary boot: no recovery marker, so the wait is a no-op.
+        result, sleeps = run_case(False, False)
+        self.assertEqual(result.stdout.strip(), "rc=0", result.stderr)
+        self.assertEqual(sleeps, 0)
+        # Recovery boot with the radio already up: returns immediately.
+        result, sleeps = run_case(True, True)
+        self.assertEqual(result.stdout.strip(), "rc=0", result.stderr)
+        self.assertEqual(sleeps, 0)
+        # Recovery boot, radio not ready: a bounded wait, then a logged timeout
+        # so the graph still starts instead of blocking forever.
+        result, sleeps = run_case(True, False)
+        self.assertIn("rc=0", result.stdout, result.stderr)
+        self.assertIn("log:recovery-radio-ready-timeout", result.stdout)
+        self.assertEqual(sleeps, 3)
 
 
 if __name__ == "__main__":

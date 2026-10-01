@@ -150,17 +150,20 @@ for line in "${COMPONENTS[@]}"; do
     done
 done
 
-# libnl is a verified build input (never staged into the image): hostapd's
+# libnl is a required pinned input (never staged into the image): hostapd's
 # netlink driver (CONFIG_LIBNL32) and iw both need it.  It is resolved from
-# --libnl-archive or --libnl-cache and hash-checked against the pin.
+# --libnl-archive or --libnl-cache and hash-checked against the pin.  It is not
+# optional in any mode that reads the lock: a --verify that skipped the check
+# could report success while the pinned archive is absent or tampered with, so
+# the check fails closed when no archive can be resolved.
 LIBNL_RECORD=$(python3 - "$LOCK" <<'PY'
 import json, sys
 record = json.load(open(sys.argv[1])).get("build_dependencies", {}).get("libnl")
-print("\t".join([record["version"], record["source_sha256"], record["source_url"]]) if record else "")
+print("\t".join([record["version"], record["source_sha256"], record["source_url"], record.get("source_license", "")]) if record else "")
 PY
 )
 [[ -n "$LIBNL_RECORD" ]] || { printf 'ERROR: SOURCE.lock declares no libnl build dependency\n' >&2; exit 1; }
-IFS=$'\t' read -r LIBNL_VERSION LIBNL_SHA LIBNL_URL <<<"$LIBNL_RECORD"
+IFS=$'\t' read -r LIBNL_VERSION LIBNL_SHA LIBNL_URL LIBNL_LICENSE <<<"$LIBNL_RECORD"
 case "$LIBNL_SHA" in
     [0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
     *) printf 'ERROR: libnl has a malformed pinned SHA-256\n' >&2; exit 1 ;;
@@ -171,16 +174,29 @@ if [[ -z "$LIBNL_ARCHIVE" && -n "$LIBNL_CACHE" ]]; then
         [[ -e "$candidate" ]] && { LIBNL_ARCHIVE=$candidate; break; }
     done
 fi
-if [[ -n "$LIBNL_ARCHIVE" ]]; then
-    [[ -f "$LIBNL_ARCHIVE" && ! -L "$LIBNL_ARCHIVE" ]] || {
-        printf 'ERROR: unsafe or missing libnl archive: %s\n' "$LIBNL_ARCHIVE" >&2; exit 1; }
-    actual=$(sha256sum "$LIBNL_ARCHIVE" | awk '{print $1}')
-    if [[ "$actual" != "$LIBNL_SHA" ]]; then
-        printf 'ERROR: libnl SHA-256 mismatch\nexpected=%s\nactual=%s\n' "$LIBNL_SHA" "$actual" >&2
-        exit 1
-    fi
-    printf 'verified libnl %s %s\n' "$LIBNL_VERSION" "$LIBNL_SHA"
+[[ -n "$LIBNL_ARCHIVE" ]] || {
+    printf 'ERROR: libnl archive is required (--libnl-archive or --libnl-cache); pinned %s %s (%s)\n' \
+        "$LIBNL_VERSION" "$LIBNL_SHA" "$LIBNL_URL" >&2
+    exit 1; }
+[[ -f "$LIBNL_ARCHIVE" && ! -L "$LIBNL_ARCHIVE" ]] || {
+    printf 'ERROR: unsafe or missing libnl archive: %s\n' "$LIBNL_ARCHIVE" >&2; exit 1; }
+actual=$(sha256sum "$LIBNL_ARCHIVE" | awk '{print $1}')
+if [[ "$actual" != "$LIBNL_SHA" ]]; then
+    printf 'ERROR: libnl SHA-256 mismatch\nexpected=%s\nactual=%s\n' "$LIBNL_SHA" "$actual" >&2
+    exit 1
 fi
+# Licence provenance for libnl, matching the component check above: the declared
+# licence text must actually be present in the verified source tree.
+if [[ -n "$LIBNL_LICENSE" ]]; then
+    libnl_verify="$work/libnl-verify"
+    mkdir -p "$libnl_verify"
+    tar -xf "$LIBNL_ARCHIVE" -C "$libnl_verify" --strip-components=1
+    [[ -f "$libnl_verify/$LIBNL_LICENSE" ]] || {
+        printf 'ERROR: libnl: declared licence %s is missing from the source tree\n' \
+            "$LIBNL_LICENSE" >&2
+        exit 1; }
+fi
+printf 'verified libnl %s %s\n' "$LIBNL_VERSION" "$LIBNL_SHA"
 fi
 
 # --- GPL corresponding-source offer ---------------------------------------
