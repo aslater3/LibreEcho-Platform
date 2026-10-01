@@ -1724,6 +1724,62 @@ class BundleStagingNegativeTests(unittest.TestCase):
                 self.builder.add_recovery_ap_bundle(stage, {}, metadata, {})
 
 
+class BundleStagingPositiveTests(unittest.TestCase):
+    """A complete pinned bundle stages cleanly (the valid-staging counterpart).
+
+    This is the positive half of the inventory contract: the same builder that
+    refuses a half-shipped or half-provenanced bundle must place every pinned
+    component, the metadata document and the manifest record when the caller
+    supplies a complete, hash-matching set.
+    """
+
+    def setUp(self) -> None:
+        self.builder = load_tool("build_recovery_image")
+
+    @unittest.skipIf(shutil.which("readelf") is None,
+                     "readelf (binutils) is required to stage a bundle")
+    def test_valid_bundle_stages_the_pinned_inventory(self) -> None:
+        elf = arm32_static_elf()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binaries_dir = root / "bin"
+            binaries_dir.mkdir()
+            payloads = {}
+            for name in RECOVERY_AP_PATHS:
+                data = elf + name.encode()
+                (binaries_dir / name).write_bytes(data)
+                payloads[name] = data
+            metadata = recovery_ap_metadata({
+                name: hashlib.sha256(data).hexdigest()
+                for name, data in payloads.items()})
+            metadata_path = root / "recovery-ap-binaries.json"
+            metadata_path.write_text(json.dumps(metadata))
+            stage = root / "stage"
+            stage.mkdir()
+            manifest: dict = {}
+
+            self.builder.add_recovery_ap_bundle(
+                stage,
+                {name: binaries_dir / name for name in RECOVERY_AP_PATHS},
+                metadata_path, manifest)
+
+            for name, relative in RECOVERY_AP_PATHS.items():
+                with self.subTest(component=name):
+                    target = stage / relative
+                    self.assertTrue(target.is_file())
+                    self.assertEqual(target.stat().st_mode & 0o777, 0o755)
+                    self.assertEqual(target.read_bytes(), payloads[name])
+            self.assertEqual(
+                (stage / "etc/libreecho/recovery-ap-binaries.json").read_bytes(),
+                metadata_path.read_bytes())
+            record = manifest["recovery_ap"]
+            self.assertTrue(record["enabled"])
+            self.assertEqual(set(record["components"]), set(RECOVERY_AP_PATHS))
+            self.assertEqual(record["source_offer"], metadata["source_offer"])
+            self.assertEqual(record["metadata"]["mode"], "0644")
+            self.assertEqual(record["marker"], "/run/libreecho/recovery-mode")
+
+
 class ImageIntegrationTests(unittest.TestCase):
     """The overlay/pin integration the recovery-AP helpers depend on."""
 
