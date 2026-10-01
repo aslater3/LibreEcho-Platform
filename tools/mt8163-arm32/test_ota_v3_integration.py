@@ -89,6 +89,21 @@ class UpdaterTests(grammar.SignedFixture):
         self.assertEqual(self.control_file('pending').read_text(), expected)
         self.assertEqual((self.root / 'activated').read_text(), 'b\n')
 
+    def test_confirm_v3_calls_target_activation_then_slot_confirm_then_commit(self):
+        self.control_file('pending').write_text('schema=3\nslot=b\ntransaction_id=test-target\nmanifest_sha256=' + 'a' * 64 + '\n')
+        calls = self.root / 'calls'
+        helper = self.root / 'transaction'
+        helper.write_text('#!/bin/sh\necho "transaction:$1" >> "$CALLS"\n')
+        helper.chmod(0o755)
+        bootctl = self.root / 'bootctl'
+        bootctl.write_text('#!/bin/sh\necho "bootctl:$1:$2" >> "$CALLS"\n')
+        bootctl.chmod(0o755)
+        script = self.script('confirm_pending')
+        script.write_text(script.read_text().replace('FEATURE_TRANSACTION=/usr/local/sbin/libreecho-feature-transaction', 'FEATURE_TRANSACTION=' + str(helper)).replace('BOOTCTL=/usr/local/sbin/libreecho-bootctl', 'BOOTCTL=' + str(bootctl)))
+        result = subprocess.run(['/bin/busybox', 'sh', str(script)], env=dict(self.env, CALLS=str(calls)), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls.read_text().splitlines(), ['transaction:activate', 'bootctl:confirm:b', 'transaction:commit'])
+
     def control_file(self, name):
         return self.update / name
 
