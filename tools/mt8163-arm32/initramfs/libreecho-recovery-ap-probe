@@ -1,0 +1,196 @@
+#!/bin/busybox sh
+# shellcheck shell=dash
+#
+# Strict recovery access-point capability and readiness probe (issue #96,
+# Platform side).  networkd runs this as its AP-capability probe
+# (--recovery-ap-probe, default /usr/local/sbin/libreecho-recovery-ap-probe)
+# once a physical recovery marker has been validated.  The probe fails closed:
+# a missing binary, a missing interface, an interface that does not advertise
+# AP mode over nl80211, or an unraised readiness surface all return non-zero so
+# the daemon reports an actionable "unavailable" reason instead of claiming an
+# AP it cannot serve.
+#
+# Subcommand (default "supported"):
+#   supported  interface exists and its phy advertises nl80211 AP mode.
+#   ready      the AP is actually serving: interface is in AP mode, hostapd
+#              has published its control surface, the DHCP/DNS side is live,
+#              and the interface carries the AP address.  This is the readiness
+#              check; it never accepts "binary exists" as proof.
+#
+# Layout is taken from the UI core (ui-recovery src/adapter/network_recovery.c)
+# so the probe checks the surfaces that actually exist:
+#   - hostapd.conf sets ctrl_interface=<run-dir> (/run/libreecho) and
+#     interface=<iface>, so hostapd publishes its control socket as
+#     <run-dir>/<iface>; the run directory itself is shared with the recovery
+#     marker and the net-up ownership state and is NOT proof hostapd is live.
+#     The image stages no hostapd_cli, so the socket is proven live from
+#     /proc: a hostapd process whose command line names this interface (or the
+#     hostapd config that binds it) must still be running.  A crashed hostapd
+#     leaves its socket inode behind, so the socket check alone would report
+#     ready for a dead AP;
+#   - dnsmasq is spawned with --no-daemon as a foreground child, so it writes NO
+#     pidfile.  Readiness therefore checks for a live dnsmasq process serving
+#     the recovery config, or an explicit pidfile if the deployment daemonizes.
+#
+# networkd passes a single probe path with no arguments, so the interface
+# defaults to wlan0 (the daemon's interface default) and is overridable with
+# RECOVERY_AP_INTERFACE.
+
+set -u
+
+MODE=supported
+IFACE=${RECOVERY_AP_INTERFACE:-wlan0}
+RUN_DIR=${RECOVERY_AP_RUN_DIR:-/run/libreecho}
+AP_ADDRESS=${RECOVERY_AP_ADDRESS:-192.168.4.1}
+DHCP_CONF=${RECOVERY_AP_DHCP_CONF:-$RUN_DIR/recovery-dnsmasq.conf}
+DHCP_PID=${RECOVERY_AP_DHCP_PID:-}
+# Optional explicit pidfile when the deployment daemonizes hostapd with -P;
+# absent that, liveness is proven from /proc (see hostapd_live below).
+HOSTAPD_PID=${RECOVERY_AP_HOSTAPD_PID:-}
+# Prefer the packaged helper binaries the image stages under /usr/local/sbin;
+# fall back to PATH so a development image without them still fails closed
+# instead of crashing.
+if [ -n "${RECOVERY_AP_IW:-}" ]; then
+    IW=$RECOVERY_AP_IW
+elif [ -x /usr/local/sbin/iw ]; then
+    IW=/usr/local/sbin/iw
+else
+    IW=iw
+fi
+if [ -n "${RECOVERY_AP_IP:-}" ]; then
+    IP=$RECOVERY_AP_IP
+elif [ -x /usr/local/sbin/ip ]; then
+    IP=/usr/local/sbin/ip
+else
+    IP=ip
+fi
+CTRL=${RECOVERY_AP_CTRL:-$RUN_DIR}
+
+case "${1:-}" in
+    supported|ready) MODE=$1; [ "$#" -le 1 ] || { printf 'unexpected arguments\n' >&2; exit 2; } ;;
+    '') ;;
+    -h|--help) printf 'usage: %s [supported|ready]\n' "$0"; exit 0 ;;
+    *) printf 'usage: %s [supported|ready]\n' "$0" >&2; exit 2 ;;
+esac
+
+command -v "$IW" >/dev/null 2>&1 || { printf 'unavailable: missing-iw\n' >&2; exit 1; }
+
+# Resolve the phy behind the interface; a missing interface is NOT AP-capable.
+dev_info=$("$IW" dev "$IFACE" info 2>/dev/null) || {
+    printf 'unavailable: interface-absent:%s\n' "$IFACE" >&2
+    exit 1
+}
+phy=$(printf '%s\n' "$dev_info" |
+    sed -n 's/^[[:space:]]*wiphy[[:space:]]\+\([0-9][0-9]*\).*/\1/p' | head -n 1)
+if [ -z "$phy" ]; then
+    printf 'unavailable: no-phy:%s\n' "$IFACE" >&2
+    exit 1
+fi
+
+# nl80211: the phy must actually advertise AP in its supported interface modes.
+phy_info=$("$IW" phy "phy$phy" info 2>/dev/null) || {
+    printf 'unavailable: phy-info-failed:%s\n' "$IFACE" >&2
+    exit 1
+}
+if ! printf '%s\n' "$phy_info" |
+        sed -n '/Supported interface modes:/,/^[[:space:]]*$/p' |
+        grep -q '^[[:space:]]*\*[[:space:]]*AP[[:space:]]*$'; then
+    printf 'unavailable: ap-mode-unsupported:%s\n' "$IFACE" >&2
+    exit 1
+fi
+
+if [ "$MODE" = supported ]; then
+    printf 'available: ap-supported:%s\n' "$IFACE"
+    exit 0
+fi
+
+# --- readiness ---
+# The interface must currently be in AP mode, not merely AP-capable.
+if ! printf '%s\n' "$dev_info" |
+        sed -n 's/^[[:space:]]*type[[:space:]]\+\(.*\)$/\1/p' |
+        grep -qi '^AP$'; then
+    printf 'unavailable: interface-not-ap:%s\n' "$IFACE" >&2
+    exit 1
+fi
+# hostapd must have published its *per-interface* Unix control socket as proof
+# it is live.  ctrl_interface is the run directory, which is shared with the
+# recovery marker and the net-up ownership state and exists even when hostapd
+# never started, so directory existence is NOT accepted: require the socket
+# hostapd creates for this interface (ctrl_interface/<ifname>).
+CTRL_SOCKET=$CTRL/$IFACE
+if [ ! -S "$CTRL_SOCKET" ]; then
+    printf 'unavailable: hostapd-control-absent:%s\n' "$CTRL_SOCKET" >&2
+    exit 1
+fi
+# The socket alone is not proof hostapd is live: a crashed hostapd leaves its
+# AF_UNIX socket inode behind, so a stale socket must not report the AP ready.
+# The image stages no hostapd_cli, so the live incarnation is proven from
+# /proc instead of a control-socket query: a running process whose comm is
+# hostapd and whose command line names this interface (-i <iface>) or the
+# hostapd config that binds it must exist.  An explicit pidfile is honoured
+# when the deployment daemonizes hostapd with -P.
+hostapd_live() {
+    if [ -n "$HOSTAPD_PID" ]; then
+        [ -s "$HOSTAPD_PID" ] || return 1
+        pid=$(sed -n '1p' "$HOSTAPD_PID")
+        case "$pid" in *[!0-9]*|'') return 1 ;; esac
+        kill -0 "$pid" 2>/dev/null || return 1
+        # The live pid must still be hostapd, not a recycled pid.
+        [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = hostapd ] || return 1
+        return 0
+    fi
+    for comm in /proc/[0-9]*/comm; do
+        [ -r "$comm" ] || continue
+        name=$(cat "$comm" 2>/dev/null) || continue
+        [ "$name" = hostapd ] || continue
+        pid=${comm#/proc/}
+        pid=${pid%/comm}
+        cmdline=/proc/$pid/cmdline
+        [ -r "$cmdline" ] || continue
+        args=$(tr '\0' ' ' <"$cmdline" 2>/dev/null) || continue
+        case "$args" in
+            *"$IFACE"*|*hostapd.conf*) return 0 ;;
+        esac
+    done
+    return 1
+}
+if ! hostapd_live; then
+    printf 'unavailable: hostapd-not-running:%s\n' "$IFACE" >&2
+    exit 1
+fi
+# The DHCP/DNS side must own a live incarnation.  dnsmasq runs --no-daemon, so
+# check for a live process serving the recovery config; an explicit pidfile is
+# honoured when the deployment daemonizes.
+dhcp_live() {
+    if [ -n "$DHCP_PID" ]; then
+        [ -s "$DHCP_PID" ] || return 1
+        pid=$(sed -n '1p' "$DHCP_PID")
+        case "$pid" in *[!0-9]*|'') return 1 ;; esac
+        kill -0 "$pid" 2>/dev/null
+        return $?
+    fi
+    for cmdline in /proc/[0-9]*/cmdline; do
+        [ -r "$cmdline" ] || continue
+        args=$(tr '\0' ' ' <"$cmdline" 2>/dev/null) || continue
+        case "$args" in
+            *dnsmasq*"$DHCP_CONF"*) return 0 ;;
+        esac
+    done
+    return 1
+}
+if ! dhcp_live; then
+    printf 'unavailable: dhcp-not-running:%s\n' "$DHCP_CONF" >&2
+    exit 1
+fi
+# ...and the interface must actually carry the AP address.  Match the inet
+# field exactly (the address before the '/prefix'), never a substring: a
+# prefix collision such as 192.168.4.10/24 must not satisfy 192.168.4.1.
+if ! "$IP" addr show dev "$IFACE" 2>/dev/null |
+        sed -n 's/^[[:space:]]*inet[[:space:]]\+\([^/[:space:]]*\).*/\1/p' |
+        grep -qxF "$AP_ADDRESS"; then
+    printf 'unavailable: interface-address-missing:%s\n' "$IFACE" >&2
+    exit 1
+fi
+
+printf 'available: ap-ready:%s\n' "$IFACE"
+exit 0

@@ -1,0 +1,72 @@
+{
+  "name": "libreecho-recovery-ap",
+  "description": "Pinned static dependencies for the MT8163 recovery access point.",
+  "components": {
+    "hostapd": {
+      "version": "2.10",
+      "license": "BSD-3-Clause",
+      "source_url": "https://w1.fi/releases/hostapd-2.10.tar.gz",
+      "source_sha256": "206e7c799b678572c2e3d12030238784bc4a9f82323b0156b4c9466f1498915d",
+      "source_license": "COPYING",
+      "artifact": "hostapd"
+    },
+    "dnsmasq": {
+      "version": "2.90",
+      "license": "GPL-2.0-or-3.0",
+      "source_url": "https://thekelleys.org.uk/dnsmasq/dnsmasq-2.90.tar.xz",
+      "source_sha256": "8e50309bd837bfec9649a812e066c09b6988b73d749b7d293c06c57d46a109e4",
+      "source_license": "COPYING",
+      "source_license_secondary": "COPYING-v3",
+      "artifact": "dnsmasq"
+    },
+    "iw": {
+      "version": "5.19",
+      "license": "ISC",
+      "source_url": "https://mirrors.edge.kernel.org/pub/software/network/iw/iw-5.19.tar.gz",
+      "source_sha256": "2a44676d28a87bbc232903d5d573e7618e4fae0cea3a1aff067a26fa66652b75",
+      "source_license": "COPYING",
+      "artifact": "iw"
+    }
+  },
+  "build_dependencies": {
+    "libnl": {
+      "version": "3.11.0",
+      "license": "LGPL-2.1-only",
+      "source_url": "https://github.com/thom311/libnl/releases/download/libnl3_11_0/libnl-3.11.0.tar.gz",
+      "source_sha256": "2a56e1edefa3e68a7c00879496736fdbf62fc94ed3232c0baba127ecfa76874d",
+      "source_license": "COPYING",
+      "role": "netlink transport for hostapd (CONFIG_LIBNL32) and iw; built static, not staged into the image"
+    }
+  },
+  "first_party": {
+    "libreecho-recovery-button": {
+      "license": "GPL-2.0-only",
+      "source_url": "https://github.com/aslater3/LibreEcho-Platform",
+      "source_path": "tools/mt8163-arm32/recovery-ap/libreecho-recovery-button.c",
+      "artifact": "libreecho-recovery-button"
+    }
+  },
+  "on_image": {
+    "license_root": "usr/local/share/licenses/libreecho-core",
+    "notice": "THIRD_PARTY_NOTICES.md",
+    "licenses": {
+      "hostapd": ["hostapd-2.10-COPYING.txt"],
+      "dnsmasq": ["dnsmasq-2.90-COPYING.txt", "dnsmasq-2.90-COPYING-v3.txt"],
+      "iw": ["iw-5.19-COPYING.txt"]
+    }
+  },
+  "source_offer": {
+    "description": "Corresponding-source offer for the GPL-family binaries the recovery image redistributes.",
+    "components": ["dnsmasq"],
+    "statement": "The complete corresponding source for the GPL-licensed dnsmasq binary is the pinned upstream archive recorded under components.dnsmasq (source_url + source_sha256). That archive, plus the pinned libnl build input, is the source that produces the shipped binary; the builder refuses to run when a GPL component is pinned here without this offer. The first-party libreecho-recovery-button detector corresponds to its source at first_party.libreecho-recovery-button.source_path in the LibreEcho-Platform repository (GPL-2.0-only)."
+  },
+  "notes": [
+    "Hashes were computed from the real upstream archives at the pinned URLs; the builder re-verifies them and fails closed on any mismatch or missing artifact.",
+    "Each component names its licence and the licence file that must exist inside the verified upstream source tree; the builder checks that file after extraction and fails closed when it is absent.",
+    "hostapd is dual BSD-3-Clause/GPL-2.0; LibreEcho uses the BSD-3-Clause terms.",
+    "dnsmasq ships both GPL-2.0 (COPYING) and GPL-3.0 (COPYING-v3) texts; it is distributed under either, and its corresponding source offer is recorded in the source_offer block.",
+    "iw depends on libnl for its netlink transport, which Platform already pins for wpa_supplicant (libnl 3.11.0).",
+    "hostapd is built with CONFIG_CRYPTO=internal and CONFIG_TLS=internal so no OpenSSL/crypto library is required; its only external dependency is the pinned libnl.",
+    "libnl is declared under build_dependencies: it is verified like the components but consumed as a static build input, not staged into the recovery image."
+  ]
+}

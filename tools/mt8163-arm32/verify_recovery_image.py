@@ -54,7 +54,7 @@ WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-INIT_SHA256 = "b470ad375673f1eff4f9071d4782f79afc45264f1f86af1169edc62e84ed4b85"
+INIT_SHA256 = "b9cb2d1075138259e44cf3fc67d3dc32ac9ca5a85ca719ec48c075525f23ca1d"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -62,6 +62,10 @@ OVERLAY_FILES = {
     "init.rc": 0o644,
     "init.recovery.mt8163.rc": 0o644,
     "libreecho-init": 0o755,
+    "libreecho-recovery-ap-probe": 0o755,
+    "libreecho-recovery-ap-ready": 0o755,
+    "libreecho-recovery-net-up": 0o755,
+    "libreecho-recovery-net-down": 0o755,
     "libreecho-mdnsd": 0o755,
     "libreecho-reconcile-features": 0o755,
     "libreecho-data-cleanup": 0o755,
@@ -79,6 +83,10 @@ OVERLAY_FILES = {
 OVERLAY_TARGETS = {
     "profile": "etc/profile",
     "libreecho-mdnsd": "etc/init.d/libreecho-mdnsd.init",
+    "libreecho-recovery-ap-probe": "usr/local/sbin/libreecho-recovery-ap-probe",
+    "libreecho-recovery-ap-ready": "usr/local/sbin/libreecho-recovery-ap-ready",
+    "libreecho-recovery-net-up": "usr/local/sbin/libreecho-recovery-net-up",
+    "libreecho-recovery-net-down": "usr/local/sbin/libreecho-recovery-net-down",
     "libreecho-reconcile-features": "usr/local/sbin/libreecho-reconcile-features",
     "libreecho-data-cleanup": "usr/local/sbin/libreecho-data-cleanup",
     "libreecho-vendor-import": "usr/local/sbin/libreecho-vendor-import",
@@ -98,6 +106,31 @@ OVERLAY_TARGETS = {
     "regulatory.db": "lib/firmware/regulatory.db",
     "regulatory.db.p7s": "lib/firmware/regulatory.db.p7s",
 }
+# Pinned recovery access-point bundle (issue #96).  The shell probes and the
+# interface helpers ship via the overlay; hostapd/dnsmasq/iw and the compiled
+# evdev button detector ship as hash-pinned components staged by
+# build_recovery_image.py --recovery-ap-binaries/--recovery-ap-metadata.
+RECOVERY_AP_COMPONENTS = {
+    "hostapd": "usr/local/sbin/hostapd",
+    "dnsmasq": "usr/local/sbin/dnsmasq",
+    "iw": "usr/local/sbin/iw",
+    "libreecho-recovery-button": "usr/local/sbin/libreecho-recovery-button",
+}
+RECOVERY_AP_OVERLAY = {
+    "ap_probe": "usr/local/sbin/libreecho-recovery-ap-probe",
+    "ready_probe": "usr/local/sbin/libreecho-recovery-ap-ready",
+    "net_up": "usr/local/sbin/libreecho-recovery-net-up",
+    "net_down": "usr/local/sbin/libreecho-recovery-net-down",
+}
+RECOVERY_AP_MARKER = "/run/libreecho/recovery-mode"
+RECOVERY_AP_METADATA = "etc/libreecho/recovery-ap-binaries.json"
+RECOVERY_AP_METADATA_SCHEMA = "libreecho-recovery-ap-binaries/v1"
+# The checked-in pin document the on-image metadata must agree with.  The
+# metadata is a self-declared JSON document, so the verifier refuses any
+# component whose name/version/source URL/source SHA-256/licence does not match
+# this file; a hand-written document cannot pass off an unlisted component.
+RECOVERY_AP_LOCK_PATH = Path(__file__).resolve().parent / "recovery-ap" / "SOURCE.lock"
+RECOVERY_AP_LICENSE_ROOT = "usr/local/share/licenses/libreecho-core"
 SSH_MEMBER_NAMES = {
     "sbin/dropbear", "sbin/dropbearkey", "usr/bin/scp", "etc/passwd", "etc/group",
     "etc/shells", "etc/init.d/libreecho-ssh.init",
@@ -2072,7 +2105,243 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
             fail(f"non-ARM32 ELF member {name}: {info[:2]}")
     validate_ssh(entries, manifest, expected_dropbear_sha256,
                  expected_dropbearkey_sha256, expected_scp_sha256)
-    return validate_connectivity(entries, manifest, schema_version)
+    connectivity_ok = validate_connectivity(entries, manifest, schema_version)
+    validate_recovery_ap(entries, manifest)
+    return connectivity_ok
+
+
+def load_recovery_ap_lock() -> dict[str, Any]:
+    """Read and structurally validate the checked-in recovery-AP SOURCE.lock."""
+    path = RECOVERY_AP_LOCK_PATH
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit(f"ERROR: recovery-AP SOURCE.lock is unavailable: {path}")
+    try:
+        lock = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"ERROR: recovery-AP SOURCE.lock is not valid JSON: {exc}") from exc
+    if not isinstance(lock, dict):
+        raise SystemExit("ERROR: recovery-AP SOURCE.lock is not a JSON object")
+    components = lock.get("components")
+    first_party = lock.get("first_party")
+    if not isinstance(components, dict) or not isinstance(first_party, dict):
+        raise SystemExit("ERROR: recovery-AP SOURCE.lock lacks component records")
+    if set(components) | set(first_party) != set(RECOVERY_AP_COMPONENTS):
+        raise SystemExit("ERROR: recovery-AP SOURCE.lock does not describe the pinned set")
+    return lock
+
+
+def validate_recovery_ap_source_lock(provenance: dict[str, Any],
+                                     source_offer: object) -> None:
+    """Bind the on-image metadata provenance to the checked-in SOURCE.lock.
+
+    The metadata is a self-declared document staged by whichever build produced
+    it, so it is only trustworthy when every component's name, version, https
+    source URL, source SHA-256, licence and on-image licence copies match the
+    repository's ``recovery-ap/SOURCE.lock``.  A metadata document written for an
+    arbitrary binary is refused.
+    """
+    lock = load_recovery_ap_lock()
+    components = lock["components"]
+    first_party = lock["first_party"]
+    on_image = lock.get("on_image")
+    on_image_licenses = on_image.get("licenses") if isinstance(on_image, dict) else None
+    if not isinstance(on_image_licenses, dict):
+        on_image_licenses = {}
+
+    for name, record in components.items():
+        entry = provenance.get(name)
+        if not isinstance(entry, dict):
+            raise SystemExit(f"ERROR: recovery-AP metadata provenance is missing for {name}")
+        for field in ("version", "license", "source_url", "source_sha256",
+                      "source_license", "artifact"):
+            if entry.get(field) != record.get(field):
+                raise SystemExit(
+                    f"ERROR: recovery-AP metadata {field} does not match SOURCE.lock: {name}"
+                )
+        if record.get("source_license_secondary") and (
+                entry.get("source_license_secondary") != record["source_license_secondary"]):
+            raise SystemExit(
+                f"ERROR: recovery-AP metadata secondary licence does not match SOURCE.lock: {name}"
+            )
+        if entry.get("image_path") != RECOVERY_AP_COMPONENTS[name]:
+            raise SystemExit(
+                f"ERROR: recovery-AP metadata image path does not match the pinned target: {name}"
+            )
+        if list(entry.get("image_license", [])) != list(on_image_licenses.get(name, [])):
+            raise SystemExit(
+                f"ERROR: recovery-AP metadata on-image licences do not match SOURCE.lock: {name}"
+            )
+
+    for name, record in first_party.items():
+        entry = provenance.get(name)
+        if not isinstance(entry, dict):
+            raise SystemExit(f"ERROR: recovery-AP metadata provenance is missing for {name}")
+        for field in ("license", "source_url", "source_path", "artifact"):
+            if entry.get(field) != record.get(field):
+                raise SystemExit(
+                    f"ERROR: recovery-AP metadata {field} does not match SOURCE.lock: {name}"
+                )
+        if entry.get("image_path") != RECOVERY_AP_COMPONENTS[name]:
+            raise SystemExit(
+                f"ERROR: recovery-AP metadata image path does not match the pinned target: {name}"
+            )
+
+    lock_offer = lock.get("source_offer")
+    if not isinstance(lock_offer, dict) or not isinstance(source_offer, dict):
+        raise SystemExit("ERROR: recovery-AP metadata has no source offer to bind to SOURCE.lock")
+    if sorted(source_offer.get("components", [])) != sorted(lock_offer.get("components", [])):
+        raise SystemExit("ERROR: recovery-AP source-offer components do not match SOURCE.lock")
+    if (str(source_offer.get("statement", "")).strip() !=
+            str(lock_offer.get("statement", "")).strip()):
+        raise SystemExit("ERROR: recovery-AP source-offer statement does not match SOURCE.lock")
+    if (str(source_offer.get("description", "")).strip() !=
+            str(lock_offer.get("description", "")).strip()):
+        raise SystemExit("ERROR: recovery-AP source-offer description does not match SOURCE.lock")
+
+
+def validate_recovery_ap(entries: dict[str, Entry], manifest: dict[str, object]) -> None:
+    """Verify the pinned recovery-AP bundle and its interface helpers.
+
+    When the bundle is disabled no component binary may be present.  When it is
+    enabled every compiled component (hostapd, dnsmasq, iw and the compiled
+    evdev button detector) must be present as a static ARM32 ELF whose bytes
+    match the hash the manifest recorded and the staged metadata file, and the
+    overlay probes/interface helpers must ship at their pinned paths.  The
+    button detector is pinned here, not accepted as "a shell file exists".
+    """
+    record = manifest.get("recovery_ap", {"enabled": False})
+    if not isinstance(record, dict) or not isinstance(record.get("enabled"), bool):
+        fail("recovery-AP manifest record is malformed")
+    assert isinstance(record, dict)
+
+    if not record["enabled"]:
+        present = sorted(
+            path for path in RECOVERY_AP_COMPONENTS.values() if path in entries
+        )
+        if present or RECOVERY_AP_METADATA in entries:
+            fail(f"recovery-AP bundle is disabled but members are present: {present}")
+        return
+
+    for key, relative in RECOVERY_AP_OVERLAY.items():
+        if record.get(key) != f"/{relative}":
+            fail(f"recovery-AP manifest {key} path mismatch")
+        if relative not in entries:
+            fail(f"recovery-AP interface helper missing: {relative}")
+        entry = entries[relative]
+        if not stat.S_ISREG(entry.mode) or stat.S_IMODE(entry.mode) != 0o755:
+            fail(f"recovery-AP interface helper mode mismatch: {relative}")
+    if record.get("marker") != RECOVERY_AP_MARKER:
+        fail("recovery-AP marker path mismatch")
+    if record.get("button_detector") != (
+        "/" + RECOVERY_AP_COMPONENTS["libreecho-recovery-button"]
+    ):
+        fail("recovery-AP button detector path mismatch")
+
+    components = record.get("components")
+    if not isinstance(components, dict) or set(components) != set(RECOVERY_AP_COMPONENTS):
+        fail("recovery-AP component inventory does not match the pinned set")
+    assert isinstance(components, dict)
+    for name, relative in RECOVERY_AP_COMPONENTS.items():
+        spec = components[name]
+        if (not isinstance(spec, dict) or spec.get("path") != f"/{relative}" or
+                spec.get("mode") != "0755"):
+            fail(f"recovery-AP component path/mode mismatch: {name}")
+        if relative not in entries:
+            fail(f"recovery-AP component missing from initramfs: {relative}")
+        entry = entries[relative]
+        if not stat.S_ISREG(entry.mode) or stat.S_IMODE(entry.mode) != 0o755:
+            fail(f"recovery-AP component mode mismatch: {name}")
+        if sha256(entry.data) != spec.get("sha256") or len(entry.data) != spec.get("size"):
+            fail(f"recovery-AP component identity mismatch: {name}")
+        info = elf_info(entry.data)
+        if info is None:
+            fail(f"recovery-AP component is not an ELF: {name}")
+        assert info is not None
+        if info[0] != 1 or info[1] != 40:
+            fail(f"recovery-AP component is not ARM32 ELF: {name}")
+        if info[2] != 0x05000400 or info[3] is not None or info[4] != () or info[5]:
+            fail(f"recovery-AP component is not a static EABI5 binary: {name}")
+
+    metadata_entry = entries.get(RECOVERY_AP_METADATA)
+    if metadata_entry is None:
+        fail("recovery-AP staged metadata is missing")
+    assert metadata_entry is not None
+    metadata_record = record.get("metadata")
+    if (not isinstance(metadata_record, dict) or
+            metadata_record.get("path") != f"/{RECOVERY_AP_METADATA}" or
+            metadata_record.get("sha256") != sha256(metadata_entry.data) or
+            metadata_record.get("size") != len(metadata_entry.data) or
+            metadata_record.get("mode") != "0644"):
+        fail("recovery-AP metadata manifest record mismatch")
+    metadata: object = None
+    try:
+        metadata = json.loads(metadata_entry.data.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        fail("recovery-AP metadata is not valid JSON")
+    binaries = metadata.get("binaries") if isinstance(metadata, dict) else None
+    if not isinstance(binaries, dict) or set(binaries) != set(RECOVERY_AP_COMPONENTS):
+        fail("recovery-AP metadata binaries do not match the pinned set")
+    assert isinstance(binaries, dict)
+    for name in RECOVERY_AP_COMPONENTS:
+        record_hash = binaries[name].get("sha256") if isinstance(binaries[name], dict) else None
+        if record_hash != sha256(entries[RECOVERY_AP_COMPONENTS[name]].data):
+            fail(f"recovery-AP metadata hash mismatch: {name}")
+
+    # The staged metadata is the on-image attribution: it must carry the licence,
+    # source, and corresponding-source offer for every redistributed binary, not
+    # just their hashes.  A disabled bundle carries neither, so this runs only
+    # for an enabled one.
+    if not isinstance(metadata, dict) or metadata.get("schema") != RECOVERY_AP_METADATA_SCHEMA:
+        fail("recovery-AP metadata schema is not the pinned contract")
+    assert isinstance(metadata, dict)
+    provenance = metadata.get("components")
+    if not isinstance(provenance, dict) or set(provenance) != set(RECOVERY_AP_COMPONENTS):
+        fail("recovery-AP metadata carries no provenance for the pinned set")
+    assert isinstance(provenance, dict)
+    offer = metadata.get("source_offer")
+    if not isinstance(offer, dict) or not str(offer.get("statement", "")).strip():
+        fail("recovery-AP metadata carries no corresponding-source statement")
+    assert isinstance(offer, dict)
+    offer_components = offer.get("components")
+    offered = set(offer_components) if isinstance(offer_components, list) else set()
+    for name, relative in RECOVERY_AP_COMPONENTS.items():
+        record = provenance[name]
+        if not isinstance(record, dict):
+            fail(f"recovery-AP metadata provenance is malformed: {name}")
+        assert isinstance(record, dict)
+        licence = record.get("license")
+        source_url = record.get("source_url")
+        if not isinstance(licence, str) or not licence.strip():
+            fail(f"recovery-AP metadata provenance declares no licence: {name}")
+        assert isinstance(licence, str)
+        if not isinstance(source_url, str) or not source_url.startswith("https://"):
+            fail(f"recovery-AP metadata provenance has no https source URL: {name}")
+        if record.get("image_path") != relative:
+            fail(f"recovery-AP metadata provenance image path mismatch: {name}")
+        source_path = record.get("source_path")
+        if not (isinstance(source_path, str) and source_path):
+            source_sha = record.get("source_sha256")
+            if not isinstance(source_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", source_sha):
+                fail(f"recovery-AP metadata provenance has no pinned source SHA-256: {name}")
+            if not isinstance(record.get("source_license"), str) or not record["source_license"]:
+                fail(f"recovery-AP metadata provenance names no licence file: {name}")
+            image_license = record.get("image_license")
+            if not isinstance(image_license, list) or not image_license:
+                fail(f"recovery-AP metadata provenance names no on-image licence copy: {name}")
+            assert isinstance(image_license, list)
+            for licence_name in image_license:
+                if not isinstance(licence_name, str) or not licence_name:
+                    fail(f"recovery-AP metadata provenance has a malformed licence name: {name}")
+                staged = f"{RECOVERY_AP_LICENSE_ROOT}/{licence_name}"
+                if staged not in entries:
+                    fail(f"recovery-AP on-image licence copy is missing: {staged}")
+            if "GPL" in licence and name not in offered:
+                fail(f"recovery-AP GPL component has no corresponding-source offer: {name}")
+
+    # The attribution above is self-declared by the staged document; bind it to
+    # the repository's checked-in pins so an image cannot claim a component the
+    # SOURCE.lock does not list, or altered version/URL/source-hash/licence.
+    validate_recovery_ap_source_lock(provenance, offer)
 
 
 def system_map_physical_end(path: Path) -> int:

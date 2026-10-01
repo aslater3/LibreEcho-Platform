@@ -58,6 +58,48 @@ recorded in `COMPONENTS.json`, the image manifest, and the release SPDX SBOM.
   and produced archive hashes are recorded in
   `tools/mt8163-arm32/mbedtls/SOURCE.lock` and `mbedtls-3.6.4-NOTICE.txt`.
   No dynamic Mbed TLS library is shipped.
+- **libogg 1.3.5 / libopus 1.4 / libopusfile 0.12** — BSD-3-Clause (Xiph.Org).
+  The release rebuilds the pinned static, HTTP/TLS-free ARM32 Opus decode stack
+  from the upstream release archives and links it into `libreecho-radiod` for
+  Ogg Opus radio playback. `libopusfile` is compiled from its four local-file
+  sources only, so the `op_open_url`/`op_http_*` API and its libcurl/OpenSSL
+  dependencies are absent by construction. The source-archive SHA-256 values,
+  build contract, and produced archive hashes are recorded in
+  `tools/mt8163-arm32/ui/opus/SOURCE.lock`; the verbatim licences accompany this
+  bundle as `libogg-1.3.5-COPYING.txt`, `opus-1.4-COPYING.txt`, and
+  `opusfile-0.12-COPYING.txt`, and are also installed into the built prefix's
+  `licenses/` directory.
+
+## Recovery access point
+
+The recovery access point redistributes compiled, statically linked third-party
+binaries. Their pins, SHA-256 values, licences and corresponding-source offer
+are recorded in `tools/mt8163-arm32/recovery-ap/SOURCE.lock`; the builder
+(`build_recovery_ap.sh`) verifies each pinned archive, the licence text inside
+each extracted source tree, and the GPL offer before it compiles, and emits
+`recovery-ap-binaries.json` binding each shipped binary to its hash, licence and
+source. The image stages that metadata at
+`/etc/libreecho/recovery-ap-binaries.json`.
+
+- **hostapd 2.10** — BSD-3-Clause. `tools/mt8163-arm32/recovery-ap/SOURCE.lock`
+  records the pinned upstream archive
+  `https://w1.fi/releases/hostapd-2.10.tar.gz`; the verbatim licence accompanies
+  this bundle as `hostapd-2.10-COPYING.txt`.
+- **dnsmasq 2.90** — GPL-2.0-or-3.0. The complete corresponding source for the
+  redistributed `dnsmasq` binary is the pinned upstream archive
+  `https://thekelleys.org.uk/dnsmasq/dnsmasq-2.90.tar.xz`
+  (SHA-256 `8e50309bd837bfec9649a812e066c09b6988b73d749b7d293c06c57d46a109e4`),
+  as recorded in the `source_offer` block of that SOURCE.lock; the builder
+  refuses to build a GPL component without it. The verbatim licences accompany
+  this bundle as `dnsmasq-2.90-COPYING.txt` (GPL-2.0) and
+  `dnsmasq-2.90-COPYING-v3.txt` (GPL-3.0).
+- **iw 5.19** — ISC. The pinned upstream archive
+  `https://mirrors.edge.kernel.org/pub/software/network/iw/iw-5.19.tar.gz`; the
+  verbatim licence accompanies this bundle as `iw-5.19-COPYING.txt`.
+- **libreecho-recovery-button** — GPL-2.0-only. The first-party compiled evdev
+  action-button detector is built from
+  `tools/mt8163-arm32/recovery-ap/libreecho-recovery-button.c` in this
+  repository; its corresponding source is the LibreEcho-Platform repository.
 
 ## Compiler/runtime closure
 

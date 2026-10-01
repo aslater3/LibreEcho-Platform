@@ -498,9 +498,27 @@ class RadarTreeDiffTests(unittest.TestCase):
     while file writes, BusyBox applets, manifests and the complete tree are real.
     """
     BASE = '2715c573c15f982555b6b48264d75d468cf3af08'
+    # Release base staged-tree amendments.  The first five are the release
+    # multi-target identity/OTA contract; the recovery-AP helpers and the
+    # libreecho-core licence set below are the batch integration's reviewed
+    # additions (recovery-AP shell probes plus the Opus/recovery-AP licence
+    # copies), which the combined tree necessarily stages on top of the base.
     ALLOWED = {'etc/libreecho/target', 'usr/local/sbin/libreecho-update',
                'usr/local/sbin/libreecho-feature-transaction', 'init', 'libreecho-init',
-               'usr/local/sbin/libreecho-bootctl'}
+               'usr/local/sbin/libreecho-bootctl',
+               'usr/local/sbin/libreecho-recovery-ap-probe',
+               'usr/local/sbin/libreecho-recovery-ap-ready',
+               'usr/local/sbin/libreecho-recovery-net-up',
+               'usr/local/sbin/libreecho-recovery-net-down',
+               'usr/local/share/licenses/libreecho-core/COMPONENTS.json',
+               'usr/local/share/licenses/libreecho-core/THIRD_PARTY_NOTICES.md',
+               'usr/local/share/licenses/libreecho-core/dnsmasq-2.90-COPYING.txt',
+               'usr/local/share/licenses/libreecho-core/dnsmasq-2.90-COPYING-v3.txt',
+               'usr/local/share/licenses/libreecho-core/hostapd-2.10-COPYING.txt',
+               'usr/local/share/licenses/libreecho-core/iw-5.19-COPYING.txt',
+               'usr/local/share/licenses/libreecho-core/opus-1.4-COPYING.txt',
+               'usr/local/share/licenses/libreecho-core/libogg-1.3.5-COPYING.txt',
+               'usr/local/share/licenses/libreecho-core/opusfile-0.12-COPYING.txt'}
     # Separately reviewed ESPHome satellite change (Platform #212), pinned to
     # its exact reviewed bytes rather than widening the multi-target allowlist.
     ESPHOME_COMMIT = '37de1c11109453194ce6170f360450f887a615d4'

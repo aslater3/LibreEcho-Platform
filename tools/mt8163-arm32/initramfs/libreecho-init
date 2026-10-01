@@ -919,6 +919,60 @@ log wmt-nodes-created
 # The web UI still reports the board's address beside the one in use, which is
 # what makes the difference visible.
 
+# Issue #96 recovery-boot coordination.  The physical recovery detector arms a
+# boot-scoped marker before the boot-path Wi-Fi worker starts, and while the
+# marker is present the recovery access point owns the single radio for the
+# whole boot.  The worker may still load the driver -- that is what creates
+# wlan0 for the AP capability probe and for hostapd -- but it must never start
+# the client supplicant: networkd's handover helper stops the client service
+# through its pidfile, and if this worker had not started it yet the stop is a
+# no-op while the worker then starts wpa_supplicant against hostapd.  The
+# marker is created before this worker is launched, so the check is
+# deterministic rather than a race.  An ordinary boot (no marker) is unchanged.
+recovery_owns_radio()
+{
+    [ -f "${PHYSICAL_RECOVERY_MARKER:-/run/libreecho/recovery-mode}" ]
+}
+
+# Issue #96 recovery-boot service ordering.  While the recovery marker is
+# present the access point owns the single radio, and the boot-path Wi-Fi worker
+# (start_wifi_network_sequence) is still loading WMT and waiting for wlan0 when
+# the UI service graph starts.  networkd's AP capability probe runs as it starts
+# and, if wlan0 does not exist yet, reports the interface absent and the portal
+# stays unavailable for the whole boot.  The worker therefore records a
+# boot-scoped marker once wlan0 exists, and the service graph waits for it --
+# bounded -- before starting networkd.  An ordinary boot has no recovery marker,
+# so recovery_owns_radio is false and this is a no-op: the service ordering on
+# an ordinary boot is unchanged.
+RECOVERY_WLAN0_MARKER=${RECOVERY_WLAN0_MARKER:-/run/libreecho/wlan0-ready}
+RECOVERY_WIFI_FAILED_MARKER=${RECOVERY_WIFI_FAILED_MARKER:-/run/libreecho/wifi-worker-failed}
+# The bound must cover the worker's complete worst-case sequence -- the 1s
+# stale-launcher settle, the 1s responder settle, up to 30s for the one-shot
+# function-on write, up to 10s waiting for the one-shot responder to exit, and
+# up to 30s waiting for wlan0 registration (72s in total) -- so a slower but
+# successful initialization is still waited for instead of being rejected as a
+# radio failure.  The wait also synchronizes on the worker's terminal outcome
+# markers: it returns as soon as the worker has finished, either the ready
+# marker (success) or the failure marker the worker records on a terminal
+# failure, and it never reports success for a worker that failed or timed out.
+RECOVERY_RADIO_WAIT=${RECOVERY_RADIO_WAIT:-90}
+recovery_radio_ready_wait()
+{
+    recovery_owns_radio || return 0
+    waited=0
+    while [ "$waited" -lt "$RECOVERY_RADIO_WAIT" ]; do
+        [ -f "$RECOVERY_WLAN0_MARKER" ] && return 0
+        if [ -f "$RECOVERY_WIFI_FAILED_MARKER" ]; then
+            log recovery-radio-ready-failed
+            return 1
+        fi
+        $BB sleep 1
+        waited=$((waited + 1))
+    done
+    log recovery-radio-ready-timeout
+    return 1
+}
+
 start_wifi_network_sequence()
 {
     packaged_wifi=/etc/wifi/wpa_supplicant.conf
@@ -950,8 +1004,40 @@ start_wifi_network_sequence()
         wifi_profile=$packaged_wifi
         log wifi-packaged-profile-selected
     fi
-    [ -n "$wifi_profile" ] || { log wifi-profile-absent; return 2; }
-    log wifi-profile-present
+    # A recovery boot owns the radio for the access point and never starts the
+    # client supplicant, so it must not require a client profile to exist: a
+    # fresh device with no /data and no packaged profile is the normal recovery
+    # case, and the WMT initialization below must still run because that is
+    # what creates wlan0 for the AP capability probe and hostapd.  An ordinary
+    # boot still needs the profile for the client start and refuses to activate
+    # the radio without one.
+    if [ -z "$wifi_profile" ] && ! recovery_owns_radio; then
+        log wifi-profile-absent
+        return 2
+    fi
+    if [ -n "$wifi_profile" ]; then
+        log wifi-profile-present
+    else
+        log wifi-profile-absent-recovery-boot
+    fi
+    # Persist the selected profile path for the recovery handover.  networkd's
+    # libreecho-recovery-net-down restarts the client service after the portal
+    # is torn down, and it does so without this boot's environment; without the
+    # recorded path it would fall back to the packaged /etc/wifi profile and the
+    # restored client could associate with the wrong config.  Boot-scoped tmpfs,
+    # written before the client start and before the recovery-boot suppression
+    # below, so the handover has the path on both paths.
+    WIFI_PROFILE_STATE=/run/libreecho/wifi-client.conf
+    if [ -n "$wifi_profile" ]; then
+        if $BB mkdir -p /run/libreecho 2>/dev/null &&
+            printf '%s\n' "$wifi_profile" > "$WIFI_PROFILE_STATE" 2>/dev/null; then
+            $BB chmod 0700 /run/libreecho 2>/dev/null
+            $BB chmod 0600 "$WIFI_PROFILE_STATE" 2>/dev/null
+            log wifi-profile-recorded
+        else
+            log wifi-profile-record-failed
+        fi
+    fi
     # This is the proven manual choreography from session e8c21eb3bbae:
     # stock-compatible configure-only init, stale-launcher cleanup, exactly one
     # one-shot command responder, then one timed Wi-Fi function-on write.  Do
@@ -1010,6 +1096,22 @@ start_wifi_network_sequence()
         i=$((i + 1))
     done
     [ -e /sys/class/net/wlan0 ] || { log wlan0-registration-timeout; return 1; }
+    # wlan0 now exists: record the boot-scoped radio-ready marker the recovery
+    # service graph waits on before it starts networkd (see
+    # recovery_radio_ready_wait).  Harmless on an ordinary boot.
+    if $BB mkdir -p /run/libreecho 2>/dev/null &&
+        : > "$RECOVERY_WLAN0_MARKER" 2>/dev/null; then
+        log wlan0-ready-recorded
+    else
+        log wlan0-ready-record-failed
+    fi
+    # Recovery boot: the driver is up and wlan0 exists for the AP probe and
+    # hostapd, but the portal owns the radio, so never start the client
+    # supplicant here (see recovery_owns_radio above).
+    if recovery_owns_radio; then
+        log wifi-client-suppressed-recovery-boot
+        return 0
+    fi
     WIFI_CONF="$wifi_profile" /sbin/libreecho-wifi start \
         >/tmp/wifi-client.log 2>&1
     client_rc=$?
@@ -1017,11 +1119,30 @@ start_wifi_network_sequence()
     return "$client_rc"
 }
 
+# The recovery service graph's bounded wait (recovery_radio_ready_wait) must
+# return as soon as the single-shot Wi-Fi activation has terminally failed and
+# must report that failure truthfully instead of starting networkd as if the
+# radio were ready.  Record the failing return code in the boot-scoped failure
+# marker once the activation can no longer succeed in this boot.
+wifi_worker_record_failure()
+{
+    $BB mkdir -p /run/libreecho 2>/dev/null || {
+        log wifi-worker-failed-record-failed
+        return 0
+    }
+    if printf '%s\n' "$1" > "$RECOVERY_WIFI_FAILED_MARKER" 2>/dev/null; then
+        log "wifi-worker-failed-recorded:$1"
+    else
+        log wifi-worker-failed-record-failed
+    fi
+}
+
 start_wifi_network()
 {
     if [ "${VENDOR_ASSETS_OK:-0}" -ne 1 ]; then
         printf 'LIBREECHO_WIFI_REJECTED=vendor-assets-unavailable\n' > /tmp/wifi.status
         log wifi-vendor-assets-unavailable
+        wifi_worker_record_failure 4
         return 4
     fi
     # The WMT firmware path is intentionally single-shot per boot.  mkdir is
@@ -1035,6 +1156,7 @@ start_wifi_network()
     wifi_rc=$?
     printf 'LIBREECHO_WIFI_RC=%s\n' "$wifi_rc" > /tmp/wifi.status
     log "wifi-activation-complete:$wifi_rc"
+    [ "$wifi_rc" -eq 0 ] || wifi_worker_record_failure "$wifi_rc"
     return "$wifi_rc"
 }
 
@@ -1079,6 +1201,148 @@ else
     log loopback-config-failed
 fi
 
+# Physical recovery detector (issue #96).  A ~5 s hold of the action button
+# (KEY_HELP, its own gpio-keys node) arms the recovery access point by dropping
+# a boot-scoped tmpfs marker that networkd validates.  The helper is a compiled
+# evdev reader: it reads the kernel's current key bitmap with EVIOCGKEY, so a
+# button already held before this point is detected even though it produces no
+# further key events, and it measures the hold with CLOCK_MONOTONIC rather than
+# trusting event timestamps.  It is bounded end to end: with no held button the
+# helper returns after its short startup no-key window, and a missing helper or
+# input node leaves the boot completely unaffected.  The helper never reboots,
+# writes persistent storage or touches a partition.
+PHYSICAL_RECOVERY_HELPER=${PHYSICAL_RECOVERY_HELPER:-/usr/local/sbin/libreecho-recovery-button}
+PHYSICAL_RECOVERY_MARKER=${PHYSICAL_RECOVERY_MARKER:-/run/libreecho/recovery-mode}
+# Must not cut the detector short: the compiled detector's own absolute cap is
+# 12000 ms (DEFAULT_MAX_MS), so a 5 s hold that begins ~7 s after the probe
+# starts still arms.  With no held button the detector returns after its 2 s
+# no-key window, so this bound costs nothing on an ordinary boot.
+PHYSICAL_RECOVERY_TIMEOUT=${PHYSICAL_RECOVERY_TIMEOUT:-13}
+# KEY_HELP (138) is bit 10 of a key-bitmap word (138 = 128 + 10).
+KEY_HELP_BIT=138
+
+# Resolve the evdev node that carries the physical action button.  The named
+# "Action Key" node is created by build_wifi_dtb.py and may enumerate after an
+# unrelated PMIC/input node (the mute/home keys), so a first miss must NOT fall
+# back to the first evdev device: the compiled detector filters KEY_HELP, and
+# another node would silently observe the wrong key.  Retry the named lookup for
+# the whole bounded window; only when input names are genuinely unavailable fall
+# back to a node whose key capability actually advertises KEY_HELP.
+physical_recovery_input_node()
+{
+    input_class=${PHYSICAL_RECOVERY_INPUT_CLASS:-/sys/class/input}
+    dev_input=${PHYSICAL_RECOVERY_DEV_INPUT:-/dev/input}
+    tries=${PHYSICAL_RECOVERY_NODE_TRIES:-5}
+    node=
+    names_seen=0
+    i=0
+    while [ "$i" -lt "$tries" ]; do
+        for sys_name in "$input_class"/event*/device/name; do
+            [ -r "$sys_name" ] || continue
+            names_seen=1
+            event=${sys_name#"$input_class"/}
+            event=${event%%/*}
+            case "$($BB cat "$sys_name" 2>/dev/null)" in
+                *[Aa]ction*) node=$dev_input/$event ;;
+            esac
+            [ -n "$node" ] && break
+        done
+        [ -n "$node" ] && break
+        i=$((i + 1))
+        [ "$i" -lt "$tries" ] && $BB sleep 1
+    done
+    if [ -z "$node" ] && [ "$names_seen" -eq 0 ]; then
+        node=$(physical_recovery_key_help_node "$input_class" "$dev_input")
+    fi
+    printf '%s\n' "$node"
+}
+
+# A node's key bitmap is a space-separated list of hex words printed by the
+# kernel's input_print_bitmap: it walks the capability words from the highest
+# nonzero word DOWN to word 0, so the LAST token is word 0 and word k is the
+# (k + 1)-th token counted from the end.  KEY_HELP (138) is word 4 bit 10 on
+# the 32-bit layout (138 = 4*32 + 10, printed "400 0 0 0 0") and word 2 bit 10
+# on the 64-bit layout (138 = 2*64 + 10, printed "400 0 0").  A word wider than
+# 8 hex digits can only come from the 64-bit layout; and when fewer than five
+# words are printed the 32-bit KEY_HELP word (word 4) cannot be present at all,
+# so only the 64-bit layout can still carry KEY_HELP.  The relevant bit is the
+# value-4 bit of that word's third-from-last hex digit, which avoids
+# overflow-prone shell arithmetic on the printed value.
+physical_recovery_key_bitmap_has_help()
+{
+    file=$1
+    # shellcheck disable=SC2046
+    set -- $($BB cat "$file" 2>/dev/null)
+    count=$#
+    [ "$count" -gt 0 ] || return 1
+    wide=0
+    for word in "$@"; do
+        case "$word" in
+            ?????????*) wide=1 ;;
+        esac
+    done
+    if [ "$wide" -eq 1 ] || [ "$count" -lt 5 ]; then
+        want=$((count - 1 - 2))
+    else
+        want=$((count - 1 - 4))
+    fi
+    [ "$want" -ge 0 ] || return 1
+    shift "$want"
+    word=$1
+    rest=${word%??}
+    digit=${rest#"${rest%?}"}
+    case "$digit" in
+        [4567cCdDeEfF]) return 0 ;;
+    esac
+    return 1
+}
+
+physical_recovery_key_help_node()
+{
+    input_class=$1
+    dev_input=$2
+    for cap in "$input_class"/event*/device/capabilities/key; do
+        [ -r "$cap" ] || continue
+        event=${cap#"$input_class"/}
+        event=${event%%/*}
+        if physical_recovery_key_bitmap_has_help "$cap"; then
+            printf '%s\n' "$dev_input/$event"
+            return 0
+        fi
+    done
+    printf '%s\n' ''
+    return 0
+}
+
+physical_recovery_probe()
+{
+    [ -x "$PHYSICAL_RECOVERY_HELPER" ] || {
+        log physical-recovery-helper-absent
+        return 0
+    }
+    node=$(physical_recovery_input_node)
+    if [ -z "$node" ]; then
+        log physical-recovery-no-input-node
+        return 0
+    fi
+    $BB mkdir -p /run/libreecho 2>/dev/null
+    $BB chmod 0700 /run/libreecho 2>/dev/null
+    if $BB timeout -k 1 "$PHYSICAL_RECOVERY_TIMEOUT" \
+            "$PHYSICAL_RECOVERY_HELPER" --device "$node" \
+            --marker "$PHYSICAL_RECOVERY_MARKER"; then
+        if [ -f "$PHYSICAL_RECOVERY_MARKER" ]; then
+            log physical-recovery-armed
+            pmsg_marker physical-recovery-armed
+        else
+            log physical-recovery-not-requested
+        fi
+    else
+        log physical-recovery-probe-timeout
+    fi
+    return 0
+}
+physical_recovery_probe
+
 # Connectivity comes up on the boot path, not at the end of init: reachability
 # (OTA, AirPlay, and the OTA health probes that need the network) must not
 # depend on the service graph having started.  This is the single automatic
@@ -1095,6 +1359,11 @@ adb_control_ready=0
 adb_tcp_ready && adb_control_ready=1
 if [ "${VENDOR_ASSETS_OK:-0}" -ne 1 ]; then
     log wifi-network-skipped-vendor-assets-unavailable
+    # VENDOR_ASSETS_OK is fixed by the vendor-assets gate above, and the
+    # single-shot activation refuses the same way, so the radio cannot
+    # initialize this boot.  Record the terminal failure so a recovery boot's
+    # bounded wait fails fast and truthfully instead of waiting out its bound.
+    wifi_worker_record_failure 4
 elif [ "$SERVICE_PROFILE" = diagnostic ]; then
     log wifi-network-policy-manual-single-shot
 elif [ "$adb_control_ready" -eq 1 ]; then
@@ -1564,6 +1833,19 @@ start_ui_services()
     start_shared_discovery_runtime
     log feature-services-deferred-until-staged
     for service in $services; do
+        # On a recovery boot the boot-path Wi-Fi worker may still be creating
+        # wlan0 when this graph starts.  Wait (bounded) for the worker's
+        # terminal outcome before starting networkd so its one-shot AP
+        # capability probe finds wlan0 instead of reporting the interface
+        # absent.  A worker that terminally failed or exceeded the bound is
+        # reported truthfully; the graph still starts networkd, whose other
+        # duties are unaffected.  This is a no-op on an ordinary boot (see
+        # recovery_radio_ready_wait).
+        if [ "$service" = networkd ]; then
+            if ! recovery_radio_ready_wait; then
+                log ui-networkd-radio-unavailable
+            fi
+        fi
         script="/etc/init.d/libreecho-$service.init"
         if [ -x "$script" ]; then
             if [ "$service" = web ] && [ "$SERVICE_PROFILE" = production ]; then

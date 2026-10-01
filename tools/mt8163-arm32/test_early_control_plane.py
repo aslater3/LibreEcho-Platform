@@ -8,6 +8,7 @@ and the network had come up, and because adbd sat behind the expdb and userdata
 waits.
 """
 from pathlib import Path
+import os
 import re
 import shlex
 import shutil
@@ -264,6 +265,463 @@ class EarlyControlPlaneContracts(unittest.TestCase):
         # ADB keeps its operator-triggered activation when the claim is free.
         self.assertIn("wifi_request_loop &", self.init)
         self.assertIn("/tmp/wifi.request", self.init)
+
+    # ------------------------------------------------- recovery-boot coordination
+    def test_recovery_owns_radio_reads_the_boot_marker(self) -> None:
+        start = self.init.index("recovery_owns_radio()")
+        body = self.init[start : self.init.index("\n}\n", start) + len("\n}\n")]
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "recovery-mode"
+            script = (
+                f"PHYSICAL_RECOVERY_MARKER={shlex.quote(str(marker))}\n"
+                + body
+                + "\nif recovery_owns_radio; then echo owned; else echo free; fi\n"
+            )
+            free = subprocess.run(["sh", "-c", script], capture_output=True, text=True)
+            self.assertEqual(free.stdout.strip(), "free", free.stderr)
+            marker.write_text("libreecho-recovery-v1\n")
+            owned = subprocess.run(["sh", "-c", script], capture_output=True, text=True)
+            self.assertEqual(owned.stdout.strip(), "owned", owned.stderr)
+
+    def test_client_start_is_suppressed_on_a_recovery_boot(self) -> None:
+        guard = self.init.index("if recovery_owns_radio; then")
+        client = self.init.index('WIFI_CONF="$wifi_profile" /sbin/libreecho-wifi start')
+        self.assertLess(guard, client)
+        between = self.init[guard:client]
+        self.assertIn("wifi-client-suppressed-recovery-boot", between)
+        self.assertIn("return 0", between)
+        # Exactly one guard, and it sits after the driver bring-up that creates
+        # wlan0, so the AP probe and hostapd still find the interface.
+        self.assertEqual(self.init.count("if recovery_owns_radio; then"), 1)
+        self.assertLess(self.init.index("wlan0-registration-timeout"), guard)
+        # Normal boot is unchanged: the client start is still present exactly
+        # once, not replaced by the suppression.
+        self.assertEqual(
+            self.init.count('WIFI_CONF="$wifi_profile" /sbin/libreecho-wifi start'), 1)
+
+    def test_wifi_profile_is_recorded_before_the_client_start(self) -> None:
+        record = self.init.index("WIFI_PROFILE_STATE=/run/libreecho/wifi-client.conf")
+        guard = self.init.index("if recovery_owns_radio; then")
+        client = self.init.index('WIFI_CONF="$wifi_profile" /sbin/libreecho-wifi start')
+        self.assertLess(record, guard)
+        self.assertLess(record, client)
+        self.assertIn(
+            "printf '%s\\n' \"$wifi_profile\" > \"$WIFI_PROFILE_STATE\"", self.init)
+
+    # ---------------------------------------- recovery-boot radio ordering
+    def test_recovery_boot_waits_for_the_radio_before_networkd(self) -> None:
+        """A recovery boot's service graph must not probe the radio too early.
+
+        The boot-path Wi-Fi worker records a boot-scoped radio-ready marker once
+        wlan0 exists, and the graph waits (bounded) for it before starting
+        networkd -- whose AP capability probe would otherwise report the
+        interface absent during the WMT load / wlan0 wait and leave the portal
+        unavailable for the whole boot.  An ordinary boot has no recovery
+        marker, so the wait is a no-op and the ordering is unchanged.
+        """
+        # The marker can only be recorded after the bounded wlan0 wait, so it
+        # implies the interface exists.
+        wlan0_wait = self.init.index("while [ \"$i\" -lt 30 ] && [ ! -e /sys/class/net/wlan0 ]")
+        marker_default = self.init.index("RECOVERY_WLAN0_MARKER=")
+        recorded = self.init.index("log wlan0-ready-recorded")
+        self.assertLess(wlan0_wait, recorded)
+        self.assertLess(marker_default, recorded)
+        # networkd's start is gated on the wait...
+        ui = self.init.index("start_ui_services()")
+        ui_body = self.init[ui:self.init.index("\n}\n", ui)]
+        gate = ui_body.index('if [ "$service" = networkd ]; then')
+        self.assertIn("recovery_radio_ready_wait", ui_body[gate:])
+        # ...and the wait itself is recovery-gated: an ordinary boot returns
+        # without touching the marker or sleeping.
+        helper = self.init.index("recovery_radio_ready_wait()")
+        helper_body = self.init[helper:self.init.index("\n}\n", helper)]
+        self.assertIn("recovery_owns_radio || return 0", helper_body)
+        self.assertIn("RECOVERY_RADIO_WAIT", helper_body)
+        # The wait synchronizes on the worker's terminal outcome: readiness
+        # succeeds, a recorded terminal failure fails, and neither path may
+        # claim success after the bound expires.
+        self.assertIn("RECOVERY_WIFI_FAILED_MARKER", helper_body)
+        self.assertIn("log recovery-radio-ready-failed", helper_body)
+        # The graph reports an unavailable radio truthfully instead of starting
+        # networkd as if readiness had been proven.
+        self.assertIn("if ! recovery_radio_ready_wait; then", ui_body)
+        self.assertIn("log ui-networkd-radio-unavailable", ui_body)
+
+    def test_recovery_radio_ready_wait_is_bounded_and_recovery_gated(self) -> None:
+        start = self.init.index("recovery_owns_radio()")
+        owns = self.init[start:self.init.index("\n}\n", start) + len("\n}\n")]
+        helper_start = self.init.index("recovery_radio_ready_wait()")
+        helper = self.init[
+            helper_start:self.init.index("\n}\n", helper_start) + len("\n}\n")]
+
+        # The default bound must cover the worker's complete worst-case
+        # sequence: the 1s stale-launcher settle, the 1s responder settle, up
+        # to 30s for the function-on write, up to 10s waiting for the
+        # responder to exit, and up to 30s waiting for wlan0 (72s total).
+        default = re.search(
+            r"RECOVERY_RADIO_WAIT=\$\{RECOVERY_RADIO_WAIT:-([0-9]+)\}",
+            self.init)
+        self.assertIsNotNone(default)
+        bound_default = int(default.group(1)) if default else 0
+        self.assertGreaterEqual(bound_default, 72)
+        # The gate may only report success when the worker recorded readiness.
+        # A terminal worker failure and the bound expiring are truthful
+        # failures, not blind successes.
+        self.assertIn('if [ -f "$RECOVERY_WIFI_FAILED_MARKER" ]; then', helper)
+        failed = helper.index("log recovery-radio-ready-failed")
+        self.assertIn("return 1", helper[failed:])
+        timeout = helper.index("log recovery-radio-ready-timeout")
+        self.assertIn("return 1", helper[timeout:])
+        self.assertNotIn("return 0", helper[timeout:])
+
+        def run_case(recovery_marker: bool, *, bound: int,
+                     ready_marker: bool = False, failed_marker: bool = False,
+                     ready_at: str = "", fail_at: str = ""):
+            """Advance the clock without real sleeping.
+
+            The worker's delayed readiness or terminal failure is published by
+            the accelerated clock at a sleep ordinal, so the whole sequence is
+            exercised with no hardware and no waiting.
+            """
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                recovery = root / "recovery-mode"
+                ready = root / "wlan0-ready"
+                failed = root / "wifi-worker-failed"
+                sleep_log = root / "sleeps"
+                busybox = root / "busybox"
+                busybox.write_text(
+                    "#!/bin/sh\n"
+                    "if [ \"$1\" = sleep ]; then\n"
+                    "  n=$(cat \"$SLEEP_LOG\" 2>/dev/null || printf 0)\n"
+                    "  n=$((n + 1))\n"
+                    "  printf '%s' \"$n\" > \"$SLEEP_LOG\"\n"
+                    "  if [ -n \"${READY_AT:-}\" ] && [ \"$n\" -ge \"$READY_AT\" ]; then\n"
+                    "    : > \"$READY_MARKER_PATH\"\n"
+                    "  fi\n"
+                    "  if [ -n \"${FAIL_AT:-}\" ] && [ \"$n\" -ge \"$FAIL_AT\" ]; then\n"
+                    "    : > \"$FAILED_MARKER_PATH\"\n"
+                    "  fi\n"
+                    "fi\n"
+                    "exit 0\n")
+                busybox.chmod(0o755)
+                if recovery_marker:
+                    recovery.write_text("libreecho-recovery-v1\n")
+                if ready_marker:
+                    ready.touch()
+                if failed_marker:
+                    failed.write_text("2\n")
+                script = (
+                    "PHYSICAL_RECOVERY_MARKER=%s\n"
+                    "RECOVERY_WLAN0_MARKER=%s\n"
+                    "RECOVERY_WIFI_FAILED_MARKER=%s\n"
+                    "RECOVERY_RADIO_WAIT=%d\n"
+                    "BB=%s\n"
+                    "log() { printf 'log:%%s\\n' \"$1\"; }\n"
+                    % (shlex.quote(str(recovery)), shlex.quote(str(ready)),
+                       shlex.quote(str(failed)), bound,
+                       shlex.quote(str(busybox)))
+                    + owns + helper
+                    + "\nrecovery_radio_ready_wait; echo rc=$?\n")
+                env = dict(os.environ)
+                env["SLEEP_LOG"] = str(sleep_log)
+                env["READY_MARKER_PATH"] = str(ready)
+                env["FAILED_MARKER_PATH"] = str(failed)
+                env["READY_AT"] = ready_at
+                env["FAIL_AT"] = fail_at
+                result = subprocess.run(["sh", "-c", script], env=env,
+                                        capture_output=True, text=True)
+                sleeps = int(sleep_log.read_text()) if sleep_log.exists() else 0
+                return result, sleeps
+
+        def rc_of(result):
+            return result.stdout.strip().splitlines()[-1]
+
+        # Ordinary boot: no recovery marker, so the wait is a no-op.
+        result, sleeps = run_case(False, bound=90)
+        self.assertEqual(rc_of(result), "rc=0", result.stderr)
+        self.assertEqual(sleeps, 0)
+        # Recovery boot with the radio already up: returns immediately.
+        result, sleeps = run_case(True, bound=90, ready_marker=True)
+        self.assertEqual(rc_of(result), "rc=0", result.stderr)
+        self.assertEqual(sleeps, 0)
+        # Recovery boot whose worker terminally failed before the graph ran:
+        # no sitting out the bound, no blind success.
+        result, sleeps = run_case(True, bound=90, failed_marker=True)
+        self.assertEqual(rc_of(result), "rc=1", result.stderr)
+        self.assertIn("log:recovery-radio-ready-failed", result.stdout)
+        self.assertEqual(sleeps, 0)
+        # Delayed worker readiness beyond the old 30s bound: the accelerated
+        # clock publishes readiness at tick 45, and the wait must cover the
+        # complete sequence and only succeed once readiness is recorded.
+        result, sleeps = run_case(True, bound=90, ready_at="45")
+        self.assertEqual(rc_of(result), "rc=0", result.stderr)
+        self.assertNotIn("recovery-radio-ready-timeout", result.stdout)
+        self.assertNotIn("recovery-radio-ready-failed", result.stdout)
+        self.assertEqual(sleeps, 45)
+        # A worker that terminally fails at tick 12: the wait ends with the
+        # worker's outcome, reports the failure truthfully, and neither sits
+        # out the bound nor claims success.
+        result, sleeps = run_case(True, bound=90, fail_at="12")
+        self.assertEqual(rc_of(result), "rc=1", result.stderr)
+        self.assertIn("log:recovery-radio-ready-failed", result.stdout)
+        self.assertNotIn("recovery-radio-ready-timeout", result.stdout)
+        self.assertEqual(sleeps, 12)
+        # No terminal outcome within a short bound: bounded, truthful timeout.
+        result, sleeps = run_case(True, bound=5)
+        self.assertEqual(rc_of(result), "rc=1", result.stderr)
+        self.assertIn("log:recovery-radio-ready-timeout", result.stdout)
+        self.assertEqual(sleeps, 5)
+
+
+class RecoveryWorkerRadioPathTests(unittest.TestCase):
+    """Execute the boot-path Wi-Fi worker instead of matching source strings.
+
+    A fresh device has no /data and no packaged client profile.  The worker
+    must still initialize the radio on a recovery boot -- that is what creates
+    wlan0 for the AP capability probe and hostapd -- while never starting the
+    client supplicant.  The shipped functions run in a host sandbox with an
+    accelerated clock, so the no-profile recovery path, the profile-bearing
+    recovery path, and the ordinary-boot profile selection are all exercised
+    behaviourally; nothing here runs on hardware.
+    """
+
+    REPLACEMENTS = (
+        ("/dev/wmtWifi", "$SB/dev/wmtWifi"),
+        ("/sbin/wmt_stock_compat", "$SB/sbin/wmt_stock_compat"),
+        ("/sbin/wmt_launcher", "$SB/sbin/wmt_launcher"),
+        ("/sbin/libreecho-wifi", "$SB/sbin/libreecho-wifi"),
+        ("/sys/class/net/wlan0", "$SB/sys/class/net/wlan0"),
+        ("/run/libreecho", "$SB/run"),
+        ("/tmp/wifi", "$SB/tmp/wifi"),
+        ("/proc/mounts", "$SB/proc-mounts"),
+        ("/etc/wifi/wpa_supplicant.conf", "$SB/etc/wifi/wpa_supplicant.conf"),
+        ("/data/libreecho/config/wpa_supplicant.conf",
+         "$SB/data/wpa_supplicant.conf"),
+        ("/bin/busybox sh -c", "sh -c"),
+    )
+
+    def setUp(self) -> None:
+        self.init = INIT.read_text()
+
+    def _function(self, name: str) -> str:
+        start = self.init.index(name)
+        return self.init[start:self.init.index("\n}\n", start) + len("\n}\n")]
+
+    @staticmethod
+    def _stub(path: Path, text: str) -> None:
+        path.write_text(text)
+        path.chmod(0o755)
+
+    @staticmethod
+    def _bind(body: str) -> str:
+        for old, new in RecoveryWorkerRadioPathTests.REPLACEMENTS:
+            body = body.replace(old, new)
+        return body
+
+    def run_worker(self, *, recovery: bool, packaged_profile: bool,
+                   wlan0: bool = True, entry: str = "sequence",
+                   wmt_fails: bool = False,
+                   vendor_assets_ok: bool = True) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for directory in ("bin", "sbin", "dev", "etc/wifi", "run", "tmp",
+                              "sys/class/net"):
+                (root / directory).mkdir(parents=True, exist_ok=True)
+            (root / "proc-mounts").write_text(
+                "rootfs / rootfs rw 0 0\nproc /proc proc rw 0 0\n")
+            if packaged_profile:
+                (root / "etc/wifi/wpa_supplicant.conf").write_text(
+                    "ssid=test\n")
+            if wlan0:
+                (root / "sys/class/net/wlan0").touch()
+            if recovery:
+                (root / "run/recovery-mode").write_text(
+                    "libreecho-recovery-v1\n")
+
+            # The fake BusyBox compresses the clock and stands in for the
+            # process primitives the worker uses: sleep is a short real delay,
+            # pidof/kill track the responder stub's pidfile, and timeout runs
+            # the bounded command directly.
+            self._stub(
+                root / "bin/busybox",
+                "#!/bin/sh\n"
+                "applet=$1\n"
+                "shift\n"
+                "case \"$applet\" in\n"
+                "    sleep)\n"
+                "        i=0\n"
+                "        while [ -n \"${FAKE_WAIT_PIDFILE:-}\" ] &&\n"
+                "              [ ! -f \"$FAKE_PIDFILE\" ] && [ \"$i\" -lt 200 ]; do\n"
+                "            sleep 0.01\n"
+                "            i=$((i + 1))\n"
+                "        done\n"
+                "        sleep 0.05\n"
+                "        exit 0\n"
+                "        ;;\n"
+                "    pidof)\n"
+                "        [ -f \"$FAKE_PIDFILE\" ] || exit 1\n"
+                "        cat \"$FAKE_PIDFILE\"\n"
+                "        exit 0\n"
+                "        ;;\n"
+                "    kill)\n"
+                "        if [ \"$1\" = \"-0\" ]; then\n"
+                "            [ -f \"$FAKE_PIDFILE\" ] || exit 1\n"
+                "        fi\n"
+                "        exit 0\n"
+                "        ;;\n"
+                "    timeout)\n"
+                "        shift\n"
+                "        exec \"$@\"\n"
+                "        ;;\n"
+                "    *)\n"
+                "        exec \"$(command -v \"$applet\")\" \"$@\"\n"
+                "        ;;\n"
+                "esac\n")
+            self._stub(
+                root / "sbin/wmt_stock_compat",
+                "#!/bin/sh\n"
+                "printf 'configure\\n' > \"$WMT_CONFIGURE_LOG\"\n"
+                "exit " + ("1" if wmt_fails else "0") + "\n")
+            self._stub(
+                root / "sbin/wmt_launcher",
+                "#!/bin/sh\n"
+                "printf '%s' \"$$\" > \"$FAKE_PIDFILE\"\n"
+                "i=0\n"
+                "while [ ! -e \"$FAKE_WMTWIFI\" ] && [ \"$i\" -lt 400 ]; do\n"
+                "    sleep 0.01\n"
+                "    i=$((i + 1))\n"
+                "done\n"
+                "rm -f \"$FAKE_PIDFILE\"\n"
+                "exit 0\n")
+            self._stub(
+                root / "sbin/libreecho-wifi",
+                "#!/bin/sh\n"
+                "printf 'conf=%s args=%s\\n' \"${WIFI_CONF:-}\" \"$*\""
+                " > \"$WIFI_CLIENT_LOG\"\n"
+                "exit 0\n")
+
+            sequence = self._function("start_wifi_network_sequence()")
+            # Every binding must be present in the shipped sequence, or the
+            # path under test silently changes.
+            for old, new in self.REPLACEMENTS:
+                self.assertIn(old, sequence, old)
+                sequence = sequence.replace(old, new)
+            functions = self._function("recovery_owns_radio()")
+            functions += sequence
+            call = "start_wifi_network_sequence"
+            if entry == "activation":
+                functions += self._bind(self._function(
+                    "wifi_worker_record_failure()"))
+                functions += self._bind(self._function("start_wifi_network()"))
+                call = "start_wifi_network"
+
+            script = (
+                "SB=" + shlex.quote(str(root)) + "\n"
+                "BB=$SB/bin/busybox\n"
+                "export FAKE_PIDFILE=\"$SB/run/responder.pid\"\n"
+                "export FAKE_WMTWIFI=\"$SB/dev/wmtWifi\"\n"
+                "export FAKE_WAIT_PIDFILE=1\n"
+                "export WMT_CONFIGURE_LOG=\"$SB/wmt-configure.log\"\n"
+                "export WIFI_CLIENT_LOG=\"$SB/client.log\"\n"
+                "PHYSICAL_RECOVERY_MARKER=\"$SB/run/recovery-mode\"\n"
+                "RECOVERY_WLAN0_MARKER=\"$SB/run/wlan0-ready\"\n"
+                "RECOVERY_WIFI_FAILED_MARKER=\"$SB/run/wifi-worker-failed\"\n"
+                "VENDOR_ASSETS_OK=" + ("1" if vendor_assets_ok else "0") + "\n"
+                "log() { printf 'log:%s\\n' \"$1\"; }\n"
+                + functions
+                + "\n" + call + "\nprintf 'worker_rc=%s\\n' \"$?\"\n")
+            result = subprocess.run(["sh", "-c", script], capture_output=True,
+                                    text=True, env=dict(os.environ))
+            failed_marker = root / "run/wifi-worker-failed"
+            profile_state = root / "run/wifi-client.conf"
+            return {
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "rc": (result.stdout.strip().splitlines()[-1]
+                       if result.stdout.strip() else ""),
+                "wmt_configured": (root / "wmt-configure.log").exists(),
+                "client_started": (root / "client.log").exists(),
+                "client_conf": ((root / "client.log").read_text().strip()
+                                if (root / "client.log").exists() else ""),
+                "wlan0_marker": (root / "run/wlan0-ready").exists(),
+                "failed_marker": (failed_marker.read_text().strip()
+                                  if failed_marker.exists() else ""),
+                "profile_state": (profile_state.read_text().strip()
+                                  if profile_state.exists() else ""),
+            }
+
+    def test_no_profile_recovery_boot_initializes_the_radio(self) -> None:
+        run = self.run_worker(recovery=True, packaged_profile=False)
+        self.assertEqual(run["rc"], "worker_rc=0",
+                         run["stdout"] + run["stderr"])
+        # The profile gate must not stop the WMT initialization that creates
+        # wlan0: a fresh device with no client profile is the normal recovery
+        # case, and the AP capability probe needs the interface to exist.
+        self.assertIn("log:wifi-profile-absent-recovery-boot\n", run["stdout"])
+        self.assertNotIn("log:wifi-profile-absent\n", run["stdout"])
+        self.assertIn("log:wlan0-ready-recorded", run["stdout"])
+        self.assertTrue(run["wmt_configured"])
+        self.assertTrue(run["wlan0_marker"])
+        # The recovery portal owns the radio: no client supplicant is started,
+        # and no handover profile record is written for a profile that does
+        # not exist.
+        self.assertIn("log:wifi-client-suppressed-recovery-boot", run["stdout"])
+        self.assertFalse(run["client_started"])
+        self.assertEqual(run["profile_state"], "")
+        self.assertNotIn("wifi-profile-record-failed", run["stdout"])
+
+    def test_profile_bearing_recovery_boot_is_unchanged(self) -> None:
+        run = self.run_worker(recovery=True, packaged_profile=True)
+        self.assertEqual(run["rc"], "worker_rc=0",
+                         run["stdout"] + run["stderr"])
+        self.assertIn("log:wifi-packaged-profile-selected", run["stdout"])
+        self.assertIn("log:wifi-client-suppressed-recovery-boot", run["stdout"])
+        self.assertFalse(run["client_started"])
+        # The recorded handover profile is still written for the teardown.
+        self.assertTrue(
+            run["profile_state"].endswith("etc/wifi/wpa_supplicant.conf"))
+
+    def test_ordinary_boot_profile_selection_is_unchanged(self) -> None:
+        run = self.run_worker(recovery=False, packaged_profile=True)
+        self.assertEqual(run["rc"], "worker_rc=0",
+                         run["stdout"] + run["stderr"])
+        self.assertIn("log:wifi-packaged-profile-selected", run["stdout"])
+        self.assertNotIn("wifi-client-suppressed", run["stdout"])
+        self.assertTrue(run["client_started"])
+        self.assertIn("etc/wifi/wpa_supplicant.conf args=start",
+                      run["client_conf"])
+        self.assertTrue(run["profile_state"])
+
+    def test_ordinary_boot_without_a_profile_still_refuses(self) -> None:
+        run = self.run_worker(recovery=False, packaged_profile=False)
+        self.assertEqual(run["rc"], "worker_rc=2",
+                         run["stdout"] + run["stderr"])
+        self.assertIn("log:wifi-profile-absent\n", run["stdout"])
+        # The radio is not initialized and no client is started.
+        self.assertFalse(run["wmt_configured"])
+        self.assertFalse(run["wlan0_marker"])
+        self.assertFalse(run["client_started"])
+
+    def test_terminal_worker_failures_are_recorded_for_the_gate(self) -> None:
+        # A failing WMT configure step is a terminal activation failure; the
+        # activation records the outcome the recovery gate waits on.
+        run = self.run_worker(recovery=True, packaged_profile=False,
+                              entry="activation", wmt_fails=True)
+        self.assertEqual(run["rc"], "worker_rc=1",
+                         run["stdout"] + run["stderr"])
+        self.assertIn("log:wifi-activation-complete:1", run["stdout"])
+        self.assertIn("log:wifi-worker-failed-recorded:1", run["stdout"])
+        self.assertEqual(run["failed_marker"], "1")
+        # The vendor-assets refusal inside the activation is recorded the same
+        # way, without running the radio sequence at all.
+        run = self.run_worker(recovery=True, packaged_profile=False,
+                              entry="activation", vendor_assets_ok=False)
+        self.assertEqual(run["rc"], "worker_rc=4",
+                         run["stdout"] + run["stderr"])
+        self.assertIn("log:wifi-worker-failed-recorded:4", run["stdout"])
+        self.assertEqual(run["failed_marker"], "4")
+        self.assertFalse(run["wmt_configured"])
 
 
 if __name__ == "__main__":

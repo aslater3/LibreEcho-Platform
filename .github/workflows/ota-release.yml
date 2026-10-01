@@ -31,6 +31,22 @@ jobs:
           persist-credentials: false
           fetch-depth: 0  # immutable release-base staging diff
 
+      - name: Check out pinned companion UI sleep generator
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          repository: aslater3/LibreEcho-UI
+          ref: 17604803f4682826f3fdb6f0af0c52bb064dd853
+          path: .test-ui
+          persist-credentials: false
+          sparse-checkout: src/adapter/sleep_generator.h
+          sparse-checkout-cone-mode: false
+
+      - name: Verify sleep media arbitration with companion UI
+        shell: bash
+        env:
+          SLEEP_GENERATOR_DIR: ${{ github.workspace }}/.test-ui/src/adapter
+        run: bash tools/mt8163-arm32/airplay/test_sleep_media_arbitration.sh
+
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
@@ -41,8 +57,74 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y device-tree-compiler espeak-ng-data squashfs-tools
+          # gcc-arm-linux-gnueabihf only *recommends* libc6-dev-armhf-cross, and
+          # --no-install-recommends drops it.  Without the target C library
+          # headers and startup objects the cross compiler cannot link anything,
+          # so configure dies with "C compiler cannot create executables".
+          sudo apt-get install --no-install-recommends -y \
+            device-tree-compiler espeak-ng-data squashfs-tools \
+            gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf \
+            libc6-dev-armhf-cross
           python -m pip install --disable-pip-version-check PyNaCl==1.5.0
+
+      - name: Build the verified ARM32 Opus prefix
+        shell: bash
+        env:
+          LIBREECHO_OPUS_ARCHIVES: ${{ runner.temp }}/libreecho-opus-archives
+          LIBREECHO_OPUS_ARM_PREFIX: ${{ runner.temp }}/libreecho-opus-arm-prefix
+        run: |
+          set -euo pipefail
+          lock=tools/mt8163-arm32/ui/opus/SOURCE.lock
+          mkdir -p "$LIBREECHO_OPUS_ARCHIVES"
+          # The archives are the exact pins recorded in SOURCE.lock: fetch each
+          # recorded URL and fail the step on any byte mismatch.  Every consumer
+          # below then runs against the pinned sources and a real ARM32 prefix
+          # instead of silently skipping for want of the archives or a prefix.
+          python3 - "$lock" "$LIBREECHO_OPUS_ARCHIVES" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+          import urllib.request
+
+          lock = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          dest = pathlib.Path(sys.argv[2])
+          names = {
+              "libogg": "libogg-1.3.5.tar.gz",
+              "opus": "opus-1.4.tar.gz",
+              "opusfile": "opusfile-0.12.tar.gz",
+          }
+          for component, filename in names.items():
+              record = lock["components"][component]
+              target = dest / filename
+              if not target.is_file():
+                  urllib.request.urlretrieve(record["source_url"], target)
+              digest = hashlib.sha256(target.read_bytes()).hexdigest()
+              if digest != record["source_sha256"]:
+                  raise SystemExit("ERROR: %s archive hash mismatch: %s" % (component, digest))
+              print("opus_source_%s_sha256=%s" % (component, digest))
+          PY
+          # Cross-build the pinned ARM32 Opus prefix with the public toolchain (no
+          # repository secrets), then fail closed unless it satisfies the exact
+          # identity/provenance/arch routine the UI bundle builder runs.  This is
+          # the same prefix ui/build_ui_bundle.sh links into radiod.
+          bash tools/mt8163-arm32/ui/build_opus.sh \
+            --ogg-archive "$LIBREECHO_OPUS_ARCHIVES/libogg-1.3.5.tar.gz" \
+            --opus-archive "$LIBREECHO_OPUS_ARCHIVES/opus-1.4.tar.gz" \
+            --opusfile-archive "$LIBREECHO_OPUS_ARCHIVES/opusfile-0.12.tar.gz" \
+            --output "$LIBREECHO_OPUS_ARM_PREFIX" \
+            --cc arm-linux-gnueabihf-gcc \
+            --ar arm-linux-gnueabihf-ar \
+            --host arm-linux-gnueabihf
+          # This job built the prefix with ui/build_opus.sh above, so it is
+          # trusted here; without the declaration the bundle refuses a
+          # caller-supplied prefix and builds Opus itself.
+          bash tools/mt8163-arm32/ui/build_ui_bundle.sh \
+            --verify-opus-prefix "$LIBREECHO_OPUS_ARM_PREFIX" \
+            --opus-prefix-trusted
+          # Export the verified prefix so the positive packaging contracts run
+          # against it (this is what keeps the real-prefix tests from skipping).
+          printf 'LIBREECHO_OPUS_ARM_PREFIX=%s\n' "$LIBREECHO_OPUS_ARM_PREFIX" >> "$GITHUB_ENV"
 
       - name: Run maintained Platform suites
         shell: bash
@@ -53,6 +135,11 @@ jobs:
           python tools/mt8163-arm32/airplay/test_audio_period_buffer.py
           bash tools/mt8163-arm32/airplay/test_speaker_dsp.sh
           bash tools/mt8163-arm32/airplay/test_speaker_mbcl.sh
+          bash tools/mt8163-arm32/airplay/test_music_features.sh
+          bash tools/mt8163-arm32/airplay/test_music_session_id.sh
+          bash tools/mt8163-arm32/airplay/test_music_feature_trace.sh
+          bash tools/mt8163-arm32/airplay/test_music_transport_wrap.sh
+          python tools/mt8163-arm32/airplay/test_music_feature_packet.py
           python -m unittest -q tools/mt8163-arm32/feature_runtime/test_runtime_package.py
           cd tools/mt8163-arm32
           python -m unittest -q \
@@ -60,6 +147,7 @@ jobs:
             test_build_wifi_dtb.py \
             test_verify_radar_puffin_dtb.py \
             test_recovery_image_tools.py \
+            test_recovery_ap.py \
             test_local_install_adoption.py \
             test_issue_169_ota_health.py \
             test_early_control_plane.py \
@@ -77,6 +165,42 @@ jobs:
             ota/test_feature_provenance.py \
             ota/test_service_identity.py \
             ota/test_dev_discovery.py
+
+      - name: Run pinned Opus decode provenance suites
+        shell: bash
+        env:
+          LIBREECHO_OPUS_ARCHIVES: ${{ runner.temp }}/libreecho-opus-archives
+        run: |
+          set -euo pipefail
+          # The archives were fetched and hash-checked, and the verified ARM32
+          # prefix built, in the step above.  Every positive Opus path below must
+          # actually run: a skip is a lost contract, so each is required to
+          # report `ok` rather than being allowed to disappear.
+          #
+          # The bundle contract (prefix refusal/accept) runs against the verified
+          # ARM32 prefix, so the real-prefix accept path cannot skip.
+          python3 tools/mt8163-arm32/ui/test_opus_bundle_contract.py -v \
+            2>&1 | tee "$LIBREECHO_OPUS_ARCHIVES/bundle.log"
+          grep -q 'test_real_arm_prefix_is_accepted .* ok' "$LIBREECHO_OPUS_ARCHIVES/bundle.log" || {
+            echo "ERROR: the real ARM32 Opus prefix accept path did not run; the bundle contract must not silently skip" >&2
+            exit 1
+          }
+          # The recovery-image-tools positive contract links through the same
+          # verified prefix; require it to run as well.
+          ( cd tools/mt8163-arm32 \
+            && python3 -c 'import sys, unittest; suite = unittest.defaultTestLoader.loadTestsFromName("test_recovery_image_tools.UiTlsPackagingTests.test_ui_bundle_binds_the_link_to_the_verified_prefix"); result = unittest.TextTestRunner(verbosity=2, descriptions=False).run(suite); sys.exit(not result.wasSuccessful())' ) \
+            2>&1 | tee "$LIBREECHO_OPUS_ARCHIVES/ui-opus-prefix.log"
+          grep -q 'test_ui_bundle_binds_the_link_to_the_verified_prefix .* ok' "$LIBREECHO_OPUS_ARCHIVES/ui-opus-prefix.log" || {
+            echo "ERROR: the recovery image positive Opus contract did not run; it must not silently skip" >&2
+            exit 1
+          }
+          # The helper test includes a real host build + Opus decode round trip;
+          # require that it ran (ok) rather than skipped.
+          LIBREECHO_OPUS_TEST_ARCHIVES="$LIBREECHO_OPUS_ARCHIVES" python3 tools/mt8163-arm32/ui/test_build_opus.py -v 2>&1 | tee "$LIBREECHO_OPUS_ARCHIVES/e2e.log"
+          grep -q 'test_host_build_decodes_ogg_opus .* ok' "$LIBREECHO_OPUS_ARCHIVES/e2e.log" || {
+            echo "ERROR: the Opus decode end-to-end test did not run; decoder CI must not silently skip" >&2
+            exit 1
+          }
 
       - name: Validate tracked Python and shell source
         shell: bash

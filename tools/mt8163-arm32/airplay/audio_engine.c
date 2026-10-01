@@ -22,6 +22,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <tinyalsa/mixer.h>
@@ -30,6 +31,7 @@
 #include "aec_reference.h"
 #include "audio_period_buffer.h"
 #include "audio_visualizer.h"
+#include "music_session_id.h"
 #include "playback_status.h"
 #include "puffin_downmix.h"
 #include "speaker_dsp.h"
@@ -91,6 +93,9 @@ struct source_bus {
 struct music_visualizer {
 	struct audio_visualizer analyzer;
 	uint8_t levels[AUDIO_VISUALIZER_BANDS];
+	struct music_features features;
+	struct music_feature_transport transport;
+	unsigned int feature_version;
 	unsigned int frame_periods;
 	unsigned int silent_periods;
 	int active;
@@ -334,6 +339,32 @@ static void set_announcement_led(int active)
 	(void)send_led_request(active ? request_on : request_off);
 }
 
+/*
+ * The producer session id is nonzero and stable for one engine lifetime.  It
+ * is reseeded only when the engine process starts (or is restarted by the
+ * supervisor), which is the producer reset boundary.  music_session_id.h makes
+ * the value collision-resistant across two rapid restarts (full monotonic ns,
+ * pid and kernel entropy) while keeping the frozen uint32 wire field.
+ */
+static uint32_t music_visualizer_seed(void)
+{
+	return music_session_id_seed();
+}
+
+/*
+ * Compatibility switch.  Version 2 (the frozen perceptual contract) is the
+ * default; LIBREECHO_AUDIO_VISUALIZER_VERSION=1 keeps the legacy twelve-level
+ * frame for a consumer that has not migrated yet.
+ */
+static unsigned int music_visualizer_feature_version(void)
+{
+	const char *value = getenv("LIBREECHO_AUDIO_VISUALIZER_VERSION");
+
+	if (value && value[0] == '1' && value[1] == '\0')
+		return 1U;
+	return MUSIC_FEATURES_VERSION;
+}
+
 static void release_music_visualizer(struct music_visualizer *visualizer)
 {
 	const char *request =
@@ -356,25 +387,17 @@ static void stop_music_visualizer(struct music_visualizer *visualizer)
 
 static int send_music_visualizer_frame(struct music_visualizer *visualizer)
 {
-	static const char hexadecimal[] = "0123456789abcdef";
-	char levels_hex[AUDIO_VISUALIZER_BANDS * 2U + 1U];
-	char request[192];
-	unsigned int band;
+	char request[MUSIC_FEATURES_FRAME_MAX];
+	uint32_t seq = music_feature_transport_next_seq(&visualizer->transport);
+	uint32_t timestamp =
+		music_feature_transport_timestamp_ms(&visualizer->transport);
 	int length;
 
-	for (band = 0; band < AUDIO_VISUALIZER_BANDS; ++band) {
-		levels_hex[band * 2U] =
-			hexadecimal[visualizer->levels[band] >> 4];
-		levels_hex[band * 2U + 1U] =
-			hexadecimal[visualizer->levels[band] & 0x0f];
-	}
-	levels_hex[AUDIO_VISUALIZER_BANDS * 2U] = '\0';
-	length = snprintf(request, sizeof(request),
-		"{\"v\":1,\"id\":2,\"cmd\":\"visualizer\",\"args\":"
-		"{\"action\":\"frame\",\"levels\":\"%s\","
-		"\"brightness\":%u,\"owner\":\"music\"}}\n",
-		levels_hex, VISUALIZER_BRIGHTNESS);
-	if (length < 0 || (size_t)length >= sizeof(request))
+	length = music_features_format_frame(request, sizeof(request),
+		&visualizer->features, visualizer->levels,
+		VISUALIZER_BRIGHTNESS, visualizer->feature_version,
+		visualizer->transport.session, seq, timestamp);
+	if (length < 0)
 		return -1;
 	return send_led_request(request);
 }
@@ -402,8 +425,19 @@ static void process_music_visualizer(struct music_visualizer *visualizer,
 		return;
 	}
 
-	audio_visualizer_process(&visualizer->analyzer, rendered, PERIOD_SIZE,
-				 OUTPUT_CHANNELS, visualizer->levels);
+	/*
+	 * Advance the producer clock.  begin_tick rotates to a fresh session
+	 * (from music_visualizer_seed) when the cumulative analysed-music clock
+	 * would wrap the frozen 32-bit timestamp_ms, so a consumer never sees a
+	 * backward timestamp inside one session; seq and the clock restart with
+	 * the new id.  The seed is only taken at that multi-week boundary.
+	 */
+	(void)music_feature_transport_begin_tick(&visualizer->transport,
+						 music_visualizer_seed);
+	audio_visualizer_process_features(&visualizer->analyzer, rendered,
+					  PERIOD_SIZE, OUTPUT_CHANNELS,
+					  visualizer->levels,
+					  &visualizer->features);
 	for (band = 0; band < AUDIO_VISUALIZER_BANDS; ++band)
 		if (visualizer->levels[band] != 0) {
 			audible = 1;
@@ -1180,6 +1214,11 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	reference.fd = -1;
 	audio_visualizer_init(&visualizer.analyzer);
 	memset(visualizer.levels, 0, sizeof(visualizer.levels));
+	memset(&visualizer.features, 0, sizeof(visualizer.features));
+	music_feature_transport_init(&visualizer.transport,
+				     music_visualizer_seed(), PERIOD_SIZE,
+				     DEFAULT_RATE);
+	visualizer.feature_version = music_visualizer_feature_version();
 	visualizer.frame_periods = 0;
 	visualizer.silent_periods = 0;
 	visualizer.active = 0;
