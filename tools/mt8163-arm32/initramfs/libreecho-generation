@@ -7,7 +7,17 @@ TARGET_MANIFEST=${TARGET_MANIFEST:-/usr/local/sbin/libreecho-target-manifest}
 CURL=${CURL:-/usr/bin/curl}
 CA=${CA:-/etc/ssl/certs/ca-certificates.crt}
 SPACE_RESERVE_BYTES=${SPACE_RESERVE_BYTES:-262144}
-fail() { printf 'ERROR:%s\n' "$1" >&2; exit 1; }
+fail() {
+    printf 'ERROR:%s\n' "$1" >&2
+    # Only a pin created by this assembly belongs to its ordinary error path.
+    # The generation lock excludes competing assemblers until exit; SIGKILL
+    # deliberately bypasses this cleanup and retains recovery evidence.
+    if [ -n "${ASSEMBLY_PIN:-}" ]; then
+        $BB rm -f "$ASSEMBLY_PIN" "$ASSEMBLY_PIN.tmp"
+        $BB sync
+    fi
+    exit 1
+}
 value() { $BB sed -n "s/^$1=//p" "$2" 2>/dev/null | $BB head -n 1; }
 valid_hash() { [ "${#1}" -eq 64 ] || return 1; case "$1" in *[!0-9a-f]*|'') return 1;; esac; }
 valid_uint() {
@@ -181,7 +191,14 @@ assemble() {
     safe_path "$dest"; safe_path "$partial"
     # Durable lifecycle pin, outside the immutable target tree. A SIGKILL retains
     # it for recovery; the installer clears it only after pending is durable.
-    atomic_write "$GENERATIONS/$tx.pin" printf '%s\n' "$tx"
+    safe_path "$GENERATIONS/$tx.pin"
+    if [ -e "$GENERATIONS/$tx.pin" ] || [ -L "$GENERATIONS/$tx.pin" ]; then
+        regular "$GENERATIONS/$tx.pin" generation-pin
+        [ "$($BB cat "$GENERATIONS/$tx.pin")" = "$tx" ] || fail generation-pin-identity
+    else
+        ASSEMBLY_PIN=$GENERATIONS/$tx.pin
+        atomic_write "$ASSEMBLY_PIN" printf '%s\n' "$tx"
+    fi
     if [ -e "$dest" ]; then
         verify_tree "$dest" "$tx"
         [ "$(hash_state "$dest/target.manifest")" = "$(hash_state "$manifest")" ] || fail generation-collision

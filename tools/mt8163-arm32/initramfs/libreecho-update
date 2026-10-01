@@ -110,8 +110,9 @@ die()
     fi
     # On an ordinary aborted install, release only this candidate's lifecycle
     # pin. A pending target remains owned by the transaction instead.
-    if [ -n "${tx:-}" ] && [ ! -e "$PENDING" ]; then
-        case "$tx" in ''|.|..|*[!A-Za-z0-9._+~:-]*) ;; *) $BB rm -f "$GENERATIONS/$tx.pin";; esac
+    if [ -n "${INSTALL_PIN:-}" ] && [ ! -e "$PENDING" ] && [ ! -L "$PENDING" ]; then
+        $BB rm -f "$INSTALL_PIN"
+        $BB sync
     fi
     cleanup_refused_install_artifacts || true
     exit 1
@@ -418,6 +419,7 @@ feature_status()
 
 install_package()
 {
+    INSTALL_PIN=
     package=$1
     require_userdata
     lock_take
@@ -426,14 +428,16 @@ install_package()
     state_write verifying 5 package
     extract_and_verify "$package"
     state_write verified 20 "$version"
-    bootctl_status
     if [ "$OTA_FORMAT" = v3 ]; then
         tx=$(manifest_value transaction_id)
         generation="${GENERATIONS:-/data/libreecho/generations}/$tx"
         "${GENERATION_TOOL:-/usr/local/sbin/libreecho-generation}" verify "$generation" || die generation_invalid
         [ "$(sha256sum "$generation/target.manifest" | $BB awk '{print $1}')" = "$(sha256sum "$STAGING/manifest" | $BB awk '{print $1}')" ] || die generation_manifest_mismatch
-
+        # The install lock and authenticated candidate identity transfer ownership
+        # before fallible boot-control probing. Unverified callers own no pin.
+        INSTALL_PIN=$GENERATIONS/$tx.pin
     fi
+    bootctl_status
 
     state_write writing 30 "$target"
     $BB dd if="$STAGING/boot.img" of="$target_device" bs=4096 \

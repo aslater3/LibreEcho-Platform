@@ -235,6 +235,19 @@ print('206' if start else '200', end='')
         (partial / 'extra.bin').write_bytes(b'extra')
         self.assert_target(10)
 
+    def test_ordinary_download_failure_releases_only_new_pin(self):
+        for preexisting in (False, True):
+            with self.subTest(preexisting=preexisting):
+                self.generations.mkdir(exist_ok=True)
+                pin = self.generations / 'test-target.pin'
+                if preexisting: pin.write_text('test-target\n')
+                (self.root / 'fail-once').touch()
+                result = self.run_assembly()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('download-asset-transport', result.stderr)
+                self.assertEqual(pin.exists(), preexisting)
+                if preexisting: self.assertEqual(pin.read_text(), 'test-target\n')
+
     def test_interrupted_download_resumes(self):
         (self.root / 'fail-once').touch()
         first = self.run_assembly()

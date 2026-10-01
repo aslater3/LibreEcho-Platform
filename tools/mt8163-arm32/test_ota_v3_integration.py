@@ -96,6 +96,46 @@ class UpdaterTests(grammar.SignedFixture):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('legacy_manifest_unsupported', result.stderr)
 
+    def assembled_package(self):
+        p, sig = self.signed(self.text)
+        cache = self.update / 'asset-cache'; cache.mkdir(exist_ok=True)
+        for feature in grammar.FEATURES:
+            for content in (('payload:' + feature).encode(), ('manifest:' + feature).encode()):
+                (cache / (hashlib.sha256(content).hexdigest() + '.part')).write_bytes(content)
+        generations = self.data / 'libreecho/generations'
+        self.env.update(ROOT=str(self.update), GENERATIONS=str(generations),
+                        GENERATION_TOOL=str(TOOLS / 'initramfs/libreecho-generation'), SPACE_RESERVE_BYTES='0')
+        result = subprocess.run(['/bin/busybox', 'sh', self.env['GENERATION_TOOL'], 'assemble', str(p), str(sig)], env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((generations / 'test-target.pin').exists())
+        (self.root / 'boot.img').write_bytes(self.boot)
+        package = self.root / 'package.tar'
+        with tarfile.open(package, 'w') as tar:
+            for path, name in ((p, 'manifest'), (sig, 'manifest.sig'), (self.root / 'boot.img', 'boot.img')): tar.add(path, arcname=name)
+        return package, generations
+
+    def test_early_install_failure_releases_assembled_pin_only(self):
+        package, generations = self.assembled_package()
+        other = generations / 'other-target.pin'; other.write_text('other-target\n')
+        bootctl = self.root / 'failing-bootctl'
+        bootctl.write_text('#!/bin/sh\nexit 1\n'); bootctl.chmod(0o755)
+        script = self.script('install_package "$1"')
+        script.write_text(script.read_text().replace('BOOTCTL=/usr/local/sbin/libreecho-bootctl', 'BOOTCTL=' + str(bootctl)))
+        result = subprocess.run(['/bin/busybox', 'sh', str(script), str(package)], env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('boot_control_status', result.stderr)
+        self.assertFalse((generations / 'test-target.pin').exists())
+        self.assertEqual(other.read_text(), 'other-target\n')
+        self.assertFalse(self.control_file('pending').exists())
+
+    def test_unverified_install_cannot_release_assembled_pin(self):
+        package, generations = self.assembled_package()
+        package.write_bytes(b'invalid package')
+        script = self.script('tx=test-target\ninstall_package "$1"')
+        result = subprocess.run(['/bin/busybox', 'sh', str(script), str(package)], env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((generations / 'test-target.pin').exists())
+
     def test_install_records_v3_pending_and_confirms_generation(self):
         p, sig = self.signed(self.text)
         directory = self.data / 'libreecho/generations/test-target'
