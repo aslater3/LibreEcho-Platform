@@ -2,13 +2,13 @@
 # Crash-safe reboot-bound feature transaction journal.
 # The signed manifest and its signature digest bind every prepared operation.
 BB=/bin/busybox
-# V3 state never enters the retired per-file transaction implementation.
 v3_root=${ROOT:-/data/libreecho/update}
-v3_schema=$($BB sed -n 's/^schema=//p' "$v3_root/pending" 2>/dev/null)
-case "${1:-}" in activate|commit|rollback|gc) v3_schema=3;; esac
-if [ "$v3_schema" = 3 ] || [ -e "$v3_root/current" ]; then
-    exec /bin/busybox sh "${GENERATION_TRANSACTION:-/usr/local/sbin/libreecho-generation-transaction}" "$@"
-fi
+v3_verify=${VERIFY:-/usr/local/libexec/libreecho-update-verify}
+v3_key=${PUBLIC_KEY:-/etc/libreecho/ota-public-key.hex}
+v3_run=${RUN_ROOT:-/run}
+v3_cmdline=${CMDLINE_FILE:-/proc/cmdline}
+v3_mountinfo=${MOUNTINFO_FILE:-/proc/self/mountinfo}
+v3_loops=${LOOP_SYS_ROOT:-/sys/dev/block}
 ROOT=/data/libreecho/update
 STAGING=$ROOT/staging
 FEATURES=/data/libreecho/features
@@ -1828,6 +1828,15 @@ provenance() {
     printf '%b\n' "$second"
 }
 
+# V3 state never enters the retired per-file transaction implementation.
+v3_schema=$($BB sed -n 's/^schema=//p' "$v3_root/pending" 2>/dev/null)
+case "${1:-}" in activate|commit|rollback|gc) v3_schema=3;; esac
+if [ "$v3_schema" = 3 ] || [ -e "$v3_root/current" ]; then
+    ROOT=$v3_root; VERIFY=$v3_verify; PUBLIC_KEY=$v3_key
+    RUN_ROOT=$v3_run; CMDLINE_FILE=$v3_cmdline; MOUNTINFO_FILE=$v3_mountinfo; LOOP_SYS_ROOT=$v3_loops
+    export ROOT VERIFY PUBLIC_KEY RUN_ROOT CMDLINE_FILE MOUNTINFO_FILE LOOP_SYS_ROOT
+    exec /bin/busybox sh "${GENERATION_TRANSACTION:-/usr/local/sbin/libreecho-generation-transaction}" "$@"
+fi
 case "${1:-}" in
  preflight) [ "$#" -ge 2 ] && [ "$#" -le 3 ] || fail usage; preflight "$2" "${3:-prewrite}";;
  prepare-boot) [ "$#" -eq 1 ] || fail usage; prepare_boot;;

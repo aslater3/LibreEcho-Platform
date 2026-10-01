@@ -455,6 +455,18 @@ stage_v2_assets()
 
 verify_manifest()
 {
+    case "$(manifest_value format)" in
+        libreecho-ota-v3)
+            "${TARGET_MANIFEST:-/usr/local/sbin/libreecho-target-manifest}" check "$STAGING/manifest" "$STAGING/manifest.sig" || die target_manifest_invalid
+            OTA_FORMAT=v3
+            version=$(manifest_value version)
+            SERVICE_PROFILE=$(manifest_value service_profile)
+            UPDATE_CHANNEL=$(manifest_value update_channel)
+            [ "$UPDATE_CHANNEL" = "$(channel_value)" ] || die update_channel_mismatch
+            boot_sha=$(manifest_value boot_sha256)
+            return 0;;
+        libreecho-ota-v1|libreecho-ota-v2) die legacy_manifest_unsupported;;
+    esac
     if [ "$(manifest_value format)" = libreecho-ota-v2 ]; then
         verify_v2_manifest
         return 0
@@ -649,6 +661,9 @@ feature_file_sha256()
 
 transaction_status()
 {
+    if [ -r "$UPDATE_ROOT/features-status" ] && [ ! -L "$UPDATE_ROOT/features-status" ]; then
+        $BB grep -E '^features_(state|error)=[A-Za-z0-9_:-]*$' "$UPDATE_ROOT/features-status"
+    fi
     transaction_state=none
     [ -r "$PENDING" ] && transaction_state=pending
     [ -r "$UPDATE_ROOT/feature-commit" ] && transaction_state=commit
@@ -739,6 +754,7 @@ feature_daemon_required()
 
 write_preserved_feature_identity()
 {
+    die legacy_manifest_unsupported
     for feature in airplay2 tts wakeword stt assistant; do
         for field in payload_sha256 payload_size manifest_sha256 daemon_sha256; do
             value=$(manifest_value "feature_${feature}_${field}")
@@ -750,6 +766,7 @@ write_preserved_feature_identity()
 
 verify_preserved_feature_identity()
 {
+    die legacy_manifest_unsupported
     IDENTITY_SOURCE=$1
     [ "$IDENTITY_SOURCE" = manifest ] || [ "$IDENTITY_SOURCE" = pending ] ||
         die preserve_identity_source
@@ -803,7 +820,12 @@ install_package()
     extract_and_verify "$package"
     state_write verified 20 "$version"
     bootctl_status
-    if [ "$OTA_FORMAT" = v2 ]; then
+    if [ "$OTA_FORMAT" = v3 ]; then
+        tx=$(manifest_value transaction_id)
+        generation="${GENERATIONS:-/data/libreecho/generations}/$tx"
+        "${GENERATION_TOOL:-/usr/local/sbin/libreecho-generation}" verify "$generation" || die generation_invalid
+        [ "$(sha256sum "$generation/target.manifest" | $BB awk '{print $1}')" = "$(sha256sum "$STAGING/manifest" | $BB awk '{print $1}')" ] || die generation_manifest_mismatch
+    elif [ "$OTA_FORMAT" = v2 ]; then
         stage_v2_assets
         [ -x "$FEATURE_TRANSACTION" ] || die feature_transaction_missing
         printf '%s\n' "$target" > "$TRANSACTION_SLOT_FILE.tmp" || die transaction_slot_write
@@ -824,7 +846,18 @@ install_package()
         $BB sha256sum | $BB awk '{print $1}')
     [ "$written" = "$boot_sha" ] || die boot_write_hash
 
-    if [ "$OTA_FORMAT" != v2 ]; then
+    if [ "$OTA_FORMAT" = v3 ]; then
+        {
+            echo schema=3
+            echo "slot=$target"
+            echo "transaction_id=$tx"
+            echo "manifest_sha256=$(sha256sum "$STAGING/manifest" | $BB awk '{print $1}')"
+        } > "$PENDING.tmp" || die pending_write
+        $BB chmod 0600 "$PENDING.tmp" || die pending_mode
+        $BB sync
+        $BB mv "$PENDING.tmp" "$PENDING" || die pending_commit
+        $BB sync
+    elif [ "$OTA_FORMAT" != v2 ]; then
         {
             echo schema=1
             echo "version=$version"
@@ -854,6 +887,15 @@ confirm_pending()
     lock_take
     [ -r "$PENDING" ] || die no_pending_update
     pending_schema=$($BB sed -n 's/^schema=//p' "$PENDING")
+    if [ "$pending_schema" = 3 ]; then
+        slot=$($BB sed -n 's/^slot=//p' "$PENDING")
+        ROOT="$UPDATE_ROOT" "$FEATURE_TRANSACTION" activate || die feature_target_not_ready
+        "$BOOTCTL" confirm "$slot" > "$UPDATE_ROOT/bootctl.confirm" || die boot_control_confirm
+        ROOT="$UPDATE_ROOT" "$FEATURE_TRANSACTION" commit || die generation_commit_pending
+        state_write installed 100 "$slot"
+        echo "UPDATE_CONFIRMED slot=$slot"
+        return 0
+    fi
     if [ "$pending_schema" = 2 ]; then
         slot=$($BB sed -n 's/^slot=//p' "$PENDING")
         version=$($BB sed -n 's/^version=//p' "$PENDING")

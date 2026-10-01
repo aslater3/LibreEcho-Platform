@@ -1091,6 +1091,10 @@ download_and_inspect()
 
 download_feature_assets()
 {
+    if [ "$(check_value_from_file "$ROOT/staging/manifest" format)" = libreecho-ota-v3 ]; then
+        ROOT="$ROOT" CURL="$CURL" CA="$CA" "${GENERATION_TOOL:-/usr/local/sbin/libreecho-generation}" assemble "$ROOT/staging/manifest" "$ROOT/staging/manifest.sig" || die generation_assembly
+        return 0
+    fi
     [ "$(check_value_from_file "$ROOT/staging/manifest" format)" = libreecho-ota-v2 ] || return 0
     [ -x "$FEATURE_TRANSACTION" ] || die feature_transaction_missing
     $BB mkdir -p "$FEATURE_STAGE" || die feature_stage_create

@@ -504,6 +504,7 @@ class RadarTreeDiffTests(unittest.TestCase):
     # additions (recovery-AP shell probes plus the Opus/recovery-AP licence
     # copies), which the combined tree necessarily stages on top of the base.
     ALLOWED = {'etc/libreecho/target', 'usr/local/sbin/libreecho-update',
+               'usr/local/sbin/libreecho-update-fetch',
                'usr/local/sbin/libreecho-feature-transaction', 'init', 'libreecho-init',
                'usr/local/sbin/libreecho-target-manifest',
                'usr/local/sbin/libreecho-generation',

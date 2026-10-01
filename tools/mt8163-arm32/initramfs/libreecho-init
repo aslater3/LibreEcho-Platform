@@ -1689,6 +1689,31 @@ commit_fresh_install()
 
 activate_feature_transaction()
 {
+    transaction=/usr/local/sbin/libreecho-feature-transaction
+    update=/data/libreecho/update
+    v3_schema=$($BB sed -n 's/^schema=//p' "$update/pending" 2>/dev/null)
+    if [ "$v3_schema" = 3 ] || [ -r "$update/current" ]; then
+        [ -x "$transaction" ] || return 1
+        if [ -r "$update/pending" ]; then
+            [ "$v3_schema" = 3 ] || { printf 'ERROR:legacy_manifest_unsupported\n'; return 1; }
+            v3_slot=$($BB sed -n 's/^slot=//p' "$update/pending")
+            v3_running=$(running_slot_id)
+            if [ "$v3_slot" != "$v3_running" ]; then
+                "$transaction" rollback || return 1
+            else
+                v3_bcb=$(/usr/local/sbin/libreecho-bootctl status) || return 1
+                v3_success=$(printf '%s\n' "$v3_bcb" | $BB sed -n "s/^slot_${v3_slot}_success=//p")
+                if [ "$v3_success" = 1 ]; then
+                    "$transaction" commit || return 1
+                else
+                    "$transaction" activate
+                    return $?
+                fi
+            fi
+        fi
+        "$transaction" activate-committed
+        return $?
+    fi
     adopt_staged_local_install
     transaction=/usr/local/sbin/libreecho-feature-transaction
     [ -x "$transaction" ] || return 0
@@ -1770,17 +1795,29 @@ start_ui_services()
         log ui-services-not-installed
         return 0
     }
-    if ! activate_feature_transaction; then
-        log ui-services-blocked-by-feature-transaction
-        return 1
+    feature_degraded=0
+    feature_error=
+    if activation_error=$(activate_feature_transaction 2>&1); then
+        features_state=ready
+    else
+        feature_degraded=1
+        features_state=degraded
+        feature_error=$(printf '%s\n' "$activation_error" | $BB sed -n 's/^ERROR://p' | $BB head -n 1 | $BB tr -cd 'A-Za-z0-9_:-' | $BB cut -c 1-160)
+        [ -n "$feature_error" ] || feature_error=target_activation_failed
+        log ui-services-degraded-by-feature-transaction
     fi
+    feature_status=/data/libreecho/update/features-status
+    $BB mkdir -p /data/libreecho/update
+    { printf 'features_state=%s\nfeatures_error=%s\n' "$features_state" "$feature_error"; } > "$feature_status.tmp" &&
+        $BB chmod 0600 "$feature_status.tmp" && $BB mv "$feature_status.tmp" "$feature_status"
+
     apply_timezone
     $BB mkdir -p /var/run /var/log /var/log/libreecho /run/libreecho
-    if [ "$SERVICE_PROFILE" = production ] && [ "${DATA_CLEANUP_OK:-0}" -ne 1 ]; then
+    if [ "$feature_degraded" = 0 ] && [ "$SERVICE_PROFILE" = production ] && [ "${DATA_CLEANUP_OK:-0}" -ne 1 ]; then
         log ui-services-blocked-by-data-contract
         return 1
     fi
-    if [ "$SERVICE_PROFILE" = diagnostic ] || [ "$FEATURE_POLICY" = exclude ]; then
+    if [ "$feature_degraded" = 1 ] || [ "$SERVICE_PROFILE" = diagnostic ] || [ "$FEATURE_POLICY" = exclude ]; then
         services="logd timed web"
         if [ "$FEATURE_POLICY" = exclude ]; then
             log feature-services-excluded
@@ -1869,7 +1906,8 @@ start_ui_services()
             log "ui-service-missing:$service"
         fi
     done
-    start_persisted_feature_services
+    [ "$feature_degraded" = 1 ] || start_persisted_feature_services
+    return 0
 }
 start_ui_services &
 log ui-services-autostart-started
