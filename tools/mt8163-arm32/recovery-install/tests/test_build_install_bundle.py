@@ -42,7 +42,8 @@ class BundleBuilderTests(unittest.TestCase):
         return {"name": path.name, "sha256": builder.sha256_file(path),
                 "size": path.stat().st_size}
 
-    def _make_assets(self, directory: Path, release: str = "0.14.0-test") -> None:
+    def _make_assets(self, directory: Path, release: str = "0.14.0-test",
+                     board: str = "radar_puffin") -> None:
         boot = directory / "libreecho-radar-puffin-0.14.0-boot.img"
         boot.write_bytes(b"\0" * (builder.BOOT_SLOT_SECTORS * 512))
         payload = directory / "libreecho-radar-puffin-0.14.0-tts.squashfs"
@@ -54,14 +55,21 @@ class BundleBuilderTests(unittest.TestCase):
         # The signed manifest and its detached signature, as the OTA bundle ships
         # them. boot_sha256 must match the boot image actually being shipped.
         (directory / "manifest").write_text(
-            "board=radar_puffin\nversion=0.14.0\n"
+            f"board={board}\nversion=0.14.0\n"
             f"boot_sha256={builder.sha256_file(boot)}\n"
-            "feature_ids=tts\n")
+            "feature_ids=tts\n"
+            "feature_tts_action=replace\n"
+            f"feature_tts_asset={payload.name}\n"
+            f"feature_tts_sha256={builder.sha256_file(payload)}\n"
+            f"feature_tts_manifest_asset={manifest.name}\n"
+            f"feature_tts_manifest_sha256={builder.sha256_file(manifest)}\n"
+            f"feature_tts_size={payload.stat().st_size}\n"
+            f"feature_tts_manifest_size={manifest.stat().st_size}\n")
         (directory / "manifest.sig").write_bytes(b"signature")
         install = {
             "schema": builder.SCHEMA,
             "release": release,
-            "board": "radar_puffin",
+            "board": board,
             "soc": "mt8163",
             "image_profile": "ota",
             "service_profile": "production",
@@ -75,8 +83,10 @@ class BundleBuilderTests(unittest.TestCase):
         }
         (directory / builder.INSTALL_MANIFEST_NAME).write_text(json.dumps(install))
 
-    def build(self, assets: Path | None = None, out: Path | None = None, release: str = "") -> dict:
-        return builder.assemble(assets or self.assets, out or self.out, SRC, release, 2153472)
+    def build(self, assets: Path | None = None, out: Path | None = None, release: str = "",
+              target: str = builder.DEFAULT_TARGET) -> dict:
+        return builder.assemble(assets or self.assets, out or self.out, SRC, release, 2153472,
+                                target=target)
 
     # --- happy path --------------------------------------------------------
     def test_bundle_is_assembled_and_self_checks(self) -> None:
@@ -130,9 +140,14 @@ class BundleBuilderTests(unittest.TestCase):
         # the manifest-driven staging: the transaction's own input, not a live-tree copy
         self.assertIn("$BUNDLE_DIR/manifest", body)
         self.assertIn("lookup_digest", body)
+        # The zip carries exactly the entry points and the self-contained
+        # direct-userdata helper; there is nothing for TWRP's broken unzip to
+        # unpack. The helper is extracted on the HOST and pushed already verified.
+        self.assertIn(builder.DIRECT_HELPER, names)
         self.assertEqual(sorted(names), [
             "META-INF/com/google/android/update-binary",
             "META-INF/com/google/android/updater-script",
+            builder.DIRECT_HELPER,
         ])
 
     def test_update_binary_carries_the_execute_bit(self) -> None:
@@ -140,6 +155,55 @@ class BundleBuilderTests(unittest.TestCase):
         with zipfile.ZipFile(self.out / builder.ZIP_NAME) as archive:
             info = archive.getinfo("META-INF/com/google/android/update-binary")
         self.assertTrue(info.external_attr >> 16 & 0o111, "TWRP requires it executable")
+
+    # --- direct-userdata protocol v2 ---------------------------------------
+    def test_manifest_declares_protocol_v2_and_transfer_roles(self) -> None:
+        self.build()
+        text = (self.out / builder.MANIFEST_NAME).read_text()
+        self.assertIn(f"protocol={builder.PROTOCOL}", text)
+        self.assertIn("transfer_bytes_total=", text)
+        roles: dict[str, tuple[str, str]] = {}
+        for line in text.splitlines():
+            if line.startswith("transfer="):
+                name, digest = builder._declared_assets(line)[0]
+                roles[line.split("=", 1)[1].split(":")[0]] = (name, digest)
+        self.assertEqual(set(roles), {"boot", "ota-manifest", "ota-signature"})
+        expected = 0
+        for name, digest in roles.values():
+            self.assertEqual(builder.sha256_file(self.out / name), digest, name)
+            expected += (self.out / name).stat().st_size
+        for line in text.splitlines():
+            if line.startswith("staging="):
+                fields = line.split("=", 1)[1].split(":")
+                expected += (self.out / fields[1]).stat().st_size
+                expected += (self.out / fields[3]).stat().st_size
+        total = int([l.split("=", 1)[1] for l in text.splitlines()
+                     if l.startswith("transfer_bytes_total=")][0])
+        self.assertEqual(total, expected)
+
+    def test_the_direct_helper_is_in_the_zip_and_self_contained(self) -> None:
+        self.build()
+        with zipfile.ZipFile(self.out / builder.ZIP_NAME) as archive:
+            body = archive.read(builder.DIRECT_HELPER).decode()
+        self.assertTrue(body.startswith("#!/sbin/sh"))
+        for token in ("--protocol", "--phase", "phase_initialize()", "phase_finalize()",
+                      "format_userdata()", "find_upload()"):
+            self.assertIn(token, body, token)
+
+    def test_both_targets_build_with_protocol_v2(self) -> None:
+        for board, slug, product in (("radar_puffin", "radar-puffin", "RADAR"),
+                                     ("biscuit", "biscuit", "BISCUIT")):
+            with self.subTest(board=board):
+                assets = self.work / f"assets-{board}"
+                assets.mkdir()
+                self._make_assets(assets, board=board)
+                out = self.work / f"out-{board}"
+                builder.assemble(assets, out, SRC, "", 2153472, target=board)
+                text = (out / f"libreecho-{slug}-bundle.manifest").read_text()
+                self.assertIn(f"protocol={builder.PROTOCOL}", text)
+                self.assertIn(f"target={board}", text)
+                self.assertIn(f"fastboot_products={product}", text)
+                self.assertIn("transfer=boot:", text)
 
     # --- reproducibility ---------------------------------------------------
     def test_the_same_inputs_give_a_byte_identical_zip(self) -> None:
@@ -187,6 +251,20 @@ class BundleBuilderTests(unittest.TestCase):
         data = json.loads(path.read_text())
         data["features"][0]["name"] = "../../etc"
         path.write_text(json.dumps(data))
+        with self.assertRaises(builder.BuildError):
+            self.build()
+
+    def test_a_mismatched_signed_feature_set_is_refused(self) -> None:
+        signed = self.assets / "manifest"
+        signed.write_text(signed.read_text().replace(
+            "feature_ids=tts\n", "feature_ids=tts,airplay2\n"))
+        with self.assertRaises(builder.BuildError):
+            self.build()
+
+    def test_an_unsupported_signed_action_is_refused(self) -> None:
+        signed = self.assets / "manifest"
+        signed.write_text(signed.read_text().replace(
+            "feature_tts_action=replace\n", "feature_tts_action=runtime\n"))
         with self.assertRaises(builder.BuildError):
             self.build()
 
@@ -322,9 +400,11 @@ class ReleaseLayoutTests(unittest.TestCase):
             "feature_tts_sha256": builder.sha256_file(self.signed_payload),
             "feature_tts_manifest_asset": self.signed_manifest.name,
             "feature_tts_manifest_sha256": builder.sha256_file(self.signed_manifest),
+            "feature_tts_size": str(len(self.payload_bytes)),
+            "feature_tts_manifest_size": str(len(self.manifest_bytes)),
         }
         signed.update(manifest_overrides or {})
-        text = "".join(f"{k}={v}\n" for k, v in signed.items())
+        text = "".join(f"{k}={v}\n" for k, v in signed.items() if v is not None)
         (self.assets / "manifest").write_text(text)
         (self.assets / "manifest.sig").write_bytes(b"signature")
         self._write_ota_tar(boot)
@@ -369,6 +449,47 @@ class ReleaseLayoutTests(unittest.TestCase):
             f"feature_tts_sha256={'0' * 64}")
         (self.assets / "manifest").write_text(corrected)
         self._write_ota_tar(self.assets / "boot.img")
+
+    def test_a_signed_feature_outside_the_install_manifest_is_refused(self) -> None:
+        # The device cross-checks the signed feature_ids against what was staged.
+        # A release whose signed manifest advertises a feature the install
+        # manifest does not carry can never pass that check, so the bundle
+        # must not be produced in the first place.
+        self._make_release({"feature_ids": "tts,airplay2"})
+        with self.assertRaises(builder.BuildError):
+            self.build()
+
+    def test_a_signed_feature_id_missing_from_the_ids_is_refused(self) -> None:
+        self._make_release({"feature_ids": "airplay2"})
+        with self.assertRaises(builder.BuildError):
+            self.build()
+
+    def test_a_duplicate_signed_feature_id_is_refused(self) -> None:
+        self._make_release({"feature_ids": "tts,tts"})
+        with self.assertRaises(builder.BuildError):
+            self.build()
+
+    def test_an_unsupported_signed_feature_action_is_refused(self) -> None:
+        # Only replace/preserve can be staged by the v2 transaction; a runtime
+        # or unknown action would stage bytes the device has no semantics for.
+        self._make_release({"feature_tts_action": "runtime"})
+        with self.assertRaises(builder.BuildError):
+            self.build()
+
+    def test_a_signed_feature_size_that_disagrees_is_refused(self) -> None:
+        self._make_release({"feature_tts_size": str(len(self.payload_bytes) + 1)})
+        with self.assertRaises(builder.BuildError):
+            self.build()
+
+    def test_a_signed_manifest_size_that_disagrees_is_refused(self) -> None:
+        self._make_release({"feature_tts_manifest_size": str(len(self.manifest_bytes) + 1)})
+        with self.assertRaises(builder.BuildError):
+            self.build()
+
+    def test_a_missing_signed_feature_size_is_refused(self) -> None:
+        self._make_release({"feature_tts_size": None})
+        with self.assertRaises(builder.BuildError):
+            self.build()
 
     def test_the_local_install_package_is_shipped_and_pinned(self) -> None:
         summary = self.build()

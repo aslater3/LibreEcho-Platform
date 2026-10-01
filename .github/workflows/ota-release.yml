@@ -161,6 +161,8 @@ jobs:
             test_source_offer_tools.py \
             recovery-install/tests/test_build_install_bundle.py \
             recovery-install/tests/test_installer_boot_write.py \
+            recovery-install/tests/test_direct_userdata_install.py \
+            recovery-install/tests/test_direct_nonce.py \
             ota/test_ota_v2_implementation.py \
             ota/test_feature_provenance.py \
             ota/test_service_identity.py \
