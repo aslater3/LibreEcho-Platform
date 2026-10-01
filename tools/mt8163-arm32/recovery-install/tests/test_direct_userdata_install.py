@@ -1431,6 +1431,9 @@ class RecoveryV2BlockerTests(_InstallFixture):
         media.parent.mkdir(parents=True)
         media.write_bytes(b"jpeg")
         (self.h.data / "tmp").mkdir()
+        # TWRP recreates /data/media/0 after formatting; an all-empty tree
+        # must go or the first boot's data contract blocks every service.
+        (self.h.data / "test" / "0" / "Android").mkdir(parents=True)
         self.land_uploads()
         result = self.h.run("finalize", self.manifest())
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout + str(self.h.receipt()))
@@ -1438,6 +1441,8 @@ class RecoveryV2BlockerTests(_InstallFixture):
         self.assertTrue(media.is_file())
         self.assertFalse((self.h.data / "tmp").exists(),
                          "empty recovery scratch dirs are removed with rmdir")
+        self.assertFalse((self.h.data / "test").exists(),
+                         "nested empty recovery scratch trees are removed")
         helper_tidy = extract_function(HELPER.read_text(), "tidy_userdata_root")
         self.assertNotIn("rm -rf", helper_tidy)
         self.assertIn("rmdir", helper_tidy)
@@ -1584,6 +1589,40 @@ class LegacyGuardTests(unittest.TestCase):
 
 
 class LegacyTidyTests(unittest.TestCase):
+    def test_legacy_tidy_removes_recovery_nested_empty_dirs(self) -> None:
+        # TWRP recreates /data/media/0 (and friends) after a format; a plain
+        # rmdir of /data/media then fails and the first boot's data contract
+        # blocks every service. Empty trees go; anything holding a file stays.
+        source = LEGACY.read_text()
+        function = extract_function(source, "tidy_userdata_root")
+        start = source.index("prune_empty_dirs() (")
+        prune = source[start:source.index("\n)\n", start) + 2]
+        work = Path(tempfile.mkdtemp(prefix="le-tidy-nested-"))
+        try:
+            data = work / "data"
+            (data / "media" / "0" / "Android" / "obb").mkdir(parents=True)
+            (data / "media" / "0" / ".hidden").mkdir()
+            (data / "libreecho").mkdir()
+            keep = data / "local" / "a" / "keep.txt"
+            keep.parent.mkdir(parents=True)
+            keep.write_text("keep")
+            harness = work / "t.sh"
+            harness.write_text(
+                "#!/bin/sh\nset -u\nDRY_RUN=0\n"
+                'ui_print() { printf "%s\\n" "$*"; }\n'
+                "sync() { :; }\n"
+                f"{prune}\n{function}\ntidy_userdata_root\n")
+            env = os.environ.copy()
+            env["LIBREECHO_DATA_ROOT"] = str(data)
+            result = subprocess.run(["/bin/sh", str(harness)], text=True,
+                                    capture_output=True, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((data / "media").exists(), result.stdout)
+            self.assertEqual(keep.read_text(), "keep")
+            self.assertTrue((data / "libreecho").is_dir())
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
     def test_legacy_tidy_never_deletes_user_files(self) -> None:
         source = LEGACY.read_text()
         function = extract_function(source, "tidy_userdata_root")
@@ -1604,6 +1643,8 @@ class LegacyTidyTests(unittest.TestCase):
                 'ui_print() { printf "%s\\n" "$*"; }\n'
                 'log_line() { printf "%s\\n" "$*"; }\n'
                 "sync() { :; }\n"
+                + source[source.index("prune_empty_dirs() ("):
+                         source.index("\n)\n", source.index("prune_empty_dirs() (")) + 2] + "\n"
                 f"{function}\n"
                 "tidy_userdata_root\n")
             env = os.environ.copy()

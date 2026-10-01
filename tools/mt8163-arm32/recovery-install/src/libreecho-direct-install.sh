@@ -846,6 +846,24 @@ ensure_userdata_mounted() {
     verify_data_mount || fail "userdata-mount-not-taken"
 }
 
+prune_empty_dirs() (
+    # Subshell body: POSIX sh has no locals, and this recurses.
+    # Remove "$1" only if it is a real directory tree containing nothing but
+    # empty directories (TWRP recreates /data/media/0/... after a format).
+    # Uses rmdir only: a regular file, symlink, device or socket anywhere in
+    # the tree keeps it, so no user data can be deleted. Depth is bounded.
+    ped_dir=$1
+    ped_depth=${2:-0}
+    [ "$ped_depth" -le 8 ] || return 1
+    [ -L "$ped_dir" ] && return 1
+    [ -d "$ped_dir" ] || return 1
+    for ped_child in "$ped_dir"/* "$ped_dir"/.[!.]* "$ped_dir"/..?*; do
+        [ -e "$ped_child" ] || [ -L "$ped_child" ] || continue
+        prune_empty_dirs "$ped_child" $((ped_depth + 1)) || return 1
+    done
+    rmdir "$ped_dir" 2>/dev/null
+)
+
 tidy_userdata_root() {
     # The OS data contract allows exactly libreecho and lost+found at the root.
     # Recovery leaves /data/media behind, which fails that contract on boot.
@@ -856,7 +874,7 @@ tidy_userdata_root() {
         [ -e "$ty_stray" ] || continue
         [ -L "$ty_stray" ] && continue
         [ -d "$ty_stray" ] || continue
-        if rmdir "$ty_stray" 2>/dev/null; then
+        if prune_empty_dirs "$ty_stray"; then
             ui_print "  removed empty $ty_stray"
         else
             ui_print "  WARNING: $ty_stray is not empty; left in place (no user data is deleted)"
