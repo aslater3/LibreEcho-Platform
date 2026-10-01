@@ -47,6 +47,16 @@ class UpdaterTests(grammar.SignedFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('UPDATE_VALID version=0.14.0', result.stdout)
 
+    def test_legacy_feature_transaction_refuses_v2(self):
+        source = (TOOLS / 'initramfs/libreecho-feature-transaction').read_text().split('# V3 state never enters', 1)[0]
+        source = source.replace('VERIFY=/usr/local/libexec/libreecho-update-verify', 'VERIFY=' + self.env['VERIFY']).replace('PUBLIC_KEY=/etc/libreecho/ota-public-key.hex', 'PUBLIC_KEY=' + self.env['PUBLIC_KEY'])
+        script = self.root / 'legacy-check'
+        script.write_text(source + '\ncheck_manifest "$1" "$2"\n')
+        p, sig = self.signed(self.text.replace('libreecho-ota-v3', 'libreecho-ota-v2'))
+        result = subprocess.run(['/bin/busybox', 'sh', str(script), str(p), str(sig)], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('legacy_manifest_unsupported', result.stderr)
+
     def test_normal_inspect_refuses_v1_and_v2(self):
         for fmt in ('libreecho-ota-v1', 'libreecho-ota-v2'):
             result = self.inspect(self.text.replace('libreecho-ota-v3', fmt))
