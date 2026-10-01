@@ -1810,6 +1810,20 @@ start_ui_services()
     $BB mkdir -p /data/libreecho/update
     { printf 'features_state=%s\nfeatures_error=%s\n' "$features_state" "$feature_error"; } > "$feature_status.tmp" &&
         $BB chmod 0600 "$feature_status.tmp" && $BB mv "$feature_status.tmp" "$feature_status"
+    config_migrate=${CONFIG_MIGRATE:-/usr/local/sbin/libreecho-config-migrate}
+    if [ -x "$config_migrate" ]; then
+        config_schema=1
+        config_tx=$($BB cat /data/libreecho/update/current 2>/dev/null)
+        if [ "$features_state" = ready ] && [ -r /data/libreecho/update/pending ]; then
+            config_tx=$($BB sed -n 's/^transaction_id=//p' /data/libreecho/update/pending)
+        fi
+        if [ -n "$config_tx" ]; then
+            case "$config_tx" in .|..|*[!A-Za-z0-9._+~:-]*) config_schema=unsupported;;
+                *) config_schema=$($BB sed -n 's/^config_schema=//p' "/data/libreecho/generations/$config_tx/target.manifest");;
+            esac
+        fi
+        "$config_migrate" "$config_schema" || log config-schema-degraded
+    fi
 
     apply_timezone
     $BB mkdir -p /var/run /var/log /var/log/libreecho /run/libreecho

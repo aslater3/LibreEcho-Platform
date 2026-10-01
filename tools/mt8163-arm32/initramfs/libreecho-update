@@ -664,6 +664,9 @@ transaction_status()
     if [ -r "$UPDATE_ROOT/features-status" ] && [ ! -L "$UPDATE_ROOT/features-status" ]; then
         $BB grep -E '^features_(state|error)=[A-Za-z0-9_:-]*$' "$UPDATE_ROOT/features-status"
     fi
+    if [ -r "$UPDATE_ROOT/config-status" ] && [ ! -L "$UPDATE_ROOT/config-status" ]; then
+        $BB grep -E '^config_(schema|error)=[A-Za-z0-9_:-]*$' "$UPDATE_ROOT/config-status"
+    fi
     transaction_state=none
     [ -r "$PENDING" ] && transaction_state=pending
     [ -r "$UPDATE_ROOT/feature-commit" ] && transaction_state=commit

@@ -508,6 +508,7 @@ class RadarTreeDiffTests(unittest.TestCase):
                'usr/local/sbin/libreecho-feature-transaction', 'init', 'libreecho-init',
                'usr/local/sbin/libreecho-target-manifest',
                'usr/local/sbin/libreecho-generation',
+               'usr/local/sbin/libreecho-config-migrate',
                'usr/local/sbin/libreecho-generation-transaction',
                'usr/local/sbin/libreecho-bootctl',
                'usr/local/sbin/libreecho-recovery-ap-probe',
