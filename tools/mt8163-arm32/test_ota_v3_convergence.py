@@ -178,6 +178,7 @@ print('206' if start else '200', end='')
                 result = subprocess.run(['/bin/busybox', 'sh', str(script), 'assemble', str(self.p), str(self.s)],
                     env=dict(self.env, SYNC_COUNT=str(count), CRASH_BOUNDARY=str(boundary)), capture_output=True)
                 self.assertEqual(result.returncode, -9)
+                self.assertTrue((self.generations / (tx + '.pin')).is_file())
                 result = self.run_assembly()
                 self.assertEqual(result.returncode, 0, result.stderr)
                 directory = self.generations / tx

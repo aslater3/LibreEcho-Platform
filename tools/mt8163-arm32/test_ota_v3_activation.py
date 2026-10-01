@@ -211,9 +211,12 @@ for daemon in ('libreecho-audio-engine','libreecho-ttsd','libreecho-waked','libr
         lock = self.control / 'generation.lock'
         lock.mkdir()
         (lock / 'owner').write_text(f'{os.getpid()} ' + Path('/proc/sys/kernel/random/boot_id').read_text())
+        (lock / 'reclaim').mkdir()
         self.set_bcb('b', '1')
         for verb in ('gc', 'commit'):
             self.assertNotEqual(self.verb(verb).returncode, 0)
+        self.assertTrue((lock / 'owner').is_file())
+        self.assertTrue((lock / 'reclaim').is_dir())
         self.assertTrue((self.control / 'pending').exists())
         self.assertEqual((self.control / 'current').read_text(), 'prior\n')
 
@@ -295,6 +298,44 @@ exit "$rc"
                         recovered = self.verb('gc')
                         self.assertEqual(recovered.returncode, 0, recovered.stderr)
                         self.assertFalse(lock.exists())
+
+    def test_simultaneous_atomic_lock_publication_has_one_winner(self):
+        import time
+        wrapper = self.root / 'publish-busybox'
+        wrapper.write_text('''#!/bin/sh
+if [ "$1" = mv ] && [ "$2" = -T ]; then
+ /bin/busybox touch "$BARRIER/$LABEL.ready"
+ while [ ! -f "$BARRIER/go" ]; do /bin/busybox sleep .01; done
+fi
+exec /bin/busybox "$@"
+''')
+        wrapper.chmod(0o755)
+        processes = []
+        try:
+            for label, name in (('first', 'libreecho-generation'), ('second', 'libreecho-generation-transaction')):
+                source = (TOOLS / 'initramfs' / name).read_text()
+                source = source[:source.rfind('case "${1:-}" in')] if label == 'first' else source.split('# Observation commands')[0]
+                source = source.replace('BB=/bin/busybox', 'BB=' + str(wrapper))
+                source += '\ngeneration_lock\n/bin/busybox touch "$BARRIER/$LABEL.entered"\nwhile [ ! -f "$BARRIER/finish" ]; do /bin/busybox sleep .01; done\n'
+                script = self.root / (label + '-publish'); script.write_text(source)
+                processes.append(subprocess.Popen(['/bin/busybox', 'sh', str(script)], env=dict(self.env, BARRIER=str(self.root), LABEL=label), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+            deadline = time.monotonic() + 5
+            while len(list(self.root.glob('*.ready'))) != 2 and time.monotonic() < deadline: time.sleep(.01)
+            self.assertEqual(len(list(self.root.glob('*.ready'))), 2)
+            (self.root / 'go').touch()
+            deadline = time.monotonic() + 5
+            while not any(p.poll() is not None for p in processes) and time.monotonic() < deadline: time.sleep(.01)
+            self.assertEqual(sum(p.poll() is not None for p in processes), 1)
+            self.assertEqual(len(list(self.root.glob('*.entered'))), 1)
+            (self.root / 'finish').touch()
+            results = []
+            for process in processes:
+                process.communicate(timeout=5); results.append(process.returncode)
+            self.assertEqual(sorted(results), [0, 1])
+        finally:
+            for process in processes:
+                if process.poll() is None: process.kill()
+                process.communicate(timeout=5)
 
     def test_concurrent_reclaimer_cannot_remove_new_live_owner(self):
         import time

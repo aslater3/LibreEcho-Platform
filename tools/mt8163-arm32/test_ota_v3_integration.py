@@ -127,6 +127,24 @@ class UpdaterTests(grammar.SignedFixture):
         self.assertFalse((generations / 'test-target.pin').exists())
         self.assertEqual(other.read_text(), 'other-target\n')
         self.assertFalse(self.control_file('pending').exists())
+        result = subprocess.run(['/bin/busybox', 'sh', str(TOOLS / 'initramfs/libreecho-generation-transaction'), 'gc'], env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((generations / 'test-target').exists())
+        self.assertEqual(other.read_text(), 'other-target\n')
+
+    def test_install_sigkill_keeps_candidate_pinned_before_pending(self):
+        package, generations = self.assembled_package()
+        bootctl = self.root / 'crash-bootctl'
+        bootctl.write_text('#!/bin/sh\nkill -KILL "$PPID"\nexit 1\n'); bootctl.chmod(0o755)
+        script = self.script('install_package "$1"')
+        script.write_text(script.read_text().replace('BOOTCTL=/usr/local/sbin/libreecho-bootctl', 'BOOTCTL=' + str(bootctl)))
+        result = subprocess.run(['/bin/busybox', 'sh', str(script), str(package)], env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, -9)
+        self.assertTrue((generations / 'test-target.pin').is_file())
+        self.assertFalse(self.control_file('pending').exists())
+        result = subprocess.run(['/bin/busybox', 'sh', str(TOOLS / 'initramfs/libreecho-generation-transaction'), 'gc'], env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((generations / 'test-target/COMPLETE').is_file())
 
     def test_unverified_install_cannot_release_assembled_pin(self):
         package, generations = self.assembled_package()
