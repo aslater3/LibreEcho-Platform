@@ -225,6 +225,21 @@ activate_generation() {
     done
 }
 
+# The only permitted link is the kernel executable handle for a numeric PID.
+# Parent paths and expected mounted daemon paths remain strictly link-free.
+process_executable() {
+    local pid=$1 expected_path=$2 expected_hash=$3 exe digest
+    case "$pid" in ''|0|*[!0-9]*) fail service-pid;; esac
+    safe_path "$PROC_ROOT/$pid"
+    safe_path "$expected_path"
+    exe=$PROC_ROOT/$pid/exe
+    [ -L "$exe" ] && [ -f "$exe" ] || fail service-exe
+    [ "$($BB readlink "$exe")" = "$expected_path" ] || fail service-exe-path
+    # Hash the opened proc handle, not the pathname's current file contents.
+    digest=$($BB sha256sum "$exe" 2>/dev/null | $BB awk '{print $1}')
+    valid_hash "$digest" && [ "$digest" = "$expected_hash" ] || fail service-exe-hash
+}
+
 service_probe() {
     local feature=$1 service socket pidfile pid exe expected engine entry found controller
     case "$feature" in
@@ -248,18 +263,18 @@ service_probe() {
         # verify_running has already authenticated the running boot image.
         controller=/usr/local/sbin/libreecho-airplayd
         regular "$controller" service-controller
-        [ "$($BB readlink "$exe")" = "$controller" ] &&
-            [ "$(hash_state "$exe")" = "$(hash_state "$controller")" ] || fail service-controller-identity
+        process_executable "$pid" "$controller" "$(hash_state "$controller")"
         engine=$RUN_ROOT/libreecho/features/airplay2/root/usr/local/sbin/libreecho-audio-engine
         found=0
         for entry in "$PROC_ROOT"/[0-9]*/exe; do
             [ "$($BB readlink "$entry" 2>/dev/null)" = "$engine" ] || continue
-            [ "$(hash_state "$entry")" = "$expected" ] || fail service-exe-hash
+            engine_pid=${entry%/exe}; engine_pid=${engine_pid##*/}
+            process_executable "$engine_pid" "$engine" "$expected"
             found=1
         done
         [ "$found" = 1 ] || fail service-engine-missing
     else
-        [ "$(hash_state "$exe")" = "$expected" ] || fail service-exe-hash
+        process_executable "$pid" "$RUN_ROOT/libreecho/features/$feature/root/$(value "feature_${feature}_daemon_path" "$MANIFEST")" "$expected"
     fi
     [ -S "$socket" ] || fail service-socket
     $BB awk -v socket="$socket" '$NF == socket { found=1 } END { exit found ? 0 : 1 }' "$PROC_NET_UNIX" >/dev/null 2>&1 || fail service-socket-owner
