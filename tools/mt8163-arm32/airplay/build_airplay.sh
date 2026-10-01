@@ -17,12 +17,18 @@ KERNEL_HEADERS=${LIBREECHO_AIRPLAY_KERNEL_HEADERS:-}
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd -P)
 AIRPLAY_AUDIO_SOURCE=${LIBREECHO_AIRPLAY_AUDIO_SOURCE:-$SCRIPT_DIR/airplay_audio.c}
 AUDIO_ENGINE_SOURCE=${LIBREECHO_AUDIO_ENGINE_SOURCE:-$SCRIPT_DIR/audio_engine.c}
+AUDIO_SINK_SOURCE=${LIBREECHO_AUDIO_SINK_SOURCE:-$SCRIPT_DIR/audio_sink.c}
+AUDIO_TIMING_SOURCE=${LIBREECHO_AUDIO_TIMING_SOURCE:-$SCRIPT_DIR/audio_timing.c}
 AUDIO_VISUALIZER_SOURCE=${LIBREECHO_AUDIO_VISUALIZER_SOURCE:-$SCRIPT_DIR/audio_visualizer.c}
 PLAYBACK_STATUS_SOURCE=${LIBREECHO_PLAYBACK_STATUS_SOURCE:-$SCRIPT_DIR/playback_status.c}
 AEC_REFERENCE_SOURCE=${LIBREECHO_AEC_REFERENCE_SOURCE:-$SCRIPT_DIR/aec_reference.c}
 RELINK_OUTPUT=${LIBREECHO_AIRPLAY_RELINK_OUTPUT:-}
 python3 "$SCRIPT_DIR/test_audio_engine_contract.py"
 python3 "$SCRIPT_DIR/test_audio_period_buffer.py"
+python3 "$SCRIPT_DIR/test_audio_sink.py"
+python3 "$SCRIPT_DIR/test_audio_timing.py"
+python3 "$SCRIPT_DIR/test_airplay_engine_build_contract_sendspin.py"
+python3 "$SCRIPT_DIR/test_audio_engine_sendspin.py"
 python3 "$SCRIPT_DIR/test_airplay_volume_contract.py"
 python3 "$SCRIPT_DIR/test_airplay_session_dsp.py"
 python3 "$SCRIPT_DIR/test_airplay_generation_fence.py"
@@ -66,6 +72,14 @@ command -v readelf >/dev/null 2>&1 || { echo "ERROR: readelf is required" >&2; e
 }
 [[ -f "$AUDIO_ENGINE_SOURCE" ]] || {
     echo "ERROR: shared audio engine source is missing: $AUDIO_ENGINE_SOURCE" >&2
+    exit 1
+}
+[[ -f "$AUDIO_SINK_SOURCE" ]] || {
+    echo "ERROR: Sendspin audio sink source is missing: $AUDIO_SINK_SOURCE" >&2
+    exit 1
+}
+[[ -f "$AUDIO_TIMING_SOURCE" ]] || {
+    echo "ERROR: audio timing source is missing: $AUDIO_TIMING_SOURCE" >&2
     exit 1
 }
 [[ -f "$AUDIO_VISUALIZER_SOURCE" ]] || {
@@ -257,6 +271,10 @@ build_audio_components() {
         -o "$OUTPUT/libreecho-airplay-audio"
     "$CC" $bridge_cflags -c "$AUDIO_ENGINE_SOURCE" \
         -o "$objects/audio_engine.o"
+    "$CC" $bridge_cflags -c "$AUDIO_SINK_SOURCE" \
+        -o "$objects/audio_sink.o"
+    "$CC" $bridge_cflags -c "$AUDIO_TIMING_SOURCE" \
+        -o "$objects/audio_timing.o"
     "$CC" $bridge_cflags -c "$AUDIO_VISUALIZER_SOURCE" \
         -o "$objects/audio_visualizer.o"
     "$CC" $bridge_cflags -c "$PLAYBACK_STATUS_SOURCE" \
@@ -264,6 +282,7 @@ build_audio_components() {
     "$CC" $bridge_cflags -c "$AEC_REFERENCE_SOURCE" \
         -o "$objects/aec_reference.o"
     "$CC" $bridge_cflags "$objects/audio_engine.o" \
+        "$objects/audio_sink.o" "$objects/audio_timing.o" \
         "$objects/audio_visualizer.o" "$objects/playback_status.o" \
         "$objects/aec_reference.o" "$tinyalsa_source/src/libtinyalsa.a" \
         -ldl -lm -o "$OUTPUT/libreecho-audio-engine"

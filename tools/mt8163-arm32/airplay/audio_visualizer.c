@@ -266,8 +266,15 @@ void audio_visualizer_process(struct audio_visualizer *visualizer,
 		return;
 
 	for (frame = 0; frame < frames; ++frame) {
-		int32_t input =
-			(int32_t)samples[frame * stride] << FILTER_INPUT_SHIFT;
+		/*
+		 * Scale the sample into the filter's fixed-point domain.
+		 * Left-shifting a negative signed value is undefined in C99, so
+		 * the power-of-two scaling is written as a multiply by the same
+		 * constant.  The product is bounded: |sample| <= 2^15 and
+		 * 1 << FILTER_INPUT_SHIFT == 2^8, so |input| <= 2^23 < INT32_MAX.
+		 */
+		int32_t input = (int32_t)samples[frame * stride] *
+			(int32_t)(1u << FILTER_INPUT_SHIFT);
 		int32_t delayed_input = visualizer->input_2;
 
 		for (band = 0; band < AUDIO_VISUALIZER_BANDS; ++band) {

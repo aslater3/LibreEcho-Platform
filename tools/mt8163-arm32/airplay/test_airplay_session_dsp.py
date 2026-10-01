@@ -264,11 +264,11 @@ int main(void)
     sources[SOURCE_MEDIA].gain_q15 = 16384;
     sources[SOURCE_MEDIA].samples[200] = 4000;
     sources[SOURCE_MEDIA].samples[201] = 4000;
-    assert(mix_sources_frame(sources, 100) == 2000);
+    assert(mix_sources_frame(sources, NULL, 0, 100) == 2000);
     sources[SOURCE_ALARM].received = sizeof(samples);
     sources[SOURCE_ALARM].samples[200] = 1000;
     sources[SOURCE_ALARM].samples[201] = 1000;
-    assert(mix_sources_frame(sources, 100) == 1000);
+    assert(mix_sources_frame(sources, NULL, 0, 100) == 1000);
     sources[SOURCE_ALARM].received = 0;
     sources[SOURCE_MEDIA].received = 0;
     for (i = 0; i < PERIOD_SIZE * INPUT_CHANNELS; ++i)
@@ -276,11 +276,11 @@ int main(void)
     sources[SOURCE_SYSTEM].received = sizeof(samples);
     sources[SOURCE_AIRPLAY].received = 0;
     puffin_dynamics_init(&dyn); speaker_dsp_init(&dsp, 100);
-    render_period(sources, output, &dyn, &dsp, 32768, &smoothed);
+    render_period(sources, NULL, 0, output, &dyn, &dsp, 32768, &smoothed);
     reference = output[100 * OUTPUT_CHANNELS];
     puffin_dynamics_init(&dyn); speaker_dsp_init(&dsp, 100);
     smoothed = 32768;
-    render_period(sources, output, &dyn, &dsp, 0, &smoothed);
+    render_period(sources, NULL, 0, output, &dyn, &dsp, 0, &smoothed);
     attenuated = output[(PERIOD_SIZE - 1) * OUTPUT_CHANNELS];
     assert(reference != 0 && smoothed == 0 && abs(attenuated) < abs(reference));
     remove_file(root, "airplay.active"); remove_file(root, "airplay.volume");
@@ -299,7 +299,7 @@ def main():
     # audiod could update the codec after the initial prepare check.
     engine = (HERE / "audio_engine.c").read_text()
     assert "if (!playback_start_failed && power_output_controls(card) < 0)" in engine
-    assert "write_period(pcm, output, &reference, first_activity) < 0 ||\n\t\t\t\t    verify_codec_reference(card) < 0 ||" in engine
+    assert "if (started < 0 || verify_codec_reference(card) < 0 ||\n\t\t\t\t    unmute_output_controls(card) < 0)" in engine
     with tempfile.TemporaryDirectory(prefix="le-airplay-session-") as tmp:
         root = Path(tmp)
         (root / "tinyalsa").mkdir()
@@ -309,7 +309,7 @@ def main():
         src.write_text(ENGINE_TEST)
         binary = root / "test"
         fixture_env = {**os.environ, "TMPDIR": str(root)}
-        subprocess.run([os.getenv("CC", "cc"), "-std=c99", "-Wall", "-Wextra", "-Werror", "-ffunction-sections", "-fdata-sections", "-I", str(root), "-I", str(HERE), str(src), "-Wl,--gc-sections", "-lm", "-o", str(binary)], check=True, timeout=60, env=fixture_env)
+        subprocess.run([os.getenv("CC", "cc"), "-std=c99", "-Wall", "-Wextra", "-Werror", "-ffunction-sections", "-fdata-sections", "-I", str(root), "-I", str(HERE), str(HERE / "audio_sink.c"), str(HERE / "audio_timing.c"), str(src), "-Wl,--gc-sections", "-lm", "-o", str(binary)], check=True, timeout=60, env=fixture_env)
         subprocess.run([str(binary)], check=True, timeout=30, env=fixture_env)
 
         # Hook/transport subprocess coverage lives in test_airplay_generation_fence.py.
