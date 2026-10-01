@@ -1,0 +1,164 @@
+{
+  "name": "sendspin",
+  "version": "8cdd4b38d029f3ef754756d494e0b53c42b81d75",
+  "license": "Apache-2.0",
+  "description": "Sendspin RC1 encrypted client. This lock mirrors the Product input inventory (docs/architecture/sendspin.md, build/inputs/public-inputs.json); the three must never diverge. Every source is an immutable commit with a SHA-256-verified archive; no moving tags and no unhashed runtime fetch.",
+  "target": "arm-linux-gnueabihf-glibc-dynamic",
+  "target_note": "Intended Sendspin companion target: the dynamic glibc ARMHF C++20 pattern used by the AirPlay 2 companion, not a static link. The fixture-verified runtime closure below was observed from a pinned-source cross-build and is enforced by the build; the production daemon closure is explicitly unknown and compile-input provenance is explicitly open.",
+  "runtime_requirements": {
+    "kind": "audited-loader-library-closure",
+    "interpreter": "/lib/ld-linux-armhf.so.3",
+    "needed": [
+      "libm.so.6",
+      "libc.so.6",
+      "ld-linux-armhf.so.3"
+    ],
+    "enforced_by": "build_sendspin.sh --elf-closure (writes elf-closure.json) and test_sdk_build.py; a later build whose NEEDED set or interpreter diverges from 'needed' fails closed",
+    "verified_closure": {
+      "artifact": "sendspin_adapter_tests.armhf (ELF32 ARM EABI5 hard-float PIE)",
+      "max_glibc": "2.38",
+      "reviewed_runtime_max_glibc": "2.39",
+      "cpp_runtime": "static (-static-libstdc++ -static-libgcc): libstdc++.so.6 and libgcc_s.so.1 are NOT dynamic dependencies of the fixture",
+      "status": "observed from the pinned-source cross-build of the LibreEcho adapter fixture and enforced above; 'needed' is the fixture closure, not a claim about any other binary"
+    },
+    "future_daemon": {
+      "needed": [
+        "libm.so.6",
+        "libc.so.6",
+        "ld-linux-armhf.so.3"
+      ],
+      "note": "The production Sendspin companion daemon has not been built. If it links the C++ runtime dynamically it would add libstdc++.so.6/libgcc_s.so.1, which are outside the reviewed mdns runtime closure unless they are bound statically as the fixture is.",
+      "status": "unknown pending an exact daemon cross-build; no version-validated symbol closure is claimed"
+    },
+    "compile_sysroot": {
+      "note": "Compilation headers/objects come from the Product archive-backed ARMHF cross-toolchain prefix (build/inputs/armhf-cross-toolchain.lock.json), verified from the locked .deb bytes by build/ci/armhf_toolchain.py `verify` before any target compiler/binutils runs. The consumer derives SYSROOT=<prefix>, CROSS_PREFIX=<prefix>/usr/bin/arm-linux-gnueabihf- and LD_LIBRARY_PATH=<prefix>/usr/lib/x86_64-linux-gnu, and rejects caller SYSROOT/CROSS_PREFIX overrides that conflict with the verified prefix. Compile-input provenance is separate from the runtime symbol closure.",
+      "pinned": false,
+      "verified_package_inputs": {
+        "status": "archive-backed: the 30 authenticated Ubuntu .deb archives of the Product toolchain lock (lock sha256 bc43cf12c4ce9ff2d87bccb5e1c82f007529d37549a5e168543d1e1b7dc6a649); verified prefix tree sha256 9f80865124867264b69bfa9e08ac8b858dbeaa062397d5749709d80a3b3131e8 (2701 files)",
+        "verified_by": "the Product materializer verify (archive bytes), re-run by the Platform consumer tools/mt8163-arm32/sendspin/build_sendspin.sh before any target tool runs"
+      },
+      "host_runtime": "the build host's amd64 glibc, loader and host tools remain external and unpinned; no hermetic or cross-host reproducibility claim",
+      "not_conflated_with": "the reviewed runtime closure and the future daemon closure are unchanged and separately stated above"
+    },
+    "status": "fixture runtime closure observed and enforced; the compile-input package closure is now archive-backed (pinned=false, host libc/tools external); the future daemon closure remains explicitly open"
+  },
+  "patch_inventory": {
+    "schema": "libreecho-sendspin-patch-inventory/1",
+    "applied": [
+      {
+        "file": "0001-stream-end-reason.patch",
+        "sha256": "d9273acc1e014ddc1550b5791a41d8ad360b9639b9f8059c3c6cb4f38ebe7090",
+        "target": "identity::sdk",
+        "pristine_archive_sha256": "2749ee07e4974f3879297af12d651349df33f46125a100cc935bf6966ed8af45",
+        "note": "Adds SendspinStreamEndReason (NATURAL/ROLE_REMOVED/DISCONNECTED) to PlayerRoleListener::on_stream_end() through a source-compatible reason overload, and an on_stream_clear() seek notification. Applied to the SDK staged tree after its archive bytes are verified; the pinned archive and its sha256 are unchanged."
+      },
+      {
+        "file": "0002-stream-clear-boundary.patch",
+        "sha256": "b01f3088e52e779070de4f1ef5191aad1c1e9501e320fb25746b1e244c59007b",
+        "target": "identity::sdk",
+        "pristine_archive_sha256": "2749ee07e4974f3879297af12d651349df33f46125a100cc935bf6966ed8af45",
+        "note": "Applied after 0001 (list order), so it diffs the 0001-patched tree. Adds PlayerRoleListener::on_stream_boundary(clear_generation): a synchronous seek boundary fired on the sync task thread inside apply_stream_clear() for both the flag and marker clear paths, once per monotonically tagged boundary. Its return value is the sink frames the consumer discarded at the boundary (the callback outcome), which are removed from sync_task's accepted-minus-played ledger (buffered_frames and new_audio_client_playtime move together) with no notify_audio_played() call, so post-seek audio is not mistaken for late and dropped. Additive default returns 0 and preserves prior behavior. Pinned archive and its sha256 are unchanged."
+      }
+    ],
+    "note": "Every applied patch is an immutable, SHA-256-pinned artifact in patches/, applied in list order (0001 then 0002) to the archive-verified staged tree. verify_sendspin_sources.py --patch-dir refuses a missing, extra, corrupt, double-applied, or path-escaping patch; a tree that is not the archive plus exactly this patch list is refused."
+  },
+  "identity": {
+    "protocol_spec": {
+      "repository": "https://github.com/Sendspin/spec.git",
+      "commit": "671a34d408581fc25ea56b3528a4a3f13e3be901",
+      "archive_url": "https://github.com/Sendspin/spec/archive/671a34d408581fc25ea56b3528a4a3f13e3be901.tar.gz",
+      "archive_sha256": "f0890562729069498cc5da57b63d1eea5f24cd661dc6dfc0c168614a216ffd3e",
+      "license": "Community-Spec-1.0"
+    },
+    "sdk": {
+      "repository": "https://github.com/Sendspin/sendspin-cpp.git",
+      "branch": "encryption-support-rc1",
+      "commit": "8cdd4b38d029f3ef754756d494e0b53c42b81d75",
+      "archive_url": "https://github.com/Sendspin/sendspin-cpp/archive/8cdd4b38d029f3ef754756d494e0b53c42b81d75.tar.gz",
+      "archive_sha256": "2749ee07e4974f3879297af12d651349df33f46125a100cc935bf6966ed8af45",
+      "license": "Apache-2.0"
+    },
+    "server_oracle": {
+      "repository": "https://github.com/Sendspin/aiosendspin.git",
+      "commit": "83209af414e1950dbbd0ebf60a9c0567b2c5f0c8",
+      "archive_url": "https://github.com/Sendspin/aiosendspin/archive/83209af414e1950dbbd0ebf60a9c0567b2c5f0c8.tar.gz",
+      "archive_sha256": "805dc716dc6bb80115040c476610342f27b68b44462bbcc0dd2713c2e98fba15",
+      "license": "Apache-2.0"
+    }
+  },
+  "dependencies": [
+    {
+      "name": "ArduinoJson",
+      "repository": "https://github.com/bblanchon/ArduinoJson.git",
+      "commit": "32520135092970120a5ac165cf45f48e658c421d",
+      "archive_url": "https://github.com/bblanchon/ArduinoJson/archive/32520135092970120a5ac165cf45f48e658c421d.tar.gz",
+      "archive_sha256": "9e48d9b1c690eed365e95a690c76f917af104eb74ffe3916568351dc78d45b2e",
+      "license": "MIT",
+      "fetched_by": "FetchContent override only"
+    },
+    {
+      "name": "IXWebSocket",
+      "repository": "https://github.com/machinezone/IXWebSocket.git",
+      "commit": "c5a02f1066fb0fde48f80f51178429a27f689a39",
+      "archive_url": "https://github.com/machinezone/IXWebSocket/archive/c5a02f1066fb0fde48f80f51178429a27f689a39.tar.gz",
+      "archive_sha256": "ef272693e67daef33275daa8d3685f48e8fe4dbe098338750f9dad3013016d96",
+      "license": "BSD-3-Clause",
+      "build_flags": ["USE_TLS=OFF", "USE_ZLIB=OFF"]
+    },
+    {
+      "name": "micro-flac",
+      "repository": "https://github.com/esphome-libs/micro-flac.git",
+      "commit": "9f8bfe5c9ee46cea175084b49ae8ac95545705b5",
+      "archive_url": "https://github.com/esphome-libs/micro-flac/archive/9f8bfe5c9ee46cea175084b49ae8ac95545705b5.tar.gz",
+      "archive_sha256": "bab7a0adc5a5a016d32bcb7cb17f38477f2397d4ef2d6f6de2dfecb990388bb7",
+      "license": "Apache-2.0",
+      "submodules": [
+        {
+          "path": "lib/micro-ogg-demuxer",
+          "repository": "https://github.com/esphome-libs/micro-ogg-demuxer.git",
+          "commit": "865ad9d831e7dc76bb9c142607bae33fc75648e7",
+          "archive_url": "https://github.com/esphome-libs/micro-ogg-demuxer/archive/865ad9d831e7dc76bb9c142607bae33fc75648e7.tar.gz",
+          "archive_sha256": "bb81cc1b64d1d888e5d5c93d12d07629887d1a197ab699e196fc37698e9f47bd",
+          "license": "Apache-2.0"
+        }
+      ]
+    },
+    {
+      "name": "noise-c",
+      "repository": "https://github.com/esphome-libs/noise-c.git",
+      "commit": "a1e08809a1b8f65cd91765ba7d68a6d00648ad61",
+      "archive_url": "https://github.com/esphome-libs/noise-c/archive/a1e08809a1b8f65cd91765ba7d68a6d00648ad61.tar.gz",
+      "archive_sha256": "0bfe220508f412c3944a9fe1ed38b741940a5bbcb001cd751f79fb0ee6ec63a8",
+      "license": "MIT",
+      "build_flags": [
+        "NOISE_USE_REFERENCE_BACKEND=1",
+        "NOISE_USE_AES=0",
+        "NOISE_USE_LIBSODIUM=0",
+        "NOISE_USE_CUSTOM_RAND=0"
+      ]
+    }
+  ],
+  "excluded_dependencies": [
+    {
+      "name": "micro-opus",
+      "repository": "https://github.com/esphome-libs/micro-opus.git",
+      "reason": "PCM-only freeze; SENDSPIN_ENABLE_OPUS=OFF. Excluded by policy and not staged or built; no licensing or patent conclusion is asserted."
+    }
+  ],
+  "feature": {
+    "kind": "logical",
+    "default": "off",
+    "independent_of": "airplay2",
+    "note": "AirPlay2 remains a physical feature and is unchanged; Sendspin is a separate, default-off logical feature that shares the C99 engine as sole ALSA owner."
+  },
+  "ownership": {
+    "sdk_companion": "LibreEcho-UI",
+    "sink_worker_and_shared_engine": "LibreEcho-Platform"
+  },
+  "build_command": "cmake -DSENDSPIN_ENABLE_OPUS=OFF -DFETCHCONTENT_SOURCE_DIR_ARDUINOJSON=<staged>/sendspin-arduinojson -DFETCHCONTENT_SOURCE_DIR_IXWEBSOCKET=<staged>/sendspin-ixwebsocket -DFETCHCONTENT_SOURCE_DIR_MICRO_FLAC=<staged>/sendspin-micro-flac -DFETCHCONTENT_SOURCE_DIR_NOISE_C=<staged>/sendspin-noise-c",
+  "notes": [
+    "The SDK is pinned to the encryption-support-rc1 branch commit; the legacy main branch is never substituted.",
+    "Staging downloads each committed archive to a local tree and verifies its SHA-256 before extraction, then materializes submodules from their own pinned archives; CMake FetchContent is pointed at the staged trees and never reaches the network.",
+    "This lock is a source-identity contract only. It is not build, image, or hardware evidence, and it makes no production-ready claim."
+  ]
+}
