@@ -172,6 +172,9 @@ assemble() {
     generation_lock
     dest=$GENERATIONS/$tx; partial=$GENERATIONS/$tx.partial
     safe_path "$dest"; safe_path "$partial"
+    # Durable lifecycle pin, outside the immutable target tree. A SIGKILL retains
+    # it for recovery; the installer clears it only after pending is durable.
+    atomic_write "$GENERATIONS/$tx.pin" printf '%s\n' "$tx"
     if [ -e "$dest" ]; then
         verify_tree "$dest" "$tx"
         [ "$(hash_state "$dest/target.manifest")" = "$(hash_state "$manifest")" ] || fail generation-collision

@@ -347,8 +347,11 @@ commit() {
         atomic_write "$ROOT/current" printf '%s\n' "$candidate"
     fi
     atomic_write "$ROOT/installed" write_result
+    safe_path "$GENERATIONS/$candidate.pin"
+    $BB rm -f "$GENERATIONS/$candidate.pin" || fail generation-unpin
     $BB rm "$PENDING" || fail pending-clear
     sync_file
+    gc
 }
 rollback() {
     [ -e "$PENDING" ] || return 0
@@ -356,11 +359,23 @@ rollback() {
     read_bcb
     [ "$SELECTED" != "$SLOT" ] && [ "$SUCCESS" = 1 ] || fail rollback-bcb
     atomic_write "$ROOT/rolled-back" write_result
+    safe_path "$GENERATIONS/$TX.pin"
+    $BB rm -f "$GENERATIONS/$TX.pin" || fail generation-unpin
     $BB rm "$PENDING" || fail pending-clear
     sync_file
+    gc
 }
 gc() {
-    local keep= id directory
+    local keep= id directory pin
+    # Snapshot pins BEFORE pointers: an installer can clear its pin only after
+    # publishing pending. This ordering closes concurrent unpin/publication gaps.
+    for pin in "$GENERATIONS"/*.pin; do
+        [ -e "$pin" ] || [ -L "$pin" ] || continue
+        regular "$pin" gc-pin
+        id=${pin##*/}; id=${id%.pin}; valid_id "$id"
+        [ "$($BB cat "$pin")" = "$id" ] || fail gc-pin-identity
+        keep="$keep $id"
+    done
     for id in current previous; do
         if [ -e "$ROOT/$id" ]; then read_pointer "$id"; keep="$keep $TX"; fi
     done
@@ -369,6 +384,7 @@ gc() {
     for directory in "$GENERATIONS"/*; do
         [ -e "$directory" ] || [ -L "$directory" ] || continue
         safe_path "$directory"
+        case "$directory" in *.pin) regular "$directory" gc-pin; continue;; esac
         [ -d "$directory" ] && [ -z "$($BB find "$directory" -type l)" ] || fail gc-type
         id=${directory##*/}; valid_id "$id"
     done
@@ -451,6 +467,6 @@ case "${1:-}" in
     activate-committed) activate_committed;;
     commit|commit-after-confirm) commit;;
     rollback|fallback) rollback;;
-    gc) gc;;
+    gc) [ ! -e "$ROOT/install.lock" ] || fail gc-install-busy; gc;;
     *) fail usage;;
 esac

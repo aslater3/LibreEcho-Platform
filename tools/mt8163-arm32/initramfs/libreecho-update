@@ -108,6 +108,11 @@ die()
             $BB mv "$STATE.tmp" "$STATE" 2>/dev/null || $BB rm -f "$STATE.tmp" 2>/dev/null
         $BB sync 2>/dev/null || true
     fi
+    # On an ordinary aborted install, release only this candidate's lifecycle
+    # pin. A pending target remains owned by the transaction instead.
+    if [ -n "${tx:-}" ] && [ ! -e "$PENDING" ]; then
+        case "$tx" in ''|.|..|*[!A-Za-z0-9._+~:-]*) ;; *) $BB rm -f "$GENERATIONS/$tx.pin";; esac
+    fi
     cleanup_refused_install_artifacts || true
     exit 1
 }
@@ -448,6 +453,8 @@ install_package()
         $BB chmod 0600 "$PENDING.tmp" || die pending_mode
         $BB sync
         $BB mv "$PENDING.tmp" "$PENDING" || die pending_commit
+        $BB sync
+        $BB rm -f "$GENERATIONS/$tx.pin" || die generation_unpin
         $BB sync
 
     fi

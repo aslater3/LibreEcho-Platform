@@ -157,7 +157,7 @@ for daemon in ('libreecho-audio-engine','libreecho-ttsd','libreecho-waked','libr
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.control / 'current').read_text(), 'prior\n')
         self.assertFalse((self.control / 'pending').exists())
-        self.assertTrue((self.generations / 'test-target/COMPLETE').exists())
+        self.assertFalse((self.generations / 'test-target').exists())
 
     def test_activate_committed_rehashes_payload(self):
         self.prepared()
@@ -267,6 +267,23 @@ for daemon in ('libreecho-audio-engine','libreecho-ttsd','libreecho-waked','libr
         (self.loops / '7:0/loop/backing_file').write_text('/wrong/payload.squashfs\n')
         self.assertNotEqual(self.verb('activate').returncode, 0)
 
+    def test_gc_retains_assembled_pin_until_pending_publication(self):
+        self.assertEqual(self.run_assembly().returncode, 0)
+        result = self.verb('gc')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.generations / 'test-target/COMPLETE').exists())
+        self.assertTrue((self.generations / 'test-target.pin').is_file())
+
+    def test_commit_collects_obsolete_generations(self):
+        self.prepared()
+        obsolete = self.generations / 'obsolete'
+        obsolete.mkdir(); (obsolete / 'bytes').write_bytes(b'obsolete')
+        self.set_bcb('b', '1')
+        result = self.verb('commit')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(obsolete.exists())
+        self.assertFalse((self.generations / 'test-target.pin').exists())
+
     def test_gc_keeps_control_targets_never_config(self):
         self.prepared()
         for tx in ('prior', 'previous', 'obsolete'):
@@ -279,7 +296,7 @@ for daemon in ('libreecho-audio-engine','libreecho-ttsd','libreecho-waked','libr
         config.write_text('{"schema":1}')
         result = self.verb('gc')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(sorted(p.name for p in self.generations.iterdir()), ['previous', 'prior', 'test-target'])
+        self.assertEqual(sorted(p.name for p in self.generations.iterdir()), ['previous', 'prior', 'test-target', 'test-target.pin'])
         self.assertEqual(config.read_text(), '{"schema":1}')
 
     def test_v3_engine_has_no_overlay_or_history_actions(self):

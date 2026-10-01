@@ -100,6 +100,7 @@ class UpdaterTests(grammar.SignedFixture):
         p, sig = self.signed(self.text)
         directory = self.data / 'libreecho/generations/test-target'
         directory.mkdir(parents=True)
+        (directory.parent / 'test-target.pin').write_text('test-target\n')
         (directory / 'target.manifest').write_bytes(p.read_bytes())
         (directory / 'target.manifest.sig').write_bytes(sig.read_bytes())
         (directory / 'COMPLETE').write_text(hashlib.sha256(p.read_bytes()).hexdigest() + '\n')
@@ -131,6 +132,7 @@ class UpdaterTests(grammar.SignedFixture):
         expected = 'schema=3\nslot=b\ntransaction_id=test-target\nmanifest_sha256=' + hashlib.sha256(p.read_bytes()).hexdigest() + '\n'
         self.assertEqual(self.control_file('pending').read_text(), expected)
         self.assertEqual((self.root / 'activated').read_text(), 'b\n')
+        self.assertFalse((directory.parent / 'test-target.pin').exists())
 
     def test_confirm_v3_calls_target_activation_then_slot_confirm_then_commit(self):
         self.control_file('pending').write_text('schema=3\nslot=b\ntransaction_id=test-target\nmanifest_sha256=' + 'a' * 64 + '\n')
