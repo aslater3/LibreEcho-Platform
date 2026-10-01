@@ -85,21 +85,28 @@ Both fail closed with a bounded `unavailable: <reason>` line.
 the client STA plane through its owning service (pidfile-scoped, never
 `pkill`), records exactly the interface/address it took in
 `/run/libreecho/recovery-net.state`, brings the link up and assigns the portal
-address.  A failure rolls the client service back.  `libreecho-recovery-net-down
+address.  It also carries the client profile the boot path recorded in
+`/run/libreecho/wifi-client.conf` into that ownership record, so the restart it
+owes uses the same profile instead of the packaged fallback; a recorded path
+that is not a regular file at the expected `/data/libreecho/config` or
+`/etc/wifi` location fails the helper closed.  A failure rolls the client
+service back.  `libreecho-recovery-net-down
 --interface IFACE` removes **only** the address it recorded and restores the
-client service only when it was the one that stopped it; the ownership record is
-retained until that restart actually succeeds, so a failed or interrupted
-restore is retried by the next teardown instead of being forgotten.  With no
-recorded ownership it is a successful no-op.  Neither helper uses `/dev/wmtWifi`,
-a pattern-based kill, or a reboot.
+client service only when it was the one that stopped it, restarting it with
+that recorded profile (`WIFI_CONF`); the ownership record is retained until that
+restart actually succeeds, so a failed or interrupted restore is retried by the
+next teardown instead of being forgotten.  With no recorded ownership it is a
+successful no-op.  Neither helper uses `/dev/wmtWifi`, a pattern-based kill, or
+a reboot.
 
 ## Pinned dependencies
 
 `SOURCE.lock` pins each component's upstream URL, SHA-256, licence and the
 licence file that must exist inside the upstream source tree.  The hashes were
-computed from the real archives at those URLs.  During a build the script
-verifies each archive hash, extracts it, and refuses to continue if a declared
-licence text is missing from the tree.
+computed from the real archives at those URLs.  The script verifies each archive
+hash, extracts it, and refuses to continue if a declared licence text is missing
+from the tree — in `--verify` as well as `--build`, so a broken licence pin is
+caught before the caller commits to a full compile.
 
 Build the static ARM32 binaries with an external toolchain:
 
@@ -116,8 +123,9 @@ tools/mt8163-arm32/recovery-ap/build_recovery_ap.sh --build \
 ```
 
 `--verify` fails closed on a missing archive, a non-regular archive, a
-malformed or mismatched SHA-256, or a GPL component with no recorded
-corresponding-source offer; `--build` performs the same verification first and
+malformed or mismatched SHA-256, a declared licence text missing from the
+extracted source tree, or a GPL component with no recorded corresponding-source
+offer; `--build` performs the same verification first and
 refuses to compile against anything unverified.  `iw` and `hostapd`
 (`CONFIG_LIBNL32`) reuse the libnl already pinned for wpa_supplicant; `hostapd`
 is built with the internal crypto/TLS backend, and the builder refuses a config

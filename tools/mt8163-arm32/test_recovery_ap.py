@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import io
 import json
 import os
 import re
@@ -31,6 +32,7 @@ import shutil
 import socket
 import stat
 import subprocess
+import tarfile
 import tempfile
 import time
 import unittest
@@ -411,6 +413,11 @@ class NetHandoverTests(unittest.TestCase):
         self.ip_state = self.root / "ipstate"
         self.ip_state.mkdir()
         self.wpa_log = self.root / "wpa.log"
+        # Profiles are validated against an expected root, pointed at a temp
+        # directory here so the location check is exercised without /etc or
+        # /data.
+        self.profile_root = self.root / "data"
+        self.profile_root.mkdir()
         self.oracle = self.root / "ip"
         self.oracle.write_text(f'''#!/bin/sh
 printf '%s\\n' "$*" >> "{self.ip_log}"
@@ -433,7 +440,7 @@ exit 0
         # makes the retry-ownership regression reproducible.
         self.wpa = self.root / "libreecho-wifi"
         self.wpa.write_text(f'''#!/bin/sh
-echo "$*" >> "{self.wpa_log}"
+printf '%s WIFI_CONF=%s\\n' "$*" "${{WIFI_CONF:-}}" >> "{self.wpa_log}"
 count_file="{self.root}/stopcount"
 case "$1" in
     stop)
@@ -463,7 +470,17 @@ exit 0
         env = dict(os.environ)
         env["RECOVERY_AP_IP"] = str(self.oracle)
         env["RECOVERY_AP_WPA_SERVICE"] = str(self.wpa)
+        env["RECOVERY_AP_PROFILE_ROOTS"] = str(self.profile_root)
         return env
+
+    def profile(self, name: str = "wpa_supplicant.conf") -> Path:
+        path = self.profile_root / name
+        path.write_text("network={}\n")
+        return path
+
+    def record_profile(self, path: Path) -> None:
+        # Exactly what the boot path writes to /run/libreecho/wifi-client.conf.
+        (self.state_dir / "wifi-client.conf").write_text(f"{path}\n")
 
     def run_net(self, helper: Path, *args: str) -> subprocess.CompletedProcess:
         return subprocess.run(["sh", str(helper), *args], text=True,
@@ -616,6 +633,80 @@ exit 0
         self.assertIn("nothing-owned", result.stdout)
         self.assertTrue((self.state_dir / "recovery-net.state").exists())
 
+    def test_net_up_records_selected_profile_and_net_down_restores_with_it(self) -> None:
+        # The boot path records the profile it selected; net-up must carry it in
+        # the ownership state and net-down must restart the client with the same
+        # WIFI_CONF instead of the packaged /etc/wifi fallback.
+        profile = self.profile()
+        self.record_profile(profile)
+        self.assertEqual(self.up().returncode, 0)
+        state = (self.state_dir / "recovery-net.state").read_text()
+        self.assertIn(f"wifi_conf={profile}", state)
+        down = self.run_net(NET_DOWN, "--interface", "wlan0",
+                            "--state-dir", str(self.state_dir))
+        self.assertEqual(down.returncode, 0, down.stderr)
+        self.assertIn(f"start WIFI_CONF={profile}", self.wpa_log_text())
+
+    def test_net_up_rollback_restores_with_the_recorded_profile(self) -> None:
+        profile = self.profile()
+        self.record_profile(profile)
+        (self.ip_state / "fail_add").touch()
+        result = self.up()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot assign", result.stderr)
+        self.assertIn(f"start WIFI_CONF={profile}", self.wpa_log_text())
+
+    def test_net_up_re_run_keeps_the_recorded_profile(self) -> None:
+        # A re-run that preserves prior ownership must also preserve the profile
+        # the restore will need.
+        profile = self.profile()
+        self.record_profile(profile)
+        self.assertEqual(self.up().returncode, 0)
+        (self.state_dir / "wifi-client.conf").unlink()
+        (self.ip_state / "addr").unlink()
+        self.assertEqual(self.up().returncode, 0)
+        self.assertIn(f"wifi_conf={profile}",
+                      (self.state_dir / "recovery-net.state").read_text())
+
+    def test_net_up_refuses_recorded_profile_outside_expected_location(self) -> None:
+        outside = self.root / "outside.conf"
+        outside.write_text("network={}\n")
+        self.record_profile(outside)
+        result = self.up()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("outside expected location", result.stderr)
+
+    def test_net_up_refuses_missing_recorded_profile(self) -> None:
+        missing = self.profile_root / "absent.conf"
+        self.record_profile(missing)
+        result = self.up()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a regular file", result.stderr)
+
+    def test_net_down_fails_closed_when_recorded_profile_disappears(self) -> None:
+        profile = self.profile()
+        self.record_profile(profile)
+        self.assertEqual(self.up().returncode, 0)
+        profile.unlink()
+        down = self.run_net(NET_DOWN, "--interface", "wlan0",
+                            "--state-dir", str(self.state_dir))
+        self.assertNotEqual(down.returncode, 0)
+        self.assertIn("client profile", down.stderr)
+        # The obligation is retained so the restore is retried rather than
+        # silently completed against the wrong profile.
+        self.assertTrue((self.state_dir / "recovery-net.state").is_file())
+
+    def test_net_down_restores_without_override_when_no_profile_recorded(self) -> None:
+        # An image that never selected a profile keeps the previous behaviour:
+        # no WIFI_CONF override on the restart.
+        self.assertEqual(self.up().returncode, 0)
+        self.assertIn("wifi_conf=\n",
+                      (self.state_dir / "recovery-net.state").read_text())
+        down = self.run_net(NET_DOWN, "--interface", "wlan0",
+                            "--state-dir", str(self.state_dir))
+        self.assertEqual(down.returncode, 0, down.stderr)
+        self.assertIn("start WIFI_CONF=\n", self.wpa_log_text())
+
 
 class NetHandoverPathTests(unittest.TestCase):
     """The handover helpers must target the Wi-Fi service the image stages."""
@@ -651,6 +742,16 @@ class NetHandoverPathTests(unittest.TestCase):
             with self.subTest(script=script.name):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, staged)
+
+    def test_client_profile_record_is_shared_with_the_boot_path(self) -> None:
+        # The boot path records the selected profile where net-up reads it; a
+        # path drift would leave the restore using the packaged fallback.
+        init = (INITRAMFS / "libreecho-init").read_text()
+        self.assertIn("WIFI_PROFILE_STATE=/run/libreecho/wifi-client.conf", init)
+        self.assertIn("PROFILE_FILE=$STATE_DIR/wifi-client.conf",
+                      NET_UP.read_text())
+        self.assertIn('WIFI_CONF="$2" "$1" start', NET_UP.read_text())
+        self.assertIn('WIFI_CONF="$2" "$1" start', NET_DOWN.read_text())
 
 
 class DependencyPinTests(unittest.TestCase):
@@ -715,11 +816,27 @@ class DependencyPinTests(unittest.TestCase):
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               timeout=120)
 
+    @staticmethod
+    def write_archive(root: Path, members=None) -> Path:
+        """A real gzip tarball whose extracted tree carries the given members.
+
+        The builder verifies the archive hash *and* extracts it to require the
+        declared licence file, so a hash-matching blob is no longer sufficient.
+        """
+        if members is None:
+            members = {"hostapd-2.10/COPYING": b"licence text\n"}
+        archive = root / "hostapd-2.10.tar.gz"
+        with tarfile.open(archive, "w:gz") as handle:
+            for member, payload in members.items():
+                info = tarfile.TarInfo(member)
+                info.size = len(payload)
+                handle.addfile(info, io.BytesIO(payload))
+        return archive
+
     def test_builder_accepts_matching_archive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            archive = root / "hostapd-2.10.tar.gz"
-            archive.write_bytes(b"pinned-artifact-bytes")
+            archive = self.write_archive(root)
             component = self.component()
             component["source_sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
             lock = self.write_lock(root, component)
@@ -759,11 +876,43 @@ class DependencyPinTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("malformed", result.stderr)
 
+    def test_verify_fails_closed_on_missing_licence(self) -> None:
+        # --verify must perform the licence-provenance check, not only --build:
+        # a verified archive whose declared licence text is absent must be
+        # refused before the caller commits to a compile.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = self.write_archive(
+                root, {"hostapd-2.10/README": b"no licence here\n"})
+            component = self.component()
+            component["source_sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+            lock = self.write_lock(root, component)
+            result = self.run_builder("--verify", "--lock", str(lock),
+                                      "--archive", f"hostapd={archive}")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("COPYING", result.stderr)
+            self.assertIn("missing from the source tree", result.stderr)
+
+    def test_verify_fails_closed_on_misspelled_licence(self) -> None:
+        # A misspelled source_license pin is exactly the drift this check exists
+        # to catch: the archive is intact but names no such file.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = self.write_archive(root, {"hostapd-2.10/COPYING": b"licence\n"})
+            component = self.component()
+            component["source_license"] = "COPYING.txt"
+            component["source_sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+            lock = self.write_lock(root, component)
+            result = self.run_builder("--verify", "--lock", str(lock),
+                                      "--archive", f"hostapd={archive}")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("COPYING.txt", result.stderr)
+            self.assertIn("missing from the source tree", result.stderr)
+
     def test_builder_requires_a_source_offer_for_gpl_components(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            archive = root / "hostapd-2.10.tar.gz"
-            archive.write_bytes(b"pinned-artifact-bytes")
+            archive = self.write_archive(root)
             component = self.component("GPL-2.0-or-3.0")
             component["source_sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
             lock = self.write_lock(root, component)
@@ -775,8 +924,7 @@ class DependencyPinTests(unittest.TestCase):
     def test_builder_accepts_gpl_component_with_source_offer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            archive = root / "hostapd-2.10.tar.gz"
-            archive.write_bytes(b"pinned-artifact-bytes")
+            archive = self.write_archive(root)
             component = self.component("GPL-2.0-or-3.0")
             component["source_sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
             lock = self.write_lock(root, component,

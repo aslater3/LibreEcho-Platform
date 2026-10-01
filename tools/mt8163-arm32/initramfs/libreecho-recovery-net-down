@@ -25,6 +25,10 @@ set -u
 BB=${BB:-/bin/busybox}
 STATE_DIR=${RECOVERY_NET_STATE_DIR:-/run/libreecho}
 WPA_SERVICE=${RECOVERY_AP_WPA_SERVICE:-/sbin/libreecho-wifi}
+# The client profile the handover recorded for the restart it owes.  It is only
+# ever accepted from the two locations the boot path writes: the persistent
+# /data config or the packaged /etc/wifi file.
+PROFILE_ROOTS=${RECOVERY_AP_PROFILE_ROOTS:-/data/libreecho/config:/etc/wifi}
 
 IFACE=
 
@@ -76,15 +80,59 @@ owned_iface=$(read_state_field iface)
 owned_address=$(read_state_field address)
 owned_stopped=$(read_state_field stopped)
 owned_service=$(read_state_field wpa_service)
+owned_wifi_conf=$(read_state_field wifi_conf)
 [ -n "$owned_service" ] || owned_service=$WPA_SERVICE
 
 address_present() {
     "$IP_BIN" addr show dev "$IFACE" 2>/dev/null | grep -q "inet $1"
 }
 
+resolve_wifi_conf() {
+    # $1 candidate path (may be empty).  Prints the validated path, or nothing
+    # when none was recorded.  An invalid recorded path is a hard error (non-zero
+    # return) rather than a silent fallback: restarting the client with the wrong
+    # profile would look like a successful restore.  It returns a status instead
+    # of calling die() because it is always invoked in a command substitution,
+    # where an exit would only terminate the subshell.
+    conf=${1:-}
+    [ -n "$conf" ] || return 0
+    case "$conf" in
+        /*) ;;
+        *) printf '%s: non-absolute client profile path: %s\n' "$0" "$conf" >&2; return 2 ;;
+    esac
+    case "$conf" in
+        *..*) printf '%s: unsafe client profile path: %s\n' "$0" "$conf" >&2; return 2 ;;
+    esac
+    if [ ! -f "$conf" ] || [ -L "$conf" ]; then
+        printf '%s: client profile is not a regular file: %s\n' "$0" "$conf" >&2
+        return 2
+    fi
+    found=0
+    saved_ifs=$IFS
+    IFS=:
+    for root in $PROFILE_ROOTS; do
+        case "$conf" in
+            "$root"/*) found=1; break ;;
+        esac
+    done
+    IFS=$saved_ifs
+    if [ "$found" != 1 ]; then
+        printf '%s: client profile outside expected location: %s\n' "$0" "$conf" >&2
+        return 2
+    fi
+    printf '%s\n' "$conf"
+}
+
 restore_client_service() {
+    # $1 service; $2 validated profile path (optional).  When a profile was
+    # recorded the service is restarted with WIFI_CONF so it re-selects the same
+    # config the boot path chose, instead of falling back to the packaged one.
     [ -x "$1" ] || return 0
-    "$1" start >/dev/null 2>&1
+    if [ -n "${2:-}" ]; then
+        WIFI_CONF="$2" "$1" start >/dev/null 2>&1
+    else
+        "$1" start >/dev/null 2>&1
+    fi
     return $?
 }
 
@@ -115,7 +163,12 @@ fi
 #    the address already gone (the removal above is idempotent) and restores the
 #    service, so discarding ownership early buys nothing and loses the debt.
 if [ "$owned_stopped" = 1 ]; then
-    if ! restore_client_service "$owned_service"; then
+    # Validate the recorded profile only when a restart is actually owed; a
+    # spurious teardown for another interface must stay the no-op success.
+    if ! restore_wifi_conf=$(resolve_wifi_conf "$owned_wifi_conf"); then
+        die "cannot restore client service $owned_service"
+    fi
+    if ! restore_client_service "$owned_service" "$restore_wifi_conf"; then
         die "cannot restore client service $owned_service"
     fi
 fi

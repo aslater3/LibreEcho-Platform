@@ -107,6 +107,11 @@ resolve_archive() {
 # image metadata from already-built artifacts reads only SOURCE.lock and the
 # output directory, so it never requires the archives.
 if [[ "$MODE" != emit-metadata ]]; then
+# The verified archives are extracted once into this scratch tree: both modes
+# need the source trees to check declared licences, and --build compiles from
+# them, so the licence-provenance check below and the compilation share it.
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
 for line in "${COMPONENTS[@]}"; do
     IFS=$'\t' read -r name version sha url artifact license source_license source_license_secondary <<<"$line"
     case "$sha" in
@@ -124,6 +129,25 @@ for line in "${COMPONENTS[@]}"; do
         exit 1
     fi
     printf 'verified %s %s %s\n' "$name" "$version" "$sha"
+done
+
+# Licence provenance: every declared licence text must actually be present in
+# the verified upstream source tree, so a component can never be pinned against
+# a tree that hides or omits its licence.  This runs for --verify as well as
+# --build: verify mode must fail closed on a missing or misspelled licence path,
+# not only after the caller has committed to a full compile.
+for line in "${COMPONENTS[@]}"; do
+    IFS=$'\t' read -r name version sha url artifact license source_license source_license_secondary <<<"$line"
+    src="$work/$name"
+    mkdir -p "$src"
+    tar -xf "${RESOLVED[$name]}" -C "$src" --strip-components=1
+    for licence in "$source_license" "${source_license_secondary:-}"; do
+        [[ -n "$licence" ]] || continue
+        [[ -f "$src/$licence" ]] || {
+            printf 'ERROR: %s: declared licence %s is missing from the source tree\n' \
+                "$name" "$licence" >&2
+            exit 1; }
+    done
 done
 
 # libnl is a verified build input (never staged into the image): hostapd's
@@ -409,8 +433,6 @@ for tool in make tar pkg-config bison flex; do
 done
 
 mkdir -p "$OUTPUT"
-work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
 
 # --- pinned libnl (static prefix shared by hostapd and iw) ---
 libnl_src="$work/libnl-src"
@@ -433,20 +455,8 @@ export PKG_CONFIG_PATH="$libnl_prefix/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
 for line in "${COMPONENTS[@]}"; do
     IFS=$'\t' read -r name version sha url artifact license source_license source_license_secondary <<<"$line"
-    archive=${RESOLVED[$name]}
+    # The verified, licence-checked source tree the pre-check above extracted.
     src="$work/$name"
-    mkdir -p "$src"
-    tar -xf "$archive" -C "$src" --strip-components=1
-    # Licence provenance: every declared licence text must actually be present
-    # in the verified upstream source tree, so a component can never be pinned
-    # against a tree that hides or omits its licence.
-    for licence in "$source_license" "${source_license_secondary:-}"; do
-        [[ -n "$licence" ]] || continue
-        [[ -f "$src/$licence" ]] || {
-            printf 'ERROR: %s: declared licence %s is missing from the source tree\n' \
-                "$name" "$licence" >&2
-            exit 1; }
-    done
     case "$name" in
         hostapd)
             # WPA-PSK AP with internal crypto/TLS: no OpenSSL (or any external

@@ -919,6 +919,21 @@ log wmt-nodes-created
 # The web UI still reports the board's address beside the one in use, which is
 # what makes the difference visible.
 
+# Issue #96 recovery-boot coordination.  The physical recovery detector arms a
+# boot-scoped marker before the boot-path Wi-Fi worker starts, and while the
+# marker is present the recovery access point owns the single radio for the
+# whole boot.  The worker may still load the driver -- that is what creates
+# wlan0 for the AP capability probe and for hostapd -- but it must never start
+# the client supplicant: networkd's handover helper stops the client service
+# through its pidfile, and if this worker had not started it yet the stop is a
+# no-op while the worker then starts wpa_supplicant against hostapd.  The
+# marker is created before this worker is launched, so the check is
+# deterministic rather than a race.  An ordinary boot (no marker) is unchanged.
+recovery_owns_radio()
+{
+    [ -f "${PHYSICAL_RECOVERY_MARKER:-/run/libreecho/recovery-mode}" ]
+}
+
 start_wifi_network_sequence()
 {
     packaged_wifi=/etc/wifi/wpa_supplicant.conf
@@ -952,6 +967,22 @@ start_wifi_network_sequence()
     fi
     [ -n "$wifi_profile" ] || { log wifi-profile-absent; return 2; }
     log wifi-profile-present
+    # Persist the selected profile path for the recovery handover.  networkd's
+    # libreecho-recovery-net-down restarts the client service after the portal
+    # is torn down, and it does so without this boot's environment; without the
+    # recorded path it would fall back to the packaged /etc/wifi profile and the
+    # restored client could associate with the wrong config.  Boot-scoped tmpfs,
+    # written before the client start and before the recovery-boot suppression
+    # below, so the handover has the path on both paths.
+    WIFI_PROFILE_STATE=/run/libreecho/wifi-client.conf
+    if $BB mkdir -p /run/libreecho 2>/dev/null &&
+        printf '%s\n' "$wifi_profile" > "$WIFI_PROFILE_STATE" 2>/dev/null; then
+        $BB chmod 0700 /run/libreecho 2>/dev/null
+        $BB chmod 0600 "$WIFI_PROFILE_STATE" 2>/dev/null
+        log wifi-profile-recorded
+    else
+        log wifi-profile-record-failed
+    fi
     # This is the proven manual choreography from session e8c21eb3bbae:
     # stock-compatible configure-only init, stale-launcher cleanup, exactly one
     # one-shot command responder, then one timed Wi-Fi function-on write.  Do
@@ -1010,6 +1041,13 @@ start_wifi_network_sequence()
         i=$((i + 1))
     done
     [ -e /sys/class/net/wlan0 ] || { log wlan0-registration-timeout; return 1; }
+    # Recovery boot: the driver is up and wlan0 exists for the AP probe and
+    # hostapd, but the portal owns the radio, so never start the client
+    # supplicant here (see recovery_owns_radio above).
+    if recovery_owns_radio; then
+        log wifi-client-suppressed-recovery-boot
+        return 0
+    fi
     WIFI_CONF="$wifi_profile" /sbin/libreecho-wifi start \
         >/tmp/wifi-client.log 2>&1
     client_rc=$?

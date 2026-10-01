@@ -265,6 +265,48 @@ class EarlyControlPlaneContracts(unittest.TestCase):
         self.assertIn("wifi_request_loop &", self.init)
         self.assertIn("/tmp/wifi.request", self.init)
 
+    # ------------------------------------------------- recovery-boot coordination
+    def test_recovery_owns_radio_reads_the_boot_marker(self) -> None:
+        start = self.init.index("recovery_owns_radio()")
+        body = self.init[start : self.init.index("\n}\n", start) + len("\n}\n")]
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "recovery-mode"
+            script = (
+                f"PHYSICAL_RECOVERY_MARKER={shlex.quote(str(marker))}\n"
+                + body
+                + "\nif recovery_owns_radio; then echo owned; else echo free; fi\n"
+            )
+            free = subprocess.run(["sh", "-c", script], capture_output=True, text=True)
+            self.assertEqual(free.stdout.strip(), "free", free.stderr)
+            marker.write_text("libreecho-recovery-v1\n")
+            owned = subprocess.run(["sh", "-c", script], capture_output=True, text=True)
+            self.assertEqual(owned.stdout.strip(), "owned", owned.stderr)
+
+    def test_client_start_is_suppressed_on_a_recovery_boot(self) -> None:
+        guard = self.init.index("if recovery_owns_radio; then")
+        client = self.init.index('WIFI_CONF="$wifi_profile" /sbin/libreecho-wifi start')
+        self.assertLess(guard, client)
+        between = self.init[guard:client]
+        self.assertIn("wifi-client-suppressed-recovery-boot", between)
+        self.assertIn("return 0", between)
+        # Exactly one guard, and it sits after the driver bring-up that creates
+        # wlan0, so the AP probe and hostapd still find the interface.
+        self.assertEqual(self.init.count("if recovery_owns_radio; then"), 1)
+        self.assertLess(self.init.index("wlan0-registration-timeout"), guard)
+        # Normal boot is unchanged: the client start is still present exactly
+        # once, not replaced by the suppression.
+        self.assertEqual(
+            self.init.count('WIFI_CONF="$wifi_profile" /sbin/libreecho-wifi start'), 1)
+
+    def test_wifi_profile_is_recorded_before_the_client_start(self) -> None:
+        record = self.init.index("WIFI_PROFILE_STATE=/run/libreecho/wifi-client.conf")
+        guard = self.init.index("if recovery_owns_radio; then")
+        client = self.init.index('WIFI_CONF="$wifi_profile" /sbin/libreecho-wifi start')
+        self.assertLess(record, guard)
+        self.assertLess(record, client)
+        self.assertIn(
+            "printf '%s\\n' \"$wifi_profile\" > \"$WIFI_PROFILE_STATE\"", self.init)
+
 
 if __name__ == "__main__":
     unittest.main()

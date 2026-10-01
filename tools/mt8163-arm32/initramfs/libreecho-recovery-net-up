@@ -74,6 +74,14 @@ case "$STATE_DIR" in
 esac
 
 STATE_FILE=$STATE_DIR/recovery-net.state
+# The boot path records the client profile it selected in a boot-scoped file so
+# the handover can restart the client service with the same profile after the
+# portal is torn down (otherwise the helper's restart falls back to the packaged
+# /etc/wifi config).
+PROFILE_FILE=$STATE_DIR/wifi-client.conf
+# ...and the recorded path is only ever accepted from the two locations the boot
+# path writes: the persistent /data config or the packaged /etc/wifi file.
+PROFILE_ROOTS=${RECOVERY_AP_PROFILE_ROOTS:-/data/libreecho/config:/etc/wifi}
 
 resolve_ip() {
     if [ -n "${RECOVERY_AP_IP:-}" ]; then
@@ -102,18 +110,55 @@ read_state_field() {
 }
 
 write_state() {
-    # $1 stopped-client flag
+    # $1 stopped-client flag; $2 validated client profile path (may be empty)
     tmp=$STATE_FILE.tmp.$$
     {
         printf 'iface=%s\n' "$IFACE"
         printf 'address=%s\n' "$ADDRESS"
         printf 'stopped=%s\n' "$1"
         printf 'wpa_service=%s\n' "$WPA_SERVICE"
+        printf 'wifi_conf=%s\n' "$2"
     } >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
     chmod 0600 "$tmp" 2>/dev/null
     [ "$(id -u 2>/dev/null)" = 0 ] && chown 0:0 "$tmp" 2>/dev/null
     mv -f "$tmp" "$STATE_FILE" 2>/dev/null || { rm -f "$tmp"; return 1; }
     return 0
+}
+
+resolve_wifi_conf() {
+    # $1 candidate path (may be empty).  Prints the validated path, or nothing
+    # when none was recorded.  An invalid recorded path is a hard error (non-zero
+    # return) rather than a silent fallback: restarting the client with the wrong
+    # profile would look like a successful restore.  It returns a status instead
+    # of calling die() because it is always invoked in a command substitution,
+    # where an exit would only terminate the subshell.
+    conf=${1:-}
+    [ -n "$conf" ] || return 0
+    case "$conf" in
+        /*) ;;
+        *) printf '%s: non-absolute client profile path: %s\n' "$0" "$conf" >&2; return 2 ;;
+    esac
+    case "$conf" in
+        *..*) printf '%s: unsafe client profile path: %s\n' "$0" "$conf" >&2; return 2 ;;
+    esac
+    if [ ! -f "$conf" ] || [ -L "$conf" ]; then
+        printf '%s: client profile is not a regular file: %s\n' "$0" "$conf" >&2
+        return 2
+    fi
+    found=0
+    saved_ifs=$IFS
+    IFS=:
+    for root in $PROFILE_ROOTS; do
+        case "$conf" in
+            "$root"/*) found=1; break ;;
+        esac
+    done
+    IFS=$saved_ifs
+    if [ "$found" != 1 ]; then
+        printf '%s: client profile outside expected location: %s\n' "$0" "$conf" >&2
+        return 2
+    fi
+    printf '%s\n' "$conf"
 }
 
 stop_client_service() {
@@ -123,8 +168,15 @@ stop_client_service() {
 }
 
 restore_client_service() {
-    [ -x "$WPA_SERVICE" ] || return 0
-    "$WPA_SERVICE" start >/dev/null 2>&1
+    # $1 service; $2 validated profile path (optional).  When a profile was
+    # recorded the service is restarted with WIFI_CONF so it re-selects the same
+    # config the boot path chose.
+    [ -x "$1" ] || return 0
+    if [ -n "${2:-}" ]; then
+        WIFI_CONF="$2" "$1" start >/dev/null 2>&1
+    else
+        "$1" start >/dev/null 2>&1
+    fi
     return $?
 }
 
@@ -157,9 +209,27 @@ if stop_client_service; then
 elif [ "$prior_stopped" = 1 ]; then
     stopped=1
 fi
+# The profile the boot path selected for this interface, if it recorded one.  A
+# re-run over an existing ownership record keeps the value that record already
+# holds when no fresh record is present.  resolve_wifi_conf validates it and
+# fails closed on a recorded-but-unusable path.
+recorded_wifi_conf=
+if [ -f "$PROFILE_FILE" ] && [ ! -L "$PROFILE_FILE" ]; then
+    recorded_wifi_conf=$(sed -n '1p' "$PROFILE_FILE" 2>/dev/null)
+fi
+if ! wifi_conf=$(resolve_wifi_conf "$recorded_wifi_conf"); then
+    exit 2
+fi
+if [ -z "$wifi_conf" ]; then
+    if ! wifi_conf=$(resolve_wifi_conf "$(read_state_field wifi_conf)"); then
+        exit 2
+    fi
+fi
+
 # Record ownership before mutating the link so a later net-down (or a rollback
-# below) can restore exactly what this call changed.
-write_state "$stopped" || die "cannot record ownership state: $STATE_FILE"
+# below) can restore exactly what this call changed -- including the client
+# profile the restore must use.
+write_state "$stopped" "$wifi_conf" || die "cannot record ownership state: $STATE_FILE"
 
 # 2. Bring the link up.
 if ! "$IP_BIN" link set dev "$IFACE" up >/dev/null 2>&1; then
@@ -168,7 +238,7 @@ if ! "$IP_BIN" link set dev "$IFACE" up >/dev/null 2>&1; then
     # restore instead of taking the nothing-owned no-op path and leaving the
     # client plane down for good.
     if [ "$stopped" = 1 ]; then
-        if ! restore_client_service; then
+        if ! restore_client_service "$WPA_SERVICE" "$wifi_conf"; then
             die "cannot bring up $IFACE and cannot restore client service $WPA_SERVICE"
         fi
     fi
@@ -185,7 +255,7 @@ if ! address_present; then
         # link-up rollback above.
         "$IP_BIN" addr del "$ADDRESS" dev "$IFACE" >/dev/null 2>&1
         if [ "$stopped" = 1 ]; then
-            if ! restore_client_service; then
+            if ! restore_client_service "$WPA_SERVICE" "$wifi_conf"; then
                 die "cannot assign $ADDRESS to $IFACE and cannot restore client service $WPA_SERVICE"
             fi
         fi
