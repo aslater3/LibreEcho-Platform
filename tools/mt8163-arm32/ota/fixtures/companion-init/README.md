@@ -1,0 +1,1 @@
+Captured unmodified LibreEcho-UI init scripts from the OTA v3 review source snapshot. Used only when the pinned sparse CI checkout lacks init scripts; these are real companion source, not mock mount helpers. Production packaging transforms its supplied UI checkout.

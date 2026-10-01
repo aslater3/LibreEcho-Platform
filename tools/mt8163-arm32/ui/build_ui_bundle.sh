@@ -511,6 +511,9 @@ do
     install -m 0755 "$UI_SOURCE/init/$script" "$OUTPUT/etc/init.d/$script"
 done
 
+# Guard the actual packaged scripts, not only the adapted source snapshot.
+python3 "$SCRIPT_DIR/ota_v3_health.py" --verify-init "$OUTPUT/etc/init.d"
+
 cp -R "$UI_SOURCE/web/." "$OUTPUT/share/libreecho/web/"
 install -m 0600 "$UI_SOURCE/config/defaults.json" \
     "$OUTPUT/etc/libreecho/web-config.json"

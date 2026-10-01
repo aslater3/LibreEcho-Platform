@@ -34,6 +34,43 @@ class WebStatusTests(FailurePolicyTests):
             with self.assertRaises((ValueError, IndexError)):
                 module.adapt_api(malformed)
 
+    def test_packaged_agentd_uses_generation_mount_without_legacy_payload(self):
+        import shutil
+        import tempfile
+        spec = importlib.util.spec_from_file_location('init_adapter', TOOLS / 'ui/ota_v3_health.py')
+        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        ui = Path(os.environ.get('LIBREECHO_OTA_UI_SOURCE', str(TOOLS.parents[1] / '.test-ui')))
+        source = self.root / 'ui-source'
+        shutil.copytree(ui, source)
+        if not (source / 'init/libreecho-agentd.init').is_file():
+            shutil.copytree(TOOLS / 'ota/fixtures/companion-init', source / 'init', dirs_exist_ok=True)
+        output = self.root / 'adapted'
+        module.prepare(source, output)
+        script = (output / 'init/libreecho-agentd.init').read_text()
+        runtime = self.root / 'run/libreecho/features/assistant/root'
+        binary = runtime / 'usr/local/sbin/libreecho-agentd'
+        binary.parent.mkdir(parents=True); binary.write_bytes(b'daemon'); binary.chmod(0o755)
+        mounts = self.root / 'mountinfo'
+        mounts.write_text(f'1 0 7:0 / {runtime} ro,nosuid,nodev - squashfs /dev/loop0 ro\n')
+        body = script[:script.rfind('case "${1:-}" in')]
+        result = subprocess.run(['/bin/busybox', 'sh'], input=body + '\nmount_runtime\n',
+            env=dict(os.environ, RUNTIME_ROOT=str(runtime), MOUNTINFO_FILE=str(mounts)), text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('/data/libreecho/features', script)
+        mounts.write_text('')
+        result = subprocess.run(['/bin/busybox', 'sh'], input=body + '\nmount_runtime\n',
+            env=dict(os.environ, RUNTIME_ROOT=str(runtime), MOUNTINFO_FILE=str(mounts)), text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        for script in (output / 'init').glob('*.init'):
+            self.assertNotIn('/data/libreecho/features', script.read_text())
+            self.assertEqual(subprocess.run(['/bin/busybox', 'sh', '-n', str(script)]).returncode, 0)
+
+    def test_unknown_companion_feature_reference_fails_build(self):
+        spec = importlib.util.spec_from_file_location('init_adapter', TOOLS / 'ui/ota_v3_health.py')
+        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        with self.assertRaises(ValueError):
+            module.adapt_init('unknown.init', 'cat /data/libreecho/features/unknown/file\n')
+
     def test_boot_failure_and_config_error_reach_status_json_and_banner(self):
         adapter = TOOLS / 'ui/ota_v3_health.py'
         self.assertTrue(adapter.is_file(), 'missing Platform companion UI health adapter')
