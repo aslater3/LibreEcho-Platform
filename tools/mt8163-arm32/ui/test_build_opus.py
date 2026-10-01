@@ -215,6 +215,73 @@ class RefusalTests(unittest.TestCase):
             self.assertIn("opus_identity_cache=hit", result.stdout)
 
 
+class ToolchainResolutionTests(unittest.TestCase):
+    """Tools may be named by PATH, not just by an explicit path.
+
+    The hosted CI invokes the builder with bare cross-prefixed names
+    (``--cc arm-linux-gnueabihf-gcc --ar arm-linux-gnueabihf-ar``).  Those must
+    be resolved on PATH; treating them as a literal path relative to the current
+    directory rejects a perfectly available toolchain.
+    """
+
+    def _cross_bindir(self, root: Path) -> Path:
+        cc = compiler()
+        ar = shutil.which("ar")
+        if not cc or not ar:
+            self.skipTest("host cc/ar unavailable")
+        bindir = root / "fake-cross-bin"
+        bindir.mkdir()
+        (bindir / "arm-linux-gnueabihf-gcc").symlink_to(cc)
+        (bindir / "arm-linux-gnueabihf-ar").symlink_to(ar)
+        return bindir
+
+    def test_bare_cross_tool_names_resolve_on_path(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bindir = self._cross_bindir(root)
+            archives = []
+            for name in ("ogg.tar.gz", "opus.tar.gz", "opusfile.tar.gz"):
+                path = root / name
+                path.write_bytes(b"not the pinned upstream archive")
+                archives.append(str(path))
+            env = dict(os.environ)
+            env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+            result = subprocess.run(
+                [
+                    "bash", str(SCRIPT), *base_archive_args(*archives),
+                    "--output", str(root / "prefix"),
+                    "--cc", "arm-linux-gnueabihf-gcc",
+                    "--ar", "arm-linux-gnueabihf-ar",
+                ],
+                capture_output=True, text=True, env=env, timeout=120,
+            )
+            # Both bare names must resolve, so the builder reaches the next
+            # fail-closed gate (the fabricated archive hashes) instead of
+            # rejecting the archiver as unavailable.
+            self.assertNotIn("is unavailable", result.stderr)
+            self.assertIn("hash mismatch", result.stderr)
+
+    def test_unresolvable_archiver_is_still_refused(self) -> None:
+        cc = compiler()
+        if not cc:
+            self.skipTest("no host C compiler available")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bash = shutil.which("bash") or "/bin/bash"
+            env = dict(os.environ)
+            env["PATH"] = str(root)  # nothing outside the (empty) dir resolves
+            result = subprocess.run(
+                [
+                    bash, str(SCRIPT), *base_archive_args("a", "b", "c"),
+                    "--output", str(root / "prefix"),
+                    "--cc", cc, "--ar", "arm-linux-gnueabihf-ar",
+                ],
+                capture_output=True, text=True, env=env, timeout=120,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("archiver is unavailable", result.stderr)
+
+
 class EndToEndTests(unittest.TestCase):
     """Full host build + real decode. Opt in with the pinned archives."""
 

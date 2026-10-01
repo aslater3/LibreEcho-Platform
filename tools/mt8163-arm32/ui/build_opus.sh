@@ -52,20 +52,43 @@ done
 }
 # --output is required: there is deliberately no default prefix, so a build can
 # never silently publish beside the source tree or into a shared location.
-CCI=${CCI:-cc}
-command -v "$CCI" >/dev/null 2>&1 || {
-  printf 'ERROR: C compiler is unavailable: %s\n' "$CCI" >&2; exit 1
+# Resolve a toolchain component given either an explicit path or a bare command
+# name.  A bare name is looked up on PATH (``command -v``); a path is checked
+# directly.  Only a resolved, executable file is accepted, and the resolved
+# absolute path is printed, so the builder never assumes the caller's working
+# directory holds the tool and later build steps cannot lose it when they run
+# from a different directory.
+resolve_tool() {
+  local tool=$1 resolved
+  [[ -n "$tool" ]] || return 1
+  if [[ "$tool" == */* ]]; then
+    resolved=$tool
+  else
+    resolved=$(command -v "$tool" 2>/dev/null || true)
+  fi
+  [[ -n "$resolved" && -f "$resolved" && -x "$resolved" ]] || return 1
+  if [[ "$resolved" != /* ]]; then
+    resolved="$(cd -- "$(dirname -- "$resolved")" && pwd -P)/$(basename -- "$resolved")" || return 1
+  fi
+  printf '%s\n' "$resolved"
 }
+
+CCI=${CCI:-cc}
+if ! resolved_cc=$(resolve_tool "$CCI"); then
+  printf 'ERROR: C compiler is unavailable: %s\n' "$CCI" >&2; exit 1
+fi
+CCI=$resolved_cc
 if [[ -z "$ARG" ]]; then
   if [[ "$CCI" == *gcc ]]; then
     ARG="${CCI%gcc}ar"
   else
-    ARG=$(command -v ar || true)
+    ARG=ar
   fi
 fi
-[[ -n "$ARG" && -x "$ARG" ]] || {
+if ! resolved_ar=$(resolve_tool "$ARG"); then
   printf 'ERROR: archiver is unavailable: %s\n' "${ARG:-<none>}" >&2; exit 1
-}
+fi
+ARG=$resolved_ar
 [[ "$JOBS" =~ ^[0-9]+$ && "$JOBS" -ge 1 ]] || {
   printf 'ERROR: invalid job count: %s\n' "$JOBS" >&2; exit 1
 }
