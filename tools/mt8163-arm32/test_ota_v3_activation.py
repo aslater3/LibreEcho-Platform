@@ -197,12 +197,24 @@ for daemon in ('libreecho-audio-engine','libreecho-ttsd','libreecho-waked','libr
 
     def test_generation_lock_blocks_gc_and_commit(self):
         self.prepared()
-        (self.control / 'generation.lock').mkdir()
+        import os
+        lock = self.control / 'generation.lock'
+        lock.mkdir()
+        (lock / 'owner').write_text(f'{os.getpid()} ' + Path('/proc/sys/kernel/random/boot_id').read_text())
         self.set_bcb('b', '1')
         for verb in ('gc', 'commit'):
             self.assertNotEqual(self.verb(verb).returncode, 0)
         self.assertTrue((self.control / 'pending').exists())
         self.assertEqual((self.control / 'current').read_text(), 'prior\n')
+
+    def test_ownerless_lock_publication_crash_recovers(self):
+        self.prepared()
+        # Legacy publication window plus abandoned prepublication temp directory.
+        (self.control / 'generation.lock').mkdir()
+        (self.control / 'generation.lock.tmp.999999').mkdir()
+        self.set_bcb('b', '1')
+        result = self.verb('commit')
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_dead_owner_lock_is_recovered(self):
         self.prepared()

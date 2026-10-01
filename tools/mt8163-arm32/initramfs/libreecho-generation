@@ -21,29 +21,37 @@ valid_token() { [ -n "$1" ] && [ "${#1}" -le 96 ] || return 1; case "$1" in [A-Z
 valid_commit() { [ "${#1}" -eq 40 ] || return 1; case "$1" in *[!0-9a-f]*|'') return 1;; esac; }
 valid_asset() { [ -n "$1" ] && [ "${#1}" -le 128 ] || return 1; case "$1" in [A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._+:-]*) ;; *) return 1;; esac; case "$1" in *[!A-Za-z0-9._+:-]*|*/*|*\\*) return 1;; esac; }
 
-# A missing/ambiguous owner fails closed (including the mkdir/owner-write window).
-# A dead PID or a different kernel boot identity permits serialized reclamation.
+# Publish owner and lock together: a prepublication crash leaves only a temp.
+# Keep /data scope because recovery callers need the same serialization domain.
 generation_lock() {
-    local lock=$ROOT/generation.lock owner pid boot now
-    safe_path "$lock"
+    local lock=$ROOT/generation.lock tmp=$ROOT/generation.lock.tmp.$$ owner pid boot now
+    safe_path "$lock"; safe_path "$tmp"
     now=$($BB cat /proc/sys/kernel/random/boot_id) || fail generation-lock-boot
-    if ! $BB mkdir "$lock" 2>/dev/null; then
-        regular "$lock/owner" generation-lock-owner
-        owner=$($BB cat "$lock/owner")
-        read -r pid boot <<EOF
+    if [ -d "$lock" ]; then
+        if [ ! -e "$lock/owner" ] && [ ! -L "$lock/owner" ]; then
+            # Only an empty legacy ownerless lock is reclaimable. New publication
+            # never exposes this state; nonempty/ambiguous directories fail closed.
+            $BB rmdir "$lock" 2>/dev/null || fail generation-busy
+        else
+            regular "$lock/owner" generation-lock-owner
+            owner=$($BB cat "$lock/owner")
+            read -r pid boot <<EOF
 $owner
 EOF
-        case "$pid" in ''|*[!0-9]*) fail generation-busy;; esac
-        [ -n "$boot" ] || fail generation-busy
-        if [ "$boot" = "$now" ] && $BB kill -0 "$pid" 2>/dev/null; then fail generation-busy; fi
-        safe_path "$lock/reclaim"
-        $BB mkdir "$lock/reclaim" 2>/dev/null || fail generation-busy
-        [ "$($BB cat "$lock/owner")" = "$owner" ] || { $BB rmdir "$lock/reclaim"; fail generation-busy; }
-        $BB rm "$lock/owner" && $BB rmdir "$lock/reclaim" && $BB rmdir "$lock" || fail generation-busy
-        $BB mkdir "$lock" 2>/dev/null || fail generation-busy
+            case "$pid" in ''|*[!0-9]*) fail generation-busy;; esac
+            [ -n "$boot" ] || fail generation-busy
+            if [ "$boot" = "$now" ] && $BB kill -0 "$pid" 2>/dev/null; then fail generation-busy; fi
+            safe_path "$lock/reclaim"
+            $BB mkdir "$lock/reclaim" 2>/dev/null || fail generation-busy
+            [ "$($BB cat "$lock/owner")" = "$owner" ] || { $BB rmdir "$lock/reclaim"; fail generation-busy; }
+            $BB rm "$lock/owner" && $BB rmdir "$lock/reclaim" && $BB rmdir "$lock" || fail generation-busy
+        fi
     fi
-    printf '%s %s\n' "$$" "$now" > "$lock/owner" || fail generation-lock-write
-    $BB chmod 0600 "$lock/owner" || fail generation-lock-mode
+    $BB mkdir "$tmp" 2>/dev/null || fail generation-lock-temp
+    printf '%s %s\n' "$$" "$now" > "$tmp/owner" && $BB chmod 0600 "$tmp/owner" || fail generation-lock-write
+    if ! $BB mv -T "$tmp" "$lock" 2>/dev/null; then
+        $BB rm -f "$tmp/owner"; $BB rmdir "$tmp"; fail generation-busy
+    fi
     trap '$BB rm -f "$ROOT/generation.lock/owner"; $BB rmdir "$ROOT/generation.lock" 2>/dev/null' EXIT
     trap 'exit 1' HUP INT TERM
 }

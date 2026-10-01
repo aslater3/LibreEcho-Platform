@@ -254,8 +254,11 @@ enter v3 through a recovery reinstall, never a composed OTA bridge.
 
 OTA keeps `current`, `previous`, and `pending` generations; garbage collection
 removes other directories whole. Mutations share `update/generation.lock` with
-an owner PID and kernel boot ID. Live owners and ambiguous ownerless locks fail
-closed; dead owners or a changed boot ID permit serialized reclamation. A
+an owner PID and kernel boot ID, atomically renamed from an owned temporary
+directory. This remains on userdata so boot and recovery callers share scope.
+Live owners and nonempty ambiguous locks fail closed; empty legacy ownerless
+locks, dead owners or a changed boot ID permit serialized reclamation. A crash
+before publication leaves a harmless unpublished temporary directory. A
 SIGKILL between durable commit writes is resumed without changing the previous
 rollback target. `installed` and `rolled-back` are schema-3 diagnostic summaries,
 not authorities for feature bytes.
