@@ -28,6 +28,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import tempfile
@@ -219,8 +220,11 @@ class ApProbeTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.bin = self.root / "bin"
         self.bin.mkdir()
+        self._servers: list[socket.socket] = []
 
     def tearDown(self) -> None:
+        for server in self._servers:
+            server.close()
         self.tmp.cleanup()
 
     def make_iw(self, *, dev_ok: bool, mode: str, ap_mode: bool) -> None:
@@ -272,9 +276,25 @@ esac
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing-iw", result.stderr)
 
-    def readiness_env(self, *, dhcp_pid: Path | None) -> dict:
+    def bind_control_socket(self, path: Path) -> None:
+        """Publish a real AF_UNIX socket the readiness probe can require."""
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(path))
+        server.listen(1)
+        self._servers.append(server)
+
+    def readiness_env(self, *, dhcp_pid: Path | None,
+                      hostapd_socket: bool = True) -> dict:
         ctrl = self.root / "hostapd"
         ctrl.mkdir(exist_ok=True)
+        if hostapd_socket:
+            # hostapd publishes its control socket as ctrl_interface/<ifname>;
+            # a bound AF_UNIX socket is the surface the probe must require.
+            self.bind_control_socket(ctrl / "wlan0")
         env = self.env(RECOVERY_AP_CTRL=str(ctrl))
         if dhcp_pid is not None:
             env["RECOVERY_AP_DHCP_PID"] = str(dhcp_pid)
@@ -310,6 +330,42 @@ esac
         env["RECOVERY_AP_CTRL"] = str(self.root / "missing")
         (self.root / "pid").write_text("1\n")
         result = self.run_probe(PROBE, "ready", env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("hostapd-control-absent", result.stderr)
+
+    def test_readiness_rejects_shared_run_dir_without_control_socket(self) -> None:
+        # The control directory is the shared /run/libreecho tree that init
+        # creates for the recovery marker and the net-up ownership state, so its
+        # mere existence must NOT be accepted as proof hostapd is live.
+        self.make_iw(dev_ok=True, mode="AP", ap_mode=True)
+        self.make_ip("192.168.4.1")
+        dhcp = subprocess.Popen(["sleep", "30"])
+        try:
+            dhcp_pid = self.root / "recovery-dhcp.pid"
+            dhcp_pid.write_text(f"{dhcp.pid}\n")
+            env = self.readiness_env(dhcp_pid=dhcp_pid, hostapd_socket=False)
+            result = self.run_probe(PROBE, "ready", env=env)
+        finally:
+            dhcp.terminate()
+            dhcp.wait()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("hostapd-control-absent", result.stderr)
+
+    def test_readiness_rejects_directory_in_place_of_control_socket(self) -> None:
+        # A directory named like the socket is not a live control surface: only
+        # a real AF_UNIX socket for the served interface counts.
+        self.make_iw(dev_ok=True, mode="AP", ap_mode=True)
+        self.make_ip("192.168.4.1")
+        dhcp = subprocess.Popen(["sleep", "30"])
+        try:
+            dhcp_pid = self.root / "recovery-dhcp.pid"
+            dhcp_pid.write_text(f"{dhcp.pid}\n")
+            (self.root / "hostapd" / "wlan0").mkdir(parents=True)
+            env = self.readiness_env(dhcp_pid=dhcp_pid, hostapd_socket=False)
+            result = self.run_probe(PROBE, "ready", env=env)
+        finally:
+            dhcp.terminate()
+            dhcp.wait()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("hostapd-control-absent", result.stderr)
 
@@ -388,6 +444,12 @@ case "$1" in
         exit 1 ;;
     start)
         rm -f "$count_file"
+        if [ -f "{self.root}/start_fail" ]; then
+            n=$(cat "{self.root}/start_fail")
+            n=$((n - 1))
+            if [ "$n" -le 0 ]; then rm -f "{self.root}/start_fail"; else printf '%s' "$n" > "{self.root}/start_fail"; fi
+            exit 1
+        fi
         exit 0 ;;
 esac
 exit 0
@@ -455,6 +517,33 @@ exit 0
                             "--state-dir", str(self.state_dir))
         self.assertEqual(down.returncode, 0, down.stderr)
         self.assertIn("start", self.wpa_log_text())
+
+    def test_net_down_retains_ownership_until_wifi_restart_succeeds(self) -> None:
+        # net-up released the client plane and recorded the ownership it owes.
+        self.assertEqual(self.up().returncode, 0)
+        state = self.state_dir / "recovery-net.state"
+        self.assertIn("stopped=1", state.read_text())
+        # First teardown: the address is released, but restarting the client
+        # wifi service fails (e.g. association/DHCP timeout).
+        (self.root / "start_fail").write_text("1\n")
+        first = self.run_net(NET_DOWN, "--interface", "wlan0",
+                             "--state-dir", str(self.state_dir))
+        self.assertNotEqual(first.returncode, 0)
+        self.assertIn("cannot restore client service", first.stderr)
+        # The obligation is retained, so a retry can still restore the client
+        # plane instead of taking the nothing-owned no-op path forever.
+        self.assertTrue(state.is_file())
+        self.assertIn("stopped=1", state.read_text())
+        # Retry: the wifi service comes back, the retry completes and clears the
+        # record only once restoration has actually succeeded.
+        second = self.run_net(NET_DOWN, "--interface", "wlan0",
+                              "--state-dir", str(self.state_dir))
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertFalse(state.exists())
+        self.assertIn("start", self.wpa_log_text())
+        # The owned address was released once already; the retry must not try to
+        # delete it a second time (it is idempotent, but only one del is owed).
+        self.assertEqual(self.ip_log_text().count("addr del"), 1)
 
     def test_net_up_rolls_back_on_address_failure(self) -> None:
         (self.ip_state / "fail_add").touch()

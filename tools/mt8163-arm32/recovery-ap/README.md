@@ -72,9 +72,10 @@ fixtures.
   supported interface modes (`iw phy ... info`).  "The binary exists" is never
   accepted as proof.
 - `ready` — the AP is actually serving: the interface is currently in AP mode,
-  the hostapd control surface exists, a live DHCP/DNS incarnation owns the
-  daemon pidfile, and the interface carries the AP address.  This is the
-  readiness check for networkd's `--recovery-ready-probe`.
+  hostapd's **per-interface** control socket exists (`ctrl_interface/<ifname>`;
+  the shared run directory existing is not proof), a live DHCP/DNS incarnation
+  owns the daemon pidfile, and the interface carries the AP address.  This is
+  the readiness check for networkd's `--recovery-ready-probe`.
 
 Both fail closed with a bounded `unavailable: <reason>` line.
 
@@ -86,9 +87,11 @@ the client STA plane through its owning service (pidfile-scoped, never
 `/run/libreecho/recovery-net.state`, brings the link up and assigns the portal
 address.  A failure rolls the client service back.  `libreecho-recovery-net-down
 --interface IFACE` removes **only** the address it recorded and restores the
-client service only when it was the one that stopped it; with no recorded
-ownership it is a successful no-op.  Neither helper uses `/dev/wmtWifi`, a
-pattern-based kill, or a reboot.
+client service only when it was the one that stopped it; the ownership record is
+retained until that restart actually succeeds, so a failed or interrupted
+restore is retried by the next teardown instead of being forgotten.  With no
+recorded ownership it is a successful no-op.  Neither helper uses `/dev/wmtWifi`,
+a pattern-based kill, or a reboot.
 
 ## Pinned dependencies
 

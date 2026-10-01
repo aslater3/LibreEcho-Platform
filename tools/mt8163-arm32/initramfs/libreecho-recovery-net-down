@@ -15,6 +15,10 @@
 # restores the client wpa service it stopped (pidfile-driven), never with a
 # pattern-based kill, never via /dev/wmtWifi, and never by rebooting.  With no
 # recorded ownership it is a no-op success, so a repeated teardown is safe.
+#
+# Ownership is retained until the client restart actually succeeds: a failed
+# restore leaves the record in place so the next teardown retries it instead of
+# forgetting the debt.
 
 set -u
 
@@ -100,17 +104,25 @@ if [ -n "$owned_address" ] && address_present "$owned_address"; then
     fi
 fi
 
-# 2. Drop ownership state before restoring the client plane, so a crash between
-#    the two does not leave a stale record pointing at a removed address.
-rm -f "$STATE_FILE"
-
-# 3. Restore client management only when this helper is the one that released
+# 2. Restore client management only when this helper is the one that released
 #    it; otherwise a spurious teardown could disturb a live client association.
+#    The ownership record is deliberately retained until the restart succeeds:
+#    if the wifi service cannot come back (association/DHCP timeout), the helper
+#    fails but leaves the recorded obligation in place, so the next teardown
+#    re-attempts the restore instead of taking the nothing-owned no-op path and
+#    leaving the client Wi-Fi service down indefinitely.  A crash between the
+#    address release and the restore is likewise recoverable: the next run sees
+#    the address already gone (the removal above is idempotent) and restores the
+#    service, so discarding ownership early buys nothing and loses the debt.
 if [ "$owned_stopped" = 1 ]; then
     if ! restore_client_service "$owned_service"; then
         die "cannot restore client service $owned_service"
     fi
 fi
+
+# 3. Only once every owed action has succeeded is the teardown complete: drop
+#    ownership so a subsequent invocation is the documented no-op success.
+rm -f "$STATE_FILE"
 
 printf 'net-down: %s %s\n' "$IFACE" "${owned_address:-none}"
 exit 0

@@ -19,8 +19,10 @@
 #
 # Layout is taken from the UI core (ui-recovery src/adapter/network_recovery.c)
 # so the probe checks the surfaces that actually exist:
-#   - hostapd.conf sets ctrl_interface=<run-dir> (/run/libreecho), so the
-#     control socket lives directly under the run directory, not a subdirectory;
+#   - hostapd.conf sets ctrl_interface=<run-dir> (/run/libreecho) and
+#     interface=<iface>, so hostapd publishes its control socket as
+#     <run-dir>/<iface>; the run directory itself is shared with the recovery
+#     marker and the net-up ownership state and is NOT proof hostapd is live;
 #   - dnsmasq is spawned with --no-daemon as a foreground child, so it writes NO
 #     pidfile.  Readiness therefore checks for a live dnsmasq process serving
 #     the recovery config, or an explicit pidfile if the deployment daemonizes.
@@ -102,9 +104,14 @@ if ! printf '%s\n' "$dev_info" |
     printf 'unavailable: interface-not-ap:%s\n' "$IFACE" >&2
     exit 1
 fi
-# hostapd must have published its control surface (proof it is running).
-if [ ! -d "$CTRL" ] && [ ! -S "$CTRL" ]; then
-    printf 'unavailable: hostapd-control-absent:%s\n' "$CTRL" >&2
+# hostapd must have published its *per-interface* Unix control socket as proof
+# it is live.  ctrl_interface is the run directory, which is shared with the
+# recovery marker and the net-up ownership state and exists even when hostapd
+# never started, so directory existence is NOT accepted: require the socket
+# hostapd creates for this interface (ctrl_interface/<ifname>).
+CTRL_SOCKET=$CTRL/$IFACE
+if [ ! -S "$CTRL_SOCKET" ]; then
+    printf 'unavailable: hostapd-control-absent:%s\n' "$CTRL_SOCKET" >&2
     exit 1
 fi
 # The DHCP/DNS side must own a live incarnation.  dnsmasq runs --no-daemon, so
