@@ -132,6 +132,16 @@ class UpdaterTests(grammar.SignedFixture):
         self.assertFalse((generations / 'test-target').exists())
         self.assertEqual(other.read_text(), 'other-target\n')
 
+    def test_corrupt_assembled_candidate_failure_releases_owned_pin(self):
+        package, generations = self.assembled_package()
+        payload = generations / 'test-target/features/tts/payload.squashfs'
+        payload.chmod(0o600); payload.write_bytes(b'corrupt')
+        script = self.script('install_package "$1"')
+        result = subprocess.run(['/bin/busybox', 'sh', str(script), str(package)], env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('generation_invalid', result.stderr)
+        self.assertFalse((generations / 'test-target.pin').exists())
+
     def test_install_sigkill_keeps_candidate_pinned_before_pending(self):
         package, generations = self.assembled_package()
         bootctl = self.root / 'crash-bootctl'

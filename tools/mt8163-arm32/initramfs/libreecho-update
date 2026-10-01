@@ -427,16 +427,18 @@ install_package()
     STATE_DIRTY=1
     state_write verifying 5 package
     extract_and_verify "$package"
-    state_write verified 20 "$version"
     if [ "$OTA_FORMAT" = v3 ]; then
         tx=$(manifest_value transaction_id)
         generation="${GENERATIONS:-/data/libreecho/generations}/$tx"
-        "${GENERATION_TOOL:-/usr/local/sbin/libreecho-generation}" verify "$generation" || die generation_invalid
+        [ -f "$generation/target.manifest" ] && [ ! -L "$generation/target.manifest" ] || die generation_manifest_mismatch
         [ "$(sha256sum "$generation/target.manifest" | $BB awk '{print $1}')" = "$(sha256sum "$STAGING/manifest" | $BB awk '{print $1}')" ] || die generation_manifest_mismatch
         # The install lock and authenticated candidate identity transfer ownership
-        # before fallible boot-control probing. Unverified callers own no pin.
+        # before fallible tree verification and boot-control probing. Unverified
+        # callers and colliding transaction identities own no pin.
         INSTALL_PIN=$GENERATIONS/$tx.pin
+        "${GENERATION_TOOL:-/usr/local/sbin/libreecho-generation}" verify "$generation" || die generation_invalid
     fi
+    state_write verified 20 "$version"
     bootctl_status
 
     state_write writing 30 "$target"
