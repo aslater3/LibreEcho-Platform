@@ -13,18 +13,30 @@
 # Subcommand (default "supported"):
 #   supported  interface exists and its phy advertises nl80211 AP mode.
 #   ready      the AP is actually serving: interface is in AP mode, hostapd
-#              control surface exists, and the DHCP/DNS side owns the AP
-#              address.  This is the readiness check; it never accepts "binary
-#              exists" as proof.
+#              has published its control surface, the DHCP/DNS side is live,
+#              and the interface carries the AP address.  This is the readiness
+#              check; it never accepts "binary exists" as proof.
 #
-# Layout note: networkd passes a single probe path with no arguments, so the
-# interface defaults to wlan0 (the daemon's interface default) and is
-# overridable with RECOVERY_AP_INTERFACE.
+# Layout is taken from the UI core (ui-recovery src/adapter/network_recovery.c)
+# so the probe checks the surfaces that actually exist:
+#   - hostapd.conf sets ctrl_interface=<run-dir> (/run/libreecho), so the
+#     control socket lives directly under the run directory, not a subdirectory;
+#   - dnsmasq is spawned with --no-daemon as a foreground child, so it writes NO
+#     pidfile.  Readiness therefore checks for a live dnsmasq process serving
+#     the recovery config, or an explicit pidfile if the deployment daemonizes.
+#
+# networkd passes a single probe path with no arguments, so the interface
+# defaults to wlan0 (the daemon's interface default) and is overridable with
+# RECOVERY_AP_INTERFACE.
 
 set -u
 
 MODE=supported
 IFACE=${RECOVERY_AP_INTERFACE:-wlan0}
+RUN_DIR=${RECOVERY_AP_RUN_DIR:-/run/libreecho}
+AP_ADDRESS=${RECOVERY_AP_ADDRESS:-192.168.4.1}
+DHCP_CONF=${RECOVERY_AP_DHCP_CONF:-$RUN_DIR/recovery-dnsmasq.conf}
+DHCP_PID=${RECOVERY_AP_DHCP_PID:-}
 # Prefer the packaged helper binaries the image stages under /usr/local/sbin;
 # fall back to PATH so a development image without them still fails closed
 # instead of crashing.
@@ -42,8 +54,7 @@ elif [ -x /usr/local/sbin/ip ]; then
 else
     IP=ip
 fi
-CTRL=${RECOVERY_AP_CTRL:-/run/libreecho/hostapd}
-DHCP_PID=${RECOVERY_AP_DHCP_PID:-/run/libreecho/recovery-dhcp.pid}
+CTRL=${RECOVERY_AP_CTRL:-$RUN_DIR}
 
 case "${1:-}" in
     supported|ready) MODE=$1; [ "$#" -le 1 ] || { printf 'unexpected arguments\n' >&2; exit 2; } ;;
@@ -96,13 +107,32 @@ if [ ! -d "$CTRL" ] && [ ! -S "$CTRL" ]; then
     printf 'unavailable: hostapd-control-absent:%s\n' "$CTRL" >&2
     exit 1
 fi
-# The DHCP/DNS side must own a live incarnation.
-if [ ! -s "$DHCP_PID" ]; then
-    printf 'unavailable: dhcp-not-running:%s\n' "$DHCP_PID" >&2
+# The DHCP/DNS side must own a live incarnation.  dnsmasq runs --no-daemon, so
+# check for a live process serving the recovery config; an explicit pidfile is
+# honoured when the deployment daemonizes.
+dhcp_live() {
+    if [ -n "$DHCP_PID" ]; then
+        [ -s "$DHCP_PID" ] || return 1
+        pid=$(sed -n '1p' "$DHCP_PID")
+        case "$pid" in *[!0-9]*|'') return 1 ;; esac
+        kill -0 "$pid" 2>/dev/null
+        return $?
+    fi
+    for cmdline in /proc/[0-9]*/cmdline; do
+        [ -r "$cmdline" ] || continue
+        args=$(tr '\0' ' ' <"$cmdline" 2>/dev/null) || continue
+        case "$args" in
+            *dnsmasq*"$DHCP_CONF"*) return 0 ;;
+        esac
+    done
+    return 1
+}
+if ! dhcp_live; then
+    printf 'unavailable: dhcp-not-running:%s\n' "$DHCP_CONF" >&2
     exit 1
 fi
 # ...and the interface must actually carry the AP address.
-if ! "$IP" addr show dev "$IFACE" 2>/dev/null | grep -q '192\.168\.4\.1'; then
+if ! "$IP" addr show dev "$IFACE" 2>/dev/null | grep -q "$AP_ADDRESS"; then
     printf 'unavailable: interface-address-missing:%s\n' "$IFACE" >&2
     exit 1
 fi

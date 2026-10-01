@@ -55,7 +55,7 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "638bb6730914d90de9c3b6d6041f374dbb5cef562e57a4553a203a859b09b301"
+RECOVERY_INIT_SHA256 = "1cb351cf8c43d06a9216fa2a772295ee84f7a35b3475b878e8adf10baf770449"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
@@ -132,7 +132,168 @@ RECOVERY_AP_BINARIES = {
     "hostapd": "usr/local/sbin/hostapd",
     "dnsmasq": "usr/local/sbin/dnsmasq",
     "iw": "usr/local/sbin/iw",
+    # The physical boot detector is a compiled evdev reader (EVIOCGKEY), built
+    # by recovery-ap/build_recovery_ap.sh, not a shell overlay file.
+    "libreecho-recovery-button": "usr/local/sbin/libreecho-recovery-button",
 }
+# The metadata document recovery-ap/build_recovery_ap.sh emits and this builder
+# consumes.  It binds the shipped bytes to their SHA-256 and to the licence /
+# corresponding-source provenance that ships on-image with them.
+RECOVERY_AP_METADATA_SCHEMA = "libreecho-recovery-ap-binaries/v1"
+
+
+def validate_recovery_ap_provenance(metadata: object) -> dict[str, dict[str, object]]:
+    """Validate the licence/source provenance the emitted metadata must carry.
+
+    A hash alone only proves the image got the bytes the caller described; it
+    does not prove the image can attribute them or offer their source.  Every
+    pinned component must therefore declare its licence and source, and every
+    redistributed GPL component must be covered by the corresponding-source
+    offer that ships on-image in the same metadata document.
+    """
+    if not isinstance(metadata, dict):
+        raise SystemExit("ERROR: recovery-AP metadata is not a JSON object")
+    if metadata.get("schema") != RECOVERY_AP_METADATA_SCHEMA:
+        raise SystemExit("ERROR: recovery-AP metadata schema is not the pinned contract")
+    provenance = metadata.get("components")
+    if not isinstance(provenance, dict) or set(provenance) != set(RECOVERY_AP_BINARIES):
+        raise SystemExit(
+            "ERROR: recovery-AP metadata does not carry provenance for the pinned set"
+        )
+    offer = metadata.get("source_offer")
+    offer_components = offer.get("components") if isinstance(offer, dict) else None
+    offered = set(offer_components) if isinstance(offer_components, list) else set()
+    statement = offer.get("statement") if isinstance(offer, dict) else None
+    if not isinstance(statement, str) or not statement.strip():
+        raise SystemExit("ERROR: recovery-AP metadata has no corresponding-source statement")
+    for name, relative in RECOVERY_AP_BINARIES.items():
+        record = provenance[name]
+        if not isinstance(record, dict):
+            raise SystemExit(f"ERROR: recovery-AP provenance for {name} is malformed")
+        license_ = record.get("license")
+        source_url = record.get("source_url")
+        if not isinstance(license_, str) or not license_.strip():
+            raise SystemExit(f"ERROR: recovery-AP provenance for {name} declares no licence")
+        if not isinstance(source_url, str) or not source_url.startswith("https://"):
+            raise SystemExit(f"ERROR: recovery-AP provenance for {name} has no https source URL")
+        if record.get("image_path") != relative:
+            raise SystemExit(f"ERROR: recovery-AP provenance image path mismatch: {name}")
+        source_path = record.get("source_path")
+        if isinstance(source_path, str) and source_path:
+            # First-party component: its corresponding source is this repository.
+            if source_path.startswith("/") or ".." in source_path.split("/"):
+                raise SystemExit(f"ERROR: recovery-AP provenance source path is unsafe: {name}")
+        else:
+            source_sha = record.get("source_sha256")
+            source_license = record.get("source_license")
+            if (not isinstance(source_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", source_sha)):
+                raise SystemExit(
+                    f"ERROR: recovery-AP provenance for {name} has no pinned source SHA-256"
+                )
+            if not isinstance(source_license, str) or not source_license:
+                raise SystemExit(
+                    f"ERROR: recovery-AP provenance for {name} names no licence file"
+                )
+            image_license = record.get("image_license")
+            if (not isinstance(image_license, list) or not image_license
+                    or not all(isinstance(item, str) and item for item in image_license)):
+                raise SystemExit(
+                    f"ERROR: recovery-AP provenance for {name} names no on-image licence copy"
+                )
+            if "GPL" in license_ and name not in offered:
+                raise SystemExit(
+                    f"ERROR: redistributed GPL component {name} has no corresponding-source offer"
+                )
+    return provenance
+
+
+def add_recovery_ap_bundle(stage: Path, binaries: dict[str, Path],
+                           metadata_path: Path, manifest: dict[str, object]) -> None:
+    """Stage the pinned recovery-AP dependencies, hash-checked against metadata.
+
+    The caller supplies the compiled hostapd/dnsmasq/iw artifacts and the
+    compiled evdev button detector plus the JSON metadata file of their expected
+    SHA-256 values and licence/source provenance emitted by
+    recovery-ap/build_recovery_ap.sh.  Every artifact must be a regular file
+    whose bytes match the recorded hash; nothing is staged on a mismatch, so an
+    unverified binary can never reach an image.  The metadata must describe
+    exactly the pinned set and carry licence/source provenance for every member:
+    an incomplete (half-shipped) bundle, or one whose binaries cannot be
+    attributed or have their corresponding source offered, is refused rather
+    than shipped.
+    """
+    metadata_data = read(metadata_path)
+    try:
+        metadata = json.loads(metadata_data.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise SystemExit(f"ERROR: recovery-AP metadata is not valid JSON: {exc}") from exc
+    records = metadata.get("binaries")
+    if not isinstance(records, dict):
+        raise SystemExit("ERROR: recovery-AP metadata lacks a binaries map")
+    if set(records) != set(RECOVERY_AP_BINARIES):
+        missing = sorted(set(RECOVERY_AP_BINARIES) - set(records))
+        extra = sorted(set(records) - set(RECOVERY_AP_BINARIES))
+        raise SystemExit(
+            "ERROR: recovery-AP metadata inventory does not match the pinned set "
+            f"(missing={missing}, unexpected={extra})"
+        )
+    provenance = validate_recovery_ap_provenance(metadata)
+
+    staged: dict[str, object] = {}
+    for name, target_relative in RECOVERY_AP_BINARIES.items():
+        if name not in binaries or name not in records:
+            raise SystemExit(f"ERROR: recovery-AP component not supplied: {name}")
+        source = binaries[name]
+        if source.is_symlink() or not source.is_file():
+            raise SystemExit(f"ERROR: recovery-AP component is not a regular file: {source}")
+        data = read(source)
+        expected = records[name].get("sha256") if isinstance(records[name], dict) else None
+        if not isinstance(expected, str) or len(expected) != 64 or sha256(data) != expected:
+            actual = sha256(data)
+            raise SystemExit(
+                f"ERROR: recovery-AP component {name} SHA-256 mismatch\n"
+                f"expected={expected}\nactual={actual}"
+            )
+        target = stage / target_relative
+        if target.exists() or target.is_symlink():
+            raise SystemExit(f"ERROR: recovery-AP component collides with {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        target.chmod(0o755)
+        staged[name] = {
+            "path": f"/{target_relative}",
+            "sha256": expected,
+            "size": len(data),
+            "mode": "0755",
+            "elf": require_elf_contract(target, 0x05000400, None, (), False),
+            "source": provenance[name],
+        }
+
+    metadata_target = stage / "etc/libreecho/recovery-ap-binaries.json"
+    metadata_target.parent.mkdir(parents=True, exist_ok=True)
+    metadata_target.write_bytes(metadata_data)
+    metadata_target.chmod(0o644)
+    manifest["recovery_ap"] = {
+        "enabled": True,
+        "ap_probe": "/usr/local/sbin/libreecho-recovery-ap-probe",
+        "ready_probe": "/usr/local/sbin/libreecho-recovery-ap-ready",
+        "net_up": "/usr/local/sbin/libreecho-recovery-net-up",
+        "net_down": "/usr/local/sbin/libreecho-recovery-net-down",
+        "button_detector": "/usr/local/sbin/libreecho-recovery-button",
+        "marker": "/run/libreecho/recovery-mode",
+        "hostapd": "/usr/local/sbin/hostapd",
+        "dhcp": "/usr/local/sbin/dnsmasq",
+        "iw": "/usr/local/sbin/iw",
+        "components": staged,
+        "provenance": provenance,
+        "source_offer": metadata.get("source_offer"),
+        "metadata": {
+            "path": "/etc/libreecho/recovery-ap-binaries.json",
+            "sha256": sha256(metadata_data),
+            "size": len(metadata_data),
+            "mode": "0644",
+        },
+    }
 
 
 def sha256(data: bytes) -> str:
@@ -428,76 +589,6 @@ def add_connectivity_bundle(stage: Path, helpers: dict[str, Path],
     }
 
 
-def add_recovery_ap_bundle(stage: Path, binaries: dict[str, Path],
-                           metadata_path: Path, manifest: dict[str, object]) -> None:
-    """Stage the pinned recovery-AP dependencies, hash-checked against metadata.
-
-    The caller supplies the compiled hostapd/dnsmasq/iw artifacts and a JSON
-    metadata file of their expected SHA-256 values.  Every artifact must be a
-    regular file whose bytes match the recorded hash; nothing is staged on a
-    mismatch, so an unverified binary can never reach an image.
-    """
-    metadata_data = read(metadata_path)
-    try:
-        metadata = json.loads(metadata_data.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise SystemExit(f"ERROR: recovery-AP metadata is not valid JSON: {exc}") from exc
-    records = metadata.get("binaries")
-    if not isinstance(records, dict):
-        raise SystemExit("ERROR: recovery-AP metadata lacks a binaries map")
-
-    staged: dict[str, object] = {}
-    for name, target_relative in RECOVERY_AP_BINARIES.items():
-        if name not in binaries or name not in records:
-            raise SystemExit(f"ERROR: recovery-AP component not supplied: {name}")
-        source = binaries[name]
-        if source.is_symlink() or not source.is_file():
-            raise SystemExit(f"ERROR: recovery-AP component is not a regular file: {source}")
-        data = read(source)
-        expected = records[name].get("sha256") if isinstance(records[name], dict) else None
-        if not isinstance(expected, str) or len(expected) != 64 or sha256(data) != expected:
-            actual = sha256(data)
-            raise SystemExit(
-                f"ERROR: recovery-AP component {name} SHA-256 mismatch\n"
-                f"expected={expected}\nactual={actual}"
-            )
-        target = stage / target_relative
-        if target.exists() or target.is_symlink():
-            raise SystemExit(f"ERROR: recovery-AP component collides with {target}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-        target.chmod(0o755)
-        staged[name] = {
-            "path": f"/{target_relative}",
-            "sha256": expected,
-            "size": len(data),
-            "mode": "0755",
-            "elf": require_elf_contract(target, 0x05000400, None, (), False),
-        }
-
-    metadata_target = stage / "etc/libreecho/recovery-ap-binaries.json"
-    metadata_target.parent.mkdir(parents=True, exist_ok=True)
-    metadata_target.write_bytes(metadata_data)
-    metadata_target.chmod(0o644)
-    manifest["recovery_ap"] = {
-        "enabled": True,
-        "ap_probe": "/usr/local/sbin/libreecho-recovery-ap-probe",
-        "ready_probe": "/usr/local/sbin/libreecho-recovery-ap-ready",
-        "button_detector": "/usr/local/sbin/libreecho-recovery-button",
-        "marker": "/run/libreecho/recovery-mode",
-        "hostapd": "/usr/local/sbin/hostapd",
-        "dhcp": "/usr/local/sbin/dnsmasq",
-        "iw": "/usr/local/sbin/iw",
-        "components": staged,
-        "metadata": {
-            "path": "/etc/libreecho/recovery-ap-binaries.json",
-            "sha256": sha256(metadata_data),
-            "size": len(metadata_data),
-            "mode": "0644",
-        },
-    }
-
-
 def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
                 expected_busybox_sha256: str, expected_loader_sha256: str,
                 qemu_arm: str,
@@ -517,14 +608,17 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         "init.rc": ("init.rc", 0o644),
         "init.recovery.mt8163.rc": ("init.recovery.mt8163.rc", 0o644),
         "libreecho-init": ("libreecho-init", 0o755),
-        "libreecho-recovery-button": (
-            "usr/local/sbin/libreecho-recovery-button", 0o755,
-        ),
         "libreecho-recovery-ap-probe": (
             "usr/local/sbin/libreecho-recovery-ap-probe", 0o755,
         ),
         "libreecho-recovery-ap-ready": (
             "usr/local/sbin/libreecho-recovery-ap-ready", 0o755,
+        ),
+        "libreecho-recovery-net-up": (
+            "usr/local/sbin/libreecho-recovery-net-up", 0o755,
+        ),
+        "libreecho-recovery-net-down": (
+            "usr/local/sbin/libreecho-recovery-net-down", 0o755,
         ),
         "libreecho-mdnsd": ("etc/init.d/libreecho-mdnsd.init", 0o755),
         "libreecho-reconcile-features": (

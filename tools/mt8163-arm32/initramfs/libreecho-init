@@ -1048,13 +1048,21 @@ fi
 
 # Physical recovery detector (issue #96).  A ~5 s hold of the action button
 # (KEY_HELP, its own gpio-keys node) arms the recovery access point by dropping
-# a boot-scoped tmpfs marker that networkd validates.  It is bounded end to end:
-# with no held button the helper returns after its short press window, and a
-# missing helper or input node leaves the boot completely unaffected.  The
-# helper never reboots, writes persistent storage or touches a partition.
+# a boot-scoped tmpfs marker that networkd validates.  The helper is a compiled
+# evdev reader: it reads the kernel's current key bitmap with EVIOCGKEY, so a
+# button already held before this point is detected even though it produces no
+# further key events, and it measures the hold with CLOCK_MONOTONIC rather than
+# trusting event timestamps.  It is bounded end to end: with no held button the
+# helper returns after its short startup no-key window, and a missing helper or
+# input node leaves the boot completely unaffected.  The helper never reboots,
+# writes persistent storage or touches a partition.
 PHYSICAL_RECOVERY_HELPER=${PHYSICAL_RECOVERY_HELPER:-/usr/local/sbin/libreecho-recovery-button}
 PHYSICAL_RECOVERY_MARKER=${PHYSICAL_RECOVERY_MARKER:-/run/libreecho/recovery-mode}
-PHYSICAL_RECOVERY_TIMEOUT=${PHYSICAL_RECOVERY_TIMEOUT:-9}
+# Must not cut the detector short: the compiled detector's own absolute cap is
+# 12000 ms (DEFAULT_MAX_MS), so a 5 s hold that begins ~7 s after the probe
+# starts still arms.  With no held button the detector returns after its 2 s
+# no-key window, so this bound costs nothing on an ordinary boot.
+PHYSICAL_RECOVERY_TIMEOUT=${PHYSICAL_RECOVERY_TIMEOUT:-13}
 physical_recovery_probe()
 {
     [ -x "$PHYSICAL_RECOVERY_HELPER" ] || {

@@ -33,3 +33,90 @@ jobs:
       - name: Run recovery packaging and real-DTB fixture contracts
         working-directory: tools/mt8163-arm32
         run: python3 -m unittest -v test_recovery_image_tools test_build_wifi_dtb test_verify_radar_puffin_dtb test_recovery_ap
+
+  recovery-ap-build:
+    name: Build pinned recovery-AP binaries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ARM cross toolchain and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf \
+            bison flex pkg-config
+      - name: Fetch and hash-check the pinned recovery-AP sources
+        working-directory: tools/mt8163-arm32
+        run: |
+          set -euo pipefail
+          cache="${RUNNER_TEMP}/recovery-ap-sources"
+          mkdir -p "$cache"
+          python3 - recovery-ap/SOURCE.lock "$cache" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+          import urllib.request
+
+          lock = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          dest = pathlib.Path(sys.argv[2])
+          records = dict(lock["components"])
+          records["libnl"] = lock["build_dependencies"]["libnl"]
+          for name, record in records.items():
+              target = dest / record["source_url"].rsplit("/", 1)[-1]
+              if not target.is_file():
+                  urllib.request.urlretrieve(record["source_url"], target)
+              digest = hashlib.sha256(target.read_bytes()).hexdigest()
+              if digest != record["source_sha256"]:
+                  raise SystemExit("ERROR: %s archive hash mismatch: %s" % (name, digest))
+              print("recovery_ap_source_%s_sha256=%s" % (name, digest))
+          PY
+      - name: Build recovery-AP binaries and emit image metadata
+        working-directory: tools/mt8163-arm32
+        run: |
+          set -euo pipefail
+          cache="${RUNNER_TEMP}/recovery-ap-sources"
+          out="${RUNNER_TEMP}/recovery-ap-out"
+          mkdir -p "$out"
+          # Public cross toolchain, no repository secrets: the same builder that
+          # produces the release artifacts runs here from the pinned sources.
+          bash recovery-ap/build_recovery_ap.sh --build \
+            --cache "$cache" \
+            --libnl-archive "$cache/libnl-3.11.0.tar.gz" \
+            --output "$out" \
+            --cc arm-linux-gnueabihf-gcc \
+            --ar arm-linux-gnueabihf-ar \
+            --ranlib arm-linux-gnueabihf-ranlib \
+            --strip arm-linux-gnueabihf-strip
+      - name: Verify the emitted metadata is consumable by the image builder
+        working-directory: tools/mt8163-arm32
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/recovery-ap-out"
+          python3 - "$out" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          import build_recovery_image
+
+          out = pathlib.Path(sys.argv[1])
+          metadata_path = out / "recovery-ap-binaries.json"
+          metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+          assert metadata["schema"] == build_recovery_image.RECOVERY_AP_METADATA_SCHEMA
+          assert set(metadata["binaries"]) == set(build_recovery_image.RECOVERY_AP_BINARIES)
+          stage = out / "verify-stage"
+          stage.mkdir()
+          manifest = {}
+          build_recovery_image.add_recovery_ap_bundle(
+              stage,
+              {name: out / name for name in build_recovery_image.RECOVERY_AP_BINARIES},
+              metadata_path,
+              manifest,
+          )
+          record = manifest["recovery_ap"]
+          assert set(record["components"]) == set(build_recovery_image.RECOVERY_AP_BINARIES)
+          assert record["source_offer"]["components"]
+          print("recovery_ap_metadata_consumed=%d" % len(record["components"]))
+          PY

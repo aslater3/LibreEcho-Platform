@@ -1,0 +1,116 @@
+#!/bin/busybox sh
+# shellcheck shell=dash
+#
+# Recovery access-point interface teardown (issue #96, Platform side).
+#
+# Contract consumed by networkd (see evidence/recovery-handoff.md):
+#   libreecho-recovery-net-down --interface <iface>
+# Exit 0 means: the portal IPv4 has been removed and <iface> has been returned
+# to normal client management (wpa_supplicant may own it again).  networkd runs
+# this on every teardown (owner stop, association success, handover, daemon
+# shutdown) whenever net-up succeeded; exact restoration is mandatory.
+#
+# It removes ONLY the address it recorded as its own when net-up ran — it never
+# flushes the interface and never touches an address the client plane owns.  It
+# restores the client wpa service it stopped (pidfile-driven), never with a
+# pattern-based kill, never via /dev/wmtWifi, and never by rebooting.  With no
+# recorded ownership it is a no-op success, so a repeated teardown is safe.
+
+set -u
+
+BB=${BB:-/bin/busybox}
+STATE_DIR=${RECOVERY_NET_STATE_DIR:-/run/libreecho}
+WPA_SERVICE=${RECOVERY_AP_WPA_SERVICE:-/usr/local/sbin/libreecho-wifi}
+
+IFACE=
+
+usage() {
+    printf '%s\n' 'usage: libreecho-recovery-net-down --interface IFACE [--state-dir DIR]' >&2
+}
+
+die() { printf 'libreecho-recovery-net-down: %s\n' "$1" >&2; exit 2; }
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --interface) [ "$#" -ge 2 ] || die 'missing --interface value'; IFACE=$2; shift 2 ;;
+        --state-dir) [ "$#" -ge 2 ] || die 'missing --state-dir value'; STATE_DIR=$2; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage; exit 2 ;;
+    esac
+done
+[ -n "$IFACE" ] || { usage; exit 2; }
+case "$IFACE" in
+    *[!A-Za-z0-9._-]*|'') die "unsafe interface name: $IFACE" ;;
+    -*) die "unsafe interface name: $IFACE" ;;
+esac
+case "$STATE_DIR" in
+    */run/*) ;;
+    *) die "refusing non-tmpfs state directory: $STATE_DIR" ;;
+esac
+
+STATE_FILE=$STATE_DIR/recovery-net.state
+
+resolve_ip() {
+    if [ -n "${RECOVERY_AP_IP:-}" ]; then
+        printf '%s\n' "$RECOVERY_AP_IP"
+    elif [ -x /bin/ip ]; then
+        printf '%s\n' /bin/ip
+    elif [ -x /sbin/ip ]; then
+        printf '%s\n' /sbin/ip
+    else
+        printf '%s\n' ip
+    fi
+}
+IP_BIN=$(resolve_ip)
+
+read_state_field() {
+    [ -f "$STATE_FILE" ] || return 0
+    sed -n "s/^$1=//p" "$STATE_FILE" | head -n 1
+}
+
+owned_iface=$(read_state_field iface)
+owned_address=$(read_state_field address)
+owned_stopped=$(read_state_field stopped)
+owned_service=$(read_state_field wpa_service)
+[ -n "$owned_service" ] || owned_service=$WPA_SERVICE
+
+address_present() {
+    "$IP_BIN" addr show dev "$IFACE" 2>/dev/null | grep -q "inet $1"
+}
+
+restore_client_service() {
+    [ -x "$1" ] || return 0
+    "$1" start >/dev/null 2>&1
+    return $?
+}
+
+# No recorded ownership: nothing of ours to release.  This is a successful
+# no-op so a repeated or premature teardown never fails the caller.
+if [ -z "$owned_iface" ] || [ "$owned_iface" != "$IFACE" ]; then
+    printf 'net-down: nothing-owned %s\n' "$IFACE"
+    exit 0
+fi
+
+# 1. Remove ONLY the portal address this helper assigned.  A missing address
+#    (already removed, or the interface went away) is not an error: the desired
+#    end state holds either way.  A refused deletion is a real failure.
+if [ -n "$owned_address" ] && address_present "$owned_address"; then
+    if ! "$IP_BIN" addr del "$owned_address" dev "$IFACE" >/dev/null 2>&1; then
+        die "cannot remove owned address $owned_address from $IFACE"
+    fi
+fi
+
+# 2. Drop ownership state before restoring the client plane, so a crash between
+#    the two does not leave a stale record pointing at a removed address.
+rm -f "$STATE_FILE"
+
+# 3. Restore client management only when this helper is the one that released
+#    it; otherwise a spurious teardown could disturb a live client association.
+if [ "$owned_stopped" = 1 ]; then
+    if ! restore_client_service "$owned_service"; then
+        die "cannot restore client service $owned_service"
+    fi
+fi
+
+printf 'net-down: %s %s\n' "$IFACE" "${owned_address:-none}"
+exit 0

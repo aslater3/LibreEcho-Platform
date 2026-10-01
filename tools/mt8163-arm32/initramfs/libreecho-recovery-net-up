@@ -1,0 +1,182 @@
+#!/bin/busybox sh
+# shellcheck shell=dash
+#
+# Recovery access-point interface bring-up (issue #96, Platform side).
+#
+# Contract consumed by networkd (see evidence/recovery-handoff.md):
+#   libreecho-recovery-net-up --interface <iface> --address <portal-addr>/<prefix>
+# Exit 0 means: the radio has been released from client-supplied STA management,
+# the portal IPv4 is assigned to <iface>, and the link is up, so hostapd and
+# dnsmasq can bind.  networkd runs this BEFORE it spawns either child and BEFORE
+# any DHCP/DNS lease is claimed; a non-zero exit fails the whole recovery start
+# closed.
+#
+# Properties the single-radio handover depends on:
+#   - idempotent: re-running with the same interface/address is a no-op success;
+#   - re-entrant: it may run again after a net-down without corrupting state;
+#   - rollback: if the address cannot be assigned after the client service was
+#     stopped, the client service is restored and the call fails;
+#   - no generic process killing: the client supplicant is stopped through its
+#     own service (pidfile-driven), never with pkill/killall;
+#   - no driver backdoor: it never touches /dev/wmtWifi, never reboots, and
+#     never writes a persistent filesystem (only the boot tmpfs state file).
+#
+# The portal address it assigns is the ONLY address it ever owns: it records it
+# in a tmpfs state file so the matching net-down removes exactly that address.
+
+set -u
+
+BB=${BB:-/bin/busybox}
+STATE_DIR=${RECOVERY_NET_STATE_DIR:-/run/libreecho}
+WPA_SERVICE=${RECOVERY_AP_WPA_SERVICE:-/usr/local/sbin/libreecho-wifi}
+DEFAULT_ADDRESS=192.168.4.1/24
+
+IFACE=
+ADDRESS=
+
+usage() {
+    printf '%s\n' \
+        'usage: libreecho-recovery-net-up --interface IFACE [--address ADDR/PREFIX]' \
+        '                                    [--state-dir DIR]' >&2
+}
+
+die() { printf 'libreecho-recovery-net-up: %s\n' "$1" >&2; exit 2; }
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --interface) [ "$#" -ge 2 ] || die 'missing --interface value'; IFACE=$2; shift 2 ;;
+        --address) [ "$#" -ge 2 ] || die 'missing --address value'; ADDRESS=$2; shift 2 ;;
+        --state-dir) [ "$#" -ge 2 ] || die 'missing --state-dir value'; STATE_DIR=$2; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage; exit 2 ;;
+    esac
+done
+[ -n "$IFACE" ] || { usage; exit 2; }
+[ -n "$ADDRESS" ] || ADDRESS=$DEFAULT_ADDRESS
+
+# An interface name must be a plain link name; anything else is a caller error
+# and must never reach the shell's argument parsing as a path or option.
+case "$IFACE" in
+    *[!A-Za-z0-9._-]*|'') die "unsafe interface name: $IFACE" ;;
+    -*) die "unsafe interface name: $IFACE" ;;
+esac
+case "$ADDRESS" in
+    [0-9]*.[0-9]*.[0-9]*.[0-9]*/[0-9]*) ;;
+    *) die "unsafe portal address: $ADDRESS" ;;
+esac
+# The state file is a boot-scoped tmpfs handoff; refuse a persistent location
+# exactly like the button detector refuses a non-tmpfs marker.
+case "$STATE_DIR" in
+    */run/*) ;;
+    *) die "refusing non-tmpfs state directory: $STATE_DIR" ;;
+esac
+
+STATE_FILE=$STATE_DIR/recovery-net.state
+
+resolve_ip() {
+    if [ -n "${RECOVERY_AP_IP:-}" ]; then
+        printf '%s\n' "$RECOVERY_AP_IP"
+    elif [ -x /bin/ip ]; then
+        printf '%s\n' /bin/ip
+    elif [ -x /sbin/ip ]; then
+        printf '%s\n' /sbin/ip
+    else
+        printf '%s\n' ip
+    fi
+}
+IP_BIN=$(resolve_ip)
+
+address_present() {
+    "$IP_BIN" addr show dev "$IFACE" 2>/dev/null | grep -q "inet $ADDRESS"
+}
+
+mkdir -p "$STATE_DIR" 2>/dev/null || die "cannot create state directory: $STATE_DIR"
+chmod 0700 "$STATE_DIR" 2>/dev/null
+
+read_state_field() {
+    # $1 field name; prints value or empty.  Only reads the file net-up wrote.
+    [ -f "$STATE_FILE" ] || return 0
+    sed -n "s/^$1=//p" "$STATE_FILE" | head -n 1
+}
+
+write_state() {
+    # $1 stopped-client flag
+    tmp=$STATE_FILE.tmp.$$
+    {
+        printf 'iface=%s\n' "$IFACE"
+        printf 'address=%s\n' "$ADDRESS"
+        printf 'stopped=%s\n' "$1"
+        printf 'wpa_service=%s\n' "$WPA_SERVICE"
+    } >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    chmod 0600 "$tmp" 2>/dev/null
+    [ "$(id -u 2>/dev/null)" = 0 ] && chown 0:0 "$tmp" 2>/dev/null
+    mv -f "$tmp" "$STATE_FILE" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    return 0
+}
+
+stop_client_service() {
+    [ -x "$WPA_SERVICE" ] || return 1
+    "$WPA_SERVICE" stop >/dev/null 2>&1 || return 1
+    return 0
+}
+
+restore_client_service() {
+    [ -x "$WPA_SERVICE" ] || return 0
+    "$WPA_SERVICE" start >/dev/null 2>&1
+    return $?
+}
+
+# Idempotent fast path: already configured for this exact interface/address.
+if [ "$(read_state_field iface)" = "$IFACE" ] &&
+        [ "$(read_state_field address)" = "$ADDRESS" ] && address_present; then
+    printf 'net-up: already-configured %s %s\n' "$IFACE" "$ADDRESS"
+    exit 0
+fi
+
+# 1. Release client-supplied STA management.  The client supplicant and its
+#    DHCP client are stopped through their owning service (pidfile-scoped);
+#    there is deliberately no pattern-based process kill here.
+#
+#    Ownership is a property of the portal, not of this invocation: if a
+#    previous net-up already released the plane for this same interface/address
+#    and recorded it, a re-run must keep that record even though the service is
+#    already stopped and its stop call now fails.  Otherwise the re-run would
+#    overwrite stopped=1 with stopped=0 and a later net-down would skip the
+#    restoration the previous call still owes.
+prior_stopped=0
+if [ "$(read_state_field iface)" = "$IFACE" ] &&
+        [ "$(read_state_field address)" = "$ADDRESS" ] &&
+        [ "$(read_state_field stopped)" = 1 ]; then
+    prior_stopped=1
+fi
+stopped=0
+if stop_client_service; then
+    stopped=1
+elif [ "$prior_stopped" = 1 ]; then
+    stopped=1
+fi
+# Record ownership before mutating the link so a later net-down (or a rollback
+# below) can restore exactly what this call changed.
+write_state "$stopped" || die "cannot record ownership state: $STATE_FILE"
+
+# 2. Bring the link up.
+if ! "$IP_BIN" link set dev "$IFACE" up >/dev/null 2>&1; then
+    [ "$stopped" = 1 ] && restore_client_service
+    rm -f "$STATE_FILE"
+    die "cannot bring up $IFACE"
+fi
+
+# 3. Assign the portal address (idempotent: only if not already present).
+if ! address_present; then
+    if ! "$IP_BIN" addr add "$ADDRESS" dev "$IFACE" >/dev/null 2>&1; then
+        # Roll back: the client service we stopped is restored and no owned
+        # address is left behind.
+        "$IP_BIN" addr del "$ADDRESS" dev "$IFACE" >/dev/null 2>&1
+        [ "$stopped" = 1 ] && restore_client_service
+        rm -f "$STATE_FILE"
+        die "cannot assign $ADDRESS to $IFACE"
+    fi
+fi
+
+printf 'net-up: %s %s\n' "$IFACE" "$ADDRESS"
+exit 0

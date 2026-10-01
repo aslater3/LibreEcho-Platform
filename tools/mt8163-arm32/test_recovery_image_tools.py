@@ -1447,7 +1447,14 @@ class SourceTests(unittest.TestCase):
         self.assertIn("getsockopt(fd, SOL_SOCKET, SO_ERROR", engine)
         self.assertIn("#define VISUALIZER_FRAME_PERIODS 2U", engine)
         self.assertIn('\\"cmd\\":\\"visualizer\\"', engine)
-        self.assertIn('\\"action\\":\\"frame\\"', engine)
+        # The visualizer frame is emitted by the shared music-features
+        # formatter (the mandatory visualizer-producer contract); the engine
+        # delegates to it rather than hand-rolling the frame JSON.
+        self.assertIn("music_features_format_frame(", engine)
+        self.assertIn(
+            '\\"action\\":\\"frame\\"',
+            (TOOLS_DIR / "airplay/music_features.h").read_text(),
+        )
         self.assertIn('\\"action\\":\\"stop\\"', engine)
         self.assertIn('\\"owner\\":\\"music\\"', engine)
         self.assertIn("process_music_visualizer(&visualizer, sources", engine)
@@ -4736,6 +4743,21 @@ class UiTlsPackagingTests(unittest.TestCase):
             + "\n"
         )
 
+    @staticmethod
+    def opus_arm_prefix() -> Path | None:
+        """Resolve the verified ARM32 Opus prefix, supplied explicitly by env.
+
+        There is deliberately no default: a tracked test must never depend on a
+        developer's private scratch location.  CI builds the pinned prefix with
+        `tools/mt8163-arm32/ui/build_opus.sh` and exports
+        `LIBREECHO_OPUS_ARM_PREFIX`; the positive contract below then skips -
+        rather than silently passing - only when it is unset.
+        """
+        configured = os.environ.get("LIBREECHO_OPUS_ARM_PREFIX")
+        if not configured:
+            return None
+        return Path(configured)
+
     def run_ui_bundle(
         self,
         tmp: Path,
@@ -4802,6 +4824,23 @@ class UiTlsPackagingTests(unittest.TestCase):
                 self.skipTest("ar is required to synthesise an mbedTLS prefix")
             if shutil.which("git") is None:
                 self.skipTest("git is required to stage a stand-in UI checkout")
+            # The builder now fails closed without a verified ARM32 Opus prefix,
+            # and that contract arch-checks every archive member, so a host
+            # synthetic prefix cannot satisfy it.  Use the real pinned prefix,
+            # supplied explicitly through LIBREECHO_OPUS_ARM_PREFIX (CI builds
+            # it with ui/build_opus.sh and exports it).
+            opus_root = self.opus_arm_prefix()
+            if opus_root is None:
+                self.skipTest(
+                    "set LIBREECHO_OPUS_ARM_PREFIX to the pinned ARM32 Opus "
+                    "prefix built by ui/build_opus.sh"
+                )
+            opus_root = opus_root.resolve()
+            if not opus_root.is_dir():
+                self.skipTest(
+                    "a verified ARM32 Opus prefix is required "
+                    "(LIBREECHO_OPUS_ARM_PREFIX); none at %s" % opus_root
+                )
             prefix = tmp / "prefix"
             self.write_mbedtls_prefix(prefix)
 
@@ -4838,6 +4877,7 @@ class UiTlsPackagingTests(unittest.TestCase):
                     "MAKE": str(shim),
                     "LE_TEST_MAKE_RECORD": str(record),
                     "LIBREECHO_UI_TLS_LIBS": decoy,
+                    "LIBREECHO_UI_OPUS_ROOT": str(opus_root),
                 },
             )
             # The stand-in UI checkout produces no binaries, so the builder
@@ -4853,6 +4893,13 @@ class UiTlsPackagingTests(unittest.TestCase):
             for line in release:
                 for archive in ("libmbedtls.a", "libmbedx509.a", "libmbedcrypto.a"):
                     self.assertIn(f"{prefix}/lib/{archive}", line)
+                # The mandatory Opus producer contract: Opus is a shipped
+                # production capability, so the link line must bind the verified
+                # ARM32 Opus archives by absolute path and must not fall back to
+                # a bare -lopus/-lopusfile search.
+                for archive in ("libopusfile.a", "libopus.a", "libogg.a"):
+                    self.assertIn(f"{opus_root}/lib/{archive}", line)
+                self.assertNotIn("-lopus", line)
 
     def test_ui_bundle_fails_closed_without_a_usable_mbedtls_prefix(self) -> None:
         """Issue #250: the builder must never produce a stub TLS bundle.
