@@ -1,0 +1,188 @@
+diff -ruN a/include/sendspin/player_role.h b/include/sendspin/player_role.h
+--- a/include/sendspin/player_role.h
++++ b/include/sendspin/player_role.h
+@@ -142,6 +142,36 @@
+     /// not-yet-played accepted bytes here, or pre-seek audio replays after the seek.
+     virtual void on_stream_clear() {}
+ 
++    /// @brief Synchronous seek boundary, delivered on the SYNC TASK thread at the exact point the
++    /// SDK applies a server stream/clear.
++    ///
++    /// Fires after every on_audio_write() for the pre-seek audio has returned and before any
++    /// on_audio_write() carrying post-seek audio is issued, on the same thread as on_audio_write().
++    /// That is a hard happens-before: unlike on_stream_clear(), which is inbox-queued and delivered
++    /// on the main loop in arrival order and may therefore run after post-seek audio has already been
++    /// accepted by a sink, an implementation that must fence its own sink can do so here without
++    /// racing the post-seek writes. stream/clear is a seek within the open stream: no stream/start
++    /// follows.
++    ///
++    /// The accepted-but-unplayed accounting below is the second half of the contract: the SDK keeps
++    /// a ledger of frames the sink accepted minus frames it reported as played, and a sink-side
++    /// discard would otherwise leave the discarded frames in that ledger forever, making the SDK
++    /// treat correctly-timed post-seek audio as late and drop or silence it.
++    ///
++    /// @param clear_generation Monotonic count of stream/clear signals observed on this role;
++    ///        strictly increases per applied boundary. Opaque beyond ordering.
++    /// @return The number of PCM frames the implementation discarded from its sink at this boundary:
++    ///         frames it had accepted from on_audio_write() but never reported as played through
++    ///         notify_audio_played(). The SDK removes exactly this many frames from its
++    ///         accepted-minus-played ledger and moves the predicted buffer playtime back by their
++    ///         duration. Such frames are counted as dropped, never as played, so they must not
++    ///         include frames already reported through notify_audio_played(). Return 0 if nothing
++    ///         was discarded; the default returns 0, which preserves the pre-boundary drain model
++    ///         for implementations that do not fence a sink here.
++    virtual uint32_t on_stream_boundary(uint32_t /*clear_generation*/) {
++        return 0;
++    }
++
+     /// @brief Called when the volume is changed by the server
+     virtual void on_volume_changed(uint8_t /*volume*/) {}
+ 
+diff -ruN a/src/sync_task.cpp b/src/sync_task.cpp
+--- a/src/sync_task.cpp
++++ b/src/sync_task.cpp
+@@ -158,6 +158,12 @@
+     if (!this->is_initialized()) {
+         return;
+     }
++    // Stamp the boundary before it can be observed. The flag below is the only rendezvous, so the
++    // generation is bumped here (acq_rel: ordered before the flag set on this thread, visible after
++    // the flag read on the sync thread) rather than captured from a per-signal event. A coalesced
++    // double signal therefore advances the token by two and the single applied boundary reports the
++    // newer value, keeping the token monotonic across applied boundaries.
++    this->clear_generation_.fetch_add(1, std::memory_order_acq_rel);
+     this->event_flags_.set(EventGroupBits::COMMAND_STREAM_CLEAR);
+     this->encoded_ring_buffer_->wake_receiver();
+ }
+@@ -713,14 +719,20 @@
+ }
+ 
+ void SyncTask::apply_stream_clear(SyncContext& sync_context) {
++    // Capture the monotonic boundary token and retire the command bit first: a stream/clear
++    // signalled while this boundary is being applied must survive to produce its own later
++    // boundary, and the token must be the value as observed here so it stays strictly increasing
++    // across applied boundaries even if a new signal races in mid-call.
++    const uint32_t boundary_token = this->clear_generation_.load(std::memory_order_acquire);
++    this->event_flags_.clear(EventGroupBits::COMMAND_STREAM_CLEAR);
++
+     // Drop in-flight decoded audio (it carries the pre-seek timestamp; appending post-seek audio to
+     // it would mis-stamp the buffer) and any pending hard-sync gap-fill silence. Codec/decoder
+-    // state, buffered_frames and new_audio_client_playtime are deliberately left intact: the audio
+-    // already handed to the sink keeps draining, and the next chunk's server timestamp lets the
+-    // sync logic re-align on its own. Force hard_syncing on so that re-alignment uses the tight
+-    // settle threshold (the post-seek timestamp jump would trigger it anyway, but this is
+-    // explicit). initial_decode is left as-is: if priming has not finished the caller resumes it
+-    // via the INITIAL_SYNC state; if it has, we must not re-prime an already-running sink.
++    // state and initial_decode are left intact; the next chunk's server timestamp lets the sync
++    // logic re-align on its own. Force hard_syncing on so that re-alignment uses the tight settle
++    // threshold (the post-seek timestamp jump would trigger it anyway, but this is explicit).
++    // initial_decode is left as-is: if priming has not finished the caller resumes it via the
++    // INITIAL_SYNC state; if it has, we must not re-prime an already-running sink.
+     sync_context.silence_remaining = 0;
+     sync_context.release_chunk = false;
+     sync_context.hard_syncing = true;
+@@ -730,7 +742,50 @@
+     if (sync_context.decode_buffer != nullptr) {
+         sync_context.decode_buffer->decrease_buffer_length(sync_context.decode_buffer->available());
+     }
+-    this->event_flags_.clear(EventGroupBits::COMMAND_STREAM_CLEAR);
++
++    // Fire the synchronous seek boundary on this (sync) thread, between the last pre-seek
++    // on_audio_write() and the first post-seek one, once per distinct boundary token. The listener
++    // fences its sink and returns the frames it discarded; those are removed from the
++    // accepted-minus-played ledger so the post-seek sync does not mistake correctly-timed audio for
++    // late. apply_stream_clear() is also reachable from decode_chunk()'s marker branch, where a
++    // marker the flag path already handled for the same signal would otherwise re-deliver the
++    // boundary and reset the ledger twice; a token already delivered is suppressed. A listener that
++    // does not discard returns 0 (the default), leaving the ledger untouched.
++    if (boundary_token != this->last_applied_boundary_) {
++        this->last_applied_boundary_ = boundary_token;
++        PlayerRoleListener* listener =
++            this->player_impl_ != nullptr ? this->player_impl_->listener : nullptr;
++        if (listener != nullptr) {
++            this->apply_dropped_frames(sync_context, listener->on_stream_boundary(boundary_token));
++        }
++    }
++}
++
++void SyncTask::apply_dropped_frames(SyncContext& sync_context, uint32_t frames) {
++    if (frames == 0) {
++        return;
++    }
++    uint32_t dropped = frames;
++    if (dropped > sync_context.buffered_frames) {
++        // The ledger is the SDK's own upper bound on what the sink can still hold (accepted minus
++        // reported-played), so a larger report is a consumer accounting error, not extra audio.
++        SS_LOGW(TAG,
++                "seek boundary: sink discarded %" PRIu32
++                " frames but only %" PRIu32 " were buffered; clamping",
++                frames, sync_context.buffered_frames);
++        dropped = sync_context.buffered_frames;
++    }
++    if (dropped == 0) {
++        return;
++    }
++    sync_context.buffered_frames -= dropped;
++    // Move the predicted end of the buffered audio back by exactly the discarded duration: the
++    // dropped frames were the sink's future timeline and no longer play, so buffered_frames and
++    // new_audio_client_playtime must move together. This is a bookkeeping correction, not a played
++    // event: the frames are NOT reported through notify_audio_played(), so they never masquerade as
++    // hardware-played audio.
++    sync_context.new_audio_client_playtime -=
++        sync_context.current_stream_info.frames_to_microseconds(dropped);
+ }
+ 
+ void SyncTask::discard_to_clear_marker(SyncContext& sync_context) {
+diff -ruN a/src/sync_task.h b/src/sync_task.h
+--- a/src/sync_task.h
++++ b/src/sync_task.h
+@@ -168,6 +168,7 @@
+     /// The task discards buffered audio up to the CHUNK_TYPE_STREAM_CLEAR_MARKER that the caller
+     /// must enqueue immediately after this call, then keeps processing the same stream with its
+     /// existing codec, decoder, and playtime accounting intact. It does not return to idle.
++    /// Each signal advances the monotonic clear generation the applied boundary carries.
+     /// Thread-safe: may be called from any context.
+     void signal_stream_clear();
+ 
+@@ -265,8 +266,23 @@
+     /// accounting, and initial_decode are left intact; the next chunk's server timestamp lets the
+     /// sync logic re-align on its own. The caller re-enters the loop at INITIAL_SYNC so unfinished
+     /// priming resumes.
++    ///
++    /// Also the single seek-boundary call site: it fires the listener's synchronous
++    /// on_stream_boundary() on this (sync) thread and applies the frames that implementation
++    /// reports it discarded to the accepted-minus-played ledger.
+     void apply_stream_clear(SyncContext& sync_context);
+ 
++    /// @brief Removes `frames` consumer-discarded frames from the accepted-minus-played ledger.
++    ///
++    /// Called only from apply_stream_clear(), for the count the listener's on_stream_boundary()
++    /// returned. `frames` is clamped to buffered_frames: the ledger is the SDK's own upper bound on
++    /// what the sink still holds, so a larger report is a consumer accounting error, not extra
++    /// audio. buffered_frames and new_audio_client_playtime move together (the predicted end of the
++    /// buffered audio moves back by exactly the discarded duration) so the post-seek sync does not
++    /// treat correctly-timed audio as late. Deliberately does not report the frames as played: this
++    /// is a bookkeeping correction, not a hardware-played event.
++    void apply_dropped_frames(SyncContext& sync_context, uint32_t frames);
++
+     /// @brief Resets SyncContext between streams without deallocating buffers
+     void reset_context(SyncContext& sync_context);
+ 
+@@ -284,6 +300,17 @@
+     // updates from the audio callback and is drained by the sync thread.
+     ShadowSlot<PlaybackProgress> playback_progress_slot_;
+     std::thread sync_thread_;
++    /// Monotonic count of stream/clear signals observed on this role. Incremented on the signalling
++    /// (network) thread before the COMMAND_STREAM_CLEAR bit is set, and read on the sync thread when
++    /// a boundary is applied, so each applied on_stream_boundary() carries a token at least as new
++    /// as the signal that caused it and strictly greater than the previous applied boundary's.
++    std::atomic<uint32_t> clear_generation_{0};
++    /// Sync-thread only: the token of the last boundary whose listener callback was delivered.
++    /// apply_stream_clear() runs from two paths (the flag check and decode_chunk()'s marker branch)
++    /// and a marker can be applied after the flag path already handled the same signal; delivering
++    /// on_stream_boundary() a second time for one token would double-fire the consumer's fence and
++    /// reset the ledger twice, so a boundary whose token has already been delivered is suppressed.
++    uint32_t last_applied_boundary_{0};
+ 
+     // Pointer fields
+     ConnectionManager* conn_manager_{nullptr};
