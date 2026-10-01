@@ -159,6 +159,16 @@ for daemon in ('libreecho-audio-engine','libreecho-ttsd','libreecho-waked','libr
         self.assertFalse((self.control / 'pending').exists())
         self.assertFalse((self.generations / 'test-target').exists())
 
+    def test_committed_activation_refuses_running_boot_mismatch(self):
+        self.prepared()
+        (self.control / 'current').write_text('test-target\n')
+        (self.control / 'pending').unlink()
+        self.boot.write_bytes(b'other release boot')
+        result = self.verb('activate-committed')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('committed-boot-hash', result.stderr)
+        self.assertFalse(self.mount_log.exists())
+
     def test_activate_committed_rehashes_payload(self):
         self.prepared()
         (self.control / 'current').write_text('test-target\n')

@@ -213,7 +213,7 @@ verify_boot() {
     safe_path "$device"
     [ -b "$device" ] || [ -f "$device" ] || fail boot-device
     actual=$($BB dd if="$device" bs=4096 count=4096 2>/dev/null | $BB sha256sum | $BB awk '{print $1}')
-    [ "$actual" = "$(value boot_sha256 "$MANIFEST")" ] || fail boot-hash
+    [ "$actual" = "$(value boot_sha256 "$MANIFEST")" ] || fail "${1:-boot-hash}"
 }
 
 activate_generation() {
@@ -323,6 +323,9 @@ activate_committed() {
     [ -e "$ROOT/current" ] || return 0
     read_pointer current
     verify_generation
+    read_bcb
+    SLOT=$SELECTED
+    verify_boot committed-boot-hash
     activate_generation
 }
 write_result() {
