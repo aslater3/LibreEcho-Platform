@@ -26,20 +26,23 @@ def field_map(record: str) -> dict:
 
 
 class DevDiscoveryTests(unittest.TestCase):
-    def run_resolver(self, data, channel='dev', status='200'):
+    def run_resolver(self, data, channel='dev', status='200', target='radar_puffin'):
         text = SOURCE.read_text()
         function = text.split('resolve_dev_release()\n',1)[1].split('\nset_channel()',1)[0]
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)
             (root/'fixture').write_bytes(data)
+            (root/'target').write_text(f'target_id={target}\n')
             script='''
 BB="$TEST_BB"
 ROOT="$TEST_ROOT"
 CURL_HEADERS="$ROOT/headers"
 CURL_STDERR="$ROOT/stderr"
 channel="$TEST_CHANNEL"
+TARGET_FILE="$ROOT/target"
 url=stable-unchanged
 bounded_curl() {
+    printf '%s\\n' "$5" >&2
     cp "$ROOT/fixture" "$1"
     STREAM_SIZE=$(wc -c < "$1")
     STREAM_CURL_RC=0
@@ -60,6 +63,15 @@ printf '%s\\n' "$url" "${DEV_RELEASE_TAG:-}" "${DEV_OTA_SHA256:-}"
         result=self.run_resolver((TAG+'\n'+'d'*64+'\n').encode())
         self.assertEqual(result.returncode,0,result.stderr+result.stdout)
         self.assertIn('/download/'+TAG+'/libreecho-'+TAG+'.ota.tar',result.stdout)
+
+    def test_discovery_namespace_follows_image_target(self):
+        for target, slug in (('radar_puffin', 'radar-puffin'), ('biscuit', 'biscuit')):
+            tag = TAG.replace('radar-puffin', slug)
+            result = self.run_resolver((tag + '\n' + SHA256 + '\n').encode(), target=target)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertIn(f'/download/{slug}-dev-channel/release-pointer-v3.txt', result.stderr)
+            self.assertIn('/download/' + tag + '/libreecho-' + tag + '.ota.tar', result.stdout)
+        self.assertNotEqual(self.run_resolver((TAG + '\n' + SHA256 + '\n').encode(), target='biscuit').returncode, 0)
 
     def test_stable_does_not_fetch_pointer(self):
         result=self.run_resolver(b'invalid','stable')

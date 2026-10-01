@@ -63,7 +63,7 @@ candidate_release_tag()
 {
     value=$(sanitize_status_value "${1:-}")
     printf '%s\n' "$value" |
-        $BB grep -Eq '^radar-puffin-(build|nightly)-[a-f0-9]{7}-[a-f0-9]{16}-[a-f0-9]{16}$' ||
+        $BB grep -Eq '^(radar-puffin|biscuit)-(build|nightly)-[a-f0-9]{7}-[a-f0-9]{16}-[a-f0-9]{16}$' ||
         return 0
     printf '%s\n' "$value"
 }
@@ -240,7 +240,8 @@ validate_source()
     expected_channel=$(channel_value)
     [ "$expected_channel" = dev ] || [ "$expected_channel" = stable ] || die source_channel
     channel=$expected_channel
-    expected_url="https://github.com/aslater3/LibreEcho/releases/latest/download/libreecho-radar-puffin-$channel.ota.tar"
+    load_fetch_target
+    expected_url="https://github.com/aslater3/LibreEcho/releases/latest/download/libreecho-$TARGET_SLUG-$channel.ota.tar"
     url=$expected_url
 }
 
@@ -260,11 +261,22 @@ resolve_dev_release()
     url="https://github.com/aslater3/LibreEcho/releases/download/$DEV_RELEASE_TAG/libreecho-$DEV_RELEASE_TAG.ota.tar"
 }
 
+load_fetch_target()
+{
+    local file=${TARGET_FILE:-/etc/libreecho/target} id
+    TARGET_SLUG=
+    if [ ! -e "$file" ] && [ ! -L "$file" ]; then TARGET_SLUG=radar-puffin; return 0; fi
+    [ -f "$file" ] && [ ! -L "$file" ] && [ "$($BB grep -c '^target_id=' "$file")" = 1 ] || die source_target
+    id=$($BB sed -n 's/^target_id=//p' "$file")
+    case "$id" in radar_puffin) TARGET_SLUG=radar-puffin;; biscuit) TARGET_SLUG=biscuit;; *) die source_target;; esac
+}
+
 read_dev_release_pointer()
 {
     # Reuse the registered bounded-probe temporary lifecycle.
     pointer=$ROOT/.control-range-probe.$$
-    pointer_url=https://github.com/aslater3/LibreEcho/releases/download/radar-puffin-dev-channel/release-pointer-v3.txt
+    load_fetch_target
+    pointer_url=https://github.com/aslater3/LibreEcho/releases/download/$TARGET_SLUG-dev-channel/release-pointer-v3.txt
     bounded_curl "$pointer" "$CURL_HEADERS" 257 60 "$pointer_url"
     curl_detail=$(downloader_stderr)
     parse_response_headers "$CURL_HEADERS" || die dev_discovery_headers
@@ -273,7 +285,7 @@ read_dev_release_pointer()
         [ "$STREAM_SIZE" -gt 0 ] && [ "$STREAM_SIZE" -le 256 ] || die dev_discovery_size
     DEV_RELEASE_TAG=$($BB sed -n '1p' "$pointer")
     DEV_OTA_SHA256=$($BB sed -n '2p' "$pointer")
-    printf '%s\n' "$DEV_RELEASE_TAG" | $BB grep -Eq '^radar-puffin-(build|nightly)-[a-f0-9]{7}-[a-f0-9]{16}-[a-f0-9]{16}$' || die dev_discovery_tag
+    printf '%s\n' "$DEV_RELEASE_TAG" | $BB grep -Eq "^$TARGET_SLUG-(build|nightly)-[a-f0-9]{7}-[a-f0-9]{16}-[a-f0-9]{16}$" || die dev_discovery_tag
     printf '%s\n' "$DEV_OTA_SHA256" | $BB grep -Eq '^[a-f0-9]{64}$' || die dev_discovery_hash
     [ "$(printf '%s\n%s\n' "$DEV_RELEASE_TAG" "$DEV_OTA_SHA256" | $BB wc -c)" -eq "$STREAM_SIZE" ] || die dev_discovery_format
     $BB rm -f "$pointer" "$CURL_HEADERS" "$CURL_STDERR"
