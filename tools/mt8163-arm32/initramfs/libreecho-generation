@@ -28,24 +28,31 @@ generation_lock() {
     safe_path "$lock"; safe_path "$tmp"
     now=$($BB cat /proc/sys/kernel/random/boot_id) || fail generation-lock-boot
     if [ -d "$lock" ]; then
-        if [ ! -e "$lock/owner" ] && [ ! -L "$lock/owner" ]; then
-            # Only an empty legacy ownerless lock is reclaimable. New publication
-            # never exposes this state; nonempty/ambiguous directories fail closed.
-            $BB rmdir "$lock" 2>/dev/null || fail generation-busy
-        else
-            regular "$lock/owner" generation-lock-owner
-            owner=$($BB cat "$lock/owner")
-            read -r pid boot <<EOF
+        # Anchor every destructive operation to the observed directory inode.
+        # A delayed concurrent reclaimer must never remove a replacement owner.
+        (
+            cd "$lock" || exit 1
+            if [ -e owner ] || [ -L owner ]; then
+                [ -f owner ] && [ ! -L owner ] || exit 1
+                owner=$($BB cat owner) || exit 1
+                read -r pid boot <<EOF
 $owner
 EOF
-            case "$pid" in ''|*[!0-9]*) fail generation-busy;; esac
-            [ -n "$boot" ] || fail generation-busy
-            if [ "$boot" = "$now" ] && $BB kill -0 "$pid" 2>/dev/null; then fail generation-busy; fi
-            safe_path "$lock/reclaim"
-            $BB mkdir "$lock/reclaim" 2>/dev/null || fail generation-busy
-            [ "$($BB cat "$lock/owner")" = "$owner" ] || { $BB rmdir "$lock/reclaim"; fail generation-busy; }
-            $BB rm "$lock/owner" && $BB rmdir "$lock/reclaim" && $BB rmdir "$lock" || fail generation-busy
-        fi
+                case "$pid" in ''|*[!0-9]*) exit 1;; esac
+                [ -n "$boot" ] || exit 1
+                if [ "$boot" = "$now" ] && $BB kill -0 "$pid" 2>/dev/null; then exit 1; fi
+                $BB rm -f owner || exit 1
+            fi
+            # Recover the old protocol's empty marker, including a crash after
+            # owner removal. Never recursively delete ambiguous lock contents.
+            if [ -e reclaim ] || [ -L reclaim ]; then
+                [ -d reclaim ] && [ ! -L reclaim ] || exit 1
+                $BB rmdir reclaim 2>/dev/null || exit 1
+            fi
+            # Only an empty directory can disappear here. Atomic publication
+            # always includes owner, so a new/live lock cannot be removed.
+            $BB rmdir "$lock" 2>/dev/null || exit 1
+        ) || fail generation-busy
     fi
     $BB mkdir "$tmp" 2>/dev/null || fail generation-lock-temp
     printf '%s %s\n' "$$" "$now" > "$tmp/owner" && $BB chmod 0600 "$tmp/owner" || fail generation-lock-write

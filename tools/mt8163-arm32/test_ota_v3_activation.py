@@ -252,6 +252,96 @@ exec /bin/busybox "$@"
                 result = self.verb('gc')
                 self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_reclamation_crash_boundaries_recover(self):
+        import shutil
+        for name in ('libreecho-generation', 'libreecho-generation-transaction'):
+            for operation in ('mkdir-reclaim', 'rm-owner', 'rmdir-reclaim', 'rmdir-lock'):
+                for phase in ('before', 'after'):
+                    with self.subTest(helper=name, operation=operation, phase=phase):
+                        lock = self.control / 'generation.lock'
+                        if lock.exists(): shutil.rmtree(lock)
+                        lock.mkdir()
+                        (lock / 'owner').write_text('99999999 ' + Path('/proc/sys/kernel/random/boot_id').read_text())
+                        if operation != 'mkdir-reclaim': (lock / 'reclaim').mkdir()
+                        wrapper = self.root / 'reclaim-busybox'
+                        wrapper.write_text('''#!/bin/sh
+last=
+for argument do last=$argument; done
+match=0
+case "$FAULT:$1:$last" in
+ mkdir-reclaim:mkdir:*/generation.lock/reclaim|rm-owner:rm:owner|rm-owner:rm:*/generation.lock/owner|rmdir-reclaim:rmdir:reclaim|rmdir-reclaim:rmdir:*/generation.lock/reclaim|rmdir-lock:rmdir:*/generation.lock) match=1;;
+esac
+if [ "$match" = 1 ] && [ "$PHASE" = before ]; then kill -KILL "$LOCK_PID"; exit 1; fi
+/bin/busybox "$@"
+rc=$?
+if [ "$match" = 1 ] && [ "$PHASE" = after ] && [ "$rc" = 0 ]; then kill -KILL "$LOCK_PID"; exit 1; fi
+exit "$rc"
+''')
+                        wrapper.chmod(0o755)
+                        source = (TOOLS / 'initramfs' / name).read_text()
+                        # Legacy marker publication is a deployed crash state; recreate
+                        # that boundary even once new helpers no longer publish markers.
+                        if operation == 'mkdir-reclaim':
+                            source = source[:source.index('generation_lock()')] + '\n$BB mkdir "$ROOT/generation.lock/reclaim"\n'
+                        else:
+                            source = source[:source.rfind('case "${1:-}" in')] if name == 'libreecho-generation' else source.split('# Observation commands')[0]
+                            source += '\ngeneration_lock\n'
+                        script = self.root / 'reclaim-helper'
+                        source = source.replace('BB=/bin/busybox', 'BB=' + str(wrapper))
+                        source = source.replace('BB=' + str(wrapper), 'BB=' + str(wrapper) + '\nexport LOCK_PID=$$')
+                        script.write_text(source)
+                        result = subprocess.run(['/bin/busybox', 'sh', str(script)], env=dict(self.env, FAULT=operation, PHASE=phase), capture_output=True, timeout=10)
+                        self.assertEqual(result.returncode, -9)
+                        recovered = self.verb('gc')
+                        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+                        self.assertFalse(lock.exists())
+
+    def test_concurrent_reclaimer_cannot_remove_new_live_owner(self):
+        import time
+        lock = self.control / 'generation.lock'
+        lock.mkdir()
+        (lock / 'owner').write_text('99999999 ' + Path('/proc/sys/kernel/random/boot_id').read_text())
+        wrapper = self.root / 'race-busybox'
+        wrapper.write_text('''#!/bin/sh
+if [ "$1" = rm ] && [ "$3" = owner ]; then
+ /bin/busybox touch "$BARRIER/$LABEL.ready"
+ while [ ! -f "$BARRIER/$LABEL.go" ]; do /bin/busybox sleep .01; done
+fi
+exec /bin/busybox "$@"
+''')
+        wrapper.chmod(0o755)
+        processes = []
+        try:
+            for label, name in (('first', 'libreecho-generation'), ('second', 'libreecho-generation-transaction')):
+                source = (TOOLS / 'initramfs' / name).read_text()
+                source = source[:source.rfind('case "${1:-}" in')] if label == 'first' else source.split('# Observation commands')[0]
+                source = source.replace('BB=/bin/busybox', 'BB=' + str(wrapper))
+                source += '\ngeneration_lock\n/bin/busybox touch "$BARRIER/$LABEL.entered"\nwhile [ ! -f "$BARRIER/finish" ]; do /bin/busybox sleep .01; done\n'
+                script = self.root / (label + '-lock'); script.write_text(source)
+                processes.append(subprocess.Popen(['/bin/busybox', 'sh', str(script)], env=dict(self.env, BARRIER=str(self.root), LABEL=label), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+            def wait_for(path):
+                deadline = time.monotonic() + 5
+                while not path.exists() and time.monotonic() < deadline: time.sleep(.01)
+                self.assertTrue(path.exists(), str(path))
+            for label in ('first', 'second'): wait_for(self.root / (label + '.ready'))
+            (self.root / 'first.go').touch()
+            wait_for(self.root / 'first.entered')
+            live_owner = (lock / 'owner').read_text()
+            (self.root / 'second.go').touch()
+            _, stderr = processes[1].communicate(timeout=5)
+            self.assertNotEqual(processes[1].returncode, 0, stderr)
+            self.assertEqual((lock / 'owner').read_text(), live_owner)
+            self.assertFalse((self.root / 'second.entered').exists())
+            self.assertNotEqual(self.verb('gc').returncode, 0)
+            (self.root / 'finish').touch()
+            _, stderr = processes[0].communicate(timeout=5)
+            self.assertEqual(processes[0].returncode, 0, stderr)
+            self.assertFalse(lock.exists())
+        finally:
+            for process in processes:
+                if process.poll() is None: process.kill()
+                process.communicate(timeout=5)
+
     def test_dead_owner_lock_is_recovered(self):
         self.prepared()
         lock = self.control / 'generation.lock'
