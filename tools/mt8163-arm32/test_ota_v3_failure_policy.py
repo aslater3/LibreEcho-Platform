@@ -47,10 +47,13 @@ class FailurePolicyTests(grammar.SignedFixture):
         b = source.index('\n}\n', a) + 3
         body = source[a:b]
         root = self.root
-        for old, new in (('/usr/local/sbin', str(root / 'bin')), ('/etc/init.d', str(root / 'init.d')),
+        # Rewrite the source's /tmp paths before injecting fixture paths. On
+        # hosted runners the fixture itself lives under /tmp, so a final /tmp
+        # replacement would recursively rewrite every newly inserted path.
+        for old, new in (('/tmp/', str(root) + '/'),
+                         ('/usr/local/sbin', str(root / 'bin')), ('/etc/init.d', str(root / 'init.d')),
                          ('/data/libreecho', str(root / 'data/libreecho')), ('/var/run', str(root / 'var/run')),
-                         ('/var/log', str(root / 'var/log')), ('/run/libreecho', str(root / 'run/libreecho')),
-                         ('/tmp/', str(root) + '/')):
+                         ('/var/log', str(root / 'var/log')), ('/run/libreecho', str(root / 'run/libreecho'))):
             body = body.replace(old, new)
         (root / 'bin').mkdir()
         (root / 'bin/libreecho-web').write_text('#!/bin/sh\nexit 0\n')
