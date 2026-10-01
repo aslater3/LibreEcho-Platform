@@ -3701,7 +3701,10 @@ start_feature_service_if_enabled
         self.assertIn('die update_channel_mismatch', updater)
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
         self.assertIn("installed_channel", fetcher)
-        self.assertIn("rolled_back_channel", fetcher)
+        # A rolled-back signed transaction is held regardless of selected channel;
+        # the unique target identity replaces the old version/channel comparison.
+        self.assertIn('check_value_from_file "$ROOT/rolled-back" transaction_id', fetcher)
+        self.assertIn('check_value_from_file "$ROOT/rolled-back" schema', fetcher)
         self.assertIn("INSTALL_LOCK=$ROOT/install.lock", fetcher)
         self.assertIn("userdata_not_mounted", fetcher)
         self.assertNotIn("pending_channel_race", fetcher)
