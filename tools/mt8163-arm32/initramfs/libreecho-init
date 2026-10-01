@@ -945,18 +945,32 @@ recovery_owns_radio()
 # so recovery_owns_radio is false and this is a no-op: the service ordering on
 # an ordinary boot is unchanged.
 RECOVERY_WLAN0_MARKER=${RECOVERY_WLAN0_MARKER:-/run/libreecho/wlan0-ready}
-RECOVERY_RADIO_WAIT=${RECOVERY_RADIO_WAIT:-30}
+RECOVERY_WIFI_FAILED_MARKER=${RECOVERY_WIFI_FAILED_MARKER:-/run/libreecho/wifi-worker-failed}
+# The bound must cover the worker's complete worst-case sequence -- the 1s
+# stale-launcher settle, the 1s responder settle, up to 30s for the one-shot
+# function-on write, up to 10s waiting for the one-shot responder to exit, and
+# up to 30s waiting for wlan0 registration (72s in total) -- so a slower but
+# successful initialization is still waited for instead of being rejected as a
+# radio failure.  The wait also synchronizes on the worker's terminal outcome
+# markers: it returns as soon as the worker has finished, either the ready
+# marker (success) or the failure marker the worker records on a terminal
+# failure, and it never reports success for a worker that failed or timed out.
+RECOVERY_RADIO_WAIT=${RECOVERY_RADIO_WAIT:-90}
 recovery_radio_ready_wait()
 {
     recovery_owns_radio || return 0
     waited=0
     while [ "$waited" -lt "$RECOVERY_RADIO_WAIT" ]; do
         [ -f "$RECOVERY_WLAN0_MARKER" ] && return 0
+        if [ -f "$RECOVERY_WIFI_FAILED_MARKER" ]; then
+            log recovery-radio-ready-failed
+            return 1
+        fi
         $BB sleep 1
         waited=$((waited + 1))
     done
     log recovery-radio-ready-timeout
-    return 0
+    return 1
 }
 
 start_wifi_network_sequence()
@@ -990,8 +1004,22 @@ start_wifi_network_sequence()
         wifi_profile=$packaged_wifi
         log wifi-packaged-profile-selected
     fi
-    [ -n "$wifi_profile" ] || { log wifi-profile-absent; return 2; }
-    log wifi-profile-present
+    # A recovery boot owns the radio for the access point and never starts the
+    # client supplicant, so it must not require a client profile to exist: a
+    # fresh device with no /data and no packaged profile is the normal recovery
+    # case, and the WMT initialization below must still run because that is
+    # what creates wlan0 for the AP capability probe and hostapd.  An ordinary
+    # boot still needs the profile for the client start and refuses to activate
+    # the radio without one.
+    if [ -z "$wifi_profile" ] && ! recovery_owns_radio; then
+        log wifi-profile-absent
+        return 2
+    fi
+    if [ -n "$wifi_profile" ]; then
+        log wifi-profile-present
+    else
+        log wifi-profile-absent-recovery-boot
+    fi
     # Persist the selected profile path for the recovery handover.  networkd's
     # libreecho-recovery-net-down restarts the client service after the portal
     # is torn down, and it does so without this boot's environment; without the
@@ -1000,13 +1028,15 @@ start_wifi_network_sequence()
     # written before the client start and before the recovery-boot suppression
     # below, so the handover has the path on both paths.
     WIFI_PROFILE_STATE=/run/libreecho/wifi-client.conf
-    if $BB mkdir -p /run/libreecho 2>/dev/null &&
-        printf '%s\n' "$wifi_profile" > "$WIFI_PROFILE_STATE" 2>/dev/null; then
-        $BB chmod 0700 /run/libreecho 2>/dev/null
-        $BB chmod 0600 "$WIFI_PROFILE_STATE" 2>/dev/null
-        log wifi-profile-recorded
-    else
-        log wifi-profile-record-failed
+    if [ -n "$wifi_profile" ]; then
+        if $BB mkdir -p /run/libreecho 2>/dev/null &&
+            printf '%s\n' "$wifi_profile" > "$WIFI_PROFILE_STATE" 2>/dev/null; then
+            $BB chmod 0700 /run/libreecho 2>/dev/null
+            $BB chmod 0600 "$WIFI_PROFILE_STATE" 2>/dev/null
+            log wifi-profile-recorded
+        else
+            log wifi-profile-record-failed
+        fi
     fi
     # This is the proven manual choreography from session e8c21eb3bbae:
     # stock-compatible configure-only init, stale-launcher cleanup, exactly one
@@ -1089,11 +1119,30 @@ start_wifi_network_sequence()
     return "$client_rc"
 }
 
+# The recovery service graph's bounded wait (recovery_radio_ready_wait) must
+# return as soon as the single-shot Wi-Fi activation has terminally failed and
+# must report that failure truthfully instead of starting networkd as if the
+# radio were ready.  Record the failing return code in the boot-scoped failure
+# marker once the activation can no longer succeed in this boot.
+wifi_worker_record_failure()
+{
+    $BB mkdir -p /run/libreecho 2>/dev/null || {
+        log wifi-worker-failed-record-failed
+        return 0
+    }
+    if printf '%s\n' "$1" > "$RECOVERY_WIFI_FAILED_MARKER" 2>/dev/null; then
+        log "wifi-worker-failed-recorded:$1"
+    else
+        log wifi-worker-failed-record-failed
+    fi
+}
+
 start_wifi_network()
 {
     if [ "${VENDOR_ASSETS_OK:-0}" -ne 1 ]; then
         printf 'LIBREECHO_WIFI_REJECTED=vendor-assets-unavailable\n' > /tmp/wifi.status
         log wifi-vendor-assets-unavailable
+        wifi_worker_record_failure 4
         return 4
     fi
     # The WMT firmware path is intentionally single-shot per boot.  mkdir is
@@ -1107,6 +1156,7 @@ start_wifi_network()
     wifi_rc=$?
     printf 'LIBREECHO_WIFI_RC=%s\n' "$wifi_rc" > /tmp/wifi.status
     log "wifi-activation-complete:$wifi_rc"
+    [ "$wifi_rc" -eq 0 ] || wifi_worker_record_failure "$wifi_rc"
     return "$wifi_rc"
 }
 
@@ -1309,6 +1359,11 @@ adb_control_ready=0
 adb_tcp_ready && adb_control_ready=1
 if [ "${VENDOR_ASSETS_OK:-0}" -ne 1 ]; then
     log wifi-network-skipped-vendor-assets-unavailable
+    # VENDOR_ASSETS_OK is fixed by the vendor-assets gate above, and the
+    # single-shot activation refuses the same way, so the radio cannot
+    # initialize this boot.  Record the terminal failure so a recovery boot's
+    # bounded wait fails fast and truthfully instead of waiting out its bound.
+    wifi_worker_record_failure 4
 elif [ "$SERVICE_PROFILE" = diagnostic ]; then
     log wifi-network-policy-manual-single-shot
 elif [ "$adb_control_ready" -eq 1 ]; then
@@ -1779,12 +1834,17 @@ start_ui_services()
     log feature-services-deferred-until-staged
     for service in $services; do
         # On a recovery boot the boot-path Wi-Fi worker may still be creating
-        # wlan0 when this graph starts.  Wait (bounded) for its radio-ready
-        # marker before starting networkd so networkd's AP capability probe
-        # finds wlan0 instead of reporting the interface absent.  This is a
-        # no-op on an ordinary boot (see recovery_radio_ready_wait).
+        # wlan0 when this graph starts.  Wait (bounded) for the worker's
+        # terminal outcome before starting networkd so its one-shot AP
+        # capability probe finds wlan0 instead of reporting the interface
+        # absent.  A worker that terminally failed or exceeded the bound is
+        # reported truthfully; the graph still starts networkd, whose other
+        # duties are unaffected.  This is a no-op on an ordinary boot (see
+        # recovery_radio_ready_wait).
         if [ "$service" = networkd ]; then
-            recovery_radio_ready_wait
+            if ! recovery_radio_ready_wait; then
+                log ui-networkd-radio-unavailable
+            fi
         fi
         script="/etc/init.d/libreecho-$service.init"
         if [ -x "$script" ]; then
