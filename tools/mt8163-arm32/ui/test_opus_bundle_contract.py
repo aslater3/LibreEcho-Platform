@@ -6,12 +6,15 @@ production bundle runs before it links any Opus archive.  These tests pin its
 fail-closed behaviour against real prefixes and against prefixes synthesized
 with the host toolchain:
 
-* a missing directory, a prefix without its identity or provenance records, and
-  a tampered identity (name / target / config), a tampered source pin (against
-  ``opus/SOURCE.lock``), a tampered archive hash, a non-ARM32 member, an
-  HTTP/URL entry point, and the honest Opus *stub* archive are all refused;
+* an untrusted prebuilt prefix is refused by default, because its metadata and
+  archive hashes certify each other; a missing directory, a prefix without its
+  identity or provenance records, and a tampered identity (name / target /
+  config), a tampered source pin (against ``opus/SOURCE.lock``), a tampered
+  archive hash, a non-ARM32 member, an HTTP/URL entry point, and the honest
+  Opus *stub* archive are all refused once the prefix is declared trusted;
 * a real 32-bit ARM32 prefix (LIBREECHO_OPUS_ARM_PREFIX, default
-  ``~/.hermes/cache/scratch/opus-arm-prefix``) is accepted.
+  ``~/.hermes/cache/scratch/opus-arm-prefix``) is accepted with
+  ``--opus-prefix-trusted`` (CI built it in the same job).
 
 The stubbed/HTTP archives are compiled from tiny C sources with the host
 compiler, so the symbol-level contract is exercised even where no ARM toolchain
@@ -54,9 +57,17 @@ REQUIRED_DECODER_SYMBOLS: list[str] = [
 HTTP_SYMBOLS: list[str] = ["op_open_url"]
 
 
-def run_verify(prefix: Path) -> subprocess.CompletedProcess:
+def run_verify(prefix: Path, *, trusted: bool = True) -> subprocess.CompletedProcess:
+    """Verify a prefix, declaring it trusted unless the test says otherwise.
+
+    A prebuilt prefix is only accepted when the caller declares it was built in
+    the same run; ``trusted=False`` exercises the default (untrusted) refusal.
+    """
+    command = ["bash", str(SCRIPT), "--verify-opus-prefix", str(prefix)]
+    if trusted:
+        command.append("--opus-prefix-trusted")
     return subprocess.run(
-        ["bash", str(SCRIPT), "--verify-opus-prefix", str(prefix)],
+        command,
         capture_output=True,
         text=True,
         timeout=120,
@@ -239,6 +250,16 @@ class SyntheticPrefixTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._td.cleanup()
+
+    def test_self_consistent_prebuilt_prefix_is_refused_by_default(self) -> None:
+        # `opus-source.json` and the archive hashes it certifies live in the
+        # same caller-controlled prefix, so a substituted pair certifies itself.
+        # Without the explicit trusted declaration the bundle must refuse it -
+        # this is the difference from a prefix CI built in the same job.
+        prefix = _synthetic_prefix(self.root)
+        result = run_verify(prefix, trusted=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("untrusted", result.stderr)
 
     def test_synthetic_whole_prefix_reaches_the_member_arch_check(self) -> None:
         # Everything passes until the archive members turn out to be host

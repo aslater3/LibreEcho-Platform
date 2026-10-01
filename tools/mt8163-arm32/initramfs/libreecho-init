@@ -1173,38 +1173,43 @@ physical_recovery_input_node()
     printf '%s\n' "$node"
 }
 
-# A node's key bitmap is a space-separated list of hex words.  A 32-bit kernel
-# prints 32-bit words, so KEY_HELP (138 = 4*32 + 10) is bit 10 of word 4; a
-# 64-bit kernel prints 64-bit words, so it is bit 10 of word 2.  A word wider
-# than 8 hex digits can only come from the 64-bit layout.  The relevant bit is
-# the value-4 bit of that word's third-from-last hex digit, which avoids
+# A node's key bitmap is a space-separated list of hex words printed by the
+# kernel's input_print_bitmap: it walks the capability words from the highest
+# nonzero word DOWN to word 0, so the LAST token is word 0 and word k is the
+# (k + 1)-th token counted from the end.  KEY_HELP (138) is word 4 bit 10 on
+# the 32-bit layout (138 = 4*32 + 10, printed "400 0 0 0 0") and word 2 bit 10
+# on the 64-bit layout (138 = 2*64 + 10, printed "400 0 0").  A word wider than
+# 8 hex digits can only come from the 64-bit layout; and when fewer than five
+# words are printed the 32-bit KEY_HELP word (word 4) cannot be present at all,
+# so only the 64-bit layout can still carry KEY_HELP.  The relevant bit is the
+# value-4 bit of that word's third-from-last hex digit, which avoids
 # overflow-prone shell arithmetic on the printed value.
 physical_recovery_key_bitmap_has_help()
 {
     file=$1
+    # shellcheck disable=SC2046
+    set -- $($BB cat "$file" 2>/dev/null)
+    count=$#
+    [ "$count" -gt 0 ] || return 1
     wide=0
-    for word in $($BB cat "$file" 2>/dev/null); do
+    for word in "$@"; do
         case "$word" in
             ?????????*) wide=1 ;;
         esac
     done
-    if [ "$wide" -eq 1 ]; then
-        want=2
+    if [ "$wide" -eq 1 ] || [ "$count" -lt 5 ]; then
+        want=$((count - 1 - 2))
     else
-        want=4
+        want=$((count - 1 - 4))
     fi
-    idx=0
-    for word in $($BB cat "$file" 2>/dev/null); do
-        if [ "$idx" -eq "$want" ]; then
-            rest=${word%??}
-            digit=${rest#"${rest%?}"}
-            case "$digit" in
-                [4567cCdDeEfF]) return 0 ;;
-            esac
-            return 1
-        fi
-        idx=$((idx + 1))
-    done
+    [ "$want" -ge 0 ] || return 1
+    shift "$want"
+    word=$1
+    rest=${word%??}
+    digit=${rest#"${rest%?}"}
+    case "$digit" in
+        [4567cCdDeEfF]) return 0 ;;
+    esac
     return 1
 }
 

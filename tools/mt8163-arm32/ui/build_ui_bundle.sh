@@ -35,6 +35,15 @@ OPUS_LOCK=$SCRIPT_DIR/opus/SOURCE.lock
 # it -- and none of the HTTP/URL entry points may be present.
 OPUS_DECODE_SYMBOLS=(op_open_callbacks op_read_stereo op_free op_channel_count)
 OPUS_FORBIDDEN_SYMBOLS='op_open_url|op_vopen_url|op_test_url|op_vtest_url|op_http_open'
+# A caller-supplied prebuilt Opus prefix self-certifies: its metadata and the
+# archive hashes it is checked against travel together, so a substituted prefix
+# can describe itself.  LIBREECHO_UI_OPUS_ROOT is therefore only trusted when
+# the caller explicitly declares that Opus was built in this same run (CI does;
+# see build_opus.sh).  Without that declaration the bundle builds the pinned
+# Opus prefix itself from the locked source archives.
+OPUS_PREFIX_TRUSTED=${LIBREECHO_UI_OPUS_PREFIX_TRUSTED:-0}
+OPUS_ARCHIVE_DIR=${LIBREECHO_OPUS_ARCHIVES_DIR:-}
+OPUS_BUILD_ROOT=
 OPUS_TMP=
 
 opus_fail() {
@@ -44,6 +53,7 @@ opus_fail() {
 
 cleanup_opus_tmp() {
     [[ -n "$OPUS_TMP" ]] && rm -rf -- "$OPUS_TMP"
+    [[ -n "$OPUS_BUILD_ROOT" ]] && rm -rf -- "$OPUS_BUILD_ROOT"
     return 0
 }
 trap cleanup_opus_tmp EXIT
@@ -77,7 +87,15 @@ verify_radiod_opus_capability() {
 # or toolchain): every path below either proves the exact pinned ARM32 build or
 # aborts the bundle.
 verify_opus_prefix() {
-    local prefix=$1
+    local prefix=$1 trusted=${2:-0}
+    # A prebuilt prefix proves nothing on its own: `opus-source.json` and the
+    # archives it certifies are written by whoever produced the prefix, so a
+    # substituted pair passes every hash below.  Only accept one when the caller
+    # declares it was built in this run (CI built it with build_opus.sh);
+    # otherwise the bundle builds the prefix itself from the locked archives.
+    if [[ "$trusted" != 1 ]]; then
+        opus_fail "refusing an untrusted prebuilt Opus prefix (its metadata self-certifies): build Opus with ui/build_opus.sh in this run and pass --opus-prefix-trusted, or let this builder build it from the pinned archives"
+    fi
     [[ -d "$prefix" && ! -L "$prefix" ]] || opus_fail "Opus prefix is unavailable: $prefix"
     [[ -f "$OPUS_LOCK" && ! -L "$OPUS_LOCK" ]] ||
         opus_fail "Opus source lock is unavailable: $OPUS_LOCK"
@@ -228,11 +246,21 @@ PY
 # Test/CI seam: verify a prefix on its own, without a UI checkout or toolchain.
 if [[ "${1:-}" == "--verify-opus-prefix" ]]; then
     shift
-    [[ $# -ge 1 && -n "$1" ]] ||
+    trusted=$OPUS_PREFIX_TRUSTED
+    prefix=
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --opus-prefix-trusted) trusted=1; shift ;;
+            --no-opus-prefix-trusted) trusted=0; shift ;;
+            -*) printf 'ERROR: unknown --verify-opus-prefix option: %s\n' "$1" >&2; exit 2 ;;
+            *) [[ -z "$prefix" ]] ||
+                   { printf 'ERROR: --verify-opus-prefix takes exactly one directory\n' >&2; exit 2; }
+               prefix=$1; shift ;;
+        esac
+    done
+    [[ -n "$prefix" ]] ||
         { printf 'ERROR: --verify-opus-prefix requires a prefix directory\n' >&2; exit 2; }
-    [[ $# -eq 1 ]] ||
-        { printf 'ERROR: --verify-opus-prefix takes exactly one directory\n' >&2; exit 2; }
-    verify_opus_prefix "$1"
+    verify_opus_prefix "$prefix" "$trusted"
     exit 0
 fi
 
@@ -280,12 +308,38 @@ command -v "$MAKE_BIN" >/dev/null 2>&1 || {
 # the honest stub (LE_RADIOD_ENABLE_OPUS unset), so radiod reports the stream
 # unsupported.  A stub bundle is not a production artifact and this builder
 # fails closed instead of producing one.
-OPUS_ROOT=${LIBREECHO_UI_OPUS_ROOT:-}
-[[ -n "$OPUS_ROOT" ]] || {
-    echo "ERROR: LIBREECHO_UI_OPUS_ROOT must name the pinned ARM32 Opus prefix (tools/mt8163-arm32/ui/build_opus.sh)" >&2
-    exit 1
-}
-verify_opus_prefix "$OPUS_ROOT"
+if [[ "$OPUS_PREFIX_TRUSTED" == 1 ]]; then
+    OPUS_ROOT=${LIBREECHO_UI_OPUS_ROOT:-}
+    [[ -n "$OPUS_ROOT" ]] || {
+        echo "ERROR: LIBREECHO_UI_OPUS_ROOT must name the pinned ARM32 Opus prefix when LIBREECHO_UI_OPUS_PREFIX_TRUSTED=1" >&2
+        exit 1
+    }
+    verify_opus_prefix "$OPUS_ROOT" 1
+else
+    # No trusted prebuilt prefix: build the pinned Opus prefix from the locked
+    # source archives here, so the archives the bundle links are produced in
+    # this run rather than trusted from a caller-supplied prefix.
+    [[ -n "$OPUS_ARCHIVE_DIR" && -d "$OPUS_ARCHIVE_DIR" ]] || {
+        echo "ERROR: no trusted Opus prefix: set LIBREECHO_UI_OPUS_PREFIX_TRUSTED=1 with LIBREECHO_UI_OPUS_ROOT, or LIBREECHO_OPUS_ARCHIVES_DIR to the locked source archives so Opus can be built here" >&2
+        exit 1
+    }
+    for archive in libogg-1.3.5.tar.gz opus-1.4.tar.gz opusfile-0.12.tar.gz; do
+        [[ -f "$OPUS_ARCHIVE_DIR/$archive" ]] || {
+            echo "ERROR: missing locked Opus source archive: $OPUS_ARCHIVE_DIR/$archive" >&2
+            exit 1
+        }
+    done
+    OPUS_BUILD_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/libreecho-opus-build.XXXXXX")
+    "$SCRIPT_DIR/build_opus.sh" \
+        --ogg-archive "$OPUS_ARCHIVE_DIR/libogg-1.3.5.tar.gz" \
+        --opus-archive "$OPUS_ARCHIVE_DIR/opus-1.4.tar.gz" \
+        --opusfile-archive "$OPUS_ARCHIVE_DIR/opusfile-0.12.tar.gz" \
+        --output "$OPUS_BUILD_ROOT/prefix" \
+        --cc "${LIBREECHO_OPUS_CC:-arm-linux-gnueabihf-gcc}" \
+        --ar "${LIBREECHO_OPUS_AR:-arm-linux-gnueabihf-ar}" \
+        --host "${LIBREECHO_OPUS_HOST:-arm-linux-gnueabihf}"
+    OPUS_ROOT=$OPUS_BUILD_ROOT/prefix
+fi
 OPUS_ROOT=$(cd -- "$OPUS_ROOT" && pwd)
 # Absolute archives in dependency order (libopusfile depends on libopus, which
 # depends on libogg), derived from the verified prefix rather than a

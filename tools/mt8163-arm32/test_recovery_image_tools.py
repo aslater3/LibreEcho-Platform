@@ -5170,6 +5170,10 @@ class UiTlsPackagingTests(unittest.TestCase):
                     "LE_TEST_MAKE_RECORD": str(record),
                     "LIBREECHO_UI_TLS_LIBS": decoy,
                     "LIBREECHO_UI_OPUS_ROOT": str(opus_root),
+                    # CI built the pinned prefix with ui/build_opus.sh in this
+                    # same job; without the declaration the builder refuses a
+                    # caller-supplied prefix and builds Opus itself.
+                    "LIBREECHO_UI_OPUS_PREFIX_TRUSTED": "1",
                 },
             )
             # The stand-in UI checkout produces no binaries, so the builder

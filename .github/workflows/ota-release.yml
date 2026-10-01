@@ -116,8 +116,12 @@ jobs:
             --cc arm-linux-gnueabihf-gcc \
             --ar arm-linux-gnueabihf-ar \
             --host arm-linux-gnueabihf
+          # This job built the prefix with ui/build_opus.sh above, so it is
+          # trusted here; without the declaration the bundle refuses a
+          # caller-supplied prefix and builds Opus itself.
           bash tools/mt8163-arm32/ui/build_ui_bundle.sh \
-            --verify-opus-prefix "$LIBREECHO_OPUS_ARM_PREFIX"
+            --verify-opus-prefix "$LIBREECHO_OPUS_ARM_PREFIX" \
+            --opus-prefix-trusted
           # Export the verified prefix so the positive packaging contracts run
           # against it (this is what keeps the real-prefix tests from skipping).
           printf 'LIBREECHO_OPUS_ARM_PREFIX=%s\n' "$LIBREECHO_OPUS_ARM_PREFIX" >> "$GITHUB_ENV"

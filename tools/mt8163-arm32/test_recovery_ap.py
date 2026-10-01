@@ -430,6 +430,7 @@ class NetHandoverTests(unittest.TestCase):
         self.ip_state = self.root / "ipstate"
         self.ip_state.mkdir()
         self.wpa_log = self.root / "wpa.log"
+        self.client_pid_dir = self.root / "client-pids"
         # Profiles are validated against an expected root, pointed at a temp
         # directory here so the location check is exercised without /etc or
         # /data.
@@ -488,6 +489,11 @@ exit 0
         env["RECOVERY_AP_IP"] = str(self.oracle)
         env["RECOVERY_AP_WPA_SERVICE"] = str(self.wpa)
         env["RECOVERY_AP_PROFILE_ROOTS"] = str(self.profile_root)
+        # The client pidfiles net-up waits on, isolated from /tmp, plus a short
+        # wait so a lingering process is detected without a multi-second stall.
+        env["RECOVERY_AP_CLIENT_PID_DIR"] = str(self.client_pid_dir)
+        env["RECOVERY_AP_STOP_TIMEOUT"] = "3"
+        env["RECOVERY_AP_STOP_POLL"] = "1"
         return env
 
     def profile(self, name: str = "wpa_supplicant.conf") -> Path:
@@ -498,6 +504,12 @@ exit 0
     def record_profile(self, path: Path) -> None:
         # Exactly what the boot path writes to /run/libreecho/wifi-client.conf.
         (self.state_dir / "wifi-client.conf").write_text(f"{path}\n")
+
+    def add_client_pid(self, name: str, pid: int) -> None:
+        # Exactly libreecho-wifi's <name>.<iface>.pid naming for the managed
+        # interface (wlan0).
+        self.client_pid_dir.mkdir(exist_ok=True)
+        (self.client_pid_dir / f"{name}.wlan0.pid").write_text(f"{pid}\n")
 
     def run_net(self, helper: Path, *args: str) -> subprocess.CompletedProcess:
         return subprocess.run(["sh", str(helper), *args], text=True,
@@ -525,6 +537,36 @@ exit 0
         self.assertIn("iface=wlan0", state)
         self.assertIn("address=192.168.4.1/24", state)
         self.assertIn("stopped=1", state)
+
+    def test_net_up_fails_closed_when_a_client_process_lingers(self) -> None:
+        # `stop` reports the client released, but the supplicant it named is
+        # still alive past the bounded wait: the radio is not released, so the
+        # handover must fail closed and must not report the portal up.
+        linger = subprocess.Popen(["sleep", "30"])
+        try:
+            self.add_client_pid("wpa_supplicant", linger.pid)
+            result = self.up()
+        finally:
+            linger.terminate()
+            linger.wait()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("net-up: ", result.stdout)
+        self.assertIn("did not exit", result.stderr)
+        # The client plane was restored, so no ownership debt is left behind.
+        self.assertFalse((self.state_dir / "recovery-net.state").exists())
+        self.assertIn("start", self.wpa_log_text())
+
+    def test_net_up_succeeds_when_a_client_process_exits_within_the_wait(self) -> None:
+        # The captured DHCP client exits a moment after `stop`; the bounded wait
+        # observes that and the handover completes normally.
+        exiting = subprocess.Popen(["sleep", "1"])
+        try:
+            self.add_client_pid("udhcpc", exiting.pid)
+            result = self.up()
+        finally:
+            exiting.wait()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("net-up: wlan0 192.168.4.1/24", result.stdout)
 
     def test_net_up_is_idempotent(self) -> None:
         self.assertEqual(self.up().returncode, 0)
@@ -854,21 +896,40 @@ class PhysicalRecoveryInputNodeTests(unittest.TestCase):
         self.assertEqual(self.run_node_lookup(busybox), "")
 
     def test_names_unavailable_falls_back_only_to_a_key_help_capability(self) -> None:
-        # No input names at all; select by KEY_HELP capability (138 = 128 + 10,
-        # word 4 bit 10 on the 32-bit layout, so the fifth word is 0x400).
+        # No input names at all; select by KEY_HELP capability.  The kernel's
+        # input_print_bitmap prints the capability words from the highest
+        # nonzero word DOWN to word 0, so on the 32-bit layout KEY_HELP
+        # (138 = 4*32 + 10, word 4 bit 10) is the FIRST word: "400 0 0 0 0".
         self.add_capability_node("event0", "0")
-        self.add_capability_node("event1", "0 0 0 0 400")
+        self.add_capability_node("event1", "400 0 0 0 0")
         busybox = self.write_busybox()
         self.assertEqual(self.run_node_lookup(busybox),
                          str(self.dev_input / "event1"))
 
     def test_64bit_key_bitmap_layout_is_recognised(self) -> None:
-        # A word wider than 8 hex digits proves the 64-bit layout, where
-        # KEY_HELP is bit 10 of word 2 (the third word).
-        self.add_capability_node("event0", "100000000 0 400")
+        # A word wider than 8 hex digits proves the 64-bit layout.  KEY_HELP is
+        # bit 10 of word 2, so it is the SECOND printed word of
+        # "100000000 400 0 0" (word 3 = 0x100000000, word 0 = 0).
+        self.add_capability_node("event0", "100000000 400 0 0")
         busybox = self.write_busybox()
         self.assertEqual(self.run_node_lookup(busybox),
                          str(self.dev_input / "event0"))
+
+    def test_64bit_key_help_only_bitmap_is_recognised(self) -> None:
+        # Only KEY_HELP is advertised, so there is no wide word to announce the
+        # layout; but the 32-bit KEY_HELP word (word 4) cannot appear in fewer
+        # than five words, so "400 0 0" is the 64-bit word 2..word 0 map.
+        self.add_capability_node("event0", "400 0 0")
+        busybox = self.write_busybox()
+        self.assertEqual(self.run_node_lookup(busybox),
+                         str(self.dev_input / "event0"))
+
+    def test_key_help_in_a_different_word_is_not_accepted(self) -> None:
+        # 0x400 sits in word 3 (the second printed word), not the KEY_HELP word
+        # 4 of the five-word 32-bit map, so no node may be selected.
+        self.add_capability_node("event0", "0 400 0 0 0")
+        busybox = self.write_busybox()
+        self.assertEqual(self.run_node_lookup(busybox), "")
 
 
 class NetHandoverPathTests(unittest.TestCase):

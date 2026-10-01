@@ -32,6 +32,16 @@ BB=${BB:-/bin/busybox}
 STATE_DIR=${RECOVERY_NET_STATE_DIR:-/run/libreecho}
 WPA_SERVICE=${RECOVERY_AP_WPA_SERVICE:-/sbin/libreecho-wifi}
 DEFAULT_ADDRESS=192.168.4.1/24
+# The client service records its supplicant and DHCP processes in
+# /tmp/<name>.<iface>.pid, named for the interface it manages (WIFI_IFACE,
+# default wlan0 -- see libreecho-wifi).  net-up stops it with the same
+# environment, so those are the files that name the processes the handover must
+# wait on before it may report the radio released.  CLIENT_PID_DIR and the wait
+# bounds are overridable so the contract can be exercised without /tmp.
+CLIENT_IFACE=${WIFI_IFACE:-wlan0}
+CLIENT_PID_DIR=${RECOVERY_AP_CLIENT_PID_DIR:-/tmp}
+STOP_WAIT_TIMEOUT=${RECOVERY_AP_STOP_TIMEOUT:-3}
+STOP_WAIT_POLL=${RECOVERY_AP_STOP_POLL:-1}
 
 IFACE=
 ADDRESS=
@@ -161,6 +171,67 @@ resolve_wifi_conf() {
     printf '%s\n' "$conf"
 }
 
+# A stable identity for a captured client process, or nothing when it is gone.
+# The kernel start time (the 20th field after the parenthesised comm in
+# /proc/<pid>/stat) distinguishes the recorded process from an unrelated one
+# that later reused the PID.
+client_process_identity() {
+    pid=$1
+    [ -r "/proc/$pid/stat" ] || return 1
+    stat=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+    # Strip up to and including the comm, which may itself contain spaces or
+    # parentheses, then read the whitespace-separated numeric fields.
+    rest=${stat##*) }
+    # shellcheck disable=SC2086
+    set -- $rest
+    [ "$#" -ge 20 ] || return 1
+    # A zombie has already exited and released the radio even though its parent
+    # has not reaped it yet; it is not a lingering client.
+    [ "$1" != Z ] || return 1
+    shift 19
+    printf '%s\n' "$1"
+}
+
+# "pid identity" records for the client processes the service's pidfiles name,
+# read BEFORE the stop (the service unlinks the pidfiles).
+capture_client_pids() {
+    for name in wpa_supplicant udhcpc; do
+        pidfile=$CLIENT_PID_DIR/$name.$CLIENT_IFACE.pid
+        [ -r "$pidfile" ] || continue
+        pid=$(cat "$pidfile" 2>/dev/null)
+        case "$pid" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        identity=$(client_process_identity "$pid") || continue
+        [ -n "$identity" ] || continue
+        printf '%s %s\n' "$pid" "$identity"
+    done
+}
+
+# Bounded wait for the captured client processes to exit.  Returns non-zero if
+# any is still alive once the timeout is spent; a process whose identity
+# changed is treated as gone (the PID was recycled).
+wait_for_client_exit() {
+    records=${1:-}
+    [ -n "$records" ] || return 0
+    remaining=$STOP_WAIT_TIMEOUT
+    while :; do
+        lingering=0
+        while IFS=' ' read -r pid identity; do
+            [ -n "$pid" ] || continue
+            current=$(client_process_identity "$pid") || continue
+            [ -n "$current" ] || continue
+            [ "$current" = "$identity" ] && lingering=1
+        done <<EOF
+$records
+EOF
+        [ "$lingering" -eq 0 ] && return 0
+        [ "$remaining" -le 0 ] && return 1
+        sleep "$STOP_WAIT_POLL"
+        remaining=$((remaining - STOP_WAIT_POLL))
+    done
+}
+
 stop_client_service() {
     [ -x "$WPA_SERVICE" ] || return 1
     "$WPA_SERVICE" stop >/dev/null 2>&1 || return 1
@@ -224,12 +295,30 @@ fi
 
 # 2. Release client-supplied STA management.  The client supplicant and its
 #    DHCP client are stopped through their owning service (pidfile-scoped);
-#    there is deliberately no pattern-based process kill here.
+#    there is deliberately no pattern-based process kill here.  Their PIDs are
+#    captured first: `stop` only signals and unlinks the pidfiles, so a client
+#    that has not actually exited must not be mistaken for a released radio.
+client_pids=$(capture_client_pids)
+
 stopped=0
 if stop_client_service; then
     stopped=1
 elif [ "$prior_stopped" = 1 ]; then
     stopped=1
+fi
+
+# The service reported the client released, but a captured supplicant/DHCP
+# client is still alive after the bounded wait: the radio is still owned by the
+# client plane, so fail closed instead of letting networkd start hostapd on it.
+# The client plane is restored, and if that restore fails the ownership record
+# is retained, exactly like the link-up rollback below.
+if [ "$stopped" = 1 ] && ! wait_for_client_exit "$client_pids"; then
+    write_state 1 "$wifi_conf" || die "cannot record ownership state: $STATE_FILE"
+    if ! restore_client_service "$WPA_SERVICE" "$wifi_conf"; then
+        die "client processes did not exit after stop and cannot restore client service $WPA_SERVICE"
+    fi
+    rm -f "$STATE_FILE"
+    die "client processes did not exit after stop"
 fi
 
 # Record ownership before mutating the link so a later net-down (or a rollback
