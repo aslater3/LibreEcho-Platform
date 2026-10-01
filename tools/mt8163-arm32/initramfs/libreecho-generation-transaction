@@ -257,8 +257,27 @@ gc() {
     done
     sync_file
 }
+https_client() {
+    read_pointer current
+    verify_generation
+    source=$GENERATIONS/$TX/features/assistant/payload.squashfs
+    target=${CLIENT_ROOT:-$RUN_ROOT/libreecho/ota-client}
+    safe_path "$target"
+    $BB mkdir -p "$target" || fail mount-directory
+    if ! $BB awk -v p="$target" '$5==p {found=1} END {exit !found}' "$MOUNTINFO_FILE"; then
+        "$MOUNT" -t squashfs -o ro,loop,nosuid,nodev "$source" "$target" || fail https-client-mount
+    fi
+    mount_matches "$target" "$source"
+    $BB awk -v p="$target" '$5==p {n++; opt=","$6","; if (opt !~ /,ro,/ || opt !~ /,nosuid,/ || opt !~ /,nodev,/) bad=1} END {exit n!=1 || bad}' "$MOUNTINFO_FILE" || fail mount-options
+}
 safe_path "$ROOT"; safe_path "$GENERATIONS"
+$BB mkdir -p "$ROOT" || fail transaction-root
+safe_path "$ROOT/generation.lock"
+$BB mkdir "$ROOT/generation.lock" 2>/dev/null || fail generation-busy
+trap '$BB rmdir "$ROOT/generation.lock" 2>/dev/null' EXIT
+trap 'exit 1' HUP INT TERM
 case "${1:-}" in
+    https-client) https_client;;
     activate|activate-mounts) activate;;
     activate-committed) activate_committed;;
     commit|commit-after-confirm) commit;;

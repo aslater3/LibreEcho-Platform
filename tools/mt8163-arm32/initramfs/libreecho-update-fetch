@@ -266,7 +266,7 @@ read_dev_release_pointer()
 {
     # Reuse the registered bounded-probe temporary lifecycle.
     pointer=$ROOT/.control-range-probe.$$
-    pointer_url=https://github.com/aslater3/LibreEcho/releases/download/radar-puffin-dev-channel/release-pointer.txt
+    pointer_url=https://github.com/aslater3/LibreEcho/releases/download/radar-puffin-dev-channel/release-pointer-v3.txt
     bounded_curl "$pointer" "$CURL_HEADERS" 257 60 "$pointer_url"
     curl_detail=$(downloader_stderr)
     parse_response_headers "$CURL_HEADERS" || die dev_discovery_headers
@@ -330,68 +330,15 @@ manifest_payload_value()
 
 prepare_https_client()
 {
-    [ -f "$ASSISTANT_PAYLOAD" ] && [ ! -L "$ASSISTANT_PAYLOAD" ] &&
-        [ -f "$ASSISTANT_MANIFEST" ] && [ ! -L "$ASSISTANT_MANIFEST" ] ||
-        die https_payload_missing
-    [ "$($BB stat -c %u "$ASSISTANT_PAYLOAD" 2>/dev/null)" = 0 ] &&
-        [ "$($BB stat -c %u "$ASSISTANT_MANIFEST" 2>/dev/null)" = 0 ] ||
-        die https_payload_owner
-    # The manifest must not be group/world writable, or an unprivileged writer
-    # could redirect which payload we mount.  Feature installation has shipped
-    # these files as 0666 in practice, which used to abort the update check
-    # entirely -- before any network I/O -- and surfaced only as the opaque
-    # "https_payload_manifest_mode".  Both files are already confirmed to be
-    # root-owned regular files above, so tightening the mode ourselves is safe
-    # and strictly reduces exposure; only fail if we cannot.
-    manifest_mode=$($BB stat -c %a "$ASSISTANT_MANIFEST" 2>/dev/null)
-    case "$manifest_mode" in
-        600|640|644) ;;
-        *)
-            $BB chmod 0644 "$ASSISTANT_MANIFEST" 2>/dev/null || true
-            manifest_mode=$($BB stat -c %a "$ASSISTANT_MANIFEST" 2>/dev/null)
-            case "$manifest_mode" in
-                600|640|644) ;;
-                *) die feature_manifest_permissions ;;
-            esac
-            ;;
-    esac
-    # Same reasoning for the payload we are about to loop-mount: refuse it if
-    # anyone but root can rewrite it, but normalise rather than abort first.
-    payload_mode=$($BB stat -c %a "$ASSISTANT_PAYLOAD" 2>/dev/null)
-    case "$payload_mode" in
-        600|640|644) ;;
-        *)
-            $BB chmod 0644 "$ASSISTANT_PAYLOAD" 2>/dev/null || true
-            payload_mode=$($BB stat -c %a "$ASSISTANT_PAYLOAD" 2>/dev/null)
-            case "$payload_mode" in
-                600|640|644) ;;
-                *) die feature_payload_permissions ;;
-            esac
-            ;;
-    esac
-    expected_size=$(manifest_payload_value size)
-    expected_sha=$(manifest_payload_value sha256)
-    case "$expected_size" in
-        ''|*[!0-9]*) die https_payload_manifest ;;
-    esac
-    case "$expected_sha" in
-        ''|*[!0-9a-f]*) die https_payload_manifest ;;
-    esac
-    [ "${#expected_sha}" -eq 64 ] || die https_payload_manifest
-    [ "$($BB stat -c %s "$ASSISTANT_PAYLOAD" 2>/dev/null)" = "$expected_size" ] ||
-        die https_payload_size
-    actual_sha=$($BB sha256sum "$ASSISTANT_PAYLOAD" | $BB awk '{print $1}')
-    [ "$actual_sha" = "$expected_sha" ] || die https_payload_hash
-
-    $BB mkdir -p "$CLIENT_ROOT" || die https_mount_directory
-    if ! $BB grep -q " $CLIENT_ROOT " "$PROC_ROOT/mounts" 2>/dev/null; then
-        $BB mount -t squashfs -o loop,ro,nosuid,nodev,noatime \
-            "$ASSISTANT_PAYLOAD" "$CLIENT_ROOT" || die https_payload_mount
-    fi
+    [ -f "$ROOT/current" ] && [ ! -L "$ROOT/current" ] || die legacy_manifest_unsupported
+    current=$($BB cat "$ROOT/current")
+    case "$current" in ''|.|..|*[!A-Za-z0-9._+~:-]*) die current_generation_invalid;; esac
+    generation="${GENERATIONS:-/data/libreecho/generations}/$current"
+    "${GENERATION_TOOL:-/usr/local/sbin/libreecho-generation}" verify "$generation" || die current_generation_invalid
+    ROOT="$ROOT" CLIENT_ROOT="$CLIENT_ROOT" "${GENERATION_TRANSACTION:-/usr/local/sbin/libreecho-generation-transaction}" https-client || die https_payload_mount
     CURL=$CLIENT_ROOT/usr/local/libexec/libreecho-curl
     CA=$CLIENT_ROOT/usr/local/share/libreecho/cacert.pem
-    [ -x "$CURL" ] && [ -f "$CA" ] && [ ! -L "$CURL" ] && [ ! -L "$CA" ] ||
-        die https_client_missing
+    [ -x "$CURL" ] && [ -f "$CA" ] && [ ! -L "$CURL" ] && [ ! -L "$CA" ] || die https_client_missing
 }
 
 record_channel()
