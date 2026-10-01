@@ -174,7 +174,7 @@ jobs:
           # The bundle contract (prefix refusal/accept) runs against the verified
           # ARM32 prefix, so the real-prefix accept path cannot skip.
           python3 tools/mt8163-arm32/ui/test_opus_bundle_contract.py -v \
-            | tee "$LIBREECHO_OPUS_ARCHIVES/bundle.log"
+            2>&1 | tee "$LIBREECHO_OPUS_ARCHIVES/bundle.log"
           grep -q 'test_real_arm_prefix_is_accepted .* ok' "$LIBREECHO_OPUS_ARCHIVES/bundle.log" || {
             echo "ERROR: the real ARM32 Opus prefix accept path did not run; the bundle contract must not silently skip" >&2
             exit 1
@@ -190,7 +190,7 @@ jobs:
           }
           # The helper test includes a real host build + Opus decode round trip;
           # require that it ran (ok) rather than skipped.
-          LIBREECHO_OPUS_TEST_ARCHIVES="$LIBREECHO_OPUS_ARCHIVES" python3 tools/mt8163-arm32/ui/test_build_opus.py -v | tee "$LIBREECHO_OPUS_ARCHIVES/e2e.log"
+          LIBREECHO_OPUS_TEST_ARCHIVES="$LIBREECHO_OPUS_ARCHIVES" python3 tools/mt8163-arm32/ui/test_build_opus.py -v 2>&1 | tee "$LIBREECHO_OPUS_ARCHIVES/e2e.log"
           grep -q 'test_host_build_decodes_ogg_opus .* ok' "$LIBREECHO_OPUS_ARCHIVES/e2e.log" || {
             echo "ERROR: the Opus decode end-to-end test did not run; decoder CI must not silently skip" >&2
             exit 1
