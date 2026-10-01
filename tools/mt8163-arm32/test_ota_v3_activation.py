@@ -226,6 +226,32 @@ for daemon in ('libreecho-audio-engine','libreecho-ttsd','libreecho-waked','libr
         result = self.verb('commit')
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_sigkill_before_owner_publication_leaves_no_visible_lock(self):
+        for name, args in (('libreecho-generation', ['assemble', str(self.p), str(self.s)]),
+                           ('libreecho-generation-transaction', ['gc'])):
+            with self.subTest(helper=name):
+                wrapper = self.root / 'crash-busybox'
+                wrapper.write_text('''#!/bin/sh
+last=
+for argument do last=$argument; done
+if [ "$1" = mkdir ]; then
+    case "$last" in *.lock.tmp.*)
+        /bin/busybox "$@" || exit 1
+        kill -KILL "$PPID"
+        exit 1;;
+    esac
+fi
+exec /bin/busybox "$@"
+''')
+                wrapper.chmod(0o755)
+                source = (TOOLS / 'initramfs' / name).read_text().replace('BB=/bin/busybox', 'BB=' + str(wrapper))
+                script = self.root / 'crash-lock'; script.write_text(source)
+                result = subprocess.run(['/bin/busybox', 'sh', str(script), *args], env=self.env, capture_output=True)
+                self.assertEqual(result.returncode, -9)
+                self.assertFalse((self.control / 'generation.lock').exists())
+                result = self.verb('gc')
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_dead_owner_lock_is_recovered(self):
         self.prepared()
         lock = self.control / 'generation.lock'

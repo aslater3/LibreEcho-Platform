@@ -36,8 +36,8 @@ class WebStatusTests(FailurePolicyTests):
 
     def test_packaged_agentd_uses_generation_mount_without_legacy_payload(self):
         import shutil
-        import tempfile
         spec = importlib.util.spec_from_file_location('init_adapter', TOOLS / 'ui/ota_v3_health.py')
+        assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
         ui = Path(os.environ.get('LIBREECHO_OTA_UI_SOURCE', str(TOOLS.parents[1] / '.test-ui')))
         source = self.root / 'ui-source'
@@ -67,6 +67,7 @@ class WebStatusTests(FailurePolicyTests):
 
     def test_unknown_companion_feature_reference_fails_build(self):
         spec = importlib.util.spec_from_file_location('init_adapter', TOOLS / 'ui/ota_v3_health.py')
+        assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
         with self.assertRaises(ValueError):
             module.adapt_init('unknown.init', 'cat /data/libreecho/features/unknown/file\n')

@@ -1172,8 +1172,6 @@ check_or_install()
     fi
     installed=$($BB sed -n 's/^version=//p' "$ROOT/installed" 2>/dev/null)
     installed_channel=$(record_channel "$ROOT/installed")
-    rolled_back=$($BB sed -n 's/^version=//p' "$ROOT/rolled-back" 2>/dev/null)
-    rolled_back_channel=$(record_channel "$ROOT/rolled-back")
     if [ "$requested_action" != install ] && [ "$version" = "$installed" ] && [ "$channel" = "$installed_channel" ] && candidate_matches_record "$ROOT/installed"; then
         check_status_write_candidate up-to-date "$version"
         echo "UPDATE_CURRENT version=$version"

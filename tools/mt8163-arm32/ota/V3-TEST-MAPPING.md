@@ -54,4 +54,28 @@ are checked from the candidate after reboot, with existing init health gates ret
 - Reboot resume: commit boundary retry/current rename and boot routing fixtures.
 - No preserve/base/runtime-authority machinery: integration physical-absence test.
 
+## Independent review regression gates
+
+Every behavior fix was preceded by a failing real-helper regression. Tests below
+run shipped BusyBox helpers; only privileged mounts/BCB and HTTPS peers are host
+fixtures. Service identity uses real child executables and kernel `/proc` links,
+not a permissive hash stub.
+
+| Finding | Regression proving the corrected behavior |
+|---|---|
+| Process executable links | `ServiceIdentity.test_distinct_controller_and_signed_engine_pass`, `test_other_services_still_require_signed_daemon`, changed hash/path negatives |
+| Biscuit empty suffix | `ActivationTests.test_empty_or_missing_slot_suffix_uses_validated_bcb`, existing explicit wrong-slot refusal |
+| Repair transport | `ActivationTests.test_https_client_ignores_corrupt_unrelated_feature`, assistant corruption and wrong loop backing refusal |
+| Lock publication | `ActivationTests.test_ownerless_lock_publication_crash_recovers`, `test_sigkill_before_owner_publication_leaves_no_visible_lock`, prior-boot/dead/live-owner cases |
+| Install/GC lifecycle | `ActivationTests.test_gc_retains_assembled_pin_until_pending_publication`, `test_commit_collects_obsolete_generations`, `UpdaterTests.test_install_records_v3_pending_and_confirms_generation` |
+| Committed boot binding | `ActivationTests.test_committed_activation_refuses_running_boot_mismatch`, committed valid boot + corrupt feature refusal |
+| Companion init packaging | `WebStatusTests.test_packaged_agentd_uses_generation_mount_without_legacy_payload`, `test_unknown_companion_feature_reference_fails_build`; all five real scripts transformed and BusyBox syntax checked |
+| Automatic replay | `ConvergenceTests.test_automatic_fetch_refuses_collected_rolled_back_transaction`, `test_automatic_fetch_refuses_current_and_previous_release` |
+| Target discovery | `DevDiscoveryTests.test_discovery_namespace_follows_image_target` tests radar-puffin and biscuit URLs and cross-target pointer refusal |
+
+Older source-shape checks now follow atomically owned temporary lock publication,
+transport-only authentication, transaction-based replay suppression, and target
+slug interpolation. They retain refusal/error ordering checks; the behavioral
+regressions above, not matching source text alone, prove these changes.
+
 This evidence is host-only; no hardware, hosted CI or release qualification is claimed.

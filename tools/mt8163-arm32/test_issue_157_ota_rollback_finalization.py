@@ -393,7 +393,9 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
         self.assertIn('"${GENERATION_TOOL:-/usr/local/sbin/libreecho-generation}" assemble', assets)
         assembly = generation[generation.index('assemble()'):]
         self.assertLess(assembly.index('generation_lock'), assembly.index('$BB mkdir -p "$partial/features"'))
-        self.assertIn('$BB mkdir "$lock" 2>/dev/null', generation)
+        self.assertIn('$BB mkdir "$tmp" 2>/dev/null', generation)
+        self.assertIn('$BB mv -T "$tmp" "$lock"', generation)
+        self.assertLess(generation.index('> "$tmp/owner"'), generation.index('$BB mv -T "$tmp" "$lock"'))
         worker = extract_function(self.init, "ota_rollback_resume_lock")
         self.assertLess(
             worker.index("/run/libreecho/fetch.lock"),

@@ -4008,9 +4008,11 @@ start_feature_service_if_enabled
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
         self.assertIn("version=$(download_and_inspect) || return 1", fetcher)
         self.assertIn(
-            'if [ -n "$rolled_back" ] && [ "$version" = "$rolled_back" ] && [ "$channel" = "$rolled_back_channel" ] && candidate_matches_record "$ROOT/rolled-back"; then',
+            'if [ -n "$candidate_id" ] && [ "$(check_value_from_file "$ROOT/rolled-back" schema)" = 3 ] &&',
             fetcher,
         )
+        self.assertLess(fetcher.index('version=$(download_and_inspect) || return 1'), fetcher.index('replay_status=$(automatic_replay_status)'))
+        self.assertIn('[ "$candidate_id" = "$(check_value_from_file "$ROOT/rolled-back" transaction_id)" ]', fetcher)
         self.assertIn("check_status_write error", fetcher)
         self.assertIn("404) die asset_missing true", fetcher)
         self.assertNotIn("state_write update-held-after-rollback", fetcher)
@@ -4075,7 +4077,7 @@ start_feature_service_if_enabled
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
         self.assertIn(expected, source)
         self.assertIn(
-            'expected_url="https://github.com/aslater3/LibreEcho/releases/latest/download/libreecho-radar-puffin-$channel.ota.tar"',
+            'expected_url="https://github.com/aslater3/LibreEcho/releases/latest/download/libreecho-$TARGET_SLUG-$channel.ota.tar"',
             fetcher,
         )
         self.assertNotIn("LibreEcho-Platform/releases", source + fetcher)
@@ -4101,7 +4103,7 @@ start_feature_service_if_enabled
 
         expected_url = (
             'expected_url="https://github.com/aslater3/LibreEcho/releases/latest/download/'
-            'libreecho-radar-puffin-$channel.ota.tar"'
+            'libreecho-$TARGET_SLUG-$channel.ota.tar"'
         )
         self.assertIn(expected_url, fetcher)
         self.assertIn("url=$expected_url", fetcher)

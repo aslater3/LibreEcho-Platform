@@ -14,7 +14,13 @@ class TransportTests(grammar.SignedFixture):
         a = source.index('prepare_https_client()')
         b = source.index('\n}\n', a) + 3
         body = source[a:b]
-        self.assertIn('GENERATION_TOOL', body)
+        self.assertIn('GENERATION_TRANSACTION', body)
+        self.assertNotIn(' verify ', body)
+        engine = (grammar.TOOLS / 'initramfs/libreecho-generation-transaction').read_text()
+        client = engine[engine.index('https_client()'):engine.index('provenance()')]
+        self.assertIn('TARGET_MANIFEST', client)
+        self.assertIn('feature_assistant_', client)
+        self.assertNotIn('verify_generation', client)
         self.assertIn('current', body)
         self.assertNotIn('chmod', body)
         self.assertNotIn('manifest_payload_value', body)
