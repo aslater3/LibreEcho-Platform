@@ -907,13 +907,61 @@ static inline void music_feature_transport_tick(
 	++transport->update_count;
 }
 
+/*
+ * The producer clock: cumulative analysed-music milliseconds.  It is computed
+ * in 64 bits so the producer can see the exact value; the frozen wire field is
+ * uint32, so at 48 kHz the counter crosses the 32-bit boundary after ~49.7 days
+ * of continuous playback.  A consumer rejects a backward timestamp *within* a
+ * session, so the producer must start a new session before that crossing rather
+ * than publish timestamp_ms=0 in the old one.
+ */
+static inline uint64_t music_feature_transport_elapsed_ms(
+	const struct music_feature_transport *transport)
+{
+	return (uint64_t)transport->update_count *
+		transport->frames_per_update * 1000U / transport->rate;
+}
+
 static inline uint32_t music_feature_transport_timestamp_ms(
 	const struct music_feature_transport *transport)
 {
-	uint64_t ns = (uint64_t)transport->update_count *
-		transport->frames_per_update * 1000U;
+	return (uint32_t)music_feature_transport_elapsed_ms(transport);
+}
 
-	return (uint32_t)(ns / transport->rate);
+/*
+ * Whether the next update-clock period would carry the analysed-music clock
+ * past the frozen 32-bit wire field.  The producer rotates the session (fresh
+ * id, seq 0, clock 0) when this is true and never emits a wrapped timestamp in
+ * a live session.
+ */
+static inline int music_feature_transport_next_tick_wraps(
+	const struct music_feature_transport *transport)
+{
+	uint64_t update_count = (uint64_t)transport->update_count + 1U;
+
+	return update_count * transport->frames_per_update * 1000U /
+		transport->rate > (uint64_t)UINT32_MAX;
+}
+
+/*
+ * Advance one update-clock period, rotating first when the next timestamp would
+ * wrap the 32-bit wire field.  A rotation takes a fresh nonzero session id from
+ * ``next_session`` and restarts seq and the clock at zero, so a consumer never
+ * sees a backward timestamp inside one session and the wire encoding is
+ * unchanged.  ``next_session`` is only called at the multi-week wrap boundary,
+ * so the producer never pays for an id it does not use.  Returns 1 on rotation.
+ */
+static inline int music_feature_transport_begin_tick(
+	struct music_feature_transport *transport, uint32_t (*next_session)(void))
+{
+	int rotated = 0;
+
+	if (music_feature_transport_next_tick_wraps(transport)) {
+		music_feature_transport_reset(transport, next_session());
+		rotated = 1;
+	}
+	music_feature_transport_tick(transport);
+	return rotated;
 }
 
 static inline uint32_t music_feature_transport_next_seq(

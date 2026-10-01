@@ -425,7 +425,15 @@ static void process_music_visualizer(struct music_visualizer *visualizer,
 		return;
 	}
 
-	music_feature_transport_tick(&visualizer->transport);
+	/*
+	 * Advance the producer clock.  begin_tick rotates to a fresh session
+	 * (from music_visualizer_seed) when the cumulative analysed-music clock
+	 * would wrap the frozen 32-bit timestamp_ms, so a consumer never sees a
+	 * backward timestamp inside one session; seq and the clock restart with
+	 * the new id.  The seed is only taken at that multi-week boundary.
+	 */
+	(void)music_feature_transport_begin_tick(&visualizer->transport,
+						 music_visualizer_seed);
 	audio_visualizer_process_features(&visualizer->analyzer, rendered,
 					  PERIOD_SIZE, OUTPUT_CHANNELS,
 					  visualizer->levels,

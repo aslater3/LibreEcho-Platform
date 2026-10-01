@@ -80,7 +80,12 @@ provider default.
 - **seq** is monotonic within a session and restarts only with a new session.
 - **timestamp_ms** is monotonic milliseconds from the analysed-period clock
   (`update_count * 2048 * 1000 / 48000`), not the wall clock: it is deterministic
-  and monotonic, and it never moves backwards.
+  and monotonic, and it never moves backwards.  The clock is tracked in 64 bits,
+  but the wire field is a frozen `uint32`, so the producer rotates the session
+  before the value would cross the 32-bit boundary (about 49.7 days of
+  continuous playback): `music_feature_transport_begin_tick()` starts a fresh
+  session (new nonzero id, `seq` 0, clock 0) on the wrapping tick instead of
+  publishing a wrapped `timestamp_ms` in the live session.
 - A consumer rejects a stale or reordered frame when `seq` does not advance or
   `timestamp_ms` moves backwards within the current session.
 
@@ -137,6 +142,7 @@ emitted correctly by `music_features_format_frame(..., feature_version=1, ...)`.
 ```sh
 bash tools/mt8163-arm32/airplay/test_music_features.sh
 bash tools/mt8163-arm32/airplay/test_music_feature_trace.sh
+bash tools/mt8163-arm32/airplay/test_music_transport_wrap.sh
 python3 tools/mt8163-arm32/airplay/test_music_feature_packet.py
 ```
 
@@ -147,6 +153,10 @@ python3 tools/mt8163-arm32/airplay/test_music_feature_packet.py
   the v1/v2 packet contract, bounded memory and host runtime.
 - `test_music_feature_trace.sh` emits a deterministic JSONL trace of real
   version-2 packets for the cross-repository roundtrip.
+- `test_music_transport_wrap.sh` drives the real transport at the production
+  period/rate one period below the 32-bit clock boundary and proves the session
+  rotates there (fresh id, `seq` 0, clock restarting), no timestamp moves
+  backwards inside a session, and the emitted frame keeps the frozen field set.
 - `test_music_feature_packet.py` compiles and runs the emitter twice, requires
   identical output, and validates every packet against this contract.
 

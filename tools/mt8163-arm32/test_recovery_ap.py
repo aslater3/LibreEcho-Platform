@@ -33,11 +33,13 @@ import shutil
 import socket
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 TOOLS_DIR = Path(__file__).resolve().parent
 INITRAMFS = TOOLS_DIR / "initramfs"
@@ -1893,6 +1895,83 @@ class BundleStagingValidationTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             builder.validate_recovery_ap_source_lock(
                 metadata["components"], metadata["source_offer"])
+
+
+class RecoveryApConnectivityPrerequisiteTests(unittest.TestCase):
+    """The recovery-AP inputs require the WMT connectivity bundle.
+
+    A staged AP whose hostapd/dnsmasq/iw ship without the connectivity bundle's
+    pinned WMT helpers and vendor importer is unreachable: init's vendor-assets
+    gate never sets VENDOR_ASSETS_OK, so wlan0 never appears and the advertised
+    portal cannot start.  The builder must refuse that option combination rather
+    than prepare an image that lies about the AP.
+    """
+
+    def setUp(self) -> None:
+        self.builder = load_tool("build_recovery_image")
+
+    def test_ap_staging_without_connectivity_is_refused(self) -> None:
+        with self.assertRaises(SystemExit) as caught:
+            self.builder.validate_recovery_ap_prerequisites(True, False)
+        self.assertIn("connectivity", str(caught.exception))
+
+    def test_ap_staging_with_connectivity_is_accepted(self) -> None:
+        self.builder.validate_recovery_ap_prerequisites(True, True)
+
+    def test_no_ap_staging_needs_no_connectivity(self) -> None:
+        self.builder.validate_recovery_ap_prerequisites(False, False)
+
+    def _argv(self, *extra: str) -> list[str]:
+        """A minimal valid CLI prefix; the build itself never runs."""
+        return [
+            "build_recovery_image.py",
+            "--boot-envelope", "envelope.bin",
+            "--adbd", "adbd",
+            "--adbd-source-metadata", "adbd.json",
+            "--busybox", "busybox",
+            "--expected-busybox-sha256", "0" * 64,
+            "--musl-loader", "ld-musl-armhf.so.1",
+            "--expected-musl-loader-sha256", "0" * 64,
+            "--image-profile", "development",
+            "--update-channel", "dev",
+            "--bootctl", "bootctl",
+            "--update-verifier", "libreecho-update-verify",
+            "--ota-public-key", "ota-public-key.hex",
+            "--zimage", "zImage",
+            "--system-map", "System.map",
+            "--output", "boot.img",
+            *extra,
+        ]
+
+    def test_main_refuses_ap_staging_without_wmt_helpers(self) -> None:
+        argv = self._argv(
+            "--recovery-ap-binaries", "recovery-ap-out",
+            "--recovery-ap-metadata", "recovery-ap-out/recovery-ap-binaries.json",
+        )
+        with mock.patch.object(sys, "argv", argv):
+            with self.assertRaises(SystemExit) as caught:
+                self.builder.main()
+        self.assertIn("connectivity", str(caught.exception))
+
+    def test_main_accepts_ap_staging_with_wmt_helpers(self) -> None:
+        argv = self._argv(
+            "--recovery-ap-binaries", "recovery-ap-out",
+            "--recovery-ap-metadata", "recovery-ap-out/recovery-ap-binaries.json",
+            "--wmt-config-helper", "wmt_config_helper",
+            "--wmt-responder", "wmt_responder",
+            "--wmt-bt-on", "wmt_bt_on",
+            "--wmt-stock-compat", "wmt_stock_compat",
+            "--wmt-launcher", "wmt_launcher",
+        )
+        with mock.patch.object(sys, "argv", argv):
+            with self.assertRaises(SystemExit) as caught:
+                self.builder.main()
+        # The AP/connectivity gate accepted the combination; the build then
+        # fails on the first missing input (the canonical boot envelope), which
+        # proves the option combination itself was not refused.
+        message = str(caught.exception)
+        self.assertNotIn("connectivity", message)
+        self.assertIn("cannot read", message)
 
 
 def write_build_receipt(output: Path, lock: Path = LOCK) -> None:

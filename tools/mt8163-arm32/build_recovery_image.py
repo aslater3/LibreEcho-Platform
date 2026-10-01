@@ -327,6 +327,27 @@ def validate_recovery_ap_provenance(metadata: object) -> dict[str, dict[str, obj
     return provenance
 
 
+def validate_recovery_ap_prerequisites(recovery_ap_requested: bool,
+                                       connectivity_enabled: bool) -> None:
+    """Refuse recovery-AP staging without the pinned WMT connectivity bundle.
+
+    The recovery portal only reaches the radio once init's vendor-assets gate
+    (``VENDOR_ASSETS_OK``) passes, and that gate requires the pinned WMT helpers
+    and the vendor-asset importer that the connectivity bundle stages.  A build
+    that staged the AP binaries alone would advertise a portal whose ``wlan0``
+    never appears, so the AP inputs are refused unless the connectivity inputs
+    are supplied too.
+    """
+    if recovery_ap_requested and not connectivity_enabled:
+        raise SystemExit(
+            "ERROR: recovery-AP staging requires the WMT connectivity bundle: "
+            "the portal advertises wlan0, which init's vendor-assets gate only "
+            "brings up when the pinned WMT helpers and the vendor importer are "
+            "staged; supply --wmt-config-helper, --wmt-responder, --wmt-bt-on, "
+            "--wmt-stock-compat and --wmt-launcher"
+        )
+
+
 def add_recovery_ap_bundle(stage: Path, binaries: dict[str, Path],
                            metadata_path: Path, manifest: dict[str, object]) -> None:
     """Stage the pinned recovery-AP dependencies, hash-checked against metadata.
@@ -2768,6 +2789,13 @@ def main() -> None:
             "ERROR: recovery-AP staging is all-or-nothing; supply "
             "--recovery-ap-binaries and --recovery-ap-metadata together"
         )
+    # An AP bundle is only reachable once init's vendor-assets gate passes,
+    # which requires the connectivity bundle's pinned WMT helpers and vendor
+    # importer; staging the AP binaries alone would advertise a portal whose
+    # wlan0 never appears.
+    validate_recovery_ap_prerequisites(
+        args.recovery_ap_binaries is not None, connectivity_enabled,
+    )
     network_options = {
         "wpa_supplicant": args.wpa_supplicant,
         "wpa_source_metadata": args.wpa_source_metadata,
