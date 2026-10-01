@@ -171,6 +171,7 @@ verify_signed_manifest() {
 check_manifest() {
     local manifest=$1 seen key field_value ids old_index expected_keys feature index action field asset manifest_asset prefix actual_keys
     verify_signed_manifest "$manifest" "${2:-}"
+    case "$(value format "$manifest")" in libreecho-ota-v1|libreecho-ota-v2) fail legacy_manifest_unsupported;; esac
     seen=
     while IFS='=' read -r key field_value; do
         [ -n "$key" ] && [ -n "$field_value" ] || fail manifest-syntax
