@@ -138,8 +138,12 @@ if ! dhcp_live; then
     printf 'unavailable: dhcp-not-running:%s\n' "$DHCP_CONF" >&2
     exit 1
 fi
-# ...and the interface must actually carry the AP address.
-if ! "$IP" addr show dev "$IFACE" 2>/dev/null | grep -q "$AP_ADDRESS"; then
+# ...and the interface must actually carry the AP address.  Match the inet
+# field exactly (the address before the '/prefix'), never a substring: a
+# prefix collision such as 192.168.4.10/24 must not satisfy 192.168.4.1.
+if ! "$IP" addr show dev "$IFACE" 2>/dev/null |
+        sed -n 's/^[[:space:]]*inet[[:space:]]\+\([^/[:space:]]*\).*/\1/p' |
+        grep -qxF "$AP_ADDRESS"; then
     printf 'unavailable: interface-address-missing:%s\n' "$IFACE" >&2
     exit 1
 fi

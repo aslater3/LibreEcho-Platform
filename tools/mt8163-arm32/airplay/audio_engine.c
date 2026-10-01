@@ -31,6 +31,7 @@
 #include "aec_reference.h"
 #include "audio_period_buffer.h"
 #include "audio_visualizer.h"
+#include "music_session_id.h"
 #include "playback_status.h"
 #include "puffin_downmix.h"
 #include "speaker_dsp.h"
@@ -341,21 +342,13 @@ static void set_announcement_led(int active)
 /*
  * The producer session id is nonzero and stable for one engine lifetime.  It
  * is reseeded only when the engine process starts (or is restarted by the
- * supervisor), which is the producer reset boundary.  The value is derived
- * from the monotonic clock so two rapid restarts do not collide.
+ * supervisor), which is the producer reset boundary.  music_session_id.h makes
+ * the value collision-resistant across two rapid restarts (full monotonic ns,
+ * pid and kernel entropy) while keeping the frozen uint32 wire field.
  */
 static uint32_t music_visualizer_seed(void)
 {
-	struct timespec now;
-	uint64_t milliseconds;
-
-	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
-		return 1U;
-	milliseconds = (uint64_t)now.tv_sec * 1000U +
-		(uint64_t)(now.tv_nsec / 1000000L);
-	if (milliseconds == 0)
-		return 1U;
-	return (uint32_t)milliseconds;
+	return music_session_id_seed();
 }
 
 /*

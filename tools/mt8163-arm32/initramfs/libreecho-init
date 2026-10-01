@@ -1134,36 +1134,104 @@ PHYSICAL_RECOVERY_MARKER=${PHYSICAL_RECOVERY_MARKER:-/run/libreecho/recovery-mod
 # starts still arms.  With no held button the detector returns after its 2 s
 # no-key window, so this bound costs nothing on an ordinary boot.
 PHYSICAL_RECOVERY_TIMEOUT=${PHYSICAL_RECOVERY_TIMEOUT:-13}
+# KEY_HELP (138) is bit 10 of a key-bitmap word (138 = 128 + 10).
+KEY_HELP_BIT=138
+
+# Resolve the evdev node that carries the physical action button.  The named
+# "Action Key" node is created by build_wifi_dtb.py and may enumerate after an
+# unrelated PMIC/input node (the mute/home keys), so a first miss must NOT fall
+# back to the first evdev device: the compiled detector filters KEY_HELP, and
+# another node would silently observe the wrong key.  Retry the named lookup for
+# the whole bounded window; only when input names are genuinely unavailable fall
+# back to a node whose key capability actually advertises KEY_HELP.
+physical_recovery_input_node()
+{
+    input_class=${PHYSICAL_RECOVERY_INPUT_CLASS:-/sys/class/input}
+    dev_input=${PHYSICAL_RECOVERY_DEV_INPUT:-/dev/input}
+    tries=${PHYSICAL_RECOVERY_NODE_TRIES:-5}
+    node=
+    names_seen=0
+    i=0
+    while [ "$i" -lt "$tries" ]; do
+        for sys_name in "$input_class"/event*/device/name; do
+            [ -r "$sys_name" ] || continue
+            names_seen=1
+            event=${sys_name#"$input_class"/}
+            event=${event%%/*}
+            case "$($BB cat "$sys_name" 2>/dev/null)" in
+                *[Aa]ction*) node=$dev_input/$event ;;
+            esac
+            [ -n "$node" ] && break
+        done
+        [ -n "$node" ] && break
+        i=$((i + 1))
+        [ "$i" -lt "$tries" ] && $BB sleep 1
+    done
+    if [ -z "$node" ] && [ "$names_seen" -eq 0 ]; then
+        node=$(physical_recovery_key_help_node "$input_class" "$dev_input")
+    fi
+    printf '%s\n' "$node"
+}
+
+# A node's key bitmap is a space-separated list of hex words.  A 32-bit kernel
+# prints 32-bit words, so KEY_HELP (138 = 4*32 + 10) is bit 10 of word 4; a
+# 64-bit kernel prints 64-bit words, so it is bit 10 of word 2.  A word wider
+# than 8 hex digits can only come from the 64-bit layout.  The relevant bit is
+# the value-4 bit of that word's third-from-last hex digit, which avoids
+# overflow-prone shell arithmetic on the printed value.
+physical_recovery_key_bitmap_has_help()
+{
+    file=$1
+    wide=0
+    for word in $($BB cat "$file" 2>/dev/null); do
+        case "$word" in
+            ?????????*) wide=1 ;;
+        esac
+    done
+    if [ "$wide" -eq 1 ]; then
+        want=2
+    else
+        want=4
+    fi
+    idx=0
+    for word in $($BB cat "$file" 2>/dev/null); do
+        if [ "$idx" -eq "$want" ]; then
+            rest=${word%??}
+            digit=${rest#"${rest%?}"}
+            case "$digit" in
+                [4567cCdDeEfF]) return 0 ;;
+            esac
+            return 1
+        fi
+        idx=$((idx + 1))
+    done
+    return 1
+}
+
+physical_recovery_key_help_node()
+{
+    input_class=$1
+    dev_input=$2
+    for cap in "$input_class"/event*/device/capabilities/key; do
+        [ -r "$cap" ] || continue
+        event=${cap#"$input_class"/}
+        event=${event%%/*}
+        if physical_recovery_key_bitmap_has_help "$cap"; then
+            printf '%s\n' "$dev_input/$event"
+            return 0
+        fi
+    done
+    printf '%s\n' ''
+    return 0
+}
+
 physical_recovery_probe()
 {
     [ -x "$PHYSICAL_RECOVERY_HELPER" ] || {
         log physical-recovery-helper-absent
         return 0
     }
-    node=
-    i=0
-    while [ -z "$node" ] && [ "$i" -lt 5 ]; do
-        # The action button is a dedicated evdev node; prefer it by its sysfs
-        # name and only fall back to the first evdev node when names are
-        # unavailable.  Never guess from a key code, which the helper filters.
-        for sys_name in /sys/class/input/event*/device/name; do
-            [ -r "$sys_name" ] || continue
-            event=${sys_name#/sys/class/input/}
-            event=${event%%/*}
-            case "$($BB cat "$sys_name" 2>/dev/null)" in
-                *[Aa]ction*) node=/dev/input/$event ;;
-            esac
-            [ -n "$node" ] && break
-        done
-        if [ -z "$node" ]; then
-            for candidate in /dev/input/event*; do
-                [ -c "$candidate" ] && { node=$candidate; break; }
-            done
-        fi
-        [ -n "$node" ] && break
-        $BB sleep 1
-        i=$((i + 1))
-    done
+    node=$(physical_recovery_input_node)
     if [ -z "$node" ]; then
         log physical-recovery-no-input-node
         return 0

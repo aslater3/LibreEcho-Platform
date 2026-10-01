@@ -187,32 +187,15 @@ if [ "$(read_state_field iface)" = "$IFACE" ] &&
     exit 0
 fi
 
-# 1. Release client-supplied STA management.  The client supplicant and its
-#    DHCP client are stopped through their owning service (pidfile-scoped);
-#    there is deliberately no pattern-based process kill here.
+# 1. Resolve and validate the client profile the boot path selected BEFORE the
+#    radio is touched.  A recorded profile that is missing, a symlink, or
+#    outside the allowed roots is a hard error, and it must fail closed without
+#    stopping the client service: on a first run there is no ownership record
+#    yet, so a stop here could never be restored by a later net-down.
 #
-#    Ownership is a property of the portal, not of this invocation: if a
-#    previous net-up already released the plane for this same interface/address
-#    and recorded it, a re-run must keep that record even though the service is
-#    already stopped and its stop call now fails.  Otherwise the re-run would
-#    overwrite stopped=1 with stopped=0 and a later net-down would skip the
-#    restoration the previous call still owes.
-prior_stopped=0
-if [ "$(read_state_field iface)" = "$IFACE" ] &&
-        [ "$(read_state_field address)" = "$ADDRESS" ] &&
-        [ "$(read_state_field stopped)" = 1 ]; then
-    prior_stopped=1
-fi
-stopped=0
-if stop_client_service; then
-    stopped=1
-elif [ "$prior_stopped" = 1 ]; then
-    stopped=1
-fi
-# The profile the boot path selected for this interface, if it recorded one.  A
-# re-run over an existing ownership record keeps the value that record already
-# holds when no fresh record is present.  resolve_wifi_conf validates it and
-# fails closed on a recorded-but-unusable path.
+#    resolve_wifi_conf validates it and fails closed on a recorded-but-unusable
+#    path.  A re-run over an existing ownership record keeps the value that
+#    record already holds when no fresh record is present.
 recorded_wifi_conf=
 if [ -f "$PROFILE_FILE" ] && [ ! -L "$PROFILE_FILE" ]; then
     recorded_wifi_conf=$(sed -n '1p' "$PROFILE_FILE" 2>/dev/null)
@@ -226,12 +209,35 @@ if [ -z "$wifi_conf" ]; then
     fi
 fi
 
+# Ownership is a property of the portal, not of this invocation: if a
+# previous net-up already released the plane for this same interface/address
+# and recorded it, a re-run must keep that record even though the service is
+# already stopped and its stop call now fails.  Otherwise the re-run would
+# overwrite stopped=1 with stopped=0 and a later net-down would skip the
+# restoration the previous call still owes.
+prior_stopped=0
+if [ "$(read_state_field iface)" = "$IFACE" ] &&
+        [ "$(read_state_field address)" = "$ADDRESS" ] &&
+        [ "$(read_state_field stopped)" = 1 ]; then
+    prior_stopped=1
+fi
+
+# 2. Release client-supplied STA management.  The client supplicant and its
+#    DHCP client are stopped through their owning service (pidfile-scoped);
+#    there is deliberately no pattern-based process kill here.
+stopped=0
+if stop_client_service; then
+    stopped=1
+elif [ "$prior_stopped" = 1 ]; then
+    stopped=1
+fi
+
 # Record ownership before mutating the link so a later net-down (or a rollback
 # below) can restore exactly what this call changed -- including the client
 # profile the restore must use.
 write_state "$stopped" "$wifi_conf" || die "cannot record ownership state: $STATE_FILE"
 
-# 2. Bring the link up.
+# 3. Bring the link up.
 if ! "$IP_BIN" link set dev "$IFACE" up >/dev/null 2>&1; then
     # Roll back.  If the client service cannot be restored, the ownership
     # record is deliberately left in place: a later net-down then retries the
@@ -246,7 +252,7 @@ if ! "$IP_BIN" link set dev "$IFACE" up >/dev/null 2>&1; then
     die "cannot bring up $IFACE"
 fi
 
-# 3. Assign the portal address (idempotent: only if not already present).
+# 4. Assign the portal address (idempotent: only if not already present).
 if ! address_present; then
     if ! "$IP_BIN" addr add "$ADDRESS" dev "$IFACE" >/dev/null 2>&1; then
         # Roll back: no owned address is left behind, and the client service we

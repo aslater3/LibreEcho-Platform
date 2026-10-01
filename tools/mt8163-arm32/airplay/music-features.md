@@ -71,9 +71,12 @@ provider default.
 
 ## Reset, clock and staleness
 
-- **Session** is a nonzero `uint32`, derived from the producer start monotonic
-  clock, forced nonzero.  It changes only on producer start or reset (an engine
-  restart), so a consumer can reject frames from a previous producer run.
+- **Session** is a nonzero `uint32`, derived from the producer start.  It folds
+  the full monotonic clock in nanoseconds, the process id and 32 bits of kernel
+  entropy (`music_session_id.h`), so two rapid producer restarts -- even inside
+  one millisecond -- get different ids.  It changes only on producer start or
+  reset (an engine restart), so a consumer can reject frames from a previous
+  producer run.
 - **seq** is monotonic within a session and restarts only with a new session.
 - **timestamp_ms** is monotonic milliseconds from the analysed-period clock
   (`update_count * 2048 * 1000 / 48000`), not the wall clock: it is deterministic

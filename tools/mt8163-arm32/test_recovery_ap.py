@@ -28,6 +28,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import stat
@@ -392,6 +393,22 @@ esac
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("interface-address-missing", result.stderr)
 
+    def test_readiness_rejects_prefix_collision_address(self) -> None:
+        # 192.168.4.10/24 contains "192.168.4.1" as a substring but is not the
+        # AP address; the probe must compare the inet address exactly.
+        self.make_iw(dev_ok=True, mode="AP", ap_mode=True)
+        self.make_ip("192.168.4.10")
+        dhcp = subprocess.Popen(["sleep", "30"])
+        try:
+            dhcp_pid = self.root / "recovery-dhcp.pid"
+            dhcp_pid.write_text(f"{dhcp.pid}\n")
+            result = self.run_probe(PROBE, "ready", env=self.readiness_env(dhcp_pid=dhcp_pid))
+        finally:
+            dhcp.terminate()
+            dhcp.wait()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("interface-address-missing", result.stderr)
+
     def test_ready_wrapper_delegates_to_probe(self) -> None:
         source = READY.read_text()
         self.assertIn("libreecho-recovery-ap-probe", source)
@@ -683,6 +700,28 @@ exit 0
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not a regular file", result.stderr)
 
+    def test_net_up_refuses_unusable_profile_before_stopping_the_client(self) -> None:
+        # A recorded profile that fails validation must fail the call closed
+        # BEFORE the client service is stopped: a first run has no ownership
+        # record, so a stop here would strand the client plane down forever.
+        outside = self.root / "outside.conf"
+        outside.write_text("network={}\n")
+        self.record_profile(outside)
+        result = self.up()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("outside expected location", result.stderr)
+        self.assertEqual(self.wpa_log_text(), "")
+        self.assertFalse((self.state_dir / "recovery-net.state").exists())
+
+    def test_net_up_refuses_missing_profile_before_stopping_the_client(self) -> None:
+        missing = self.profile_root / "absent.conf"
+        self.record_profile(missing)
+        result = self.up()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a regular file", result.stderr)
+        self.assertEqual(self.wpa_log_text(), "")
+        self.assertFalse((self.state_dir / "recovery-net.state").exists())
+
     def test_net_down_fails_closed_when_recorded_profile_disappears(self) -> None:
         profile = self.profile()
         self.record_profile(profile)
@@ -706,6 +745,130 @@ exit 0
                             "--state-dir", str(self.state_dir))
         self.assertEqual(down.returncode, 0, down.stderr)
         self.assertIn("start WIFI_CONF=\n", self.wpa_log_text())
+
+
+class PhysicalRecoveryInputNodeTests(unittest.TestCase):
+    """The init button-node discovery.
+
+    The named "Action Key" node is created by build_wifi_dtb.py and may
+    enumerate after an unrelated PMIC key node.  Discovery must keep retrying
+    for the named node for the bounded window and must never silently select a
+    wrong evdev node (the compiled detector filters KEY_HELP); only when input
+    names are genuinely unavailable may it fall back, and then only to a node
+    whose key bitmap advertises KEY_HELP.
+    """
+
+    FUNCTIONS = (
+        "physical_recovery_input_node",
+        "physical_recovery_key_bitmap_has_help",
+        "physical_recovery_key_help_node",
+    )
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        text = (INITRAMFS / "libreecho-init").read_text()
+        cls.functions = {}
+        for name in cls.FUNCTIONS:
+            match = re.search(rf"^{name}\(\)\n\{{.*?^\}}\n", text,
+                              re.MULTILINE | re.DOTALL)
+            assert match is not None, f"{name} not found in libreecho-init"
+            cls.functions[name] = match.group(0)
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.input_class = self.root / "sys" / "class" / "input"
+        self.dev_input = self.root / "dev" / "input"
+        self.input_class.mkdir(parents=True)
+        self.dev_input.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def add_named_node(self, event: str, name: str) -> None:
+        device = self.input_class / event / "device"
+        device.mkdir(parents=True)
+        (device / "name").write_text(name + "\n")
+        (self.dev_input / event).touch()
+
+    def add_capability_node(self, event: str, key_bitmap: str) -> None:
+        # No device/name: this is the "input names are unavailable" case.
+        caps = self.input_class / event / "device" / "capabilities"
+        caps.mkdir(parents=True)
+        (caps / "key").write_text(key_bitmap + "\n")
+        (self.dev_input / event).touch()
+
+    def write_busybox(self, sleep_body: str = "") -> Path:
+        """A stand-in /bin/busybox that execs the subcommand.
+
+        The optional sleep_body replaces the retry delay so the retry window is
+        driven without real time; this is how the "node appears later" case is
+        made deterministic.
+        """
+        wrapper = self.root / "busybox"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = sleep ]; then\n"
+            + sleep_body
+            + "  exit 0\n"
+            "fi\n"
+            "exec \"$@\"\n")
+        wrapper.chmod(0o755)
+        return wrapper
+
+    def run_node_lookup(self, busybox: Path) -> str:
+        harness = self.root / "harness.sh"
+        harness.write_text(
+            "#!/bin/sh\n"
+            f"BB={shlex.quote(str(busybox))}\n"
+            + "\n".join(self.functions.values())
+            + "\nphysical_recovery_input_node\n")
+        env = dict(os.environ)
+        env["PHYSICAL_RECOVERY_INPUT_CLASS"] = str(self.input_class)
+        env["PHYSICAL_RECOVERY_DEV_INPUT"] = str(self.dev_input)
+        env["PHYSICAL_RECOVERY_NODE_TRIES"] = "3"
+        result = subprocess.run(["sh", str(harness)], text=True, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_named_node_appearing_after_an_unrelated_node_is_selected(self) -> None:
+        # event0 (an unrelated PMIC node) exists first; the action node only
+        # materialises on the first retry.  The old code fell back to event0.
+        self.add_named_node("event0", "mtk-pmic-keys")
+        busybox = self.write_busybox(
+            f"  mkdir -p {shlex.quote(str(self.input_class))}/event1/device\n"
+            f"  printf 'Action Key\\n' > "
+            f"{shlex.quote(str(self.input_class))}/event1/device/name\n"
+            f"  touch {shlex.quote(str(self.dev_input))}/event1\n")
+        self.assertEqual(self.run_node_lookup(busybox),
+                         str(self.dev_input / "event1"))
+
+    def test_unrelated_named_nodes_never_select_a_wrong_device(self) -> None:
+        # Names are available but none is the action button: fail closed with
+        # no node rather than observing an unrelated device.
+        self.add_named_node("event0", "mtk-pmic-keys")
+        self.add_named_node("event1", "mtk-home-key")
+        busybox = self.write_busybox()
+        self.assertEqual(self.run_node_lookup(busybox), "")
+
+    def test_names_unavailable_falls_back_only_to_a_key_help_capability(self) -> None:
+        # No input names at all; select by KEY_HELP capability (138 = 128 + 10,
+        # word 4 bit 10 on the 32-bit layout, so the fifth word is 0x400).
+        self.add_capability_node("event0", "0")
+        self.add_capability_node("event1", "0 0 0 0 400")
+        busybox = self.write_busybox()
+        self.assertEqual(self.run_node_lookup(busybox),
+                         str(self.dev_input / "event1"))
+
+    def test_64bit_key_bitmap_layout_is_recognised(self) -> None:
+        # A word wider than 8 hex digits proves the 64-bit layout, where
+        # KEY_HELP is bit 10 of word 2 (the third word).
+        self.add_capability_node("event0", "100000000 0 400")
+        busybox = self.write_busybox()
+        self.assertEqual(self.run_node_lookup(busybox),
+                         str(self.dev_input / "event0"))
 
 
 class NetHandoverPathTests(unittest.TestCase):
