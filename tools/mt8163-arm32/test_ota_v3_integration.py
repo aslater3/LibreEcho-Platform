@@ -42,6 +42,39 @@ class UpdaterTests(grammar.SignedFixture):
         return subprocess.run(['/bin/busybox', 'sh', str(script), str(package)], env=self.env,
                               capture_output=True, text=True)
 
+    def test_channel_mismatch_is_refused(self):
+        result = self.inspect(self.text.replace('update_channel=dev', 'update_channel=stable'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('update_channel_mismatch', result.stderr)
+
+    def test_legacy_machinery_is_physically_absent(self):
+        for name in ('libreecho-feature-transaction', 'libreecho-update'):
+            source = (TOOLS / 'initramfs' / name).read_text()
+            for forbidden in ('preserved_identity', 'reconcile_operation', 'move_expected', 'abort_operation_untouched',
+                              'runtime_authority', 'base_payload_sha256', 'build_intent', 'verify_preserved_feature_identity'):
+                self.assertNotIn(forbidden, source)
+
+    def test_status_reads_current_generation_not_legacy_features(self):
+        directory = self.data / 'libreecho/generations/test-target/features'
+        for f in grammar.FEATURES:
+            d = directory / f
+            d.mkdir(parents=True)
+            (d / 'payload.squashfs').write_bytes(b'current')
+            (d / 'manifest.json').write_bytes(b'metadata')
+            old = self.data / 'libreecho/features' / f
+            old.mkdir(parents=True)
+            (old / 'payload.squashfs').write_bytes(b'legacy')
+        self.control_file('current').write_text('test-target\n')
+        script = self.script('feature_status')
+        result = subprocess.run(['/bin/busybox', 'sh', str(script)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('feature_airplay2_payload_sha256=' + hashlib.sha256(b'current').hexdigest(), result.stdout)
+        self.assertNotIn(hashlib.sha256(b'legacy').hexdigest(), result.stdout)
+        self.control_file('current').write_text('../features\n')
+        result = subprocess.run(['/bin/busybox', 'sh', str(script)], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn(hashlib.sha256(b'legacy').hexdigest(), result.stdout)
+
     def test_normal_inspect_accepts_signed_v3(self):
         result = self.inspect(self.text)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -108,11 +141,11 @@ class UpdaterTests(grammar.SignedFixture):
         bootctl = self.root / 'bootctl'
         bootctl.write_text('#!/bin/sh\necho "bootctl:$1:$2" >> "$CALLS"\n')
         bootctl.chmod(0o755)
-        script = self.script('confirm_pending')
+        script = self.script('target_device_for_slot() { :; }\nconfirm_pending')
         script.write_text(script.read_text().replace('FEATURE_TRANSACTION=/usr/local/sbin/libreecho-feature-transaction', 'FEATURE_TRANSACTION=' + str(helper)).replace('BOOTCTL=/usr/local/sbin/libreecho-bootctl', 'BOOTCTL=' + str(bootctl)))
         result = subprocess.run(['/bin/busybox', 'sh', str(script)], env=dict(self.env, CALLS=str(calls)), capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(calls.read_text().splitlines(), ['transaction:activate', 'bootctl:confirm:b', 'transaction:commit'])
+        self.assertEqual(calls.read_text().splitlines(), ['transaction:verify-running', 'bootctl:confirm:b', 'transaction:commit'])
 
     def control_file(self, name):
         return self.update / name

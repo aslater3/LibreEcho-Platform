@@ -377,7 +377,8 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
         # tree, and the worker takes the same two in the same order.
         fetcher = (HERE / "initramfs/libreecho-update-fetch").read_text()
         installer = (HERE / "initramfs/libreecho-update").read_text()
-        self.assertIn("FEATURE_STAGE=$ROOT/staging/features", fetcher)
+        generation = (HERE / "initramfs/libreecho-generation").read_text()
+        self.assertIn('GENERATIONS=${GENERATIONS:-/data/libreecho/generations}', generation)
         self.assertIn("INSTALL_LOCK=$ROOT/install.lock", fetcher)
         self.assertIn("$RUN_ROOT/libreecho/fetch.lock", fetcher)
         self.assertIn('$BB mkdir "$INSTALL_LOCK" 2>/dev/null || die update_busy', fetcher)
@@ -389,11 +390,10 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
         self.assertLess(check.index("install_unlock"), check.index("download_feature_assets"))
         # ... and it writes the staging tree the worker removes.
         assets = extract_top_level_function(fetcher, "download_feature_assets")
-        self.assertIn("$FEATURE_STAGE", assets)
-        self.assertLess(
-            fetcher.index("$BB mkdir \"$LOCK\" 2>/dev/null"),
-            fetcher.index("$BB mkdir -p \"$FEATURE_STAGE\""),
-        )
+        self.assertIn('"${GENERATION_TOOL:-/usr/local/sbin/libreecho-generation}" assemble', assets)
+        assembly = generation[generation.index('assemble()'):]
+        self.assertLess(assembly.index('generation_lock'), assembly.index('$BB mkdir -p "$partial/features"'))
+        self.assertIn('$BB mkdir "$lock" 2>/dev/null', generation)
         worker = extract_function(self.init, "ota_rollback_resume_lock")
         self.assertLess(
             worker.index("/run/libreecho/fetch.lock"),

@@ -88,6 +88,11 @@ class ManifestTests(SignedFixture):
     def test_rejects_board_mismatch(self):
         self.assertNotEqual(self.check(manifest().replace('board=radar_puffin', 'board=biscuit')).returncode, 0)
 
+    def test_rejects_inexact_feature_set(self):
+        exact = ','.join(FEATURES)
+        for wrong in ('airplay2,tts,wakeword,stt', exact + ',extra', ','.join(reversed(FEATURES))):
+            self.assertNotEqual(self.check(manifest().replace('feature_ids=' + exact, 'feature_ids=' + wrong)).returncode, 0)
+
     def test_rejects_v2_format(self):
         result = self.check(manifest().replace('libreecho-ota-v3', 'libreecho-ota-v2'))
         self.assertNotEqual(result.returncode, 0)

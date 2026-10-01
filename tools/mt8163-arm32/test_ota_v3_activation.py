@@ -72,6 +72,31 @@ for daemon in ('libreecho-audio-engine','libreecho-ttsd','libreecho-waked','libr
         return subprocess.run(['/bin/busybox', 'sh', str(TRANSACTION), verb],
                               env=self.env, capture_output=True, text=True)
 
+    def test_boot_daemon_and_mount_options_mismatch_fail_closed(self):
+        self.prepared()
+        original = self.boot.read_bytes()
+        self.boot.write_bytes(b'wrong boot')
+        self.assertNotEqual(self.verb('activate').returncode, 0)
+        self.assertFalse(self.mount_log.exists())
+        self.boot.write_bytes(original)
+        self.assertEqual(self.verb('activate').returncode, 0)
+        daemon = self.runroot / 'libreecho/features/assistant/root/usr/local/sbin/libreecho-agentd'
+        daemon.write_bytes(b'stale daemon')
+        self.assertNotEqual(self.verb('activate').returncode, 0)
+        daemon.write_bytes(b'daemon')
+        self.mountinfo.write_text(self.mountinfo.read_text().replace('ro,nosuid,nodev', 'rw,nosuid,nodev'))
+        self.assertNotEqual(self.verb('activate').returncode, 0)
+
+    def test_ambiguous_bcb_and_selected_running_mismatch_fail_closed(self):
+        self.prepared()
+        for bcb in ('selected_slot=a\nslot_a_success=0\n',
+                    'selected_slot=b\nselected_slot=a\nslot_b_success=0\n',
+                    'selected_slot=b\nslot_b_success=2\n'):
+            self.bcb.write_text(bcb)
+            result = self.verb('activate')
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(self.mount_log.exists())
+
     def test_activate_exact_pending_readonly_loop_mounts(self):
         self.prepared()
         result = self.verb('activate')
@@ -105,6 +130,8 @@ for daemon in ('libreecho-audio-engine','libreecho-ttsd','libreecho-waked','libr
         self.assertFalse((self.control / 'pending').exists())
         self.assertEqual(self.verb('commit').returncode, 0)
         self.assertEqual((self.control / 'previous').read_text(), 'prior\n')
+        self.assertIn('schema=3', (self.control / 'installed').read_text())
+        self.assertIn('transaction_id=test-target', (self.control / 'installed').read_text())
 
     def test_commit_resume_after_current_rename_keeps_previous(self):
         self.prepared()
@@ -155,6 +182,51 @@ for daemon in ('libreecho-audio-engine','libreecho-ttsd','libreecho-waked','libr
             self.assertNotEqual(self.verb(verb).returncode, 0)
         self.assertTrue((self.control / 'pending').exists())
         self.assertEqual((self.control / 'current').read_text(), 'prior\n')
+
+    def test_dead_owner_lock_is_recovered(self):
+        self.prepared()
+        lock = self.control / 'generation.lock'
+        lock.mkdir()
+        (lock / 'owner').write_text('99999999 ' + Path('/proc/sys/kernel/random/boot_id').read_text().strip() + '\n')
+        self.set_bcb('b', '1')
+        result = self.verb('commit')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(lock.exists())
+
+    def test_prior_boot_lock_is_recovered_but_live_owner_is_not(self):
+        import os
+        self.prepared()
+        lock = self.control / 'generation.lock'
+        lock.mkdir()
+        (lock / 'owner').write_text(str(os.getpid()) + ' previous-boot\n')
+        self.assertEqual(self.verb('activate').returncode, 0)
+        lock.mkdir()
+        (lock / 'owner').write_text(str(os.getpid()) + ' ' + Path('/proc/sys/kernel/random/boot_id').read_text().strip() + '\n')
+        result = self.verb('gc')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('generation-busy', result.stderr)
+
+    def test_commit_sigkill_at_each_durable_boundary_resumes(self):
+        engine = TOOLS / 'initramfs/libreecho-generation-transaction'
+        for boundary in (1, 2, 3, 4):
+            with self.subTest(boundary=boundary):
+                self.prepared()
+                self.set_bcb('b', '1')
+                count = self.root / 'sync-count'
+                count.write_text('0')
+                script = self.root / 'crash-engine'
+                source = engine.read_text().replace(
+                    'sync_file() { $BB sync 2>/dev/null || fail sync-failed; }',
+                    'sync_file() { $BB sync; n=$(( $(cat "$SYNC_COUNT") + 1 )); echo "$n" > "$SYNC_COUNT"; [ "$n" != "$CRASH_BOUNDARY" ] || kill -KILL $$; }')
+                script.write_text(source)
+                result = subprocess.run(['/bin/busybox', 'sh', str(script), 'commit'],
+                    env=dict(self.env, SYNC_COUNT=str(count), CRASH_BOUNDARY=str(boundary)), capture_output=True)
+                self.assertEqual(result.returncode, -9)
+                result = self.verb('commit')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((self.control / 'current').read_text(), 'test-target\n')
+                self.assertEqual((self.control / 'previous').read_text(), 'prior\n')
+                self.assertFalse((self.control / 'pending').exists())
 
     def test_loop_backing_mismatch_is_rejected(self):
         self.prepared()

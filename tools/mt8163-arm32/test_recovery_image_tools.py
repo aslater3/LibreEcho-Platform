@@ -984,7 +984,7 @@ class SourceTests(unittest.TestCase):
         init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
         updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
         ota = (TOOLS_DIR / "ota/make_ota_bundle.py").read_text()
-        for source in (builder, verifier, updater, ota):
+        for source in (builder, verifier, ota):
             self.assertIn("redistributable", source)
         self.assertIn("redistributable policy requires external AirPlay, TTS, STT, and assistant payloads", builder)
         self.assertIn("wakeword payload inputs are forbidden by feature_policy=redistributable", builder)
@@ -999,7 +999,7 @@ class SourceTests(unittest.TestCase):
         init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
         updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
         ota = (TOOLS_DIR / "ota/make_ota_bundle.py").read_text()
-        for source in (builder, verifier, init, updater, ota):
+        for source in (builder, verifier, init, ota):
             self.assertIn("community-noncommercial", source)
         self.assertIn(
             "community-noncommercial policy requires external AirPlay, TTS, "
@@ -2801,31 +2801,12 @@ ota_health_services_ready
             malformed = subprocess.run(["sh", "-c", airplay_harness])
             self.assertNotEqual(malformed.returncode, 0)
 
-    def test_updater_identity_uses_compact_selected_topology(self) -> None:
+    def test_v3_updater_gates_complete_generation_before_boot_io(self) -> None:
         updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
-        start = updater.index("feature_daemon_required()\n")
-        end = updater.index("\n}\n", start) + 3
-        function = updater[start:end]
-        busybox = shutil.which("busybox")
-        if not busybox:
-            self.skipTest("busybox is required for updater shell behavior")
-        with tempfile.TemporaryDirectory() as td:
-            config = Path(td) / "web-config.json"
-            function = function.replace(
-                "/data/libreecho/config/web-config.json", str(config)
-            )
-            harness = f"""
-BB={busybox}
-CURRENT_SERVICE_PROFILE=production
-{function}
-feature_daemon_required tts
-"""
-            config.write_text('{"integrations":1}\n')
-            home_assistant = subprocess.run(["sh", "-c", harness])
-            self.assertNotEqual(home_assistant.returncode, 0)
-            config.write_text('{"integrations":0}\n')
-            local = subprocess.run(["sh", "-c", harness])
-            self.assertEqual(local.returncode, 0)
+        install = updater[updater.index("install_package()"):updater.index("confirm_pending()")]
+        self.assertLess(install.index('verify "$generation"'), install.index('dd if="$STAGING/boot.img"'))
+        self.assertNotIn('feature_daemon_required()', updater)
+
 
     def test_feature_staging_requires_verified_service_liveness(self) -> None:
         stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()
@@ -2868,7 +2849,7 @@ feature_daemon_required tts
         self.assertIn('"$script"', body)
         self.assertIn('return "$rc"', body)
         self.assertIn(
-            "    start_persisted_feature_services", init_script[init_script.index("start_ui_services()"):]
+            "    [ \"$feature_degraded\" = 1 ] || start_persisted_feature_services", init_script[init_script.index("start_ui_services()"):]
         )
         service_start = init_script[
             init_script.index("start_ui_services()"):
@@ -3694,10 +3675,9 @@ start_feature_service_if_enabled
             updater.index("target_device_for_slot \"$target\""),
             updater.index('dd if="$STAGING/boot.img" of="$target_device"'),
         )
-        self.assertLess(
-            updater.rindex("target_device_for_slot \"$slot\""),
-            updater.rindex('dd if="$target_device" bs=4096 count=4096'),
-        )
+        confirm = updater[updater.index('confirm_pending()'):]
+        self.assertLess(confirm.index('target_device_for_slot "$slot"'),
+                        confirm.index('"$FEATURE_TRANSACTION" verify-running'))
 
     def test_ota_manual_installer_seeds_persistent_channel(self) -> None:
         updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
@@ -3710,20 +3690,15 @@ start_feature_service_if_enabled
         self.assertIn('write_channel()', updater)
 
         updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
-        self.assertIn(
-            "boot_sha256 feature_policy image_profile service_profile update_channel'",
-            updater,
-        )
-        self.assertIn("diagnostic|production", updater)
+        parser = (TOOLS_DIR / "initramfs/libreecho-target-manifest").read_text()
+        self.assertIn('service_profile', parser)
+        self.assertIn('production', parser)
         self.assertIn("update_channel", updater)
-        self.assertIn("dev|stable", updater)
-        self.assertIn("update_channel=$UPDATE_CHANNEL", updater)
+        self.assertIn("dev|stable", parser)
+        self.assertIn("UPDATE_CHANNEL=$(manifest_value update_channel)", updater)
         self.assertIn("channel_value()", updater)
         self.assertIn("write_channel()", updater)
-        self.assertLess(
-            updater.index('update_channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)', updater.index('confirm_pending()')),
-            updater.index('update_channel=$(channel_value)', updater.index('confirm_pending()')),
-        )
+        self.assertIn('die update_channel_mismatch', updater)
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
         self.assertIn("installed_channel", fetcher)
         self.assertIn("rolled_back_channel", fetcher)
@@ -3733,9 +3708,7 @@ start_feature_service_if_enabled
         self.assertNotIn("migrate_pending_channel", fetcher)
         verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
         self.assertIn("args.expected_update_channel, args.expected_busybox_sha256", verifier)
-        self.assertIn("pending_channel_preserve", updater)
-        self.assertIn("printf '%s\\n' \"channel=$selected_channel\"", updater)
-        self.assertIn("die manifest_service_profile", updater)
+        self.assertIn("die update_channel_mismatch", updater)
 
     def test_ota_status_reports_effective_feature_payload_identity(self) -> None:
         """Status must expose preserved payload and running-daemon identities."""
@@ -3753,7 +3726,7 @@ start_feature_service_if_enabled
         # fixture rewrites this literal in its generated copy; production does
         # not accept a caller-selected feature root.
         self.assertIn("DATA_ROOT=/data", updater)
-        self.assertIn("FEATURE_ROOT=$DATA_ROOT/libreecho/features", updater)
+        self.assertIn("FEATURE_ROOT=$GENERATIONS/$current/features", updater)
         self.assertIn("feature_root=$FEATURE_ROOT/$feature", updater)
         self.assertIn("payload=$feature_root/payload.squashfs", updater)
         self.assertIn("manifest=$feature_root/manifest.json", updater)
@@ -3866,58 +3839,8 @@ start_feature_service_if_enabled
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("preserve policy requires candidate feature identities", result.stderr)
 
-    def test_preserve_installer_fails_before_boot_write_on_identity_mismatch(self) -> None:
-        """The updater must gate retained daemon identity before any block write."""
-        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
-        self.assertIn("verify_preserved_feature_identity()", updater)
-        self.assertIn("preserve_feature_payload_mismatch", updater)
-        self.assertIn("preserve_feature_daemon_mismatch", updater)
-        self.assertIn("feature_daemon_required()", updater)
-        self.assertIn("integrations & 1", updater)
-        self.assertIn("if ! feature_daemon_required \"$feature\"; then", updater)
-        install = updater[updater.index('install_package()'):]
-        verify_call = install.index('verify_preserved_feature_identity')
-        boot_write = install.index('dd if="$STAGING/boot.img" of="$target_device"')
-        self.assertLess(verify_call, boot_write)
 
-    def test_preserve_installer_uses_installed_profile_for_transitions(self) -> None:
-        """Daemon requirements must describe the running image, not the candidate."""
-        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
-        self.assertIn(
-            'current=$($BB cat /etc/libreecho/service-profile 2>/dev/null)',
-            updater,
-        )
-        self.assertIn("CURRENT_SERVICE_PROFILE=$current", updater)
-        self.assertIn('[ "$CURRENT_SERVICE_PROFILE" != diagnostic ] || return 1', updater)
-        self.assertNotIn('[ "${SERVICE_PROFILE:-production}" != diagnostic ] || return 1', updater)
-        # A diagnostic -> production install must validate retained files but
-        # must not require production daemons before the reboot boundary.
-        self.assertIn('SERVICE_PROFILE=$(manifest_value service_profile)', updater)
-        daemon_guard = updater[updater.index("feature_daemon_required()"):updater.index("write_preserved_feature_identity()")]
-        self.assertNotIn("SERVICE_PROFILE=", daemon_guard)
 
-    def test_preserve_pending_transaction_revalidates_after_staging(self) -> None:
-        """Confirmation must use identities persisted before feature staging."""
-        updater = (TOOLS_DIR / "initramfs/libreecho-update").read_text()
-        install = updater[updater.index("install_package()"):updater.index("confirm_pending()")]
-        writer = updater[updater.index("write_preserved_feature_identity()"):updater.index("verify_preserved_feature_identity()")]
-        confirm = updater[updater.index("confirm_pending()"):]
-        self.assertIn("write_preserved_feature_identity", install)
-        for field in ("payload_sha256", "payload_size", "manifest_sha256", "daemon_sha256"):
-            self.assertIn(f"feature_${{feature}}_${{field}}", writer)
-        self.assertIn(
-            "feature_policy=$($BB sed -n 's/^feature_policy=//p' \"$PENDING\")",
-            confirm,
-        )
-        self.assertIn("verify_preserved_feature_identity pending", confirm)
-        verify = updater[updater.index("verify_preserved_feature_identity()") :]
-        self.assertIn("preserved_identity_value", verify)
-        self.assertIn("preserve_feature_payload_mismatch", verify)
-        self.assertIn("preserve_feature_manifest_mismatch", verify)
-        self.assertLess(
-            confirm.index("verify_preserved_feature_identity pending"),
-            confirm.index('"$BOOTCTL" confirm'),
-        )
 
     def test_boot_control_accepts_both_supported_boot_layouts(self) -> None:
         """The pinned upstream chain names the slot stores boot_a/boot_b, while the
@@ -5141,6 +5064,16 @@ class UiTlsPackagingTests(unittest.TestCase):
             source = tmp / "ui-source"
             source.mkdir()
             (source / "Makefile").write_text("release:\n\t@true\n")
+            # The v3 packager now adapts a private source snapshot before make.
+            # Use the same pinned companion handler/overview as source CI, not
+            # an invented stub that can omit the shipped health contract.
+            companion = Path(os.environ.get("LIBREECHO_OTA_UI_SOURCE", str(TOOLS_DIR.parents[1] / ".test-ui")))
+            for relative in ("src/api.c", "web/js/app.js"):
+                origin = companion / relative
+                self.assertTrue(origin.is_file(), f"pinned companion source missing: {origin}")
+                destination = source / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(origin, destination)
             for command in (
                 ("init", "--quiet"),
                 ("config", "user.email", "fixture@example.invalid"),

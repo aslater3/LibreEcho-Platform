@@ -75,34 +75,23 @@ printf '%s\\n' "$url" "${DEV_RELEASE_TAG:-}" "${DEV_OTA_SHA256:-}"
         for data in ((TAG+'\n'+'z'*64+'\n').encode(),(TAG+'\n'+'d'*64+'\nextra\n').encode(),b'x'*257):
             self.assertNotEqual(self.run_resolver(data).returncode,0)
 
-    def test_dev_candidate_identity_includes_boot_and_v2_manifest(self):
-        import hashlib
+    def test_legacy_records_cannot_claim_v3_candidate_identity(self):
         source = SOURCE.read_text()
-        function = source.split('candidate_matches_record()\n', 1)[1].split('\ncheck_or_install()', 1)[0]
+        function = source.split('candidate_matches_record()\n', 1)[1].split('\ncheck_status_write_candidate()', 1)[0]
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root/'staging').mkdir()
-            manifest = 'format=libreecho-ota-v2\nboot_sha256=' + 'a'*64 + '\n'
-            (root/'staging/manifest').write_text(manifest)
-            digest = hashlib.sha256(manifest.encode()).hexdigest()
-            script = '''
-BB="$TEST_BB"
-ROOT="$TEST_ROOT"
-channel="$TEST_CHANNEL"
-check_value_from_file() { "$BB" sed -n "s/^$2=//p" "$1"; }
-candidate_matches_record()
-''' + function + '\ncandidate_matches_record "$ROOT/installed"\n'
-            for channel, boot, identity, expected in [
-                ('dev', 'a'*64, digest, 0),
-                ('dev', 'b'*64, digest, 0),
-                ('dev', 'a'*64, 'c'*64, 1),
-                ('dev', 'a'*64, '', 1),
-                ('stable', 'b'*64, '', 0),
-            ]:
-                (root/'installed').write_text('boot_sha256='+boot+'\nmanifest_sha256='+identity+'\n')
-                env = os.environ | dict(TEST_ROOT=tmp, TEST_CHANNEL=channel, TEST_BB=shutil.which('busybox') or '/bin/busybox')
-                result = subprocess.run(['sh','-c',script], env=env, capture_output=True, text=True)
-                self.assertEqual(result.returncode, expected, result.stderr)
+            root = Path(tmp); (root / 'staging').mkdir()
+            raw = 'format=libreecho-ota-v3\nboot_sha256=' + 'a' * 64 + '\n'
+            (root / 'staging/manifest').write_text(raw)
+            digest = hashlib.sha256(raw.encode()).hexdigest()
+            script = 'BB="$TEST_BB"\nROOT="$TEST_ROOT"\nchannel="$TEST_CHANNEL"\ncheck_value_from_file() { "$BB" sed -n "s/^$2=//p" "$1"; }\ncandidate_matches_record()\n' + function + '\ncandidate_matches_record "$ROOT/installed"\n'
+            for schema in ('1', '2'):
+                for channel in ('dev', 'stable'):
+                    (root / 'installed').write_text('schema=' + schema + '\nboot_sha256=' + 'a' * 64 + '\nmanifest_sha256=' + digest + '\n')
+                    env = os.environ | dict(TEST_ROOT=tmp, TEST_CHANNEL=channel, TEST_BB=BUSYBOX)
+                    result = subprocess.run(['sh', '-c', script], env=env, capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+        # The positive v3 and stale-record cases are signed-generation fixtures
+        # in ConvergenceTests.test_stale_installed_record_cannot_claim_current_target.
 
     def test_rejects_http_failure(self):
         self.assertNotEqual(self.run_resolver((TAG+'\n'+'d'*64+'\n').encode(),status='404').returncode,0)

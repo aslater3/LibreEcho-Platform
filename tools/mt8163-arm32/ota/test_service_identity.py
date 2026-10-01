@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import unittest
 
-SOURCE = Path(__file__).resolve().parents[1] / 'initramfs/libreecho-feature-transaction'
+SOURCE = Path(__file__).resolve().parents[1] / 'initramfs/libreecho-generation-transaction'
 
 class ServiceIdentity(unittest.TestCase):
     def probe(self, engine=True, corrupt=False, controller_bad=False, wrong_path=False, feature='airplay2'):
@@ -45,12 +45,12 @@ class ServiceIdentity(unittest.TestCase):
                 body = text[text.index('service_probe() {'):text.index('verify_required_services() {')]
                 body = body.replace('/usr/local/sbin/libreecho-airplayd', str(controller))
                 script = 'BB=/bin/busybox\n'
-                for key, val in dict(PROC_ROOT=proc, RUN_ROOT=run, VAR_RUN_ROOT=var, STAGING=staging, PROC_NET_UNIX=net).items():
+                for key, val in dict(PROC_ROOT=proc, RUN_ROOT=run, VAR_RUN_ROOT=var, STAGING=staging, PROC_NET_UNIX=net, MANIFEST=staging / 'manifest').items():
                     script += f'{key}={shlex.quote(str(val))}\n'
                 script += '''fail() { echo "ERROR:$1" >&2; exit 1; }
 regular() { [ -f "$1" ] && [ ! -L "$1" ] || fail "$2"; }
 value() { $BB sed -n "s/^$1=//p" "$2"; }
-file_hash() { $BB sha256sum "$1" | $BB cut -d ' ' -f 1; }
+hash_state() { $BB sha256sum "$1" | $BB cut -d ' ' -f 1; }
 '''
                 result = subprocess.run(['/bin/busybox', 'sh'], input=script + body + f'\nservice_probe {feature}\n', text=True, capture_output=True)
                 return result

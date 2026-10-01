@@ -195,71 +195,41 @@ class TargetCLITests(unittest.TestCase):
 
 
 class RuntimeTargetTests(unittest.TestCase):
-    def check(self, target, board, *, consumer='libreecho-update', v2=False, mutate=None):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            target_file = root / 'target'
-            if target is not None:
-                target_file.write_text('target_id=' + target + '\n')
-            staging = root / 'staging'; staging.mkdir()
-            if v2:
-                data = manifest([feature('assistant', 'replace')])
-                raw = feature_manifest.serialize_manifest(data).decode().replace('board=radar_puffin', 'board=' + board)
-                if board == 'biscuit': raw = raw.replace('libreecho-radar-puffin-', 'libreecho-biscuit-')
-            else:
-                raw = ('format=libreecho-ota-v1\nmanifest_version=1\nboard=' + board +
-                       '\nsoc=mt8163\narchitecture=armv7\nversion=0.14.0\nboot_filename=boot.img\nboot_size=16777216\nboot_sha256=' + 'a' * 64 +
-                       '\nfeature_policy=exclude\nimage_profile=ota\nservice_profile=diagnostic\nupdate_channel=dev\n')
+    def check(self, target, board, *, consumer='libreecho-update', mutate=None):
+        import test_ota_v3_integration as fixtures
+        fixture = fixtures.UpdaterTests()
+        fixture.setUp()
+        try:
+            target_file = fixture.root / 'target'
+            if target is None: target_file.unlink()
+            else: target_file.write_text('target_id=' + target + '\n')
+            raw = fixture.text.replace('board=radar_puffin', 'board=' + board)
+            if board == 'biscuit': raw = raw.replace('libreecho-radar-puffin-', 'libreecho-biscuit-')
             if mutate: raw = mutate(raw)
-            (staging / 'manifest').write_text(raw)
-            source = (TOOLS / 'initramfs' / consumer).read_text()
             if consumer == 'libreecho-update':
-                source = source.split('\ncase "${1:-}" in', 1)[0]
-                invocation = 'verify_manifest'
-            else:
-                # Only pure manifest validation plus real immutable target loader;
-                # cryptography is covered by the maintained transaction suite.
-                names = ['value', 'valid_hash', 'valid_uint', 'valid_token', 'valid_commit', 'valid_asset', 'key_allowed', 'check_manifest']
-                if 'load_image_target()' in source: names.insert(0, 'load_image_target')
-                source = '\n'.join(function(source, name) for name in names)
-                source = 'BB=/bin/busybox\n' + source
-                invocation = 'check_manifest "$STAGING/manifest"'
-            source = source.replace('/etc/libreecho/target', str(target_file))
-            harness = root / 'check.sh'
-            harness.write_text(source + '\n' +
-                f'STAGING={shlex.quote(str(staging))}\n' +
-                'channel_value() { echo dev; }\n'
-                'die() { echo "ERROR:$1" >&2; exit 1; }\n'
-                'fail() { echo "ERROR:$1" >&2; exit 1; }\n'
-                'verify_signed_manifest() { :; }\n' +
-                invocation + '\n')
-            return run(['/bin/busybox', 'sh', str(harness)])
+                return fixture.inspect(raw)
+            p, sig = fixture.signed(raw)
+            return run(['/bin/busybox', 'sh', str(TOOLS / 'initramfs/libreecho-feature-transaction'),
+                        'preflight', str(p), str(sig)], env=fixture.env)
+        finally:
+            fixture.doCleanups()
 
-    def test_missing_identity_accepts_radar_v1_and_logs(self):
+    def test_missing_identity_accepts_radar_v3_and_logs(self):
         result = self.check(None, 'radar_puffin')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('target-file=missing fallback=radar_puffin', result.stderr)
 
-    def test_same_target_v1_acceptance(self):
+    def test_same_target_v3_acceptance(self):
         for target in ('radar_puffin', 'biscuit'):
             result = self.check(target, target)
             self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_cross_target_v1_refused(self):
-        for target, board in (('radar_puffin', 'biscuit'), ('biscuit', 'radar_puffin'), (None, 'biscuit')):
-            result = self.check(target, board)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn('manifest_board', result.stderr)
-
-    def test_same_and_cross_target_v2_updater_and_transaction(self):
+    def test_cross_target_v3_refused(self):
         for consumer in ('libreecho-update', 'libreecho-feature-transaction'):
-            for target in ('radar_puffin', 'biscuit'):
-                with self.subTest(consumer=consumer, target=target):
-                    result = self.check(target, target, consumer=consumer, v2=True,
-                                        mutate=lambda raw: raw.replace('update_channel=stable', 'update_channel=dev'))
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    other = 'biscuit' if target == 'radar_puffin' else 'radar_puffin'
-                    self.assertNotEqual(self.check(target, other, consumer=consumer, v2=True).returncode, 0)
+            for target, board in (('radar_puffin', 'biscuit'), ('biscuit', 'radar_puffin'), (None, 'biscuit')):
+                result = self.check(target, board, consumer=consumer)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('manifest-board', result.stderr)
 
     def test_unknown_or_duplicate_runtime_identity_fails_closed(self):
         for target in ('unknown', '', 'radar_puffin\ntarget_id=biscuit'):
@@ -279,38 +249,13 @@ class RuntimeTargetTests(unittest.TestCase):
             self.assertEqual(self.check(None, 'radar_puffin').returncode, 0)
             self.assertNotEqual(self.check(None, 'biscuit').returncode, 0)
 
-    def test_missing_v2_identity_accepts_radar_and_logs_for_both_consumers(self):
+    def test_legacy_formats_are_refused_for_both_consumers(self):
         for consumer in ('libreecho-update', 'libreecho-feature-transaction'):
-            result = self.check(None, 'radar_puffin', consumer=consumer, v2=True,
-                                mutate=lambda raw: raw.replace('update_channel=stable', 'update_channel=dev'))
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn('target-file=missing fallback=radar_puffin', result.stderr)
-
-    def test_signed_cross_target_ota_refused_without_slot_or_bcb_writes(self):
-        import test_ota_v2_implementation as fixtures
-        for target, board in [('radar_puffin', 'biscuit'), ('biscuit', 'radar_puffin')]:
-            fixture = fixtures.RuntimeHarnessTests()
-            fixture.setUp()
-            try:
-                fixture.manifest['board'] = board
-                if board == 'biscuit':
-                    for record in fixture.manifest['features']:
-                        for field in ('asset', 'manifest_asset'):
-                            if field in record: record[field] = record[field].replace('radar-puffin', 'biscuit')
-                fixture.package.write_bytes(feature_manifest.build_control_tar(fixture.manifest, fixture.boot, fixtures.KEY))
-                identity = fixture.root / 'target'
-                identity.write_text('target_id=' + target + '\n')
-                transaction = fixtures.transaction_fixture(fixture.root, fixture.env)
-                updater = fixtures.updater_fixture(fixture.root, fixture.env, transaction)
-                updater.write_text(updater.read_text().replace('/etc/libreecho/target', str(identity)))
-                before = [(fixture.parts / f'boot_{slot}').read_bytes() for slot in ('a', 'b')]
-                result = run(['/bin/busybox', 'sh', str(updater), 'install', str(fixture.package)], env=fixture.env)
-                self.assertNotEqual(result.returncode, 0, result.stderr)
-                self.assertIn('ERROR:v2_board', result.stderr)
-                self.assertEqual(before, [(fixture.parts / f'boot_{slot}').read_bytes() for slot in ('a', 'b')])
-                self.assertFalse(fixture.bootctl_log.exists())
-            finally:
-                fixture.tearDown()
+            for fmt in ('v1', 'v2'):
+                result = self.check('radar_puffin', 'radar_puffin', consumer=consumer,
+                                    mutate=lambda raw: raw.replace('libreecho-ota-v3', 'libreecho-ota-' + fmt))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('legacy_manifest_unsupported', result.stderr)
 
     def test_first_install_marker_target_matching(self):
         source = (TOOLS / 'initramfs/libreecho-init').read_text()

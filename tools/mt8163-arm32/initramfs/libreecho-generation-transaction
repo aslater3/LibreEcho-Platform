@@ -12,6 +12,10 @@ MOUNT=${MOUNT:-/bin/mount}
 RUN_ROOT=${RUN_ROOT:-/run}
 MOUNTINFO_FILE=${MOUNTINFO_FILE:-/proc/self/mountinfo}
 LOOP_SYS_ROOT=${LOOP_SYS_ROOT:-/sys/dev/block}
+PROC_ROOT=${PROC_ROOT:-/proc}
+PROC_NET_UNIX=${PROC_NET_UNIX:-$PROC_ROOT/net/unix}
+VAR_RUN_ROOT=${VAR_RUN_ROOT:-/var/run}
+CONFIG_FILE=${CONFIG_FILE:-/data/libreecho/config/web-config.json}
 PENDING=$ROOT/pending
 fail() { printf 'ERROR:%s\n' "$1" >&2; exit 1; }
 value() { $BB sed -n "s/^$1=//p" "$2" 2>/dev/null | $BB head -n 1; }
@@ -26,6 +30,33 @@ valid_uint() {
 valid_token() { [ -n "$1" ] && [ "${#1}" -le 96 ] || return 1; case "$1" in [A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._+~:-]*) ;; *) return 1;; esac; }
 valid_commit() { [ "${#1}" -eq 40 ] || return 1; case "$1" in *[!0-9a-f]*|'') return 1;; esac; }
 valid_asset() { [ -n "$1" ] && [ "${#1}" -le 128 ] || return 1; case "$1" in [A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._+:-]*) ;; *) return 1;; esac; case "$1" in *[!A-Za-z0-9._+:-]*|*/*|*\\*) return 1;; esac; }
+
+# A missing/ambiguous owner fails closed (including the mkdir/owner-write window).
+# A dead PID or a different kernel boot identity permits serialized reclamation.
+generation_lock() {
+    local lock=$ROOT/generation.lock owner pid boot now
+    safe_path "$lock"
+    now=$($BB cat /proc/sys/kernel/random/boot_id) || fail generation-lock-boot
+    if ! $BB mkdir "$lock" 2>/dev/null; then
+        regular "$lock/owner" generation-lock-owner
+        owner=$($BB cat "$lock/owner")
+        read -r pid boot <<EOF
+$owner
+EOF
+        case "$pid" in ''|*[!0-9]*) fail generation-busy;; esac
+        [ -n "$boot" ] || fail generation-busy
+        if [ "$boot" = "$now" ] && $BB kill -0 "$pid" 2>/dev/null; then fail generation-busy; fi
+        safe_path "$lock/reclaim"
+        $BB mkdir "$lock/reclaim" 2>/dev/null || fail generation-busy
+        [ "$($BB cat "$lock/owner")" = "$owner" ] || { $BB rmdir "$lock/reclaim"; fail generation-busy; }
+        $BB rm "$lock/owner" && $BB rmdir "$lock/reclaim" && $BB rmdir "$lock" || fail generation-busy
+        $BB mkdir "$lock" 2>/dev/null || fail generation-busy
+    fi
+    printf '%s %s\n' "$$" "$now" > "$lock/owner" || fail generation-lock-write
+    $BB chmod 0600 "$lock/owner" || fail generation-lock-mode
+    trap '$BB rm -f "$ROOT/generation.lock/owner"; $BB rmdir "$ROOT/generation.lock" 2>/dev/null' EXIT
+    trap 'exit 1' HUP INT TERM
+}
 
 safe_path() {
     local path=$1 current remainder old_ifs IFS
@@ -194,6 +225,69 @@ activate_generation() {
     done
 }
 
+service_probe() {
+    local feature=$1 service socket pidfile pid exe expected engine entry found controller
+    case "$feature" in
+        airplay2) service=airplayd; socket=$RUN_ROOT/libreecho/airplay.sock;;
+        tts) service=ttsd; socket=$RUN_ROOT/libreecho/tts.sock;;
+        wakeword) service=waked; socket=$RUN_ROOT/libreecho/wakeword.sock;;
+        stt) service=sttd; socket=$RUN_ROOT/libreecho/stt.sock;;
+        assistant) service=agentd; socket=$RUN_ROOT/libreecho/agent.sock;;
+        *) fail service-feature;;
+    esac
+    pidfile=$VAR_RUN_ROOT/libreecho-$service.pid
+    regular "$pidfile" service-pidfile
+    pid=$($BB sed -n '1p' "$pidfile")
+    case "$pid" in ''|*[!0-9]*) fail service-pid;; esac
+    exe=$PROC_ROOT/$pid/exe
+    [ -f "$exe" ] || fail service-exe
+    expected=$(value "feature_${feature}_daemon_sha256" "$MANIFEST")
+    if [ "$feature" = airplay2 ]; then
+        # AirPlay's pidfile/socket belong to the boot-resident controller.
+        # The signed feature daemon identity is the separate audio engine.
+        # verify_running has already authenticated the running boot image.
+        controller=/usr/local/sbin/libreecho-airplayd
+        regular "$controller" service-controller
+        [ "$($BB readlink "$exe")" = "$controller" ] &&
+            [ "$(hash_state "$exe")" = "$(hash_state "$controller")" ] || fail service-controller-identity
+        engine=$RUN_ROOT/libreecho/features/airplay2/root/usr/local/sbin/libreecho-audio-engine
+        found=0
+        for entry in "$PROC_ROOT"/[0-9]*/exe; do
+            [ "$($BB readlink "$entry" 2>/dev/null)" = "$engine" ] || continue
+            [ "$(hash_state "$entry")" = "$expected" ] || fail service-exe-hash
+            found=1
+        done
+        [ "$found" = 1 ] || fail service-engine-missing
+    else
+        [ "$(hash_state "$exe")" = "$expected" ] || fail service-exe-hash
+    fi
+    [ -S "$socket" ] || fail service-socket
+    $BB awk -v socket="$socket" '$NF == socket { found=1 } END { exit found ? 0 : 1 }' "$PROC_NET_UNIX" >/dev/null 2>&1 || fail service-socket-owner
+}
+
+verify_required_services() {
+    local feature integrations=0
+    if [ -r "$CONFIG_FILE" ]; then
+        integrations=$($BB sed -n 's/.*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$CONFIG_FILE" | $BB head -n 1)
+        case "$integrations" in ''|*[!0-9]*) integrations=0;; esac
+    fi
+    [ "$(value service_profile "$MANIFEST")" = production ] || return 0
+    for feature in airplay2 tts wakeword stt assistant; do
+        case "$feature" in
+            airplay2) [ $((integrations & 16)) -ne 0 ] || continue;;
+            tts|stt|assistant) [ $((integrations & 1)) -eq 0 ] || continue;;
+        esac
+        service_probe "$feature"
+    done
+}
+verify_running() {
+    validate_pending
+    read_bcb
+    [ "$SELECTED" = "$SLOT" ] || fail candidate-bcb
+    verify_boot
+    activate_generation
+    verify_required_services
+}
 activate() {
     validate_pending
     read_bcb
@@ -206,6 +300,11 @@ activate_committed() {
     read_pointer current
     verify_generation
     activate_generation
+}
+write_result() {
+    printf 'schema=3\nslot=%s\ntransaction_id=%s\nversion=%s\nupdate_channel=%s\nmanifest_sha256=%s\n' \
+        "$SLOT" "$(value transaction_id "$MANIFEST")" "$(value version "$MANIFEST")" \
+        "$(value update_channel "$MANIFEST")" "$(hash_state "$MANIFEST")"
 }
 commit() {
     [ -e "$PENDING" ] || return 0
@@ -223,6 +322,7 @@ commit() {
     else
         atomic_write "$ROOT/current" printf '%s\n' "$candidate"
     fi
+    atomic_write "$ROOT/installed" write_result
     $BB rm "$PENDING" || fail pending-clear
     sync_file
 }
@@ -231,7 +331,7 @@ rollback() {
     validate_pending
     read_bcb
     [ "$SELECTED" != "$SLOT" ] && [ "$SUCCESS" = 1 ] || fail rollback-bcb
-    atomic_copy "$PENDING" "$ROOT/rolled-back"
+    atomic_write "$ROOT/rolled-back" write_result
     $BB rm "$PENDING" || fail pending-clear
     sync_file
 }
@@ -270,13 +370,43 @@ https_client() {
     mount_matches "$target" "$source"
     $BB awk -v p="$target" '$5==p {n++; opt=","$6","; if (opt !~ /,ro,/ || opt !~ /,nosuid,/ || opt !~ /,nodev,/) bad=1} END {exit n!=1 || bad}' "$MOUNTINFO_FILE" || fail mount-options
 }
+provenance() {
+    local directory digest feature kind file field observed expected output initial
+    [ ! -e "$PENDING" ] && [ ! -L "$PENDING" ] || fail provenance-pending
+    read_pointer current
+    directory=$GENERATIONS/$TX
+    initial=$(hash_state "$ROOT/current")
+    MANIFEST=$directory/target.manifest
+    "${TARGET_MANIFEST:-/usr/local/sbin/libreecho-target-manifest}" check "$MANIFEST" "$directory/target.manifest.sig" || fail provenance-target-invalid
+    digest=$(hash_state "$MANIFEST")
+    regular "$directory/COMPLETE" provenance-complete
+    [ "$($BB cat "$directory/COMPLETE")" = "$digest" ] || fail provenance-complete-mismatch
+    [ "$(value transaction_id "$MANIFEST")" = "$TX" ] || fail provenance-installed-transaction-mismatch
+    output="schema=libreecho-feature-provenance-v3\ngeneration=$TX\ntarget_manifest_sha256=$digest"
+    for feature in airplay2 tts wakeword stt assistant; do
+        for kind in payload manifest; do
+            if [ "$kind" = payload ]; then file=payload.squashfs; field=sha256; else file=manifest.json; field=manifest_sha256; fi
+            regular "$directory/features/$feature/$file" "provenance-$feature-$kind"
+            observed=$(hash_state "$directory/features/$feature/$file")
+            expected=$(value "feature_${feature}_${field}" "$MANIFEST")
+            [ "$observed" = "$expected" ] || fail "provenance-$feature-$kind-mismatch"
+            output="$output\nfeature_${feature}_${kind}_sha256=$observed\nfeature_${feature}_target_${kind}_sha256=$expected"
+        done
+    done
+    "$GENERATION_TOOL" verify "$directory" >/dev/null || fail provenance-generation-invalid
+    [ "$(hash_state "$ROOT/current")" = "$initial" ] && [ ! -e "$PENDING" ] || fail provenance-observation-changed
+    printf '%b\n' "$output"
+}
+# Observation commands never acquire or create mutable control state.
+case "${1:-}" in
+    provenance) provenance; exit $?;;
+    status) [ ! -e "$ROOT/current" ] || { read_pointer current; printf 'generation=%s\n' "$TX"; }; exit 0;;
+esac
 safe_path "$ROOT"; safe_path "$GENERATIONS"
 $BB mkdir -p "$ROOT" || fail transaction-root
-safe_path "$ROOT/generation.lock"
-$BB mkdir "$ROOT/generation.lock" 2>/dev/null || fail generation-busy
-trap '$BB rmdir "$ROOT/generation.lock" 2>/dev/null' EXIT
-trap 'exit 1' HUP INT TERM
+generation_lock
 case "${1:-}" in
+    verify-running) verify_running;;
     https-client) https_client;;
     activate|activate-mounts) activate;;
     activate-committed) activate_committed;;

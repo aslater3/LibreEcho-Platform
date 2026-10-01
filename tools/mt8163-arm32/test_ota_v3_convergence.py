@@ -84,6 +84,79 @@ print('206' if start else '200', end='')
         self.assertEqual(len(self.requests.read_text().splitlines()) if self.requests.exists() else 0, count)
         self.assertFalse((self.generations / 'test-target.partial').exists())
 
+    def test_space_policy_and_insufficient_space_fail_before_download(self):
+        for reserve, reason in [('invalid', 'space-reserve'), ('9223372036854775807', 'space-overflow'),
+                                ('1000000000000', 'generation-space')]:
+            with self.subTest(reserve=reserve):
+                old = self.env['SPACE_RESERVE_BYTES']
+                self.env['SPACE_RESERVE_BYTES'] = reserve
+                result = self.run_assembly()
+                self.env['SPACE_RESERVE_BYTES'] = old
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(reason, result.stderr)
+                self.assertFalse(self.requests.exists())
+                self.assertFalse((self.generations / 'test-target/COMPLETE').exists())
+
+    def test_verified_generation_rejects_extra_files_and_wrong_id(self):
+        self.assert_target(10)
+        directory = self.generations / 'test-target'
+        directory.chmod(0o700)
+        extra = directory / 'stray'
+        extra.write_text('not in target')
+        result = subprocess.run(['/bin/busybox', 'sh', str(GENERATION), 'verify', str(directory)], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('generation-file-set', result.stderr)
+        extra.unlink()
+        renamed = self.generations / 'other-id'
+        directory.rename(renamed)
+        result = subprocess.run(['/bin/busybox', 'sh', str(GENERATION), 'verify', str(renamed)], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('generation-identity', result.stderr)
+
+    def test_stale_installed_record_cannot_claim_current_target(self):
+        self.assert_target(10)
+        (self.control / 'current').write_text('test-target\n')
+        staging = self.control / 'staging'; staging.mkdir()
+        (staging / 'manifest').write_bytes(self.p.read_bytes())
+        record = self.control / 'installed'
+        record.write_text('schema=3\ntransaction_id=unrelated\nmanifest_sha256=' + hashlib.sha256(self.p.read_bytes()).hexdigest() + '\n')
+        source = FETCH.read_text()
+        a = source.index('candidate_matches_record()')
+        b = source.index('\n}\n', a) + 3
+        script = self.root / 'candidate-match'
+        script.write_text('BB=/bin/busybox\ncheck_value_from_file() { sed -n "s/^$2=//p" "$1"; }\n' + source[a:b] + '\ncandidate_matches_record "$ROOT/installed"\n')
+        result = subprocess.run(['/bin/busybox', 'sh', str(script)], env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0, 'stale installed identity claimed current bytes')
+        record.write_text(record.read_text().replace('unrelated', 'test-target'))
+        self.assertEqual(subprocess.run(['/bin/busybox', 'sh', str(script)], env=self.env).returncode, 0)
+        (staging / 'manifest').write_text(self.p.read_text().replace('transaction_id=test-target', 'transaction_id=new-target'))
+        self.assertNotEqual(subprocess.run(['/bin/busybox', 'sh', str(script)], env=self.env).returncode, 0)
+
+    def test_assembly_sigkill_at_each_durable_boundary_rebuilds_identically(self):
+        source = GENERATION.read_text()
+        for boundary in (1, 2, 3, 4, 5):
+            with self.subTest(boundary=boundary):
+                # Use a separate signed transaction for each boundary; prior
+                # complete generations stay untouched and retained as evidence.
+                tx = 'crash-target-' + str(boundary)
+                self.p, self.s = self.signed(self.text.replace('transaction_id=test-target', 'transaction_id=' + tx))
+                count = self.root / 'sync-count'; count.write_text('0')
+                script = self.root / 'crash-builder'
+                script.write_text(source.replace('sync_file() { $BB sync 2>/dev/null || fail sync-failed; }',
+                    'sync_file() { $BB sync; n=$(( $(cat "$SYNC_COUNT") + 1 )); echo "$n" > "$SYNC_COUNT"; [ "$n" != "$CRASH_BOUNDARY" ] || kill -KILL $$; }'))
+                result = subprocess.run(['/bin/busybox', 'sh', str(script), 'assemble', str(self.p), str(self.s)],
+                    env=dict(self.env, SYNC_COUNT=str(count), CRASH_BOUNDARY=str(boundary)), capture_output=True)
+                self.assertEqual(result.returncode, -9)
+                result = self.run_assembly()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                directory = self.generations / tx
+                result = subprocess.run(['/bin/busybox', 'sh', str(GENERATION), 'verify', str(directory)], env=self.env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for feature, (payload, metadata) in self.assets.items():
+                    self.assertEqual((directory / 'features' / feature / 'payload.squashfs').read_bytes(), payload)
+                    self.assertEqual((directory / 'features' / feature / 'manifest.json').read_bytes(), metadata)
+                self.assertFalse((self.generations / (tx + '.partial')).exists())
+
     def test_empty(self):
         self.assert_target(10)
 
