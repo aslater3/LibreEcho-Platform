@@ -32,6 +32,15 @@ class FailurePolicyTests(grammar.SignedFixture):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(calls.read_text().splitlines(), expected)
 
+    def test_boot_calls_image_schema_gate_and_keeps_web_on_config_error(self):
+        source = (TOOLS / 'initramfs/libreecho-init').read_text()
+        a = source.index('start_ui_services()')
+        b = source.index('\n}\n', a) + 3
+        body = source[a:b]
+        self.assertIn('CONFIG_MIGRATE', body, 'boot never applies the image config schema gate')
+        self.assertIn('config_schema', body)
+        self.assertIn('config-schema-degraded', body)
+
     def test_feature_failure_starts_web_but_not_feature_daemons(self):
         source = (TOOLS / 'initramfs/libreecho-init').read_text()
         a = source.index('start_ui_services()')
