@@ -54,7 +54,7 @@ for daemon in ('libreecho-audio-engine','libreecho-ttsd','libreecho-waked','libr
     p.write_bytes(b'daemon')
 ''')
         mount.chmod(0o755)
-        self.env.update(BOOTCTL=str(bootctl), BCB_SOURCE=str(self.bcb), CMDLINE_FILE=str(self.cmdline),
+        self.env.update(GENERATION_TRANSACTION=str(TOOLS / 'initramfs/libreecho-generation-transaction'), BOOTCTL=str(bootctl), BCB_SOURCE=str(self.bcb), CMDLINE_FILE=str(self.cmdline),
                         BOOT_A=str(self.boot_a), BOOT_B=str(self.boot), MOUNT=str(mount),
                         MOUNTINFO_FILE=str(self.mountinfo), LOOP_SYS_ROOT=str(self.loops),
                         RUN_ROOT=str(self.runroot), MOUNT_LOG=str(self.mount_log))

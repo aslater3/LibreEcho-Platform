@@ -1,0 +1,268 @@
+#!/bin/busybox sh
+# Signed whole-generation boot-slot transaction, no per-file switching.
+BB=/bin/busybox
+ROOT=${ROOT:-/data/libreecho/update}
+GENERATIONS=${GENERATIONS:-/data/libreecho/generations}
+GENERATION_TOOL=${GENERATION_TOOL:-/usr/local/sbin/libreecho-generation}
+BOOTCTL=${BOOTCTL:-/usr/local/sbin/libreecho-bootctl}
+CMDLINE_FILE=${CMDLINE_FILE:-/proc/cmdline}
+BOOT_A=${BOOT_A:-/dev/mmcblk0p10}
+BOOT_B=${BOOT_B:-/dev/mmcblk0p11}
+MOUNT=${MOUNT:-/bin/mount}
+RUN_ROOT=${RUN_ROOT:-/run}
+MOUNTINFO_FILE=${MOUNTINFO_FILE:-/proc/self/mountinfo}
+LOOP_SYS_ROOT=${LOOP_SYS_ROOT:-/sys/dev/block}
+PENDING=$ROOT/pending
+fail() { printf 'ERROR:%s\n' "$1" >&2; exit 1; }
+value() { $BB sed -n "s/^$1=//p" "$2" 2>/dev/null | $BB head -n 1; }
+valid_hash() { [ "${#1}" -eq 64 ] || return 1; case "$1" in *[!0-9a-f]*|'') return 1;; esac; }
+valid_uint() {
+    local value=$1
+    case "$value" in 0|[1-9]|[1-9][0-9]*) ;; *) return 1;; esac
+    [ "${#value}" -lt 19 ] ||
+        { [ "${#value}" -eq 19 ] && [ "$value" \< "9223372036854775808" ]; } ||
+        return 1
+}
+valid_token() { [ -n "$1" ] && [ "${#1}" -le 96 ] || return 1; case "$1" in [A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._+~:-]*) ;; *) return 1;; esac; }
+valid_commit() { [ "${#1}" -eq 40 ] || return 1; case "$1" in *[!0-9a-f]*|'') return 1;; esac; }
+valid_asset() { [ -n "$1" ] && [ "${#1}" -le 128 ] || return 1; case "$1" in [A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._+:-]*) ;; *) return 1;; esac; case "$1" in *[!A-Za-z0-9._+:-]*|*/*|*\\*) return 1;; esac; }
+
+safe_path() {
+    local path=$1 current remainder old_ifs IFS
+    case "$path" in *[!A-Za-z0-9._/+:-]*) fail invalid-path ;; esac
+    case "$path" in
+        /|*//*|*/./*|*/../*|*/..|*/.) fail invalid-path ;;
+        /*) ;;
+        *) fail nonabsolute-path ;;
+    esac
+    [ "$path" != / ] || fail root-path
+    current=/
+    remainder=${path#/}
+    old_ifs=$IFS
+    IFS=/
+    set -f
+    set -- $remainder
+    set +f
+    IFS=$old_ifs
+    for component do
+        [ -n "$component" ] || continue
+        if [ "$current" = / ]; then current=/$component; else current=$current/$component; fi
+        [ ! -L "$current" ] || fail symlink-path
+    done
+}
+
+regular() {
+    safe_path "$1"
+    [ -f "$1" ] && [ ! -L "$1" ] || fail "$2-not-regular"
+}
+sync_file() { $BB sync 2>/dev/null || fail sync-failed; }
+atomic_write() {
+    local target=$1 tmp=$1.tmp; shift
+    safe_path "$target"; safe_path "$tmp"
+    [ ! -L "$tmp" ] || fail journal-temp-symlink
+    { "$@"; } > "$tmp" || fail journal-write
+    $BB chmod 0600 "$tmp" 2>/dev/null || fail journal-mode
+    $BB mv "$tmp" "$target" || fail journal-rename
+    sync_file
+}
+atomic_copy() {
+    local source=$1 target=$2 tmp=$2.tmp
+    regular "$source" intent-source
+    safe_path "$target"; safe_path "$tmp"
+    [ ! -L "$tmp" ] || fail journal-temp-symlink
+    $BB cp "$source" "$tmp" || fail journal-copy
+    $BB chmod 0600 "$tmp" 2>/dev/null || fail journal-mode
+    $BB mv "$tmp" "$target" || fail journal-rename
+    sync_file
+}
+
+# Return a content hash or the explicit absence marker.  Anything other than a
+# regular file is an ambiguity, never an absent file.
+hash_state() {
+    local path=$1 digest
+    safe_path "$path"
+    [ ! -L "$path" ] || fail symlink-path
+    if [ -e "$path" ]; then
+        [ -f "$path" ] || fail nonregular-path
+        digest=$(sha256sum "$path" 2>/dev/null | $BB awk '{print $1}') || fail hash-read
+        valid_hash "$digest" || fail hash-read
+        printf '%s\n' "$digest"
+    else
+        printf '%s\n' none
+    fi
+}
+
+
+
+valid_id() {
+    case "$1" in ''|.|..|*[!A-Za-z0-9._+~:-]*) fail generation-id;; esac
+    [ "${#1}" -le 96 ] || fail generation-id
+}
+
+mount_matches() {
+    local target=$1 source=$2 record device mounted mount_root filesystem loop backing
+    [ -r "$MOUNTINFO_FILE" ] || fail mountinfo-unavailable
+    record=$($BB awk -v target="$target" '
+        $5 == target {
+            total++;
+            for (i=7; i<=NF; i++) if ($i == "-") {
+                row=$3 " " $4 " " $(i+1) " " $(i+2); break
+            }
+        }
+        END { if (total != 1 || row == "") exit 1; print row }
+    ' "$MOUNTINFO_FILE") || fail candidate-mount-identity
+    read -r device mount_root filesystem mounted <<EOF
+$record
+EOF
+    # Direct sources remain supported. Linux loop mounts instead report the
+    # block device; bind identity to its kernel-reported backing file, never
+    # merely accept any loop source at the expected target.
+    [ "$mounted" = "$source" ] && return 0
+    case "$device" in 7:[0-9]*) ;; *) fail candidate-mount-identity;; esac
+    case "${device#7:}" in *[!0-9]*|'') fail candidate-mount-identity;; esac
+    [ "$mounted" = "/dev/loop${device#7:}" ] &&
+        [ "$filesystem" = squashfs ] && [ "$mount_root" = / ] || fail candidate-mount-identity
+    loop=$LOOP_SYS_ROOT/$device/loop
+    backing=$($BB cat "$loop/backing_file" 2>/dev/null) || fail candidate-mount-identity
+    [ "$backing" = "$source" ] || fail candidate-mount-identity
+    regular "$source" candidate-mount-source
+    [ "$($BB cat "$loop/offset" 2>/dev/null)" = 0 ] &&
+        [ "$($BB cat "$loop/sizelimit" 2>/dev/null)" = 0 ] || fail candidate-mount-identity
+}
+
+
+read_pointer() {
+    regular "$ROOT/$1" "$1"
+    TX=$($BB cat "$ROOT/$1"); valid_id "$TX"
+    safe_path "$GENERATIONS/$TX"
+}
+
+validate_pending() {
+    local keys
+    regular "$PENDING" pending
+    keys=$($BB sed 's/=.*//' "$PENDING" | $BB tr '\n' ' ')
+    [ "$keys" = 'schema slot transaction_id manifest_sha256 ' ] || fail pending-grammar
+    [ "$(value schema "$PENDING")" = 3 ] || fail legacy_manifest_unsupported
+    SLOT=$(value slot "$PENDING"); case "$SLOT" in a|b) ;; *) fail pending-slot;; esac
+    TX=$(value transaction_id "$PENDING"); valid_id "$TX"
+    verify_generation
+    [ "$(value manifest_sha256 "$PENDING")" = "$(hash_state "$GENERATIONS/$TX/target.manifest")" ] || fail pending-manifest
+}
+verify_generation() {
+    safe_path "$GENERATIONS/$TX"
+    "$GENERATION_TOOL" verify "$GENERATIONS/$TX" || fail generation-invalid
+    MANIFEST=$GENERATIONS/$TX/target.manifest
+}
+
+read_bcb() {
+    local bcb running
+    bcb=$("$BOOTCTL" status) || fail boot-control-read
+    [ "$(printf '%s\n' "$bcb" | $BB grep -c '^selected_slot=')" = 1 ] || fail bcb-grammar
+    SELECTED=$(printf '%s\n' "$bcb" | $BB sed -n 's/^selected_slot=//p')
+    case "$SELECTED" in a|b) ;; *) fail bcb-selected;; esac
+    [ "$(printf '%s\n' "$bcb" | $BB grep -c "^slot_${SELECTED}_success=")" = 1 ] || fail bcb-grammar
+    SUCCESS=$(printf '%s\n' "$bcb" | $BB sed -n "s/^slot_${SELECTED}_success=//p")
+    case "$SUCCESS" in 0|1) ;; *) fail bcb-success;; esac
+    running=$($BB tr ' ' '\n' < "$CMDLINE_FILE" | $BB sed -n 's/^androidboot.slot_suffix=_//p')
+    case "$running" in a|b) ;; *) fail running-slot;; esac
+    [ "$running" = "$SELECTED" ] || fail running-selected-mismatch
+}
+verify_boot() {
+    local device actual
+    if [ "$SLOT" = a ]; then device=$BOOT_A; else device=$BOOT_B; fi
+    safe_path "$device"
+    [ -b "$device" ] || [ -f "$device" ] || fail boot-device
+    actual=$($BB dd if="$device" bs=4096 count=4096 2>/dev/null | $BB sha256sum | $BB awk '{print $1}')
+    [ "$actual" = "$(value boot_sha256 "$MANIFEST")" ] || fail boot-hash
+}
+
+activate_generation() {
+    local feature source target daemon
+    for feature in airplay2 tts wakeword stt assistant; do
+        source=$GENERATIONS/$TX/features/$feature/payload.squashfs
+        target=$RUN_ROOT/libreecho/features/$feature/root
+        safe_path "$target"
+        $BB mkdir -p "$target" || fail mount-directory
+        if ! $BB awk -v p="$target" '$5==p {found=1} END {exit !found}' "$MOUNTINFO_FILE"; then
+            "$MOUNT" -t squashfs -o ro,loop,nosuid,nodev "$source" "$target" || fail "feature-$feature-mount"
+        fi
+        mount_matches "$target" "$source"
+        $BB awk -v p="$target" '$5==p {n++; opt=","$6","; if (opt !~ /,ro,/ || opt !~ /,nosuid,/ || opt !~ /,nodev,/) bad=1} END {exit n!=1 || bad}' "$MOUNTINFO_FILE" || fail mount-options
+        daemon=$(value "feature_${feature}_daemon_path" "$MANIFEST")
+        regular "$target/$daemon" feature-daemon
+        [ "$(hash_state "$target/$daemon")" = "$(value "feature_${feature}_daemon_sha256" "$MANIFEST")" ] || fail "feature-$feature-daemon-hash"
+    done
+}
+
+activate() {
+    validate_pending
+    read_bcb
+    [ "$SELECTED" = "$SLOT" ] && [ "$SUCCESS" = 0 ] || fail candidate-bcb
+    verify_boot
+    activate_generation
+}
+activate_committed() {
+    [ -e "$ROOT/current" ] || return 0
+    read_pointer current
+    verify_generation
+    activate_generation
+}
+commit() {
+    [ -e "$PENDING" ] || return 0
+    validate_pending
+    read_bcb
+    [ "$SELECTED" = "$SLOT" ] && [ "$SUCCESS" = 1 ] || fail commit-bcb
+    verify_boot
+    candidate=$TX
+    if [ -e "$ROOT/current" ]; then
+        read_pointer current
+        if [ "$TX" != "$candidate" ]; then
+            atomic_write "$ROOT/previous" printf '%s\n' "$TX"
+            atomic_write "$ROOT/current" printf '%s\n' "$candidate"
+        fi
+    else
+        atomic_write "$ROOT/current" printf '%s\n' "$candidate"
+    fi
+    $BB rm "$PENDING" || fail pending-clear
+    sync_file
+}
+rollback() {
+    [ -e "$PENDING" ] || return 0
+    validate_pending
+    read_bcb
+    [ "$SELECTED" != "$SLOT" ] && [ "$SUCCESS" = 1 ] || fail rollback-bcb
+    atomic_copy "$PENDING" "$ROOT/rolled-back"
+    $BB rm "$PENDING" || fail pending-clear
+    sync_file
+}
+gc() {
+    local keep= id directory
+    for id in current previous; do
+        if [ -e "$ROOT/$id" ]; then read_pointer "$id"; keep="$keep $TX"; fi
+    done
+    if [ -e "$PENDING" ]; then validate_pending; keep="$keep $TX"; fi
+    # Validate the complete deletion set before deleting anything.
+    for directory in "$GENERATIONS"/*; do
+        [ -e "$directory" ] || [ -L "$directory" ] || continue
+        safe_path "$directory"
+        [ -d "$directory" ] && [ -z "$($BB find "$directory" -type l)" ] || fail gc-type
+        id=${directory##*/}; valid_id "$id"
+    done
+    for directory in "$GENERATIONS"/*; do
+        [ -d "$directory" ] || continue
+        id=${directory##*/}
+        case " $keep " in *" $id "*) continue;; esac
+        $BB find "$directory" -type d -exec $BB chmod 0700 '{}' ';' || fail gc-mode
+        $BB rm -rf "$directory" || fail gc-delete
+    done
+    sync_file
+}
+safe_path "$ROOT"; safe_path "$GENERATIONS"
+case "${1:-}" in
+    activate|activate-mounts) activate;;
+    activate-committed) activate_committed;;
+    commit|commit-after-confirm) commit;;
+    rollback|fallback) rollback;;
+    gc) gc;;
+    *) fail usage;;
+esac

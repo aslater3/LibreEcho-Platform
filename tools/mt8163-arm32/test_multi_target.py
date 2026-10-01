@@ -505,6 +505,9 @@ class RadarTreeDiffTests(unittest.TestCase):
     # copies), which the combined tree necessarily stages on top of the base.
     ALLOWED = {'etc/libreecho/target', 'usr/local/sbin/libreecho-update',
                'usr/local/sbin/libreecho-feature-transaction', 'init', 'libreecho-init',
+               'usr/local/sbin/libreecho-target-manifest',
+               'usr/local/sbin/libreecho-generation',
+               'usr/local/sbin/libreecho-generation-transaction',
                'usr/local/sbin/libreecho-bootctl',
                'usr/local/sbin/libreecho-recovery-ap-probe',
                'usr/local/sbin/libreecho-recovery-ap-ready',

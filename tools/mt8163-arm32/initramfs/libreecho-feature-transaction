@@ -2,6 +2,13 @@
 # Crash-safe reboot-bound feature transaction journal.
 # The signed manifest and its signature digest bind every prepared operation.
 BB=/bin/busybox
+# V3 state never enters the retired per-file transaction implementation.
+v3_root=${ROOT:-/data/libreecho/update}
+v3_schema=$($BB sed -n 's/^schema=//p' "$v3_root/pending" 2>/dev/null)
+case "${1:-}" in activate|commit|rollback|gc) v3_schema=3;; esac
+if [ "$v3_schema" = 3 ] || [ -e "$v3_root/current" ]; then
+    exec /bin/busybox sh "${GENERATION_TRANSACTION:-/usr/local/sbin/libreecho-generation-transaction}" "$@"
+fi
 ROOT=/data/libreecho/update
 STAGING=$ROOT/staging
 FEATURES=/data/libreecho/features

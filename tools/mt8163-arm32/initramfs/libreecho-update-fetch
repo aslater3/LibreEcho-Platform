@@ -2,6 +2,12 @@
 # GitHub Releases transport for the signed LibreEcho OTA installer.
 
 BB=/bin/busybox
+# The explicit host/recovery assembly surface uses the same immutable engine
+# as the normal fetch path, before touching any legacy transport state.
+if [ "${1:-}" = assemble-generation ]; then
+    [ "$#" = 3 ] || exit 2
+    exec /bin/busybox sh "${GENERATION_TOOL:-/usr/local/sbin/libreecho-generation}" assemble "$2" "$3"
+fi
 UPDATE=/usr/local/sbin/libreecho-update
 CONFIG=/etc/libreecho/ota-source.conf
 PROFILE=/etc/libreecho/image-profile

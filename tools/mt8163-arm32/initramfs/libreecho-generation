@@ -1,0 +1,232 @@
+#!/bin/busybox sh
+# Whole, immutable generation assembly and verification.
+BB=/bin/busybox
+ROOT=${ROOT:-/data/libreecho/update}
+GENERATIONS=${GENERATIONS:-/data/libreecho/generations}
+TARGET_MANIFEST=${TARGET_MANIFEST:-/usr/local/sbin/libreecho-target-manifest}
+CURL=${CURL:-/usr/bin/curl}
+CA=${CA:-/etc/ssl/certs/ca-certificates.crt}
+SPACE_RESERVE_BYTES=${SPACE_RESERVE_BYTES:-262144}
+fail() { printf 'ERROR:%s\n' "$1" >&2; exit 1; }
+value() { $BB sed -n "s/^$1=//p" "$2" 2>/dev/null | $BB head -n 1; }
+valid_hash() { [ "${#1}" -eq 64 ] || return 1; case "$1" in *[!0-9a-f]*|'') return 1;; esac; }
+valid_uint() {
+    local value=$1
+    case "$value" in 0|[1-9]|[1-9][0-9]*) ;; *) return 1;; esac
+    [ "${#value}" -lt 19 ] ||
+        { [ "${#value}" -eq 19 ] && [ "$value" \< "9223372036854775808" ]; } ||
+        return 1
+}
+valid_token() { [ -n "$1" ] && [ "${#1}" -le 96 ] || return 1; case "$1" in [A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._+~:-]*) ;; *) return 1;; esac; }
+valid_commit() { [ "${#1}" -eq 40 ] || return 1; case "$1" in *[!0-9a-f]*|'') return 1;; esac; }
+valid_asset() { [ -n "$1" ] && [ "${#1}" -le 128 ] || return 1; case "$1" in [A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._+:-]*) ;; *) return 1;; esac; case "$1" in *[!A-Za-z0-9._+:-]*|*/*|*\\*) return 1;; esac; }
+
+safe_path() {
+    local path=$1 current remainder old_ifs IFS
+    case "$path" in *[!A-Za-z0-9._/+:-]*) fail invalid-path ;; esac
+    case "$path" in
+        /|*//*|*/./*|*/../*|*/..|*/.) fail invalid-path ;;
+        /*) ;;
+        *) fail nonabsolute-path ;;
+    esac
+    [ "$path" != / ] || fail root-path
+    current=/
+    remainder=${path#/}
+    old_ifs=$IFS
+    IFS=/
+    set -f
+    set -- $remainder
+    set +f
+    IFS=$old_ifs
+    for component do
+        [ -n "$component" ] || continue
+        if [ "$current" = / ]; then current=/$component; else current=$current/$component; fi
+        [ ! -L "$current" ] || fail symlink-path
+    done
+}
+
+regular() {
+    safe_path "$1"
+    [ -f "$1" ] && [ ! -L "$1" ] || fail "$2-not-regular"
+}
+sync_file() { $BB sync 2>/dev/null || fail sync-failed; }
+atomic_write() {
+    local target=$1 tmp=$1.tmp; shift
+    safe_path "$target"; safe_path "$tmp"
+    [ ! -L "$tmp" ] || fail journal-temp-symlink
+    { "$@"; } > "$tmp" || fail journal-write
+    $BB chmod 0600 "$tmp" 2>/dev/null || fail journal-mode
+    $BB mv "$tmp" "$target" || fail journal-rename
+    sync_file
+}
+atomic_copy() {
+    local source=$1 target=$2 tmp=$2.tmp
+    regular "$source" intent-source
+    safe_path "$target"; safe_path "$tmp"
+    [ ! -L "$tmp" ] || fail journal-temp-symlink
+    $BB cp "$source" "$tmp" || fail journal-copy
+    $BB chmod 0600 "$tmp" 2>/dev/null || fail journal-mode
+    $BB mv "$tmp" "$target" || fail journal-rename
+    sync_file
+}
+
+# Return a content hash or the explicit absence marker.  Anything other than a
+# regular file is an ambiguity, never an absent file.
+hash_state() {
+    local path=$1 digest
+    safe_path "$path"
+    [ ! -L "$path" ] || fail symlink-path
+    if [ -e "$path" ]; then
+        [ -f "$path" ] || fail nonregular-path
+        digest=$(sha256sum "$path" 2>/dev/null | $BB awk '{print $1}') || fail hash-read
+        valid_hash "$digest" || fail hash-read
+        printf '%s\n' "$digest"
+    else
+        printf '%s\n' none
+    fi
+}
+
+
+
+valid_id() {
+    case "$1" in ''|.|..|*[!A-Za-z0-9._+~:-]*) fail generation-id;; esac
+    [ "${#1}" -le 96 ] || fail generation-id
+}
+
+matches() {
+    local file=$1 size=$2 digest=$3
+    safe_path "$file"
+    [ -f "$file" ] && [ ! -L "$file" ] &&
+        [ "$($BB stat -c %s "$file")" = "$size" ] &&
+        [ "$(hash_state "$file")" = "$digest" ]
+}
+
+verify_tree() {
+    local directory=$1 manifest=$1/target.manifest feature kind file size digest actual expected
+    safe_path "$directory"
+    regular "$directory/COMPLETE" complete
+    "$TARGET_MANIFEST" check "$manifest" "$directory/target.manifest.sig" || fail target-invalid
+    [ "$($BB cat "$directory/COMPLETE")" = "$(hash_state "$manifest")" ] || fail complete-hash
+    [ "$(value transaction_id "$manifest")" = "${2:-${directory##*/}}" ] || fail generation-identity
+    expected='COMPLETE
+features
+target.manifest
+target.manifest.sig'
+    for feature in airplay2 tts wakeword stt assistant; do
+        expected="$expected
+features/$feature
+features/$feature/manifest.json
+features/$feature/payload.squashfs"
+        for kind in payload manifest; do
+            if [ "$kind" = payload ]; then file=payload.squashfs; size=size; digest=sha256
+            else file=manifest.json; size=manifest_size; digest=manifest_sha256; fi
+            matches "$directory/features/$feature/$file" "$(value "feature_${feature}_${size}" "$manifest")" "$(value "feature_${feature}_${digest}" "$manifest")" || fail "feature-$feature-$kind-hash"
+        done
+    done
+    [ -z "$($BB find "$directory" -type l)" ] || fail generation-symlink
+    actual=$($BB find "$directory" -mindepth 1 | $BB sed "s#^$directory/##" | $BB sort)
+    [ "$actual" = "$(printf '%s\n' "$expected" | $BB sort)" ] || fail generation-file-set
+}
+
+assemble() {
+    local manifest=$1 signature=$2 tx partial dest current= source feature kind file asset size digest part http rc needed=0 bytes available
+    "$TARGET_MANIFEST" check "$manifest" "$signature" || fail target-invalid
+    tx=$(value transaction_id "$manifest"); valid_id "$tx"
+    safe_path "$ROOT"; safe_path "$GENERATIONS"
+    $BB mkdir -p "$ROOT" "$GENERATIONS" || fail generation-root
+    safe_path "$ROOT/generation.lock"
+    $BB mkdir "$ROOT/generation.lock" 2>/dev/null || fail generation-busy
+    trap '$BB rmdir "$ROOT/generation.lock" 2>/dev/null' EXIT
+    trap 'exit 1' HUP INT TERM
+    dest=$GENERATIONS/$tx; partial=$GENERATIONS/$tx.partial
+    safe_path "$dest"; safe_path "$partial"
+    if [ -e "$dest" ]; then
+        verify_tree "$dest" "$tx"
+        [ "$(hash_state "$dest/target.manifest")" = "$(hash_state "$manifest")" ] || fail generation-collision
+        return 0
+    fi
+    if [ -e "$ROOT/current" ]; then
+        regular "$ROOT/current" current
+        current=$($BB cat "$ROOT/current"); valid_id "$current"
+        safe_path "$GENERATIONS/$current"
+    fi
+    # Discard only this transaction's unpublished assembly, never a generation.
+    if [ -e "$partial" ]; then
+        [ -d "$partial" ] && [ -z "$($BB find "$partial" -type l)" ] || fail partial-type
+        $BB find "$partial" -type d -exec $BB chmod 0700 '{}' ';' || fail partial-mode
+        $BB rm -rf "$partial" || fail partial-discard
+    fi
+    safe_path "$ROOT/asset-cache"; $BB mkdir -p "$ROOT/asset-cache" || fail cache-create
+    for feature in airplay2 tts wakeword stt assistant; do
+        for kind in payload manifest; do
+            if [ "$kind" = payload ]; then file=payload.squashfs; size=size; digest=sha256
+            else file=manifest.json; size=manifest_size; digest=manifest_sha256; fi
+            bytes=$(value "feature_${feature}_${size}" "$manifest")
+            if [ -n "$current" ] && matches "$GENERATIONS/$current/features/$feature/$file" "$bytes" "$(value "feature_${feature}_${digest}" "$manifest")"; then continue; fi
+            # Block-round allocations and reject arithmetic overflow before write.
+            [ "$bytes" -le 9223372036854767615 ] || fail space-overflow
+            bytes=$(((bytes + 4095) / 4096 * 4096))
+            [ "$needed" -le "$((9223372036854775807 - bytes))" ] || fail space-overflow
+            needed=$((needed + bytes))
+        done
+    done
+    case "$SPACE_RESERVE_BYTES" in ''|*[!0-9]*) fail space-reserve;; esac
+    [ "$SPACE_RESERVE_BYTES" -le "$((9223372036854775807 - needed))" ] || fail space-overflow
+    needed=$((needed + SPACE_RESERVE_BYTES + 65536))
+    available=$($BB df -Pk "$GENERATIONS" | $BB awk 'NR==2 {print $4}')
+    case "$available" in ''|*[!0-9]*) fail space-probe;; esac
+    [ "$available" -ge "$(((needed + 1023) / 1024))" ] || fail generation-space
+    $BB mkdir -p "$partial/features" || fail partial-create
+    atomic_copy "$manifest" "$partial/target.manifest"
+    atomic_copy "$signature" "$partial/target.manifest.sig"
+    for feature in airplay2 tts wakeword stt assistant; do
+        $BB mkdir "$partial/features/$feature" || fail feature-create
+        for kind in payload manifest; do
+            if [ "$kind" = payload ]; then file=payload.squashfs; asset=asset; size=size; digest=sha256
+            else file=manifest.json; asset=manifest_asset; size=manifest_size; digest=manifest_sha256; fi
+            asset=$(value "feature_${feature}_${asset}" "$manifest")
+            size=$(value "feature_${feature}_${size}" "$manifest")
+            digest=$(value "feature_${feature}_${digest}" "$manifest")
+            source=$GENERATIONS/$current/features/$feature/$file
+            if [ -n "$current" ] && matches "$source" "$size" "$digest"; then
+                $BB ln "$source" "$partial/features/$feature/$file" || fail generation-link
+                matches "$partial/features/$feature/$file" "$size" "$digest" || fail generation-link-hash
+                continue
+            fi
+            part=$ROOT/asset-cache/$digest.part; safe_path "$part"
+            if [ -e "$part" ]; then
+                regular "$part" asset-part
+                if [ "$($BB stat -c %s "$part")" -ge "$size" ] && ! matches "$part" "$size" "$digest"; then
+                    $BB mv "$part" "$ROOT/asset-cache/$digest.bad" || fail asset-quarantine
+                fi
+            fi
+            if ! matches "$part" "$size" "$digest"; then
+                http=$("$CURL" --fail --location --silent --show-error --proto '=https' --proto-redir '=https' \
+                    --tlsv1.2 --cacert "$CA" --connect-timeout 20 --max-time 1800 --max-filesize "$size" \
+                    --output "$part" --write-out '%{http_code}' --continue-at - \
+                    "https://github.com/aslater3/LibreEcho/releases/download/$(value release "$manifest")/$asset")
+                rc=$?
+                [ "$rc" = 0 ] || fail download-asset-transport
+                case "$http" in 2??) ;; *) fail download-asset-http;; esac
+                if ! matches "$part" "$size" "$digest"; then
+                    $BB mv "$part" "$ROOT/asset-cache/$digest.bad" || fail asset-quarantine
+                    fail download-asset-hash
+                fi
+            fi
+            $BB mv "$part" "$partial/features/$feature/$file" || fail asset-rename
+        done
+    done
+    atomic_write "$partial/COMPLETE" printf '%s\n' "$(hash_state "$manifest")"
+    verify_tree "$partial" "$tx"
+    $BB find "$partial" -type f -exec $BB chmod 0400 '{}' ';' || fail generation-mode
+    $BB find "$partial" -type d -exec $BB chmod 0500 '{}' ';' || fail generation-mode
+    sync_file
+    $BB mv "$partial" "$dest" || fail generation-publish
+    sync_file
+    printf 'generation=%s\n' "$tx"
+}
+case "${1:-}" in
+    assemble) [ "$#" = 3 ] || fail usage; assemble "$2" "$3";;
+    verify) [ "$#" = 2 ] || fail usage; verify_tree "$2";;
+    *) fail usage;;
+esac
