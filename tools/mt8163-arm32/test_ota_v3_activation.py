@@ -170,6 +170,20 @@ for daemon in ('libreecho-audio-engine','libreecho-ttsd','libreecho-waked','libr
         p.write_bytes(b'corrupted')
         self.assertNotEqual(self.verb('activate-committed').returncode, 0)
 
+    def test_https_client_ignores_corrupt_unrelated_feature(self):
+        self.prepared()
+        (self.control / 'current').write_text('test-target\n')
+        (self.control / 'pending').unlink()
+        payload = self.generations / 'test-target/features/stt/payload.squashfs'
+        payload.chmod(0o600); payload.write_bytes(b'corrupted')
+        result = self.verb('https-client')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        assistant = self.generations / 'test-target/features/assistant/payload.squashfs'
+        assistant.chmod(0o600); assistant.write_bytes(b'corrupted')
+        result = self.verb('https-client')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('https-transport-corrupt', result.stderr)
+
     def test_https_client_mount_is_bound_to_signed_current_generation(self):
         self.prepared()
         (self.control / 'current').write_text('test-target\n')

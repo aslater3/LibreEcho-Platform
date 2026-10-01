@@ -267,3 +267,14 @@ banner. Platform's build-time companion UI adapter applies these fields to a
 private source snapshot and records its digest; it never edits a device or the
 caller's UI checkout. Host C/JS fixtures verify the status serializer and banner;
 these are not hardware or hosted-CI qualification.
+
+### Repair transport limitation
+
+The HTTPS mount verifies the current target manifest signature and only the
+assistant payload and feature manifest size/digest pins. Corrupt STT or another
+unrelated feature does not prevent fetching a repair. A corrupt assistant fails
+`https-transport-corrupt`; fetch uses `/usr/bin/curl` plus
+`/etc/ssl/certs/ca-certificates.crt` only if both exist as boot-resident regular
+files. Otherwise it fails `https_transport_unavailable`. Images without this
+optional boot client require recovery/local install to repair the transport;
+no new bootstrap client is implied.

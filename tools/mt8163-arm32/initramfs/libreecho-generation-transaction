@@ -374,8 +374,23 @@ gc() {
     sync_file
 }
 https_client() {
+    local directory feature kind file size digest
     read_pointer current
-    verify_generation
+    directory=$GENERATIONS/$TX
+    MANIFEST=$directory/target.manifest
+    regular "$MANIFEST" https-target
+    regular "$directory/target.manifest.sig" https-signature
+    "${TARGET_MANIFEST:-/usr/local/sbin/libreecho-target-manifest}" check "$MANIFEST" "$directory/target.manifest.sig" || fail https-target-invalid
+    [ "$(value transaction_id "$MANIFEST")" = "$TX" ] || fail https-target-identity
+    # Repair transport authenticates only its own signed bytes; unrelated feature
+    # corruption is precisely what an update must be able to repair.
+    for kind in payload manifest; do
+        if [ "$kind" = payload ]; then file=payload.squashfs; size=size; digest=sha256
+        else file=manifest.json; size=manifest_size; digest=manifest_sha256; fi
+        regular "$directory/features/assistant/$file" https-transport
+        [ "$($BB stat -c %s "$directory/features/assistant/$file")" = "$(value "feature_assistant_$size" "$MANIFEST")" ] &&
+            [ "$(hash_state "$directory/features/assistant/$file")" = "$(value "feature_assistant_$digest" "$MANIFEST")" ] || fail https-transport-corrupt
+    done
     source=$GENERATIONS/$TX/features/assistant/payload.squashfs
     target=${CLIENT_ROOT:-$RUN_ROOT/libreecho/ota-client}
     safe_path "$target"

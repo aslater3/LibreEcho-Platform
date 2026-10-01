@@ -332,8 +332,13 @@ prepare_https_client()
     current=$($BB cat "$ROOT/current")
     case "$current" in ''|.|..|*[!A-Za-z0-9._+~:-]*) die current_generation_invalid;; esac
     generation="${GENERATIONS:-/data/libreecho/generations}/$current"
-    "${GENERATION_TOOL:-/usr/local/sbin/libreecho-generation}" verify "$generation" || die current_generation_invalid
-    ROOT="$ROOT" CLIENT_ROOT="$CLIENT_ROOT" "${GENERATION_TRANSACTION:-/usr/local/sbin/libreecho-generation-transaction}" https-client || die https_payload_mount
+    if ! ROOT="$ROOT" CLIENT_ROOT="$CLIENT_ROOT" "${GENERATION_TRANSACTION:-/usr/local/sbin/libreecho-generation-transaction}" https-client; then
+        # Optional boot-resident transport; do not depend on the damaged userdata.
+        CURL=/usr/bin/curl
+        CA=/etc/ssl/certs/ca-certificates.crt
+        [ -x "$CURL" ] && [ ! -L "$CURL" ] && [ -f "$CA" ] && [ ! -L "$CA" ] || die https_transport_unavailable
+        return 0
+    fi
     CURL=$CLIENT_ROOT/usr/local/libexec/libreecho-curl
     CA=$CLIENT_ROOT/usr/local/share/libreecho/cacert.pem
     [ -x "$CURL" ] && [ -f "$CA" ] && [ ! -L "$CURL" ] && [ ! -L "$CA" ] || die https_client_missing
