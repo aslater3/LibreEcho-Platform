@@ -182,7 +182,7 @@ jobs:
           # The recovery-image-tools positive contract links through the same
           # verified prefix; require it to run as well.
           ( cd tools/mt8163-arm32 \
-            && python3 -m unittest -v test_recovery_image_tools.UiTlsPackagingTests.test_ui_bundle_binds_the_link_to_the_verified_prefix ) \
+            && python3 -c 'import sys, unittest; suite = unittest.defaultTestLoader.loadTestsFromName("test_recovery_image_tools.UiTlsPackagingTests.test_ui_bundle_binds_the_link_to_the_verified_prefix"); result = unittest.TextTestRunner(verbosity=2, descriptions=False).run(suite); sys.exit(not result.wasSuccessful())' ) \
             2>&1 | tee "$LIBREECHO_OPUS_ARCHIVES/ui-opus-prefix.log"
           grep -q 'test_ui_bundle_binds_the_link_to_the_verified_prefix .* ok' "$LIBREECHO_OPUS_ARCHIVES/ui-opus-prefix.log" || {
             echo "ERROR: the recovery image positive Opus contract did not run; it must not silently skip" >&2
