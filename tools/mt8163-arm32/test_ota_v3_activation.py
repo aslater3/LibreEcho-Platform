@@ -136,6 +136,26 @@ for daemon in ('libreecho-audio-engine','libreecho-ttsd','libreecho-waked','libr
         p.write_bytes(b'corrupted')
         self.assertNotEqual(self.verb('activate-committed').returncode, 0)
 
+    def test_https_client_mount_is_bound_to_signed_current_generation(self):
+        self.prepared()
+        (self.control / 'current').write_text('test-target\n')
+        (self.control / 'pending').unlink()
+        result = self.verb('https-client')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.mount_log.read_text().splitlines()), 1)
+        self.assertIn(str(self.generations / 'test-target/features/assistant/payload.squashfs'), self.mount_log.read_text())
+        (self.loops / '7:0/loop/backing_file').write_text('/wrong.squashfs\n')
+        self.assertNotEqual(self.verb('https-client').returncode, 0)
+
+    def test_generation_lock_blocks_gc_and_commit(self):
+        self.prepared()
+        (self.control / 'generation.lock').mkdir()
+        self.set_bcb('b', '1')
+        for verb in ('gc', 'commit'):
+            self.assertNotEqual(self.verb(verb).returncode, 0)
+        self.assertTrue((self.control / 'pending').exists())
+        self.assertEqual((self.control / 'current').read_text(), 'prior\n')
+
     def test_loop_backing_mismatch_is_rejected(self):
         self.prepared()
         self.assertEqual(self.verb('activate').returncode, 0)
