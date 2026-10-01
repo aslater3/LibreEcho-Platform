@@ -53,6 +53,45 @@ class UpdaterTests(grammar.SignedFixture):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('legacy_manifest_unsupported', result.stderr)
 
+    def test_install_records_v3_pending_and_confirms_generation(self):
+        p, sig = self.signed(self.text)
+        directory = self.data / 'libreecho/generations/test-target'
+        directory.mkdir(parents=True)
+        (directory / 'target.manifest').write_bytes(p.read_bytes())
+        (directory / 'target.manifest.sig').write_bytes(sig.read_bytes())
+        (directory / 'COMPLETE').write_text(hashlib.sha256(p.read_bytes()).hexdigest() + '\n')
+        for f in grammar.FEATURES:
+            feature = directory / 'features' / f
+            feature.mkdir(parents=True)
+            (feature / 'payload.squashfs').write_bytes(('payload:' + f).encode())
+            (feature / 'manifest.json').write_bytes(('manifest:' + f).encode())
+        (self.control_file('current')).write_text('prior\n')
+        (self.root / 'boot.img').write_bytes(self.boot)
+        package = self.root / 'package.tar'
+        with tarfile.open(package, 'w') as tar:
+            for path, name in ((p, 'manifest'), (sig, 'manifest.sig'), (self.root / 'boot.img', 'boot.img')):
+                tar.add(path, arcname=name)
+        boot_b = self.root / 'boot_b'
+        boot_b.write_bytes(b'old')
+        bootctl = self.root / 'bootctl'
+        bootctl.write_text('#!/bin/sh\ncase "$1" in status) echo selected_slot=a; echo inactive_slot=b; echo slot_a_success=1;; activate) echo "$2" > "$ACTIVATED";; esac\n')
+        bootctl.chmod(0o755)
+        script = self.script('install_package "$1"')
+        text = script.read_text().replace('BOOTCTL=/usr/local/sbin/libreecho-bootctl', 'BOOTCTL=' + str(bootctl))
+        text = text.replace('install_package "$1"', 'target_device_for_slot() { target_device="' + str(boot_b) + '"; }\ninstall_package "$1"')
+        script.write_text(text)
+        env = dict(self.env, GENERATION_TOOL=str(TOOLS / 'initramfs/libreecho-generation'),
+                   GENERATIONS=str(directory.parent), ROOT=str(self.update), ACTIVATED=str(self.root / 'activated'))
+        result = subprocess.run(['/bin/busybox', 'sh', str(script), str(package)], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(boot_b.read_bytes(), self.boot)
+        expected = 'schema=3\nslot=b\ntransaction_id=test-target\nmanifest_sha256=' + hashlib.sha256(p.read_bytes()).hexdigest() + '\n'
+        self.assertEqual(self.control_file('pending').read_text(), expected)
+        self.assertEqual((self.root / 'activated').read_text(), 'b\n')
+
+    def control_file(self, name):
+        return self.update / name
+
     def test_fetch_download_path_calls_generation_builder(self):
         source = (TOOLS / 'initramfs/libreecho-update-fetch').read_text()
         a = source.index('download_feature_assets()')
