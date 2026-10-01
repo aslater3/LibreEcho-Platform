@@ -39,6 +39,32 @@
 #endif
 
 /*
+ * getrandom(2) flags.  GRND_NONBLOCK is required: a bare flags=0 request
+ * blocks until the kernel CRNG is initialised, which on an embedded boot with
+ * little entropy is a multi-second stall of the engine.  Defined here when the
+ * kernel headers do not expose it.
+ */
+#ifndef GRND_NONBLOCK
+#  define GRND_NONBLOCK 0x0001
+#endif
+
+/*
+ * Overridable entropy hooks.  Production uses the raw syscall (so a sysroot
+ * without <sys/random.h> still links) and /dev/urandom; the session-id test
+ * replaces them with a wrapper that forces the pre-CRNG-init EAGAIN and an
+ * unavailable /dev/urandom so the fail-safe fallback is exercised on the host.
+ */
+#ifdef MUSIC_SESSION_ID_HAVE_GETRANDOM
+#  ifndef MUSIC_SESSION_ID_GETRANDOM
+#    define MUSIC_SESSION_ID_GETRANDOM(buf, len, flags) \
+	syscall(SYS_getrandom, (buf), (len), (flags))
+#  endif
+#endif
+#ifndef MUSIC_SESSION_ID_OPEN_URANDOM
+#  define MUSIC_SESSION_ID_OPEN_URANDOM() open("/dev/urandom", O_RDONLY)
+#endif
+
+/*
  * Deterministic finalizer.  Same clock and pid with different entropy must
  * produce different ids (that is the collision-resistance contract the test
  * asserts); the splitmix64 tail spreads the input bits before the 64->32 fold.
@@ -62,9 +88,13 @@ static inline uint32_t music_session_id_mix(uint64_t monotonic_ns,
 
 /*
  * Best-effort 32-bit entropy.  getrandom(2) is attempted without the glibc
- * wrapper (so a sysroot without <sys/random.h> still links), then a direct read
- * of /dev/urandom.  If neither is available the clock/pid derivation keeps the
- * value nonzero and restart-varying rather than returning a constant.
+ * wrapper (so a sysroot without <sys/random.h> still links) and explicitly
+ * non-blocking: before the CRNG is initialised (early boot on an embedded
+ * device with little entropy) a blocking request would stall the engine for
+ * seconds.  Any error -- EAGAIN, ENOSYS or otherwise -- falls through to a
+ * direct read of /dev/urandom.  If neither is available the clock/pid
+ * derivation keeps the value nonzero and restart-varying rather than returning
+ * a constant.
  */
 static inline uint32_t music_session_id_random(uint64_t monotonic_ns, uint32_t pid)
 {
@@ -72,14 +102,15 @@ static inline uint32_t music_session_id_random(uint64_t monotonic_ns, uint32_t p
 
 #ifdef MUSIC_SESSION_ID_HAVE_GETRANDOM
 	{
-		long got = syscall(SYS_getrandom, &value, sizeof(value), 0U);
+		long got = (long)MUSIC_SESSION_ID_GETRANDOM(
+			&value, sizeof(value), (unsigned int)GRND_NONBLOCK);
 
 		if (got == (long)sizeof(value))
 			return value;
 	}
 #endif
 	{
-		int fd = open("/dev/urandom", O_RDONLY);
+		int fd = MUSIC_SESSION_ID_OPEN_URANDOM();
 
 		if (fd >= 0) {
 			ssize_t got = read(fd, &value, sizeof(value));

@@ -22,7 +22,12 @@
 #   - hostapd.conf sets ctrl_interface=<run-dir> (/run/libreecho) and
 #     interface=<iface>, so hostapd publishes its control socket as
 #     <run-dir>/<iface>; the run directory itself is shared with the recovery
-#     marker and the net-up ownership state and is NOT proof hostapd is live;
+#     marker and the net-up ownership state and is NOT proof hostapd is live.
+#     The image stages no hostapd_cli, so the socket is proven live from
+#     /proc: a hostapd process whose command line names this interface (or the
+#     hostapd config that binds it) must still be running.  A crashed hostapd
+#     leaves its socket inode behind, so the socket check alone would report
+#     ready for a dead AP;
 #   - dnsmasq is spawned with --no-daemon as a foreground child, so it writes NO
 #     pidfile.  Readiness therefore checks for a live dnsmasq process serving
 #     the recovery config, or an explicit pidfile if the deployment daemonizes.
@@ -39,6 +44,9 @@ RUN_DIR=${RECOVERY_AP_RUN_DIR:-/run/libreecho}
 AP_ADDRESS=${RECOVERY_AP_ADDRESS:-192.168.4.1}
 DHCP_CONF=${RECOVERY_AP_DHCP_CONF:-$RUN_DIR/recovery-dnsmasq.conf}
 DHCP_PID=${RECOVERY_AP_DHCP_PID:-}
+# Optional explicit pidfile when the deployment daemonizes hostapd with -P;
+# absent that, liveness is proven from /proc (see hostapd_live below).
+HOSTAPD_PID=${RECOVERY_AP_HOSTAPD_PID:-}
 # Prefer the packaged helper binaries the image stages under /usr/local/sbin;
 # fall back to PATH so a development image without them still fails closed
 # instead of crashing.
@@ -112,6 +120,42 @@ fi
 CTRL_SOCKET=$CTRL/$IFACE
 if [ ! -S "$CTRL_SOCKET" ]; then
     printf 'unavailable: hostapd-control-absent:%s\n' "$CTRL_SOCKET" >&2
+    exit 1
+fi
+# The socket alone is not proof hostapd is live: a crashed hostapd leaves its
+# AF_UNIX socket inode behind, so a stale socket must not report the AP ready.
+# The image stages no hostapd_cli, so the live incarnation is proven from
+# /proc instead of a control-socket query: a running process whose comm is
+# hostapd and whose command line names this interface (-i <iface>) or the
+# hostapd config that binds it must exist.  An explicit pidfile is honoured
+# when the deployment daemonizes hostapd with -P.
+hostapd_live() {
+    if [ -n "$HOSTAPD_PID" ]; then
+        [ -s "$HOSTAPD_PID" ] || return 1
+        pid=$(sed -n '1p' "$HOSTAPD_PID")
+        case "$pid" in *[!0-9]*|'') return 1 ;; esac
+        kill -0 "$pid" 2>/dev/null || return 1
+        # The live pid must still be hostapd, not a recycled pid.
+        [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = hostapd ] || return 1
+        return 0
+    fi
+    for comm in /proc/[0-9]*/comm; do
+        [ -r "$comm" ] || continue
+        name=$(cat "$comm" 2>/dev/null) || continue
+        [ "$name" = hostapd ] || continue
+        pid=${comm#/proc/}
+        pid=${pid%/comm}
+        cmdline=/proc/$pid/cmdline
+        [ -r "$cmdline" ] || continue
+        args=$(tr '\0' ' ' <"$cmdline" 2>/dev/null) || continue
+        case "$args" in
+            *"$IFACE"*|*hostapd.conf*) return 0 ;;
+        esac
+    done
+    return 1
+}
+if ! hostapd_live; then
+    printf 'unavailable: hostapd-not-running:%s\n' "$IFACE" >&2
     exit 1
 fi
 # The DHCP/DNS side must own a live incarnation.  dnsmasq runs --no-daemon, so

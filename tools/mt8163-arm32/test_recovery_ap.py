@@ -224,10 +224,14 @@ class ApProbeTests(unittest.TestCase):
         self.bin = self.root / "bin"
         self.bin.mkdir()
         self._servers: list[socket.socket] = []
+        self._procs: list[subprocess.Popen] = []
 
     def tearDown(self) -> None:
         for server in self._servers:
             server.close()
+        for proc in self._procs:
+            proc.kill()
+            proc.wait()
         self.tmp.cleanup()
 
     def make_iw(self, *, dev_ok: bool, mode: str, ap_mode: bool) -> None:
@@ -290,14 +294,46 @@ esac
         server.listen(1)
         self._servers.append(server)
 
+    def spawn_hostapd(self, iface: str = "wlan0") -> subprocess.Popen:
+        """A live process the probe can identify as hostapd for ``iface``.
+
+        The recovery image stages no hostapd_cli, so the probe proves the live
+        incarnation from /proc: a process whose comm is ``hostapd`` and whose
+        command line names the served interface.  A copy of the shell named
+        ``hostapd`` yields exactly that (comm from the executable name, the
+        interface as an argument) without needing a cross-built hostapd.
+        """
+        binary = self.root / "sbin" / "hostapd"
+        binary.parent.mkdir(exist_ok=True)
+        shutil.copyfile(shutil.which("sh") or "/bin/sh", binary)
+        binary.chmod(0o755)
+        proc = subprocess.Popen(
+            [str(binary), "-c", "sleep 60", iface],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self._procs.append(proc)
+        # The child must have execed before /proc reports it as hostapd.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                if (Path(f"/proc/{proc.pid}/comm").read_text().strip()
+                        == "hostapd"):
+                    break
+            except OSError:
+                pass
+            time.sleep(0.01)
+        return proc
+
     def readiness_env(self, *, dhcp_pid: Path | None,
-                      hostapd_socket: bool = True) -> dict:
+                      hostapd_socket: bool = True,
+                      hostapd_process: bool = True) -> dict:
         ctrl = self.root / "hostapd"
         ctrl.mkdir(exist_ok=True)
         if hostapd_socket:
             # hostapd publishes its control socket as ctrl_interface/<ifname>;
             # a bound AF_UNIX socket is the surface the probe must require.
             self.bind_control_socket(ctrl / "wlan0")
+        if hostapd_process:
+            self.spawn_hostapd()
         env = self.env(RECOVERY_AP_CTRL=str(ctrl))
         if dhcp_pid is not None:
             env["RECOVERY_AP_DHCP_PID"] = str(dhcp_pid)
@@ -371,6 +407,82 @@ esac
             dhcp.wait()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("hostapd-control-absent", result.stderr)
+
+    def test_readiness_rejects_stale_hostapd_control_socket(self) -> None:
+        # A crashed hostapd leaves its AF_UNIX control socket inode behind.  The
+        # socket alone must not report the AP ready: with the socket present but
+        # no live hostapd process the probe must fail closed.
+        self.make_iw(dev_ok=True, mode="AP", ap_mode=True)
+        self.make_ip("192.168.4.1")
+        dhcp = subprocess.Popen(["sleep", "30"])
+        try:
+            dhcp_pid = self.root / "recovery-dhcp.pid"
+            dhcp_pid.write_text(f"{dhcp.pid}\n")
+            env = self.readiness_env(dhcp_pid=dhcp_pid, hostapd_process=False)
+            result = self.run_probe(PROBE, "ready", env=env)
+        finally:
+            dhcp.terminate()
+            dhcp.wait()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("hostapd-not-running", result.stderr)
+
+    def test_readiness_rejects_hostapd_for_another_interface(self) -> None:
+        # A live hostapd that serves a different interface must not satisfy the
+        # per-interface readiness: the process command line must name wlan0.
+        self.make_iw(dev_ok=True, mode="AP", ap_mode=True)
+        self.make_ip("192.168.4.1")
+        dhcp = subprocess.Popen(["sleep", "30"])
+        try:
+            dhcp_pid = self.root / "recovery-dhcp.pid"
+            dhcp_pid.write_text(f"{dhcp.pid}\n")
+            env = self.readiness_env(dhcp_pid=dhcp_pid, hostapd_process=False)
+            self.spawn_hostapd(iface="wlan1")
+            result = self.run_probe(PROBE, "ready", env=env)
+        finally:
+            dhcp.terminate()
+            dhcp.wait()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("hostapd-not-running", result.stderr)
+
+    def test_readiness_accepts_live_hostapd_pidfile(self) -> None:
+        # When the deployment daemonizes hostapd with -P, the live pid backed by
+        # a real hostapd process satisfies the readiness check.
+        self.make_iw(dev_ok=True, mode="AP", ap_mode=True)
+        self.make_ip("192.168.4.1")
+        dhcp = subprocess.Popen(["sleep", "30"])
+        try:
+            dhcp_pid = self.root / "recovery-dhcp.pid"
+            dhcp_pid.write_text(f"{dhcp.pid}\n")
+            hostapd = self.spawn_hostapd()
+            hostapd_pid = self.root / "hostapd.pid"
+            hostapd_pid.write_text(f"{hostapd.pid}\n")
+            env = self.readiness_env(dhcp_pid=dhcp_pid, hostapd_process=False)
+            env["RECOVERY_AP_HOSTAPD_PID"] = str(hostapd_pid)
+            result = self.run_probe(PROBE, "ready", env=env)
+        finally:
+            dhcp.terminate()
+            dhcp.wait()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_readiness_rejects_dead_hostapd_pidfile(self) -> None:
+        # A pidfile naming no live process (the crashed-hostapd case) must fail
+        # closed even though the stale control socket is still present.
+        self.make_iw(dev_ok=True, mode="AP", ap_mode=True)
+        self.make_ip("192.168.4.1")
+        dhcp = subprocess.Popen(["sleep", "30"])
+        try:
+            dhcp_pid = self.root / "recovery-dhcp.pid"
+            dhcp_pid.write_text(f"{dhcp.pid}\n")
+            hostapd_pid = self.root / "hostapd.pid"
+            hostapd_pid.write_text("2147483\n")  # not a live pid
+            env = self.readiness_env(dhcp_pid=dhcp_pid, hostapd_process=False)
+            env["RECOVERY_AP_HOSTAPD_PID"] = str(hostapd_pid)
+            result = self.run_probe(PROBE, "ready", env=env)
+        finally:
+            dhcp.terminate()
+            dhcp.wait()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("hostapd-not-running", result.stderr)
 
     def test_readiness_rejects_client_mode_interface(self) -> None:
         self.make_iw(dev_ok=True, mode="managed", ap_mode=True)
