@@ -586,12 +586,17 @@ class RadarTreeDiffTests(unittest.TestCase):
             prior_bundle, next_bundle = root / 'before-bundle', root / 'after-bundle'
             old_bundle.assemble(assets, prior_bundle, base_tools / 'recovery-install/src', '', 2153472)
             bundle.assemble(assets, next_bundle, TOOLS / 'recovery-install/src', '', 2153472)
+            # Target identity plus the additive direct-userdata protocol-v2
+            # controls are the only manifest lines allowed to differ.
             self.assertEqual((prior_bundle / 'bundle.manifest').read_text(),
                              '\n'.join(line for line in (next_bundle / 'bundle.manifest').read_text().splitlines()
-                                       if not line.startswith(('target=', 'fastboot_products='))) + '\n')
+                                       if not line.startswith(('target=', 'fastboot_products=', 'protocol=',
+                                                               'transfer=', 'transfer_bytes_total='))) + '\n')
             import zipfile
             with zipfile.ZipFile(prior_bundle / 'libreecho-install.zip') as prior, zipfile.ZipFile(next_bundle / 'libreecho-install.zip') as next_zip:
-                self.assertEqual(prior.namelist(), next_zip.namelist())
+                # Protocol v2 adds exactly one member: the direct-userdata helper.
+                self.assertEqual(sorted(set(next_zip.namelist()) - set(prior.namelist())), [bundle.DIRECT_HELPER])
+                self.assertEqual([n for n in next_zip.namelist() if n != bundle.DIRECT_HELPER], prior.namelist())
                 for name in prior.namelist():
                     self.assertEqual(prior.getinfo(name).external_attr, next_zip.getinfo(name).external_attr)
                     if name != 'META-INF/com/google/android/update-binary':

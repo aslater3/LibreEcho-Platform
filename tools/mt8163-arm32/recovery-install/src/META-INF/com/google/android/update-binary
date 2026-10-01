@@ -220,6 +220,54 @@ partition_number() {
     echo "$base" | sed -n 's/^mmcblk0p\([0-9]*\)$/\1/p'
 }
 
+bundle_source_is_userdata() {
+    # True when "$1" lives on the same block device as userdata. The legacy
+    # flow formats userdata, so a legacy bundle staged on userdata is destroyed
+    # by the format step it must survive; the browser's direct-userdata protocol
+    # is the path for payloads that come from userdata, not this one.
+    #
+    # Fail-closed: /data and /sdcard are rejected lexically, and a mount source
+    # that cannot be resolved to a *different* raw mmcblk0 partition is refused
+    # too - a device-mapper/FBE, overlay, bind or loop source may still be
+    # userdata behind indirection, and assuming otherwise destroys the bundle.
+    bsu_path=$1
+    [ -n "$bsu_path" ] || return 1
+    case "$bsu_path" in
+        /data|/data/*|/sdcard|/sdcard/*) return 0 ;;
+    esac
+    bsu_mounts=${LIBREECHO_MOUNTS_FILE:-/proc/mounts}
+    bsu_ud=$(partition_node userdata 2>/dev/null) || return 1
+    [ -n "$bsu_ud" ] || return 1
+    # Longest mount point that is a prefix of the path wins.
+    bsu_dev=
+    bsu_best=0
+    while read -r bsu_line; do
+        bsu_mp=$(printf '%s\n' "$bsu_line" | awk '{ print $2 }')
+        case "$bsu_mp" in ''|/proc*|/sys*|/dev*) continue ;; esac
+        case "$bsu_path" in
+            "$bsu_mp"|"$bsu_mp"/*)
+                bsu_len=${#bsu_mp}
+                if [ "$bsu_len" -gt "$bsu_best" ]; then
+                    bsu_best=$bsu_len
+                    bsu_dev=$(printf '%s\n' "$bsu_line" | awk '{ print $1 }')
+                fi
+                ;;
+        esac
+    done < "$bsu_mounts"
+    [ -n "$bsu_dev" ] || return 1
+    # Resolve a by-name link before judging the source.
+    case "$bsu_dev" in
+        /dev/block/by-name/*) bsu_dev=$(part_node "$bsu_dev") ;;
+    esac
+    # Only a source proven to be a raw mmcblk0 partition can be compared; any
+    # other source is unresolved and therefore refused (fail closed).
+    case "$bsu_dev" in
+        /dev/block/mmcblk0p*) ;;
+        *) return 0 ;;
+    esac
+    [ "$(part_node "$bsu_dev")" = "$(part_node "$bsu_ud")" ]
+}
+
 sha256_of() {
     /sbin/sha256sum "$1" 2>/dev/null | awk '{print $1}'
 }
@@ -467,19 +515,27 @@ tidy_userdata_root() {
     # (libreecho and lost+found). Left in place it makes the cleanup helper fail
     # its contract on the next boot, which blocks the service graph - and on a
     # first boot is the prime suspect for taking the staged features with it.
-    # Remove anything recovery left at the root, then prove the root is clean.
+    # This never deletes user data: recovery's own *empty* scratch directories
+    # are removed with rmdir; anything holding files is left in place and
+    # reported, because the legacy flow must not destroy unrelated data either.
+    ty_dir=${LIBREECHO_DATA_ROOT:-/data}
     ui_print "Tidying the userdata root for the data contract"
     if [ "$DRY_RUN" = 1 ]; then
-        ui_print "  DRY RUN - would remove recovery's own /data/media and friends"
+        ui_print "  DRY RUN - would remove recovery's own empty /data/media and friends"
         return 0
     fi
-    for stray in /data/media /data/local /data/tmp /data/test; do
-        if [ -e "$stray" ]; then
-            rm -rf "$stray" && ui_print "  removed $stray"
+    for ty_stray in "$ty_dir/media" "$ty_dir/local" "$ty_dir/tmp" "$ty_dir/test"; do
+        [ -e "$ty_stray" ] || continue
+        [ -L "$ty_stray" ] && continue
+        [ -d "$ty_stray" ] || continue
+        if rmdir "$ty_stray" 2>/dev/null; then
+            ui_print "  removed empty $ty_stray"
+        else
+            ui_print "  WARNING: $ty_stray is not empty; left in place (no user data is deleted)"
         fi
     done
     sync
-    for entry in /data/*; do
+    for entry in "$ty_dir"/*; do
         [ -e "$entry" ] || continue
         base=${entry##*/}
         case "$base" in
@@ -707,6 +763,9 @@ main() {
     ZIPFILE=${3:-}
     BUNDLE_DIR=$(dirname "$ZIPFILE")
     [ -d "$BUNDLE_DIR" ] || die "cannot determine the bundle directory"
+    if bundle_source_is_userdata "$BUNDLE_DIR"; then
+        die "bundle-on-userdata: the legacy install must stage from /cache, not from the partition it formats"
+    fi
     # Select the manifest bound to the invoked ZIP, not Radar's legacy alias
     # (both targets can coexist in a combined release directory).
     case "${ZIPFILE##*/}" in
