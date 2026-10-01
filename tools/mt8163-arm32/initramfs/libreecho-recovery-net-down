@@ -24,7 +24,7 @@ set -u
 
 BB=${BB:-/bin/busybox}
 STATE_DIR=${RECOVERY_NET_STATE_DIR:-/run/libreecho}
-WPA_SERVICE=${RECOVERY_AP_WPA_SERVICE:-/usr/local/sbin/libreecho-wifi}
+WPA_SERVICE=${RECOVERY_AP_WPA_SERVICE:-/sbin/libreecho-wifi}
 
 IFACE=
 

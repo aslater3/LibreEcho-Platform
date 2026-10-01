@@ -14,8 +14,10 @@
 # Properties the single-radio handover depends on:
 #   - idempotent: re-running with the same interface/address is a no-op success;
 #   - re-entrant: it may run again after a net-down without corrupting state;
-#   - rollback: if the address cannot be assigned after the client service was
-#     stopped, the client service is restored and the call fails;
+#   - rollback: if the link cannot come up or the address cannot be assigned
+#     after the client service was stopped, the client service is restored and
+#     the call fails; if that restore itself fails the ownership record is kept
+#     so a later net-down retries it instead of losing the debt;
 #   - no generic process killing: the client supplicant is stopped through its
 #     own service (pidfile-driven), never with pkill/killall;
 #   - no driver backdoor: it never touches /dev/wmtWifi, never reboots, and
@@ -28,7 +30,7 @@ set -u
 
 BB=${BB:-/bin/busybox}
 STATE_DIR=${RECOVERY_NET_STATE_DIR:-/run/libreecho}
-WPA_SERVICE=${RECOVERY_AP_WPA_SERVICE:-/usr/local/sbin/libreecho-wifi}
+WPA_SERVICE=${RECOVERY_AP_WPA_SERVICE:-/sbin/libreecho-wifi}
 DEFAULT_ADDRESS=192.168.4.1/24
 
 IFACE=
@@ -161,7 +163,15 @@ write_state "$stopped" || die "cannot record ownership state: $STATE_FILE"
 
 # 2. Bring the link up.
 if ! "$IP_BIN" link set dev "$IFACE" up >/dev/null 2>&1; then
-    [ "$stopped" = 1 ] && restore_client_service
+    # Roll back.  If the client service cannot be restored, the ownership
+    # record is deliberately left in place: a later net-down then retries the
+    # restore instead of taking the nothing-owned no-op path and leaving the
+    # client plane down for good.
+    if [ "$stopped" = 1 ]; then
+        if ! restore_client_service; then
+            die "cannot bring up $IFACE and cannot restore client service $WPA_SERVICE"
+        fi
+    fi
     rm -f "$STATE_FILE"
     die "cannot bring up $IFACE"
 fi
@@ -169,10 +179,16 @@ fi
 # 3. Assign the portal address (idempotent: only if not already present).
 if ! address_present; then
     if ! "$IP_BIN" addr add "$ADDRESS" dev "$IFACE" >/dev/null 2>&1; then
-        # Roll back: the client service we stopped is restored and no owned
-        # address is left behind.
+        # Roll back: no owned address is left behind, and the client service we
+        # stopped is restored.  A failed restore keeps the ownership record so
+        # the debt survives for a later net-down to retry, exactly like the
+        # link-up rollback above.
         "$IP_BIN" addr del "$ADDRESS" dev "$IFACE" >/dev/null 2>&1
-        [ "$stopped" = 1 ] && restore_client_service
+        if [ "$stopped" = 1 ]; then
+            if ! restore_client_service; then
+                die "cannot assign $ADDRESS to $IFACE and cannot restore client service $WPA_SERVICE"
+            fi
+        fi
         rm -f "$STATE_FILE"
         die "cannot assign $ADDRESS to $IFACE"
     fi

@@ -131,12 +131,45 @@ binary, the SHA-256 and size of the artefact the builder just produced plus the
 licence, https source, pinned source SHA-256 and on-image licence copies that
 ship with it.  It is generated from the real artefacts, never hand-written, so
 the metadata and the binaries can never drift apart.  The image builder
-re-validates every field and refuses a bundle whose metadata lacks provenance or
-a corresponding-source offer; the image stages the document at
-`/etc/libreecho/recovery-ap-binaries.json` so the attribution travels with the
-binaries.  `--emit-metadata` re-emits the document for an existing output
-directory (used by CI to validate the build result) without re-verifying the
-source archives.
+re-validates every field, binds the whole document to the checked-in
+`SOURCE.lock` — each component's name, version, https source URL, source SHA-256,
+licence and on-image licence copies must match exactly — and refuses a bundle
+whose metadata lacks provenance or a corresponding-source offer; the image
+stages the document at `/etc/libreecho/recovery-ap-binaries.json` so the
+attribution travels with the binaries.  `verify_recovery_image.py` applies the
+same `SOURCE.lock` binding to the staged document, so a tampered version, URL,
+source hash or licence is refused even inside a built image.
+
+`--build` also writes `recovery-ap-build-receipt.json` immediately before it
+emits the metadata.  The receipt binds the emitted metadata to the SOURCE.lock in
+force (its SHA-256), the toolchain identity (`--cc/--ar/--ranlib` plus the
+compiler version line) and the SHA-256/size of every output binary.
+`--emit-metadata` refuses to run unless that receipt is present and every
+artefact still matches it, so a standalone re-emission can only republish the
+exact bytes the verified `--build` produced for this lock.  A missing receipt, a
+receipt bound to a different SOURCE.lock, or a binary swapped in after the build
+is refused.
+
+## Trust boundary and authenticity
+
+The metadata and the build receipt are integrity bindings, not signatures.  A
+receipt proves that the artefacts in a directory are the ones the verified
+`--build` path produced for this `SOURCE.lock`, and the image builder and
+verifier refuse any metadata that disagrees with the repository's checked-in
+pins.  They do **not** prove *who* ran the build: a party who controls the whole
+output directory could write a matching receipt and matching metadata for an
+arbitrary binary.  The repository has no signing key for the recovery-AP build —
+its only existing Ed25519 authenticity mechanism is the OTA bundle signature
+(`ota/make_ota_bundle.py` plus the device OTA public key), which authenticates
+the OTA package, not recovery-AP build outputs — and the recovery-AP CI job
+deliberately runs with only a public cross toolchain and no repository secrets.
+Authenticity of a recovery-AP build therefore rests on the trusted builder/CI:
+the `recovery-ap-build` job fetches only the pinned sources, builds with the
+public toolchain and validates the emitted metadata through
+`build_recovery_image.add_recovery_ap_bundle`.  Anyone consuming a locally
+supplied recovery-AP output must trust whoever built it; the checks here only
+guarantee the output was not altered after the build and that it matches the
+pins.
 
 ## Licence provenance and GPL source offer
 

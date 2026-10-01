@@ -11,6 +11,11 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd -P)
 LOCK="$SCRIPT_DIR/SOURCE.lock"
+# The build receipt --build writes and --emit-metadata requires.  It binds a
+# standalone metadata emission to the SOURCE.lock in force and to the exact
+# artefacts the verified build produced (plus the toolchain that compiled them).
+RECEIPT_NAME=recovery-ap-build-receipt.json
+RECEIPT_SCHEMA=libreecho-recovery-ap-build-receipt/v1
 
 usage() {
     printf '%s\n' \
@@ -21,6 +26,9 @@ usage() {
         '                                 --output DIR --cc FILE --ar FILE --ranlib FILE' \
         '                                 [--sysroot DIR] [--strip FILE]' \
         '       build_recovery_ap.sh --emit-metadata --output DIR'
+        ''
+        'emit-metadata refuses to run unless DIR holds the build receipt the'
+        'verified --build path wrote there for the same SOURCE.lock and binaries.'
 }
 
 MODE=
@@ -191,14 +199,18 @@ emit_metadata() {
     local output=$1
     [[ -d "$output" ]] || {
         printf 'ERROR: metadata output directory is unavailable: %s\n' "$output" >&2; exit 1; }
-    python3 - "$LOCK" "$output" <<'PY'
+    python3 - "$LOCK" "$output" "$RECEIPT_NAME" "$RECEIPT_SCHEMA" <<'PY'
 import hashlib
 import json
 import os
 import sys
 
-lock = json.load(open(sys.argv[1], encoding="utf-8"))
+lock_path = sys.argv[1]
 output = sys.argv[2]
+receipt_name = sys.argv[3]
+receipt_schema = sys.argv[4]
+lock_data = open(lock_path, "rb").read()
+lock = json.loads(lock_data.decode("utf-8"))
 image_paths = {
     "hostapd": "usr/local/sbin/hostapd",
     "dnsmasq": "usr/local/sbin/dnsmasq",
@@ -211,6 +223,31 @@ def digest(path):
     with open(path, "rb") as handle:
         data = handle.read()
     return hashlib.sha256(data).hexdigest(), len(data)
+
+
+# A standalone emission is only trustworthy when it re-publishes an output the
+# verified --build path produced: the build receipt binds the artefacts to this
+# SOURCE.lock and to the toolchain that compiled them.  Without it, an arbitrary
+# directory of ELF files could be labelled as the pinned set.
+receipt_path = os.path.join(output, receipt_name)
+if not os.path.isfile(receipt_path) or os.path.islink(receipt_path):
+    raise SystemExit(
+        "ERROR: --emit-metadata requires the build receipt %s written by --build"
+        % receipt_name)
+with open(receipt_path, encoding="utf-8") as handle:
+    receipt = json.load(handle)
+if not isinstance(receipt, dict) or receipt.get("schema") != receipt_schema:
+    raise SystemExit("ERROR: build receipt schema is not the pinned contract")
+if receipt.get("lock_sha256") != hashlib.sha256(lock_data).hexdigest():
+    raise SystemExit("ERROR: build receipt is not bound to this SOURCE.lock")
+toolchain = receipt.get("toolchain")
+if (not isinstance(toolchain, dict) or
+        not all(isinstance(toolchain.get(key), str) and toolchain[key].strip()
+                for key in ("cc", "ar", "ranlib"))):
+    raise SystemExit("ERROR: build receipt carries no toolchain identity")
+receipt_binaries = receipt.get("binaries")
+if not isinstance(receipt_binaries, dict) or not receipt_binaries:
+    raise SystemExit("ERROR: build receipt carries no binary identities")
 
 
 components = {}
@@ -255,6 +292,17 @@ missing = sorted(set(image_paths) - set(binaries))
 if missing:
     raise SystemExit(
         "ERROR: SOURCE.lock does not describe the pinned set: missing %s" % ", ".join(missing))
+# Refuse when any artefact no longer matches the receipt the verified build wrote:
+# a binary swapped in after the build must not be re-labelled as the pinned set.
+if set(receipt_binaries) != set(binaries):
+    raise SystemExit("ERROR: build receipt binary set does not match the pinned set")
+for name, record in binaries.items():
+    receipt_record = receipt_binaries.get(name)
+    if (not isinstance(receipt_record, dict) or
+            receipt_record.get("sha256") != record["sha256"] or
+            receipt_record.get("size") != record["size"]):
+        raise SystemExit(
+            "ERROR: artefact %s no longer matches the build receipt" % name)
 document = {
     "schema": "libreecho-recovery-ap-binaries/v1",
     "builder": "tools/mt8163-arm32/recovery-ap/build_recovery_ap.sh",
@@ -267,6 +315,72 @@ with open(target, "w", encoding="utf-8") as handle:
     json.dump(document, handle, indent=2, sort_keys=True)
     handle.write("\n")
 print("metadata=%s" % target)
+PY
+}
+
+# Record what the verified --build path actually produced, so a later
+# --emit-metadata can prove it is re-publishing this run's artefacts rather than
+# labelling an arbitrary directory.  The receipt is never shipped in an image; it
+# only binds the metadata emission to SOURCE.lock and the toolchain that compiled
+# the binaries.  Authenticity of a locally supplied build still rests on whoever
+# ran the trusted builder/CI, not on this receipt.
+write_build_receipt() {
+    local output=$1
+    python3 - "$LOCK" "$output" "$RECEIPT_NAME" "$RECEIPT_SCHEMA" \
+        "$CC" "$AR" "$RANLIB" "${STRIP:-}" <<'PY'
+import hashlib
+import json
+import os
+import subprocess
+import sys
+
+lock_path, output, receipt_name, schema = sys.argv[1:5]
+cc, ar, ranlib, strip = sys.argv[5:9]
+lock_data = open(lock_path, "rb").read()
+lock = json.loads(lock_data.decode("utf-8"))
+
+
+def digest(path):
+    with open(path, "rb") as handle:
+        data = handle.read()
+    return hashlib.sha256(data).hexdigest(), len(data)
+
+
+def identity(tool):
+    try:
+        result = subprocess.run([tool, "--version"], capture_output=True, text=True)
+    except OSError:
+        return tool
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.splitlines()[0].strip()
+    return tool
+
+
+binaries = {}
+for name, record in lock["components"].items():
+    sha256, size = digest(os.path.join(output, record["artifact"]))
+    binaries[name] = {"sha256": sha256, "size": size}
+for name, record in lock.get("first_party", {}).items():
+    sha256, size = digest(os.path.join(output, record["artifact"]))
+    binaries[name] = {"sha256": sha256, "size": size}
+receipt = {
+    "schema": schema,
+    "lock_path": os.path.abspath(lock_path),
+    "lock_sha256": hashlib.sha256(lock_data).hexdigest(),
+    "toolchain": {
+        "cc": cc,
+        "ar": ar,
+        "ranlib": ranlib,
+        "strip": strip,
+        "cc_identity": identity(cc),
+    },
+    "binaries": binaries,
+}
+target = os.path.join(output, receipt_name)
+with open(target, "w", encoding="utf-8") as handle:
+    json.dump(receipt, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+print("build_receipt=%s" % target)
 PY
 }
 
@@ -397,5 +511,7 @@ if [[ -n "$STRIP" ]]; then "$STRIP" "$OUTPUT/libreecho-recovery-button"; fi
 sha256sum "$OUTPUT/libreecho-recovery-button"
 
 # Emit the verified image input alongside the artifacts, so the build output and
-# the metadata build_recovery_image.py consumes can never drift apart.
+# the metadata build_recovery_image.py consumes can never drift apart.  The build
+# receipt is written first: --emit-metadata refuses to run without it.
+write_build_receipt "$OUTPUT"
 emit_metadata "$OUTPUT"

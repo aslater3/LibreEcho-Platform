@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -142,6 +143,123 @@ RECOVERY_AP_BINARIES = {
 # consumes.  It binds the shipped bytes to their SHA-256 and to the licence /
 # corresponding-source provenance that ships on-image with them.
 RECOVERY_AP_METADATA_SCHEMA = "libreecho-recovery-ap-binaries/v1"
+# The checked-in pin document the emitted metadata must agree with.  Metadata is
+# self-declared by whichever build produced it, so the builder refuses any
+# component whose name/version/source URL/source SHA-256/licence does not match
+# this file: a hand-written metadata document cannot smuggle an unlisted or
+# altered component into an image.
+RECOVERY_AP_LOCK_PATH = Path(__file__).resolve().parent / "recovery-ap" / "SOURCE.lock"
+# The staged on-image path of the client Wi-Fi service the recovery handover
+# stops and restores.  It ships as an overlay file (see add_overlay) and the
+# net-up/net-down RECOVERY_AP_WPA_SERVICE defaults must resolve to exactly this
+# path, or the handover would stop/restore a service the image never installed.
+RECOVERY_AP_WPA_SERVICE_PATH = "sbin/libreecho-wifi"
+
+
+def load_recovery_ap_lock(lock_path: Path | None = None) -> dict[str, object]:
+    """Read and structurally validate the checked-in recovery-AP SOURCE.lock."""
+    path = lock_path or RECOVERY_AP_LOCK_PATH
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit(f"ERROR: recovery-AP SOURCE.lock is unavailable: {path}")
+    try:
+        lock = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"ERROR: recovery-AP SOURCE.lock is not valid JSON: {exc}") from exc
+    if not isinstance(lock, dict):
+        raise SystemExit("ERROR: recovery-AP SOURCE.lock is not a JSON object")
+    components = lock.get("components")
+    first_party = lock.get("first_party")
+    if not isinstance(components, dict) or not isinstance(first_party, dict):
+        raise SystemExit("ERROR: recovery-AP SOURCE.lock lacks component records")
+    if set(components) | set(first_party) != set(RECOVERY_AP_BINARIES):
+        raise SystemExit(
+            "ERROR: recovery-AP SOURCE.lock does not describe the pinned set"
+        )
+    return lock
+
+
+def validate_recovery_ap_source_lock(provenance: dict[str, Any],
+                                     source_offer: object,
+                                     lock_path: Path | None = None) -> None:
+    """Bind the emitted provenance to the checked-in SOURCE.lock.
+
+    The metadata document is produced by the recovery-AP builder, but nothing
+    about a JSON file proves its values are the pinned ones: a caller could
+    hand-write matching hashes for an arbitrary binary.  This refuses any
+    component whose name, version, https source URL, source SHA-256, licence or
+    on-image licence copies differ from ``recovery-ap/SOURCE.lock``, so the
+    image can only ever ship the components the repository actually pins.
+    """
+    lock = load_recovery_ap_lock(lock_path)
+    components = lock["components"]
+    first_party = lock["first_party"]
+    on_image = lock.get("on_image")
+    on_image_licenses = on_image.get("licenses") if isinstance(on_image, dict) else None
+    if not isinstance(on_image_licenses, dict):
+        on_image_licenses = {}
+    assert isinstance(components, dict) and isinstance(first_party, dict)
+
+    for name, record in components.items():
+        entry = provenance.get(name)
+        if not isinstance(entry, dict):
+            raise SystemExit(f"ERROR: recovery-AP provenance is missing for {name}")
+        for field in ("version", "license", "source_url", "source_sha256",
+                      "source_license", "artifact"):
+            if entry.get(field) != record.get(field):
+                raise SystemExit(
+                    f"ERROR: recovery-AP metadata {field} does not match "
+                    f"SOURCE.lock: {name}"
+                )
+        if record.get("source_license_secondary") and (
+                entry.get("source_license_secondary") != record["source_license_secondary"]):
+            raise SystemExit(
+                f"ERROR: recovery-AP metadata secondary licence does not match "
+                f"SOURCE.lock: {name}"
+            )
+        if entry.get("image_path") != RECOVERY_AP_BINARIES[name]:
+            raise SystemExit(
+                f"ERROR: recovery-AP metadata image path does not match the "
+                f"pinned target: {name}"
+            )
+        if list(entry.get("image_license", [])) != list(on_image_licenses.get(name, [])):
+            raise SystemExit(
+                f"ERROR: recovery-AP metadata on-image licences do not match "
+                f"SOURCE.lock: {name}"
+            )
+
+    for name, record in first_party.items():
+        entry = provenance.get(name)
+        if not isinstance(entry, dict):
+            raise SystemExit(f"ERROR: recovery-AP provenance is missing for {name}")
+        for field in ("license", "source_url", "source_path", "artifact"):
+            if entry.get(field) != record.get(field):
+                raise SystemExit(
+                    f"ERROR: recovery-AP metadata {field} does not match "
+                    f"SOURCE.lock: {name}"
+                )
+        if entry.get("image_path") != RECOVERY_AP_BINARIES[name]:
+            raise SystemExit(
+                f"ERROR: recovery-AP metadata image path does not match the "
+                f"pinned target: {name}"
+            )
+
+    lock_offer = lock.get("source_offer")
+    if not isinstance(lock_offer, dict) or not isinstance(source_offer, dict):
+        raise SystemExit("ERROR: recovery-AP metadata has no source offer to bind to SOURCE.lock")
+    if sorted(source_offer.get("components", [])) != sorted(lock_offer.get("components", [])):
+        raise SystemExit(
+            "ERROR: recovery-AP source-offer components do not match SOURCE.lock"
+        )
+    if (str(source_offer.get("statement", "")).strip() !=
+            str(lock_offer.get("statement", "")).strip()):
+        raise SystemExit(
+            "ERROR: recovery-AP source-offer statement does not match SOURCE.lock"
+        )
+    if (str(source_offer.get("description", "")).strip() !=
+            str(lock_offer.get("description", "")).strip()):
+        raise SystemExit(
+            "ERROR: recovery-AP source-offer description does not match SOURCE.lock"
+        )
 
 
 def validate_recovery_ap_provenance(metadata: object) -> dict[str, dict[str, object]]:
@@ -240,6 +358,7 @@ def add_recovery_ap_bundle(stage: Path, binaries: dict[str, Path],
             f"(missing={missing}, unexpected={extra})"
         )
     provenance = validate_recovery_ap_provenance(metadata)
+    validate_recovery_ap_source_lock(provenance, metadata.get("source_offer"))
 
     staged: dict[str, object] = {}
     for name, target_relative in RECOVERY_AP_BINARIES.items():
@@ -647,7 +766,7 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
             "usr/local/sbin/libreecho-feature-transaction", 0o755,
         ),
         "ota-source.conf": ("etc/libreecho/ota-source.conf", 0o644),
-        "libreecho-wifi": ("sbin/libreecho-wifi", 0o755),
+        "libreecho-wifi": (RECOVERY_AP_WPA_SERVICE_PATH, 0o755),
         "udhcpc.script": ("etc/udhcpc.script", 0o755),
         "wpa_supplicant.conf.example": (
             "etc/wifi/wpa_supplicant.conf.example", 0o600,

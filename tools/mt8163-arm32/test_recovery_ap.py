@@ -554,6 +554,26 @@ exit 0
         # the client service this call stopped must have been restored.
         self.assertIn("start", self.wpa_log_text())
 
+    def test_net_up_rollback_retains_ownership_when_restore_fails(self) -> None:
+        # The client service is stopped (ownership recorded), the address
+        # assignment fails, and the rollback's client restart also fails.
+        (self.ip_state / "fail_add").touch()
+        (self.root / "start_fail").write_text("1\n")
+        result = self.up()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot restore client service", result.stderr)
+        state = self.state_dir / "recovery-net.state"
+        # Ownership is retained, not forgotten, so a later net-down still owes
+        # the restore instead of taking the nothing-owned no-op path.
+        self.assertTrue(state.is_file())
+        self.assertIn("stopped=1", state.read_text())
+        # The retry teardown now restarts the client service and clears the debt.
+        retry = self.run_net(NET_DOWN, "--interface", "wlan0",
+                             "--state-dir", str(self.state_dir))
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertFalse(state.exists())
+        self.assertIn("start", self.wpa_log_text())
+
     def test_net_up_refuses_unsafe_interface(self) -> None:
         result = self.run_net(NET_UP, "--interface", "wlan0;/bin/sh",
                               "--state-dir", str(self.state_dir))
@@ -595,6 +615,42 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("nothing-owned", result.stdout)
         self.assertTrue((self.state_dir / "recovery-net.state").exists())
+
+
+class NetHandoverPathTests(unittest.TestCase):
+    """The handover helpers must target the Wi-Fi service the image stages."""
+
+    def test_wifi_service_default_matches_the_staged_install_path(self) -> None:
+        # The client helper ships as an overlay file; its default service path
+        # must be the exact path build_recovery_image.py stages it at, or the
+        # handover stops/restores a service that is not installed.
+        builder = load_tool("build_recovery_image")
+        staged = "/" + builder.RECOVERY_AP_WPA_SERVICE_PATH
+        pattern = re.compile(
+            r"^WPA_SERVICE=\$\{RECOVERY_AP_WPA_SERVICE:-([^}]+)\}", re.MULTILINE)
+        for script in (NET_UP, NET_DOWN):
+            with self.subTest(script=script.name):
+                match = pattern.search(script.read_text())
+                self.assertIsNotNone(match, f"{script.name} has no WPA_SERVICE default")
+                assert match is not None
+                self.assertEqual(match.group(1), staged)
+
+    def test_wifi_service_default_resolves_without_the_env_override(self) -> None:
+        # Without RECOVERY_AP_WPA_SERVICE in the environment the helper resolves
+        # the staged path; the env var only ever overrides it for tests.
+        builder = load_tool("build_recovery_image")
+        staged = "/" + builder.RECOVERY_AP_WPA_SERVICE_PATH
+        for script in (NET_UP, NET_DOWN):
+            line = next(
+                candidate for candidate in script.read_text().splitlines()
+                if candidate.startswith("WPA_SERVICE="))
+            result = subprocess.run(
+                ["sh", "-c",
+                 f"unset RECOVERY_AP_WPA_SERVICE; {line}; printf '%s' \"$WPA_SERVICE\""],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            with self.subTest(script=script.name):
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, staged)
 
 
 class DependencyPinTests(unittest.TestCase):
@@ -796,31 +852,43 @@ WORKFLOW = TOOLS_DIR.parents[1] / ".github" / "workflows" / "button-backport.yml
 
 
 def recovery_ap_metadata(hashes: dict) -> dict:
-    """The exact document build_recovery_ap.sh --emit-metadata produces."""
+    """A metadata document matching build_recovery_ap.sh's emitted contract.
+
+    The provenance is derived from the real ``recovery-ap/SOURCE.lock`` so these
+    fixtures exercise exactly the values the builder and verifier now bind to the
+    checked-in pins, not placeholders a lock comparison would (correctly) reject.
+    """
+    lock = json.loads(LOCK.read_text())
     components = {}
-    for name, relative in RECOVERY_AP_PATHS.items():
+    for name, record in lock["components"].items():
         entry = {
-            "license": RECOVERY_AP_LICENSES[name],
-            "source_url": "https://example.invalid/recovery-ap",
-            "artifact": name,
-            "image_path": relative,
+            "version": record["version"],
+            "license": record["license"],
+            "source_url": record["source_url"],
+            "source_sha256": record["source_sha256"],
+            "source_license": record["source_license"],
+            "artifact": record["artifact"],
+            "image_path": RECOVERY_AP_PATHS[name],
         }
-        if name == "libreecho-recovery-button":
-            entry["source_path"] = (
-                "tools/mt8163-arm32/recovery-ap/libreecho-recovery-button.c")
-        else:
-            entry["source_sha256"] = "a" * 64
-            entry["source_license"] = "COPYING"
-            entry["image_license"] = list(RECOVERY_AP_IMAGE_LICENSES[name])
+        if record.get("source_license_secondary"):
+            entry["source_license_secondary"] = record["source_license_secondary"]
+        copies = lock["on_image"]["licenses"].get(name)
+        if copies:
+            entry["image_license"] = list(copies)
         components[name] = entry
+    for name, record in lock["first_party"].items():
+        components[name] = {
+            "license": record["license"],
+            "source_url": record["source_url"],
+            "source_path": record["source_path"],
+            "artifact": record["artifact"],
+            "image_path": RECOVERY_AP_PATHS[name],
+        }
     return {
         "schema": "libreecho-recovery-ap-binaries/v1",
         "components": components,
         "binaries": {name: {"sha256": digest} for name, digest in hashes.items()},
-        "source_offer": {
-            "components": ["dnsmasq"],
-            "statement": "corresponding-source offer for the GPL components",
-        },
+        "source_offer": json.loads(json.dumps(lock["source_offer"])),
     }
 
 
@@ -972,6 +1040,18 @@ class RecoveryApVerifierTests(unittest.TestCase):
         self.make_fixtures()
         self.assert_rejected(self.mutated(
             lambda m: m["components"]["dnsmasq"].__setitem__("image_path", "usr/bin/dnsmasq")))
+
+    def test_enabled_bundle_rejects_tampered_source_version(self) -> None:
+        # The staged metadata is self-declared; the verifier binds it to the
+        # checked-in SOURCE.lock and refuses an altered version.
+        self.make_fixtures()
+        self.assert_rejected(self.mutated(
+            lambda m: m["components"]["hostapd"].__setitem__("version", "9.99")))
+
+    def test_enabled_bundle_rejects_tampered_source_hash(self) -> None:
+        self.make_fixtures()
+        self.assert_rejected(self.mutated(
+            lambda m: m["components"]["dnsmasq"].__setitem__("source_sha256", "b" * 64)))
 
 
 class BundleStagingNegativeTests(unittest.TestCase):
@@ -1134,9 +1214,76 @@ class BundleStagingValidationTests(unittest.TestCase):
         metadata["components"]["libreecho-recovery-button"]["source_path"] = "../evil.c"
         self.assert_rejected(metadata)
 
+    def test_source_lock_binding_accepts_the_pinned_metadata(self) -> None:
+        builder = load_tool("build_recovery_image")
+        metadata = self.metadata()
+        provenance = builder.validate_recovery_ap_provenance(metadata)
+        # A metadata document derived from SOURCE.lock binds cleanly.
+        builder.validate_recovery_ap_source_lock(provenance, metadata["source_offer"])
+
+    def assert_lock_rejected(self, mutate) -> None:
+        builder = load_tool("build_recovery_image")
+        metadata = self.metadata()
+        mutate(metadata["components"])
+        with self.assertRaises(SystemExit):
+            builder.validate_recovery_ap_source_lock(
+                metadata["components"], metadata["source_offer"])
+
+    def test_tampered_source_version_is_refused(self) -> None:
+        self.assert_lock_rejected(
+            lambda components: components["hostapd"].__setitem__("version", "9.99"))
+
+    def test_tampered_source_sha256_is_refused(self) -> None:
+        self.assert_lock_rejected(
+            lambda components: components["dnsmasq"].__setitem__("source_sha256", "b" * 64))
+
+    def test_tampered_source_url_is_refused(self) -> None:
+        self.assert_lock_rejected(
+            lambda components: components["iw"].__setitem__(
+                "source_url", "https://evil.invalid/iw-5.19.tar.gz"))
+
+    def test_tampered_licence_is_refused(self) -> None:
+        self.assert_lock_rejected(
+            lambda components: components["hostapd"].__setitem__("license", "MIT"))
+
+    def test_tampered_source_offer_is_refused(self) -> None:
+        builder = load_tool("build_recovery_image")
+        metadata = self.metadata()
+        metadata["source_offer"]["components"] = []
+        with self.assertRaises(SystemExit):
+            builder.validate_recovery_ap_source_lock(
+                metadata["components"], metadata["source_offer"])
+
+
+def write_build_receipt(output: Path, lock: Path = LOCK) -> None:
+    """Write the receipt build_recovery_ap.sh --build emits for ``output``.
+
+    It binds the artefacts currently in ``output`` to the given lock file and a
+    toolchain identity, exactly as the real --build path does before it calls
+    --emit-metadata.
+    """
+    lock_data = lock.read_bytes()
+    binaries = {}
+    for name in RECOVERY_AP_PATHS:
+        data = (output / name).read_bytes()
+        binaries[name] = {
+            "sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
+        }
+    receipt = {
+        "schema": "libreecho-recovery-ap-build-receipt/v1",
+        "lock_path": str(lock),
+        "lock_sha256": hashlib.sha256(lock_data).hexdigest(),
+        "toolchain": {
+            "cc": "cc", "ar": "ar", "ranlib": "ranlib", "strip": "",
+            "cc_identity": "cc (test)",
+        },
+        "binaries": binaries,
+    }
+    (output / "recovery-ap-build-receipt.json").write_text(json.dumps(receipt))
+
 
 class MetadataEmissionTests(unittest.TestCase):
-    """build_recovery_ap.sh --emit-metadata binds artifacts to provenance."""
+    """build_recovery_ap.sh --emit-metadata is bound to a trusted build receipt."""
 
     def emit(self, output: Path) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -1144,12 +1291,17 @@ class MetadataEmissionTests(unittest.TestCase):
              "--output", str(output)],
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
 
+    def seed(self, output: Path, *, receipt: bool = True) -> None:
+        elf = arm32_static_elf()
+        for name in RECOVERY_AP_PATHS:
+            (output / name).write_bytes(elf + name.encode())
+        if receipt:
+            write_build_receipt(output)
+
     def test_emission_matches_the_pinned_set_and_real_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp)
-            elf = arm32_static_elf()
-            for name in RECOVERY_AP_PATHS:
-                (output / name).write_bytes(elf + name.encode())
+            self.seed(output)
             result = self.emit(output)
             self.assertEqual(result.returncode, 0, result.stderr)
             document = json.loads((output / "recovery-ap-binaries.json").read_text())
@@ -1168,27 +1320,53 @@ class MetadataEmissionTests(unittest.TestCase):
             for name, copies in RECOVERY_AP_IMAGE_LICENSES.items():
                 self.assertEqual(document["components"][name]["image_license"], copies)
 
+    def test_emission_without_the_build_receipt_is_refused(self) -> None:
+        # Arbitrary ELF files with no receipt must not be labelled as the pinned
+        # set: a standalone emission may only republish a verified build.
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            self.seed(output, receipt=False)
+            result = self.emit(output)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("build receipt", result.stderr)
+            self.assertFalse((output / "recovery-ap-binaries.json").exists())
+
     def test_emission_refuses_a_missing_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp)
-            elf = arm32_static_elf()
-            for name in RECOVERY_AP_PATHS:
-                (output / name).write_bytes(elf)
+            self.seed(output)
             (output / "iw").unlink()
             result = self.emit(output)
             self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((output / "recovery-ap-binaries.json").exists())
+
+    def test_emission_refuses_a_binary_swapped_after_the_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            self.seed(output)
+            # A binary changed after the build must not be re-labelled as pinned.
+            (output / "hostapd").write_bytes(arm32_static_elf() + b"tampered")
+            result = self.emit(output)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("build receipt", result.stderr)
             self.assertFalse((output / "recovery-ap-binaries.json").exists())
 
     def test_emitted_metadata_satisfies_the_image_builder_contract(self) -> None:
         builder = load_tool("build_recovery_image")
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp)
-            elf = arm32_static_elf()
-            for name in RECOVERY_AP_PATHS:
-                (output / name).write_bytes(elf)
+            self.seed(output)
             self.assertEqual(self.emit(output).returncode, 0)
             document = json.loads((output / "recovery-ap-binaries.json").read_text())
-            builder.validate_recovery_ap_provenance(document)
+            provenance = builder.validate_recovery_ap_provenance(document)
+            builder.validate_recovery_ap_source_lock(provenance, document["source_offer"])
+
+    def test_build_path_writes_the_receipt_before_emitting(self) -> None:
+        text = BUILDER.read_text()
+        self.assertGreater(
+            text.rindex('emit_metadata "$OUTPUT"'),
+            text.rindex('write_build_receipt "$OUTPUT"'),
+        )
 
 
 class LicenseCatalogTests(unittest.TestCase):

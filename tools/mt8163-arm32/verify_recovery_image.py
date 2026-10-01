@@ -125,6 +125,11 @@ RECOVERY_AP_OVERLAY = {
 RECOVERY_AP_MARKER = "/run/libreecho/recovery-mode"
 RECOVERY_AP_METADATA = "etc/libreecho/recovery-ap-binaries.json"
 RECOVERY_AP_METADATA_SCHEMA = "libreecho-recovery-ap-binaries/v1"
+# The checked-in pin document the on-image metadata must agree with.  The
+# metadata is a self-declared JSON document, so the verifier refuses any
+# component whose name/version/source URL/source SHA-256/licence does not match
+# this file; a hand-written document cannot pass off an unlisted component.
+RECOVERY_AP_LOCK_PATH = Path(__file__).resolve().parent / "recovery-ap" / "SOURCE.lock"
 RECOVERY_AP_LICENSE_ROOT = "usr/local/share/licenses/libreecho-core"
 SSH_MEMBER_NAMES = {
     "sbin/dropbear", "sbin/dropbearkey", "usr/bin/scp", "etc/passwd", "etc/group",
@@ -2105,6 +2110,95 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     return connectivity_ok
 
 
+def load_recovery_ap_lock() -> dict[str, Any]:
+    """Read and structurally validate the checked-in recovery-AP SOURCE.lock."""
+    path = RECOVERY_AP_LOCK_PATH
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit(f"ERROR: recovery-AP SOURCE.lock is unavailable: {path}")
+    try:
+        lock = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"ERROR: recovery-AP SOURCE.lock is not valid JSON: {exc}") from exc
+    if not isinstance(lock, dict):
+        raise SystemExit("ERROR: recovery-AP SOURCE.lock is not a JSON object")
+    components = lock.get("components")
+    first_party = lock.get("first_party")
+    if not isinstance(components, dict) or not isinstance(first_party, dict):
+        raise SystemExit("ERROR: recovery-AP SOURCE.lock lacks component records")
+    if set(components) | set(first_party) != set(RECOVERY_AP_COMPONENTS):
+        raise SystemExit("ERROR: recovery-AP SOURCE.lock does not describe the pinned set")
+    return lock
+
+
+def validate_recovery_ap_source_lock(provenance: dict[str, Any],
+                                     source_offer: object) -> None:
+    """Bind the on-image metadata provenance to the checked-in SOURCE.lock.
+
+    The metadata is a self-declared document staged by whichever build produced
+    it, so it is only trustworthy when every component's name, version, https
+    source URL, source SHA-256, licence and on-image licence copies match the
+    repository's ``recovery-ap/SOURCE.lock``.  A metadata document written for an
+    arbitrary binary is refused.
+    """
+    lock = load_recovery_ap_lock()
+    components = lock["components"]
+    first_party = lock["first_party"]
+    on_image = lock.get("on_image")
+    on_image_licenses = on_image.get("licenses") if isinstance(on_image, dict) else None
+    if not isinstance(on_image_licenses, dict):
+        on_image_licenses = {}
+
+    for name, record in components.items():
+        entry = provenance.get(name)
+        if not isinstance(entry, dict):
+            raise SystemExit(f"ERROR: recovery-AP metadata provenance is missing for {name}")
+        for field in ("version", "license", "source_url", "source_sha256",
+                      "source_license", "artifact"):
+            if entry.get(field) != record.get(field):
+                raise SystemExit(
+                    f"ERROR: recovery-AP metadata {field} does not match SOURCE.lock: {name}"
+                )
+        if record.get("source_license_secondary") and (
+                entry.get("source_license_secondary") != record["source_license_secondary"]):
+            raise SystemExit(
+                f"ERROR: recovery-AP metadata secondary licence does not match SOURCE.lock: {name}"
+            )
+        if entry.get("image_path") != RECOVERY_AP_COMPONENTS[name]:
+            raise SystemExit(
+                f"ERROR: recovery-AP metadata image path does not match the pinned target: {name}"
+            )
+        if list(entry.get("image_license", [])) != list(on_image_licenses.get(name, [])):
+            raise SystemExit(
+                f"ERROR: recovery-AP metadata on-image licences do not match SOURCE.lock: {name}"
+            )
+
+    for name, record in first_party.items():
+        entry = provenance.get(name)
+        if not isinstance(entry, dict):
+            raise SystemExit(f"ERROR: recovery-AP metadata provenance is missing for {name}")
+        for field in ("license", "source_url", "source_path", "artifact"):
+            if entry.get(field) != record.get(field):
+                raise SystemExit(
+                    f"ERROR: recovery-AP metadata {field} does not match SOURCE.lock: {name}"
+                )
+        if entry.get("image_path") != RECOVERY_AP_COMPONENTS[name]:
+            raise SystemExit(
+                f"ERROR: recovery-AP metadata image path does not match the pinned target: {name}"
+            )
+
+    lock_offer = lock.get("source_offer")
+    if not isinstance(lock_offer, dict) or not isinstance(source_offer, dict):
+        raise SystemExit("ERROR: recovery-AP metadata has no source offer to bind to SOURCE.lock")
+    if sorted(source_offer.get("components", [])) != sorted(lock_offer.get("components", [])):
+        raise SystemExit("ERROR: recovery-AP source-offer components do not match SOURCE.lock")
+    if (str(source_offer.get("statement", "")).strip() !=
+            str(lock_offer.get("statement", "")).strip()):
+        raise SystemExit("ERROR: recovery-AP source-offer statement does not match SOURCE.lock")
+    if (str(source_offer.get("description", "")).strip() !=
+            str(lock_offer.get("description", "")).strip()):
+        raise SystemExit("ERROR: recovery-AP source-offer description does not match SOURCE.lock")
+
+
 def validate_recovery_ap(entries: dict[str, Entry], manifest: dict[str, object]) -> None:
     """Verify the pinned recovery-AP bundle and its interface helpers.
 
@@ -2243,6 +2337,11 @@ def validate_recovery_ap(entries: dict[str, Entry], manifest: dict[str, object])
                     fail(f"recovery-AP on-image licence copy is missing: {staged}")
             if "GPL" in licence and name not in offered:
                 fail(f"recovery-AP GPL component has no corresponding-source offer: {name}")
+
+    # The attribution above is self-declared by the staged document; bind it to
+    # the repository's checked-in pins so an image cannot claim a component the
+    # SOURCE.lock does not list, or altered version/URL/source-hash/licence.
+    validate_recovery_ap_source_lock(provenance, offer)
 
 
 def system_map_physical_end(path: Path) -> int:
