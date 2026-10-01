@@ -6,7 +6,7 @@ import verify_recovery_image as verify
 from test_multi_target import RadarTreeDiffTests
 
 TOOLS = Path(__file__).resolve().parent
-HELPERS = ('libreecho-target-manifest', 'libreecho-generation', 'libreecho-generation-transaction')
+HELPERS = ('libreecho-target-manifest', 'libreecho-generation', 'libreecho-generation-transaction', 'libreecho-config-migrate')
 
 
 class PackagingTests(unittest.TestCase):
