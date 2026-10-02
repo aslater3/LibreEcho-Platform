@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -2159,6 +2160,18 @@ def add_stt_external_payload(payload: Path, payload_manifest: Path,
     }
 
 
+def add_boot_https_transport(stage: Path, payload: Path, payload_manifest: Path,
+                             manifest: dict[str, object], qemu_arm: str = "qemu-arm") -> None:
+    """Ship authenticated repair transport independently of all feature payloads."""
+    from boot_https_transport import MEMBERS, stage_transport
+    digest, _size, files = read_external_feature(
+        "assistant", payload, payload_manifest, tuple(MEMBERS.values()),
+    )
+    manifest["boot_https_transport"] = stage_transport(
+        stage, payload, digest, sha256(read(payload_manifest)), files, qemu_arm,
+    )
+
+
 def add_assistant_external_payload(payload: Path, payload_manifest: Path,
                                    manifest: dict[str, object]) -> None:
     """Record the provider-neutral streamed voice-assistant runtime."""
@@ -2721,6 +2734,10 @@ def main() -> None:
                         help="external SquashFS English streaming STT feature payload")
     parser.add_argument("--stt-payload-manifest", type=Path,
                         help="manifest for the external English STT feature payload")
+    parser.add_argument("--boot-https-payload", type=Path,
+                        help="verified assistant transport input for images without an assistant feature")
+    parser.add_argument("--boot-https-payload-manifest", type=Path,
+                        help="manifest for the build-time boot HTTPS transport input")
     parser.add_argument("--assistant-payload", type=Path,
                         help="external SquashFS streamed assistant feature payload")
     parser.add_argument("--assistant-payload-manifest", type=Path,
@@ -2928,6 +2945,13 @@ def main() -> None:
         raise SystemExit(
             f"ERROR: STT payload inputs are all-or-nothing; missing {missing}"
         )
+    boot_https_payload = args.boot_https_payload or args.assistant_payload
+    boot_https_manifest = args.boot_https_payload_manifest or args.assistant_payload_manifest
+    if ((args.boot_https_payload is None) != (args.boot_https_payload_manifest is None)):
+        raise SystemExit("ERROR: boot HTTPS payload and manifest inputs are all-or-nothing")
+    if boot_https_payload is None or boot_https_manifest is None:
+        raise SystemExit("ERROR: mandatory boot HTTPS transport input is missing")
+
     assistant_payload_options = {
         "assistant_payload": args.assistant_payload,
         "assistant_payload_manifest": args.assistant_payload_manifest,
@@ -3219,6 +3243,9 @@ def main() -> None:
                 stage, args.wpa_supplicant.resolve(), args.wpa_source_metadata.resolve(),
                 args.wifi_config.resolve(), manifest,
             )
+        add_boot_https_transport(
+            stage, boot_https_payload, boot_https_manifest, manifest, args.qemu_arm,
+        )
         validate_stage(stage)
         cpio = build_cpio(stage, 0)
     ramdisk = gzip.compress(cpio, compresslevel=9, mtime=0)

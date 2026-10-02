@@ -71,10 +71,14 @@ verifier = load_tool("verify_recovery_image")
 
 
 def newc_member(name: bytes, mode: int = stat.S_IFREG | 0o644,
-                payload: bytes = b"") -> bytes:
+                payload: bytes = b"", *, ino: int = 1, nlink: int = 1,
+                uid: int = 0, gid: int = 0, mtime: int = 0,
+                devmajor: int = 0, devminor: int = 0,
+                rdevmajor: int = 0, rdevminor: int = 0, checksum: int = 0) -> bytes:
     name_field = name + b"\0"
     values = (
-        1, mode, 0, 0, 1, 0, len(payload), 0, 0, 0, 0, len(name_field), 0,
+        ino, mode, uid, gid, nlink, mtime, len(payload), devmajor, devminor,
+        rdevmajor, rdevminor, len(name_field), checksum,
     )
     header = b"070701" + b"".join(f"{value:08x}".encode() for value in values)
     record = header + name_field
@@ -5819,6 +5823,38 @@ class UiTlsPackagingTests(unittest.TestCase):
             rejected = self.run_tls_prefix(unrecorded)
             self.assertEqual(rejected.returncode, 1, rejected.stdout)
             self.assertIn("include", rejected.stderr)
+
+
+class BootHttpsImageBoundaryTests(unittest.TestCase):
+    def test_image_verifier_requires_boot_transport_before_optional_features(self):
+        import gzip
+        import inspect
+        # Exercise the actual image verifier entry point, not source text.
+        options = {
+            name: None for name, parameter in inspect.signature(verifier.validate_initramfs).parameters.items()
+            if parameter.default is inspect.Parameter.empty
+        }
+        options.update(ramdisk=gzip.compress(newc_archive(), mtime=0), manifest={}, schema_version=2)
+        with self.assertRaisesRegex(SystemExit, 'mandatory boot HTTPS transport'):
+            verifier.validate_initramfs(**options)
+
+    def test_builder_rejects_image_without_any_boot_transport_input(self):
+        # Input paths are deliberately unavailable. Missing transport must fail
+        # before image output or unverified binary inputs can be consumed.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            command = [sys.executable, str(TOOLS_DIR / 'build_recovery_image.py')]
+            for flag in ('boot-envelope', 'adbd', 'adbd-source-metadata', 'busybox',
+                         'musl-loader', 'bootctl', 'update-verifier', 'ota-public-key',
+                         'zimage', 'system-map', 'output', 'ramdisk-output', 'manifest'):
+                command += ['--' + flag, str(root / flag)]
+            command += ['--expected-busybox-sha256', '0' * 64,
+                        '--expected-musl-loader-sha256', '0' * 64,
+                        '--image-profile', 'ota', '--update-channel', 'stable']
+            result = subprocess.run(command, capture_output=True, text=True, timeout=20)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('mandatory boot HTTPS transport input is missing', result.stderr)
+            self.assertFalse((root / 'output').exists())
 
 
 if __name__ == "__main__":

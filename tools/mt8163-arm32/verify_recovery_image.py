@@ -1178,6 +1178,75 @@ def validate_connectivity(entries: dict[str, Entry], manifest: dict[str, object]
     return True
 
 
+BOOT_HTTPS_CA_SHA256 = "c0c940a0e30d859783f7f130868d8082e79936ff0b41a0b1098ac7f98909263b"
+
+
+def validate_boot_https_transport(entries: dict[str, Entry], manifest: dict[str, object],
+                                 expected_payload_sha256: str | None) -> None:
+    # Independently enforce paths, ABI, mode, CA pin and closure; not presence-only.
+    sources = {
+        "usr/bin/curl": "usr/local/libexec/libreecho-curl",
+        "etc/ssl/certs/ca-certificates.crt": "usr/local/share/libreecho/cacert.pem",
+        "usr/local/share/licenses/curl/COPYING": "usr/local/share/licenses/curl/COPYING",
+        "usr/local/share/licenses/ca-certificates/copyright": "usr/local/share/licenses/ca-certificates/copyright",
+    }
+    for name in ("THIRD_PARTY_NOTICES.txt", "OpenSSL-copyright", "glibc-copyright",
+                 "gcc-runtime-copyright", "LGPL-2.1.txt", "GPL-3.0.txt"):
+        path = "usr/local/share/licenses/libreecho-assistant/" + name
+        sources[path] = path
+    record = manifest.get("boot_https_transport")
+    if (not isinstance(record, dict) or
+            record.get("schema") != "libreecho-boot-https-transport/v1" or
+            record.get("payload_dependency") is not False or
+            record.get("userdata_dependency") is not False or
+            record.get("client") != "/usr/bin/curl" or
+            record.get("ca") != "/etc/ssl/certs/ca-certificates.crt" or
+            record.get("curl_source_sha256") != "aa1b66a70eace83dc624508745646c08ae561de512ab403adffb93ac87fc72e6"):
+        fail("mandatory boot HTTPS transport manifest is missing or invalid")
+    assert isinstance(record, dict)
+    if (expected_payload_sha256 is None or
+            not re.fullmatch(r"[0-9a-f]{64}", expected_payload_sha256) or
+            record.get("source_payload_sha256") != expected_payload_sha256 or
+            not re.fullmatch(r"[0-9a-f]{64}", str(record.get("source_manifest_sha256", "")))):
+        fail("boot HTTPS transport source identity is not trusted")
+    if record.get("capabilities") != {
+            "curl": "8.21.0", "tls": "OpenSSL/3.0.13", "protocols": ["http", "https"]}:
+        fail("boot HTTPS client capability record is missing or invalid")
+    files = record.get("files")
+    if not isinstance(files, dict) or set(files) != set(sources):
+        fail("boot HTTPS transport closure is incomplete")
+    assert isinstance(files, dict)
+    for name, source in sources.items():
+        item = files[name]
+        mode = 0o755 if name == "usr/bin/curl" else 0o644
+        if (not isinstance(item, dict) or
+                set(item) != {"source_member", "sha256", "size", "mode"} or
+                item.get("source_member") != source or item.get("mode") != f"{mode:04o}" or
+                type(item.get("size")) is not int or item["size"] <= 0 or
+                not re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256", "")))):
+            fail(f"boot HTTPS transport record is invalid: {name}")
+        assert isinstance(item, dict)
+        member = require_member(entries, name, item["sha256"], mode)
+        if len(member.data) != item["size"]:
+            fail(f"boot HTTPS transport member size mismatch: {name}")
+        if name == "usr/bin/curl" and elf_info(member.data) != (1, 40, 0x05000400, None, (), False):
+            fail("boot HTTPS curl is not static ARM32 hard-float")
+        if name.startswith("etc/ssl/") and sha256(member.data) != BOOT_HTTPS_CA_SHA256:
+            fail("boot HTTPS CA identity changed")
+    assistant = manifest.get("assistant", {})
+    if isinstance(assistant, dict) and assistant.get("enabled"):
+        payload = assistant.get("payload", {})
+        if isinstance(payload, dict) and payload.get("sha256") == expected_payload_sha256:
+            for name, source in sources.items():
+                originals = payload.get("files")
+                if not isinstance(originals, dict) or not isinstance(originals.get(source), dict):
+                    fail(f"boot HTTPS source member is missing: {source}")
+                assert isinstance(originals, dict)
+                original = originals[source]
+                if any(original.get(key) != files[name][key] for key in ("sha256", "size", "mode")):
+                    fail(f"boot HTTPS transport differs from verified assistant input: {name}")
+
+
 def validate_target_identity(entries: dict[str, Entry], manifest: dict[str, object],
                              target: str, digest: str | None = None) -> None:
     get_target(target)
@@ -1232,7 +1301,8 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                        expected_wpa_supplicant_sha256: str | None = None,
                        expected_mdns_runtime_manifest_sha256: str | None = None,
                        expected_target: str | None = None,
-                       target_descriptor_sha256: str | None = None) -> bool:
+                       target_descriptor_sha256: str | None = None,
+                       expected_boot_https_payload_sha256: str | None = None) -> bool:
     if ramdisk[:4] != b"\x1f\x8b\x08\x00":
         fail("ramdisk gzip header is not deterministic")
     try:
@@ -1242,6 +1312,9 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     entries = parse_newc(cpio)
     validate_archive_tree(entries)
     validate_symlinks(entries)
+    validate_boot_https_transport(
+        entries, manifest, expected_boot_https_payload_sha256 or expected_assistant_payload_sha256,
+    )
     validate_no_connectivity_autostart(entries)
     if expected_target is not None:
         validate_target_identity(entries, manifest, expected_target, target_descriptor_sha256)
@@ -2444,6 +2517,8 @@ def main() -> None:
                         help="require this external English STT SquashFS payload")
     parser.add_argument("--expected-stt-payload-size", type=int,
                         help="require this external English STT payload size")
+    parser.add_argument("--expected-boot-https-payload-sha256",
+                        help="trusted boot transport input hash (defaults to assistant payload hash)")
     parser.add_argument("--expected-assistant-payload-sha256",
                         help="require this external streamed assistant SquashFS payload")
     parser.add_argument("--expected-assistant-payload-size", type=int,
@@ -2586,6 +2661,7 @@ def main() -> None:
         args.expected_mdns_runtime_manifest_sha256,
         expected_target=args.target,
         target_descriptor_sha256=args.target_descriptor_sha256,
+        expected_boot_https_payload_sha256=args.expected_boot_https_payload_sha256,
     )
     expected_connectivity = args.expected_connectivity_bundle != "none"
     if connectivity_enabled != expected_connectivity:
