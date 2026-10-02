@@ -2118,10 +2118,9 @@ class PolicyTests(unittest.TestCase):
         valid_agentd = "\n".join((
             "AGENT_DEPENDENCY_TIMEOUT_SECONDS=${AGENT_DEPENDENCY_TIMEOUT_SECONDS:-90}",
             "AGENT_DEPENDENCY_POLL_SECONDS=${AGENT_DEPENDENCY_POLL_SECONDS:-1}",
-            "PAYLOAD=/data/libreecho/features/assistant/payload.squashfs",
             "RUNTIME_ROOT=/run/libreecho/features/assistant/root",
             "mount_runtime() {",
-            "    mount -t squashfs -o loop,ro,none \"$PAYLOAD\" \"$RUNTIME_ROOT\"",
+            "    awk -v p=\"$RUNTIME_ROOT\" '$5==p {n++} END {exit n!=1}' /proc/self/mountinfo || return 1",
             "}",
             "unmount_runtime() { :; }",
             "dependency_sockets_ready() {",
@@ -2173,10 +2172,9 @@ class PolicyTests(unittest.TestCase):
             web.write_text(valid_web)
             agentd.write_text(valid_agentd)
             feature_script = "\n".join((
-                "PAYLOAD=/data/libreecho/features/feature/payload.squashfs",
                 "RUNTIME_ROOT=/run/libreecho/features/feature/root",
                 "mount_runtime() {",
-                "    mount -t squashfs -o loop,ro,none \"$PAYLOAD\" \"$RUNTIME_ROOT\"",
+                "    awk -v p=\"$RUNTIME_ROOT\" '$5==p {n++} END {exit n!=1}' /proc/self/mountinfo || return 1",
                 "}",
                 "unmount_runtime() { :; }",
                 "start_service() {",
@@ -2271,6 +2269,18 @@ class PolicyTests(unittest.TestCase):
 
             led.write_text(valid_led.replace("--startup-animation ", ""))
             with self.assertRaisesRegex(SystemExit, "startup-animation"):
+                builder.validate_ui_startup_contract(bundle)
+            led.write_text(valid_led)
+
+            sttd = bundle / "etc/init.d/libreecho-sttd.init"
+            sttd.write_text(feature_script.replace(
+                "mount_runtime() {\n",
+                "mount_runtime() {\n    mount -t squashfs -o loop,ro /data/libreecho/features/stt/payload.squashfs \"$RUNTIME_ROOT\"\n",
+            ))
+            with self.assertRaisesRegex(SystemExit, "legacy payload bytes"):
+                builder.validate_ui_startup_contract(bundle)
+            sttd.write_text(feature_script.replace("/proc/self/mountinfo", "/dev/null"))
+            with self.assertRaisesRegex(SystemExit, "does not verify the generation mount"):
                 builder.validate_ui_startup_contract(bundle)
 
     def test_production_boot_defers_payload_backed_services(self) -> None:

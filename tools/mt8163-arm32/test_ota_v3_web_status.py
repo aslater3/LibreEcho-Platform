@@ -30,6 +30,34 @@ class WebStatusTests(FailurePolicyTests):
         self.assertIn("printf 'ui_ota_adapter_sha256=%s\\n' \"$ui_ota_adapter_sha256\"", source)
         self.assertIn("printf 'source_diff_sha256=%s\\n' \"$ui_diff_sha256\"", source)
 
+    def test_adapted_feature_init_scripts_pass_the_image_startup_contract(self):
+        # The image builder validates the packaged init scripts. After the v3
+        # adapter, a feature service no longer owns its payload: Platform mounts
+        # the authenticated generation and the service only verifies that mount.
+        # The contract must accept that shape and reject any legacy mount.
+        import importlib.util, tempfile, subprocess, sys
+        ui = os.environ.get('LIBREECHO_OTA_UI_SOURCE')
+        if not ui or not (Path(ui) / 'init/libreecho-agentd.init').is_file():
+            self.skipTest('complete companion UI init scripts are not available')
+        spec = importlib.util.spec_from_file_location('bri', TOOLS / 'build_recovery_image.py')
+        bri = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bri)
+        with tempfile.TemporaryDirectory() as tmp:
+            adapted = Path(tmp) / 'ui'
+            subprocess.run([sys.executable, str(TOOLS / 'ui/ota_v3_health.py'), '--source', ui,
+                            '--output', str(adapted)], check=True)
+            bundle = Path(tmp) / 'bundle'
+            (bundle / 'etc/init.d').mkdir(parents=True)
+            for script in (adapted / 'init').glob('*.init'):
+                (bundle / 'etc/init.d' / script.name).write_bytes(script.read_bytes())
+            bri.validate_ui_startup_contract(bundle)
+            agentd = bundle / 'etc/init.d/libreecho-agentd.init'
+            text = agentd.read_text()
+            agentd.write_text(text.replace('mount_runtime() {\n',
+                'mount_runtime() {\n    mount -t squashfs -o ro "$PAYLOAD" "$RUNTIME_ROOT"\n', 1))
+            with self.assertRaises(SystemExit):
+                bri.validate_ui_startup_contract(bundle)
+
     def test_packager_publishes_snapshot_build_tree_to_caller_checkout(self):
         # Product snapshots relink objects from "$UI_SOURCE/build" of the
         # checkout it passed in, after this builder returns. The compile runs in
