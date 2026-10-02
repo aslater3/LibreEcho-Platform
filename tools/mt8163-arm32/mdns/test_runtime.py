@@ -18,6 +18,7 @@ from pathlib import Path
 
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = Path(__file__).resolve().parent
@@ -583,7 +584,7 @@ class SupervisorLifecycleTests(unittest.TestCase):
     """
 
     INIT = HERE.parent / "initramfs/libreecho-mdnsd"
-    FUNCTIONS = ("pid_alive", "process_exe", "own_process",
+    FUNCTIONS = ("pid_alive", "proc_field", "process_exe", "own_process",
                  "runtime_responder_pids", "supervisor_pids",
                  "runtime_pair", "record_runtime_pair", "status",
                  "stopped_wait", "stop")
@@ -707,6 +708,28 @@ class SupervisorLifecycleTests(unittest.TestCase):
         for proc in (supervisor, dbus, avahi):
             proc.wait(timeout=5)
         self.assertFalse(self.pidfile.exists())
+
+    def test_stop_kills_a_supervisor_that_ignores_sigterm(self) -> None:
+        # A supervisor that survives SIGTERM would respawn the pair after
+        # cleanup; stop must not report success while it is still running.
+        source = self.work / "stubborn.c"
+        source.write_text(
+            "#include <signal.h>\n#include <unistd.h>\n"
+            "int main(void){signal(SIGTERM,SIG_IGN);sleep(60);return 0;}\n")
+        compiler = shutil.which("cc") or shutil.which("gcc") or "cc"
+        self.supervisor.unlink()
+        subprocess.run([compiler, "-o", str(self.supervisor), str(source)],
+                       check=True)
+        supervisor = self._spawn(self.supervisor)
+        time.sleep(0.2)
+        self._spawn(self.dbus)
+        self._spawn(self.avahi)
+        self._bus()
+        out = self._run("stop")
+        self.assertIn("rc=0", out)
+        self.assertIsNotNone(supervisor.poll(),
+                             "supervisor survived a successful stop")
+        self.assertIn("mdns-supervisor-stop-timeout:", self.log.read_text())
 
     def test_record_runtime_pair_writes_the_identity_pair(self) -> None:
         self._spawn(self.supervisor)

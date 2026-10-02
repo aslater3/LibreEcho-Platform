@@ -165,6 +165,8 @@ stopped_wait() {
     count=0
     while [ "$count" -lt "$STOP_TIMEOUT" ]; do
         pid_alive "$pid" || return 0
+        # A zombie has exited; only its parent's reap is outstanding.
+        [ "$(proc_field "$pid" 3)" = Z ] && return 0
         $BB sleep 1
         count=$((count + 1))
     done
@@ -177,7 +179,15 @@ stop() {
     # the pair while it runs only produces a new pair.
     for pid in $(supervisor_pids); do
         $BB kill "$pid" 2>/dev/null
-        stopped_wait "$pid" || log "mdns-supervisor-stop-timeout:$pid"
+        stopped_wait "$pid" && continue
+        log "mdns-supervisor-stop-timeout:$pid"
+        $BB kill -9 "$pid" 2>/dev/null
+        stopped_wait "$pid" || {
+            # Still running: it would respawn the pair after cleanup, and a
+            # following start would race it with a second supervisor.
+            log "mdns-supervisor-kill-failed:$pid"
+            return 1
+        }
     done
     if [ -s "$PIDFILE" ]; then
         server_pid=$($BB sed -n '2p' "$PIDFILE" 2>/dev/null)
@@ -371,7 +381,7 @@ case "$action" in
         stop
         ;;
     restart)
-        stop
+        stop || exit 1
         start
         ;;
     status)
