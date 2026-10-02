@@ -332,6 +332,16 @@ def discover(assets: Path, target: str = DEFAULT_TARGET) -> dict:
         raise BuildError(f"invalid signed feature ids: {feature_ids!r}")
     if len(id_list) != len(set(id_list)):
         raise BuildError(f"duplicate signed feature id: {feature_ids!r}")
+    # OTA v3 publishes a complete target state: every feature is a full signed
+    # asset with size and digest, and composition from a device's prior bytes
+    # (actions, base hashes) does not exist. Any such key in a v3 manifest is a
+    # malformed release, not a preference.
+    is_v3 = ota.get("format") == "libreecho-ota-v3"
+    if is_v3:
+        legacy = sorted(k for k in ota if re.fullmatch(
+            r"feature_[A-Za-z0-9._-]+_(action|base_payload_sha256|base_manifest_sha256)", k))
+        if legacy:
+            raise BuildError(f"v3 target manifest carries legacy composition keys: {legacy}")
     names_seen: set[str] = set()
     for record in records:
         if not isinstance(record, dict) or set(record) != {"name", "payload", "manifest"}:
@@ -342,7 +352,7 @@ def discover(assets: Path, target: str = DEFAULT_TARGET) -> dict:
         if name in names_seen:
             raise BuildError(f"feature listed twice in the install manifest: {name}")
         names_seen.add(name)
-        action = ota.get(f"feature_{name}_action")
+        action = "replace" if is_v3 else ota.get(f"feature_{name}_action")
         if action not in ("replace", "preserve"):
             raise BuildError(
                 f"feature {name} has an unsupported signed action: {action or 'none'}")

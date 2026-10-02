@@ -464,6 +464,26 @@ class ReleaseLayoutTests(unittest.TestCase):
         with self.assertRaises(builder.BuildError):
             self.build()
 
+    def test_a_v3_target_manifest_builds_without_feature_actions(self) -> None:
+        # OTA v3 publishes the whole target state: every feature is a complete
+        # signed asset, and the manifest carries no per-feature action.
+        self._make_release({"format": "libreecho-ota-v3", "feature_tts_action": None})
+        self.build()
+        text = (self.out / builder.MANIFEST_NAME).read_text()
+        staging = [l for l in text.splitlines() if l.startswith("staging=")]
+        self.assertEqual(len(staging), 1)
+        self.assertEqual(staging[0].split("=", 1)[1].split(":")[1], self.signed_payload.name)
+
+    def test_a_v3_manifest_carrying_legacy_composition_keys_is_refused(self) -> None:
+        for key in ("feature_tts_action", "feature_tts_base_payload_sha256",
+                    "feature_tts_base_manifest_sha256"):
+            with self.subTest(key=key):
+                overrides = {"format": "libreecho-ota-v3", "feature_tts_action": None}
+                overrides[key] = "replace" if key.endswith("action") else "0" * 64
+                self._make_release(overrides)
+                with self.assertRaises(builder.BuildError):
+                    self.build()
+
     def test_a_duplicate_signed_feature_id_is_refused(self) -> None:
         self._make_release({"feature_ids": "tts,tts"})
         with self.assertRaises(builder.BuildError):

@@ -63,6 +63,55 @@ class RecoveryParityTests(grammar.SignedFixture):
                              (h.incoming / payload.name).stat().st_ino)
 
 
+    def test_twrp_installer_publishes_the_same_generation_as_ota(self):
+        """The TWRP zip and the browser helper consume one bundle; both must
+        publish the OTA-assembled generation byte for byte and point current
+        at it, with no legacy feature tree."""
+        import subprocess, sys
+        sys.path.insert(0, str(grammar.TOOLS / 'recovery-install/tests'))
+        from test_installer_boot_write import extract_function, INSTALLER
+        ota = convergence.ConvergenceTests('test_empty')
+        ota.setUp()
+        self.addCleanup(ota.doCleanups)
+        result = ota.run_assembly()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        bundle = self.root / 'twrp-bundle'
+        bundle.mkdir()
+        (bundle / 'manifest').write_bytes(ota.p.read_bytes())
+        (bundle / 'manifest.sig').write_bytes(ota.s.read_bytes())
+        fields = dict(row.split('=', 1) for row in ota.text.splitlines())
+        for f in grammar.FEATURES:
+            # Build-tag names, as the release ships them: found by digest.
+            (bundle / f'build-{f}.squashfs').write_bytes(ota.assets[f][0])
+            (bundle / f'build-{f}.manifest.json').write_bytes(ota.assets[f][1])
+        data = self.root / 'twrp-data'
+        source = INSTALLER.read_text()
+        functions = '\n'.join(extract_function(source, name) for name in (
+            'index_feature_assets', 'lookup_digest', 'stage_features', 'stage_v3_generation'))
+        harness = self.root / 'twrp.sh'
+        harness.write_text(
+            'set -u\n'
+            f'BUNDLE_DIR="{bundle}"\nDRY_RUN=0\n'
+            f'LIVE_UPDATE="{data}/libreecho/update"\nSTAGING="$LIVE_UPDATE/staging"\n'
+            f'LIVE_FEATURES="{data}/libreecho/features"\nLIVE_GENERATIONS="{data}/libreecho/generations"\n'
+            'ui_print() { :; }\nreceipt_set() { :; }\n'
+            'die() { printf "FAILED: %s\\n" "$*" >&2; exit 1; }\n'
+            'sha256_of() { sha256sum "$1" | cut -d" " -f1; }\n'
+            + functions + '\nstage_features\n')
+        result = subprocess.run(['/bin/busybox', 'sh', str(harness)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        installed = data / 'libreecho/generations' / fields['transaction_id']
+        snapshot = lambda root: {str(p.relative_to(root)): p.read_bytes() for p in root.rglob('*') if p.is_file()}
+        self.assertEqual(snapshot(installed), snapshot(ota.generations / fields['transaction_id']))
+        self.assertEqual((data / 'libreecho/update/current').read_text(), fields['transaction_id'] + '\n')
+        for p in [installed, *installed.rglob('*')]:
+            self.assertEqual(p.stat().st_mode & 0o777, 0o500 if p.is_dir() else 0o400)
+        self.assertFalse((data / 'libreecho/features').exists(), 'v3 must not populate the legacy feature tree')
+        self.assertFalse((data / 'libreecho/update/staging/features').exists())
+        # A second run must refuse rather than overwrite a published generation.
+        result = subprocess.run(['/bin/busybox', 'sh', str(harness)], capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+
 if __name__ == '__main__':
     import unittest
     unittest.main()
