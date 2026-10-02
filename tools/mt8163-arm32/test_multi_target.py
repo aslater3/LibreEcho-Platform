@@ -456,6 +456,8 @@ class RadarTreeDiffTests(unittest.TestCase):
                'usr/local/sbin/libreecho-config-migrate',
                # Feature-directory symlink skip in legacy residue cleanup.
                'usr/local/sbin/libreecho-data-cleanup',
+               # mDNS wrapper status resolves the live supervisor, not a pidfile.
+               'etc/init.d/libreecho-mdnsd.init',
                'usr/local/sbin/libreecho-generation-transaction',
                'usr/local/sbin/libreecho-bootctl',
                'usr/local/sbin/libreecho-recovery-ap-probe',
