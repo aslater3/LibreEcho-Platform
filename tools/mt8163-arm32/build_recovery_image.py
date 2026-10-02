@@ -1187,10 +1187,8 @@ def validate_ui_startup_contract(bundle: Path) -> None:
             (
                 "AGENT_DEPENDENCY_TIMEOUT_SECONDS=${AGENT_DEPENDENCY_TIMEOUT_SECONDS:-90}",
                 "AGENT_DEPENDENCY_POLL_SECONDS=${AGENT_DEPENDENCY_POLL_SECONDS:-1}",
-                "PAYLOAD=",
                 "RUNTIME_ROOT=",
                 "mount_runtime()",
-                "mount -t squashfs",
                 "unmount_runtime()",
                 "mount_runtime || return 1",
                 "dependency_sockets_ready()",
@@ -1205,10 +1203,8 @@ def validate_ui_startup_contract(bundle: Path) -> None:
     )
     payload_contracts = {
         "etc/init.d/libreecho-airplayd.init": (
-            "PAYLOAD=",
             "RUNTIME_ROOT=",
             "mount_runtime()",
-            "mount -t squashfs",
             "unmount_runtime()",
             "mount_runtime || return 1",
             "start) start_service",
@@ -1219,28 +1215,22 @@ def validate_ui_startup_contract(bundle: Path) -> None:
             "persistent AirPlay disable",
         ),
         "etc/init.d/libreecho-sttd.init": (
-            "PAYLOAD=",
             "RUNTIME_ROOT=",
             "mount_runtime()",
-            "mount -t squashfs",
             "unmount_runtime()",
             "mount_runtime || return 1",
             "start) start_service",
         ),
         "etc/init.d/libreecho-ttsd.init": (
-            "PAYLOAD=",
             "RUNTIME_ROOT=",
             "mount_runtime()",
-            "mount -t squashfs",
             "unmount_runtime()",
             "mount_runtime || return 1",
             "start) start_service",
         ),
         "etc/init.d/libreecho-waked.init": (
-            "PAYLOAD=",
             "RUNTIME_ROOT=",
             "mount_runtime()",
-            "mount -t squashfs",
             "unmount_runtime()",
             "mount_runtime || return 1",
             "start) start_service",
@@ -1331,6 +1321,20 @@ def validate_ui_startup_contract(bundle: Path) -> None:
                 raise SystemExit(
                     "ERROR: agentd start case does not wait for dependencies"
                 )
+        if relative in payload_contracts or relative.endswith("libreecho-agentd.init"):
+            # OTA v3: Platform mounts the authenticated generation; a feature
+            # service only verifies that read-only squashfs mount and must never
+            # mount bytes itself or name the legacy feature tree.
+            mount_body = re.search(r"(?ms)^mount_runtime\(\) \{\n(.*?)^\}", text)
+            if not mount_body:
+                raise SystemExit(f"ERROR: feature service has no mount_runtime: {relative}")
+            if ("mount -t" in mount_body.group(1) or "$PAYLOAD" in text
+                    or "/data/libreecho/features" in text):
+                raise SystemExit(
+                    f"ERROR: feature service mounts legacy payload bytes: {relative}")
+            if "/proc/self/mountinfo" not in mount_body.group(1):
+                raise SystemExit(
+                    f"ERROR: feature service does not verify the generation mount: {relative}")
         if relative in payload_contracts:
             start_service_start = text.index("start_service()")
             dispatch_start = text.index('case "${1:-}" in')
