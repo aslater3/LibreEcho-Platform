@@ -17,6 +17,19 @@ class WebStatusTests(FailurePolicyTests):
         self.assertLess(source.index('ota_v3_health.py'), source.index('"$MAKE_BIN" -C "$UI_SOURCE" clean'))
         self.assertIn('ui_ota_adapter_sha256', source)
 
+    def test_manifest_source_identity_is_the_callers_unmodified_checkout(self):
+        # Product pins source_diff_sha256 to the hash of the checkout it passed
+        # in (build_recovery_image --expected-ui-diff-sha256). The OTA health
+        # adapter is recorded separately as ui_ota_adapter_sha256 and must not
+        # be folded into the source identity, or every rebuilt bundle fails the pin.
+        source = (TOOLS / 'ui/build_ui_bundle.sh').read_text()
+        captured = 'ui_diff_sha256=$(source_state_sha256 "$UI_SOURCE")'
+        self.assertEqual(source.count('ui_diff_sha256=$('), 1)
+        self.assertIn(captured, source)
+        self.assertLess(source.index(captured), source.index('ota_v3_health.py" --source'))
+        self.assertIn("printf 'ui_ota_adapter_sha256=%s\\n' \"$ui_ota_adapter_sha256\"", source)
+        self.assertIn("printf 'source_diff_sha256=%s\\n' \"$ui_diff_sha256\"", source)
+
     def test_packager_publishes_snapshot_build_tree_to_caller_checkout(self):
         # Product snapshots relink objects from "$UI_SOURCE/build" of the
         # checkout it passed in, after this builder returns. The compile runs in

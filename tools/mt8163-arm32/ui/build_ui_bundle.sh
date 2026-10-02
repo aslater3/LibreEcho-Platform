@@ -389,7 +389,6 @@ UI_HEALTH_TMP=$(mktemp -d "${TMPDIR:-/tmp}/libreecho-ui-health.XXXXXX")
 python3 "$SCRIPT_DIR/ota_v3_health.py" --source "$UI_SOURCE" --output "$UI_HEALTH_TMP/source"
 UI_SOURCE=$UI_HEALTH_TMP/source
 ui_ota_adapter_sha256=$(sha256sum "$SCRIPT_DIR/ota_v3_health.py" "$SCRIPT_DIR/ota_v3_health.h" | awk '{print $1}' | sha256sum | awk '{print $1}')
-ui_diff_sha256=$(printf '%s\n%s\n' "$ui_diff_sha256" "$ui_ota_adapter_sha256" | sha256sum | awk '{print $1}')
 
 # The UI Makefile appends its own definitions to CPPFLAGS, so the mbedTLS and
 # Opus include paths are exported (a command-line CPPFLAGS would suppress them).
