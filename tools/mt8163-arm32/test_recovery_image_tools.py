@@ -4218,6 +4218,84 @@ start_feature_service_if_enabled
             stderr=subprocess.PIPE,
         )
 
+    def _v3_layout(self, data: Path, *, fresh: bool) -> None:
+        """The /data tree a v3 install or OTA really leaves behind.
+
+        Recovery's direct install publishes generations/<tx>, keeps the
+        hardlinked uploads in libreecho/incoming and writes update/current.
+        A committed OTA adds update/previous, the generation lock, the asset
+        cache and the status records.
+        """
+        root = data / "libreecho"
+        for name in ("config", "secrets", "features", "update/staging"):
+            (root / name).mkdir(parents=True, exist_ok=True)
+        generation = root / "generations/txn-a/features/airplay2"
+        generation.mkdir(parents=True)
+        (generation / "payload.squashfs").write_text("p")
+        (root / "generations/txn-a/COMPLETE").write_text("c")
+        (root / "update/current").write_text("txn-a\n")
+        if fresh:
+            (root / "incoming").mkdir()
+            (root / "incoming/upload").write_text("p")
+            (root / "update/staging/manifest").write_text("m")
+            (root / "update/staging/manifest.sig").write_text("s")
+            return
+        (root / "generations/txn-b").mkdir()
+        (root / "generations/txn-a.pin").write_text("txn-a\n")
+        (root / "update/previous").write_text("txn-b\n")
+        (root / "update/generation.lock").mkdir()
+        (root / "update/generation.lock/owner").write_text("1 boot\n")
+        (root / "update/asset-cache").mkdir()
+        (root / "update/fetch.lock").mkdir()
+        for name in ("config-status", "features-status", "transaction-slot"):
+            (root / "update" / name).write_text("x\n")
+
+    def test_userdata_cleanup_accepts_the_v3_generation_layout(self) -> None:
+        """A v3 /data tree must pass the contract the v3 image itself enforces.
+
+        The contract gates the production service graph: a failure here is
+        ui-services-blocked-by-data-contract on the first boot after a v3
+        install, so the device never reaches startup-ready and rolls back.
+        """
+        for fresh in (True, False):
+            with self.subTest(fresh=fresh), tempfile.TemporaryDirectory() as temporary:
+                data = Path(temporary) / "data"
+                self._v3_layout(data, fresh=fresh)
+                result = self._run_cleanup(data)
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 0, output)
+                self.assertIn("DATA_CLEANUP_OK", output)
+                self.assertNotIn("DATA_CLEANUP_UNKNOWN", output)
+                self.assertNotIn("DATA_CLEANUP_TOLERATED", output)
+                # Immutable generations are owned by the transaction tool;
+                # the cleanup must never delete or descend into them.
+                self.assertTrue((data / "libreecho/generations/txn-a/COMPLETE").is_file())
+                self.assertTrue((data / "libreecho/update/current").is_file())
+
+    def test_userdata_cleanup_still_rejects_unknown_v3_shapes(self) -> None:
+        """Allowlisting v3 names must not open the contract to other shapes."""
+        for relative, make_dir in (
+            ("libreecho/generations-old", True),
+            ("libreecho/update/generation.lock.stale", True),
+        ):
+            with self.subTest(path=relative), tempfile.TemporaryDirectory() as temporary:
+                data = Path(temporary) / "data"
+                self._v3_layout(data, fresh=False)
+                path = data / relative
+                path.mkdir() if make_dir else path.write_text("x")
+                result = self._run_cleanup(data)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("DATA_CLEANUP_UNKNOWN", result.stderr)
+        # A generations root that is a symlink is tampering, not version skew.
+        with tempfile.TemporaryDirectory() as temporary:
+            data = Path(temporary) / "data"
+            self._v3_layout(data, fresh=True)
+            real = data / "elsewhere"
+            (data / "libreecho/generations").rename(real)
+            (data / "libreecho/generations").symlink_to(real)
+            result = self._run_cleanup(data)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+
     def test_userdata_cleanup_accepts_the_timer_schedule(self) -> None:
         """timerd's saved schedule, and the temporary it renames over it.
 
