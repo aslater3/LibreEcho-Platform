@@ -570,5 +570,153 @@ class SupervisorReadinessTests(unittest.TestCase):
             self.assertIn("cleaned", log_text)
 
 
+class SupervisorLifecycleTests(unittest.TestCase):
+    """status/stop must work for the supervisor path, not only the fallback.
+
+    On hardware the UI supervisor owns D-Bus and Avahi but never wrote the
+    pidfile that status() required, so status always failed. Every caller
+    that probes before acting (the AirPlay init, the web API's discovery
+    refresh) then ran start, which tore the live responder down. stop() also
+    left the supervisor itself running, so it respawned the pair it had just
+    lost. These run the real wrapper functions against fake processes whose
+    executables sit inside a private runtime root.
+    """
+
+    INIT = HERE.parent / "initramfs/libreecho-mdnsd"
+    FUNCTIONS = ("pid_alive", "process_exe", "own_process",
+                 "runtime_responder_pids", "supervisor_pids",
+                 "runtime_pair", "record_runtime_pair", "status",
+                 "stopped_wait", "stop")
+
+    def _function(self, source: str, name: str) -> str:
+        marker = f"{name}() {{"
+        start = source.index(marker)
+        depth = 0
+        for offset, char in enumerate(source[start:], start):
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[start:offset + 1]
+        raise AssertionError(f"unterminated function: {name}")
+
+    def setUp(self) -> None:
+        self.busybox = shutil.which("busybox") or ""
+        if not self.busybox:
+            self.skipTest("busybox unavailable")
+        self.work = Path(tempfile.mkdtemp(prefix="le-mdns-lifecycle-"))
+        self.root = self.work / "root"
+        for sub in ("usr/sbin", "usr/bin", "run/dbus"):
+            (self.root / sub).mkdir(parents=True)
+        # Copies of one tiny sleeper, so /proc/<pid>/exe identifies each fake
+        # exactly as the device's processes are identified. Built here because
+        # host sleep/busybox binaries are often multicall and dispatch on their
+        # own file name, which a renamed copy breaks.
+        compiler = shutil.which("cc") or shutil.which("gcc")
+        if not compiler:
+            self.skipTest("no C compiler for the fake responder")
+        source = self.work / "sleeper.c"
+        source.write_text("#include <unistd.h>\nint main(void){sleep(60);return 0;}\n")
+        sleeper = self.work / "sleeper"
+        subprocess.run([compiler, "-o", str(sleeper), str(source)], check=True)
+        self.avahi = self.root / "usr/sbin/avahi-daemon"
+        self.dbus = self.root / "usr/bin/dbus-daemon"
+        self.supervisor = self.work / "libreecho-mdnsd"
+        for target in (self.avahi, self.dbus, self.supervisor):
+            shutil.copy(sleeper, target)
+        self.bus_socket = self.root / "run/dbus/system_bus_socket"
+        self.pidfile = self.work / "mdnsd.pid"
+        self.log = self.work / "mdns.log"
+        self.procs: list[subprocess.Popen] = []
+
+    def tearDown(self) -> None:
+        for proc in self.procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        shutil.rmtree(self.work, ignore_errors=True)
+
+    def _spawn(self, exe: Path) -> subprocess.Popen:
+        proc = subprocess.Popen([str(exe)])
+        self.procs.append(proc)
+        return proc
+
+    def _bus(self) -> None:
+        import socket as socketlib
+        sock = socketlib.socket(socketlib.AF_UNIX)
+        sock.bind(str(self.bus_socket))
+        self.addCleanup(sock.close)
+
+    def _run(self, call: str) -> str:
+        source = self.INIT.read_text()
+        body = "\n".join(self._function(source, n) for n in self.FUNCTIONS)
+        harness = self.work / "harness.sh"
+        harness.write_text("\n".join([
+            "set -u",
+            f"BB={shlex.quote(self.busybox)}",
+            "PROC_ROOT=/proc",
+            f"RUNTIME_ROOT={shlex.quote(str(self.root))}",
+            f"SUPERVISOR={shlex.quote(str(self.supervisor))}",
+            f"PIDFILE={shlex.quote(str(self.pidfile))}",
+            f"BUS_SOCKET={shlex.quote(str(self.bus_socket))}",
+            "STOP_TIMEOUT=3",
+            f'log() {{ printf "%s\\n" "$*" >> {shlex.quote(str(self.log))}; }}',
+            body,
+            call,
+            'printf "rc=%s\\n" "$?"',
+            "",
+        ]))
+        result = subprocess.run([self.busybox, "sh", str(harness)], text=True,
+                                capture_output=True, timeout=30)
+        return result.stdout + result.stderr
+
+    def test_supervisor_owned_runtime_reports_running_without_a_pidfile(self) -> None:
+        self._spawn(self.supervisor)
+        self._spawn(self.dbus)
+        self._spawn(self.avahi)
+        self._bus()
+        self.assertFalse(self.pidfile.exists())
+        self.assertIn("rc=0", self._run("status"))
+
+    def test_status_still_fails_when_the_pair_is_incomplete(self) -> None:
+        self._spawn(self.supervisor)
+        self._spawn(self.dbus)
+        self._bus()
+        self.assertIn("rc=1", self._run("status"))
+
+    def test_status_fails_without_the_bus_socket(self) -> None:
+        self._spawn(self.dbus)
+        self._spawn(self.avahi)
+        self.assertIn("rc=1", self._run("status"))
+
+    def test_a_responder_outside_the_runtime_root_is_not_counted(self) -> None:
+        stray = self.work / "avahi-daemon"
+        shutil.copy(self.avahi, stray)
+        self._spawn(stray)
+        self._spawn(self.dbus)
+        self._bus()
+        self.assertIn("rc=1", self._run("status"))
+
+    def test_stop_ends_the_supervisor_before_its_pair(self) -> None:
+        supervisor = self._spawn(self.supervisor)
+        dbus = self._spawn(self.dbus)
+        avahi = self._spawn(self.avahi)
+        self._bus()
+        self.assertIn("rc=0", self._run("stop"))
+        for proc in (supervisor, dbus, avahi):
+            proc.wait(timeout=5)
+        self.assertFalse(self.pidfile.exists())
+
+    def test_record_runtime_pair_writes_the_identity_pair(self) -> None:
+        self._spawn(self.supervisor)
+        dbus = self._spawn(self.dbus)
+        avahi = self._spawn(self.avahi)
+        self._bus()
+        self.assertIn("rc=0", self._run("record_runtime_pair"))
+        self.assertEqual(self.pidfile.read_text().split(),
+                         [str(avahi.pid), str(dbus.pid)])
+
+
 if __name__ == '__main__':
     unittest.main()
