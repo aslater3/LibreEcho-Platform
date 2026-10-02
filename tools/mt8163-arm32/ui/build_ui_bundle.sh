@@ -587,6 +587,12 @@ record = json.load(open(sys.argv[1], encoding="utf-8"))
 print("%s %s %s" % (record.get("name", ""), record.get("target", ""), record.get("config", "")))
 PY
 )
+# The compile ran in a private snapshot that the EXIT trap deletes. Callers
+# (Product build.sh) snapshot relink objects from "$UI_SOURCE/build" of the
+# checkout they passed in, so publish the final build tree back there. Only the
+# build output is copied; the caller's sources and source identity are untouched.
+rm -rf -- "$ui_input_source/build"
+cp -a -- "$UI_SOURCE/build" "$ui_input_source/build"
 printf 'ui_source=%s\nui_commit=%s\nui_diff_sha256=%s\nui_manifest_sha256=%s\nui_tls=real\nui_tls_libs=%s\nui_mbedtls_root=%s\nui_opus=real\nui_opus_name=%s\nui_opus_target=%s\nui_opus_config=%s\nui_opus_libs=libopusfile.a libopus.a libogg.a\n' \
     "$ui_input_source" "$ui_commit" "$ui_diff_sha256" "$ui_manifest_sha256" \
     "$TLS_LIBS" "$MBEDTLS_ROOT" $opus_meta
