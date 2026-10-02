@@ -139,7 +139,9 @@ done
 # never every file under a feature directory.
 if [ -d "$DATA_ROOT/libreecho/features" ]; then
     for feature_dir in "$DATA_ROOT/libreecho/features"/*; do
-        [ -d "$feature_dir" ] || continue
+        # -d follows symlinks; a linked feature directory is rejected by the
+        # contract check below and must not be deleted through first.
+        [ ! -L "$feature_dir" ] && [ -d "$feature_dir" ] || continue
         remove_path "$feature_dir/payload.squashfs.previous"
         remove_path "$feature_dir/staging"
     done

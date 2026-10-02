@@ -582,7 +582,11 @@ recover_stale_download_artifacts()
         validate_owned_manifest "$manifest" "$owner" || continue
         while IFS= read -r path || [ -n "$path" ]; do
             case "$path" in
-                pid:*) stop_owned_child "${path#pid:}" ;;
+                # A stale manifest lives on /data and can predate this boot,
+                # so its PIDs may now name unrelated processes, and a bare PID
+                # carries no identity to prove otherwise. Recover only the
+                # inert files and never signal a saved PID.
+                pid:*) ;;
                 *) canonical=$(manifest_entry_path "$path" "$owner") && remove_temp_artifact "$canonical" ;;
             esac
         done < "$manifest"
