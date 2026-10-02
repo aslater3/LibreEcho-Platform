@@ -111,7 +111,7 @@ PY
 done
 make -C "$src" -j"${LIBREECHO_BUILD_JOBS:-2}" \
   CC="$wrapper_dir/gcc" AR="$wrapper_dir/ar" RANLIB="$wrapper_dir/ranlib" \
-  CFLAGS="${cflags[*]}" LDFLAGS='-static -no-pie -Wl,--build-id=none' iwconfig >/dev/null
+  CFLAGS="${cflags[*]}" LDFLAGS='-static -no-pie -Wl,--build-id=none -Wl,--strip-all' iwconfig >/dev/null
 install -m 0755 "$src/iwconfig" "$OUTPUT/iwconfig"
 install -m 0644 "$src/COPYING" "$OUTPUT/wireless-tools-COPYING"
 

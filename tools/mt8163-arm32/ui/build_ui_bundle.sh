@@ -54,6 +54,7 @@ opus_fail() {
 cleanup_opus_tmp() {
     [[ -n "$OPUS_TMP" ]] && rm -rf -- "$OPUS_TMP"
     [[ -n "$OPUS_BUILD_ROOT" ]] && rm -rf -- "$OPUS_BUILD_ROOT"
+    [[ -z "${UI_HEALTH_TMP:-}" ]] || rm -rf -- "$UI_HEALTH_TMP"
     return 0
 }
 trap cleanup_opus_tmp EXIT
@@ -381,6 +382,14 @@ source_state_sha256() {
     } | sha256sum | awk '{print $1}'
 }
 ui_diff_sha256=$(source_state_sha256 "$UI_SOURCE")
+# V3 control-plane health belongs to Platform. Build the companion against a
+# private snapshot, so the supplied checkout and its source identity stay intact.
+ui_input_source=$UI_SOURCE
+UI_HEALTH_TMP=$(mktemp -d "${TMPDIR:-/tmp}/libreecho-ui-health.XXXXXX")
+python3 "$SCRIPT_DIR/ota_v3_health.py" --source "$UI_SOURCE" --output "$UI_HEALTH_TMP/source"
+UI_SOURCE=$UI_HEALTH_TMP/source
+ui_ota_adapter_sha256=$(sha256sum "$SCRIPT_DIR/ota_v3_health.py" "$SCRIPT_DIR/ota_v3_health.h" | awk '{print $1}' | sha256sum | awk '{print $1}')
+ui_diff_sha256=$(printf '%s\n%s\n' "$ui_diff_sha256" "$ui_ota_adapter_sha256" | sha256sum | awk '{print $1}')
 
 # The UI Makefile appends its own definitions to CPPFLAGS, so the mbedTLS and
 # Opus include paths are exported (a command-line CPPFLAGS would suppress them).
@@ -502,6 +511,9 @@ do
     install -m 0755 "$UI_SOURCE/init/$script" "$OUTPUT/etc/init.d/$script"
 done
 
+# Guard the actual packaged scripts, not only the adapted source snapshot.
+python3 "$SCRIPT_DIR/ota_v3_health.py" --verify-init "$OUTPUT/etc/init.d"
+
 cp -R "$UI_SOURCE/web/." "$OUTPUT/share/libreecho/web/"
 install -m 0600 "$UI_SOURCE/config/defaults.json" \
     "$OUTPUT/etc/libreecho/web-config.json"
@@ -555,6 +567,7 @@ fi
 {
     printf 'schema=1\n'
     printf 'source_commit=%s\n' "$ui_commit"
+    printf 'ui_ota_adapter_sha256=%s\n' "$ui_ota_adapter_sha256"
     printf 'source_diff_sha256=%s\n' "$ui_diff_sha256"
     while IFS= read -r relative; do
         hash=$(sha256sum "$OUTPUT/$relative" | awk '{print $1}')
@@ -575,5 +588,5 @@ print("%s %s %s" % (record.get("name", ""), record.get("target", ""), record.get
 PY
 )
 printf 'ui_source=%s\nui_commit=%s\nui_diff_sha256=%s\nui_manifest_sha256=%s\nui_tls=real\nui_tls_libs=%s\nui_mbedtls_root=%s\nui_opus=real\nui_opus_name=%s\nui_opus_target=%s\nui_opus_config=%s\nui_opus_libs=libopusfile.a libopus.a libogg.a\n' \
-    "$UI_SOURCE" "$ui_commit" "$ui_diff_sha256" "$ui_manifest_sha256" \
+    "$ui_input_source" "$ui_commit" "$ui_diff_sha256" "$ui_manifest_sha256" \
     "$TLS_LIBS" "$MBEDTLS_ROOT" $opus_meta

@@ -1,0 +1,482 @@
+#!/bin/busybox sh
+# Signed whole-generation boot-slot transaction, no per-file switching.
+BB=/bin/busybox
+ROOT=${ROOT:-/data/libreecho/update}
+GENERATIONS=${GENERATIONS:-/data/libreecho/generations}
+GENERATION_TOOL=${GENERATION_TOOL:-/usr/local/sbin/libreecho-generation}
+BOOTCTL=${BOOTCTL:-/usr/local/sbin/libreecho-bootctl}
+CMDLINE_FILE=${CMDLINE_FILE:-/proc/cmdline}
+BOOT_A=${BOOT_A:-/dev/mmcblk0p10}
+BOOT_B=${BOOT_B:-/dev/mmcblk0p11}
+MOUNT=${MOUNT:-/bin/mount}
+RUN_ROOT=${RUN_ROOT:-/run}
+MOUNTINFO_FILE=${MOUNTINFO_FILE:-/proc/self/mountinfo}
+LOOP_SYS_ROOT=${LOOP_SYS_ROOT:-/sys/dev/block}
+PROC_ROOT=${PROC_ROOT:-/proc}
+PROC_NET_UNIX=${PROC_NET_UNIX:-$PROC_ROOT/net/unix}
+VAR_RUN_ROOT=${VAR_RUN_ROOT:-/var/run}
+CONFIG_FILE=${CONFIG_FILE:-/data/libreecho/config/web-config.json}
+PENDING=$ROOT/pending
+fail() { printf 'ERROR:%s\n' "$1" >&2; exit 1; }
+value() { $BB sed -n "s/^$1=//p" "$2" 2>/dev/null | $BB head -n 1; }
+valid_hash() { [ "${#1}" -eq 64 ] || return 1; case "$1" in *[!0-9a-f]*|'') return 1;; esac; }
+valid_uint() {
+    local value=$1
+    case "$value" in 0|[1-9]|[1-9][0-9]*) ;; *) return 1;; esac
+    [ "${#value}" -lt 19 ] ||
+        { [ "${#value}" -eq 19 ] && [ "$value" \< "9223372036854775808" ]; } ||
+        return 1
+}
+valid_token() { [ -n "$1" ] && [ "${#1}" -le 96 ] || return 1; case "$1" in [A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._+~:-]*) ;; *) return 1;; esac; }
+valid_commit() { [ "${#1}" -eq 40 ] || return 1; case "$1" in *[!0-9a-f]*|'') return 1;; esac; }
+valid_asset() { [ -n "$1" ] && [ "${#1}" -le 128 ] || return 1; case "$1" in [A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._+:-]*) ;; *) return 1;; esac; case "$1" in *[!A-Za-z0-9._+:-]*|*/*|*\\*) return 1;; esac; }
+
+# Publish owner and lock together: a prepublication crash leaves only a temp.
+# Keep /data scope because recovery callers need the same serialization domain.
+generation_lock() {
+    local lock=$ROOT/generation.lock tmp=$ROOT/generation.lock.tmp.$$ owner pid boot now
+    safe_path "$lock"; safe_path "$tmp"
+    now=$($BB cat /proc/sys/kernel/random/boot_id) || fail generation-lock-boot
+    if [ -d "$lock" ]; then
+        # Anchor every destructive operation to the observed directory inode.
+        # A delayed concurrent reclaimer must never remove a replacement owner.
+        (
+            cd "$lock" || exit 1
+            if [ -e owner ] || [ -L owner ]; then
+                [ -f owner ] && [ ! -L owner ] || exit 1
+                owner=$($BB cat owner) || exit 1
+                read -r pid boot <<EOF
+$owner
+EOF
+                case "$pid" in ''|*[!0-9]*) exit 1;; esac
+                [ -n "$boot" ] || exit 1
+                if [ "$boot" = "$now" ] && $BB kill -0 "$pid" 2>/dev/null; then exit 1; fi
+                $BB rm -f owner || exit 1
+            fi
+            # Recover the old protocol's empty marker, including a crash after
+            # owner removal. Never recursively delete ambiguous lock contents.
+            if [ -e reclaim ] || [ -L reclaim ]; then
+                [ -d reclaim ] && [ ! -L reclaim ] || exit 1
+                $BB rmdir reclaim 2>/dev/null || exit 1
+            fi
+            # Only an empty directory can disappear here. Atomic publication
+            # always includes owner, so a new/live lock cannot be removed.
+            $BB rmdir "$lock" 2>/dev/null || exit 1
+        ) || fail generation-busy
+    fi
+    $BB mkdir "$tmp" 2>/dev/null || fail generation-lock-temp
+    printf '%s %s\n' "$$" "$now" > "$tmp/owner" && $BB chmod 0600 "$tmp/owner" || fail generation-lock-write
+    if ! $BB mv -T "$tmp" "$lock" 2>/dev/null; then
+        $BB rm -f "$tmp/owner"; $BB rmdir "$tmp"; fail generation-busy
+    fi
+    trap '$BB rm -f "$ROOT/generation.lock/owner"; $BB rmdir "$ROOT/generation.lock" 2>/dev/null' EXIT
+    trap 'exit 1' HUP INT TERM
+}
+
+safe_path() {
+    local path=$1 current remainder old_ifs IFS
+    case "$path" in *[!A-Za-z0-9._/+:-]*) fail invalid-path ;; esac
+    case "$path" in
+        /|*//*|*/./*|*/../*|*/..|*/.) fail invalid-path ;;
+        /*) ;;
+        *) fail nonabsolute-path ;;
+    esac
+    [ "$path" != / ] || fail root-path
+    current=/
+    remainder=${path#/}
+    old_ifs=$IFS
+    IFS=/
+    set -f
+    set -- $remainder
+    set +f
+    IFS=$old_ifs
+    for component do
+        [ -n "$component" ] || continue
+        if [ "$current" = / ]; then current=/$component; else current=$current/$component; fi
+        [ ! -L "$current" ] || fail symlink-path
+    done
+}
+
+regular() {
+    safe_path "$1"
+    [ -f "$1" ] && [ ! -L "$1" ] || fail "$2-not-regular"
+}
+sync_file() { $BB sync 2>/dev/null || fail sync-failed; }
+atomic_write() {
+    local target=$1 tmp=$1.tmp; shift
+    safe_path "$target"; safe_path "$tmp"
+    [ ! -L "$tmp" ] || fail journal-temp-symlink
+    { "$@"; } > "$tmp" || fail journal-write
+    $BB chmod 0600 "$tmp" 2>/dev/null || fail journal-mode
+    $BB mv "$tmp" "$target" || fail journal-rename
+    sync_file
+}
+atomic_copy() {
+    local source=$1 target=$2 tmp=$2.tmp
+    regular "$source" intent-source
+    safe_path "$target"; safe_path "$tmp"
+    [ ! -L "$tmp" ] || fail journal-temp-symlink
+    $BB cp "$source" "$tmp" || fail journal-copy
+    $BB chmod 0600 "$tmp" 2>/dev/null || fail journal-mode
+    $BB mv "$tmp" "$target" || fail journal-rename
+    sync_file
+}
+
+# Return a content hash or the explicit absence marker.  Anything other than a
+# regular file is an ambiguity, never an absent file.
+hash_state() {
+    local path=$1 digest
+    safe_path "$path"
+    [ ! -L "$path" ] || fail symlink-path
+    if [ -e "$path" ]; then
+        [ -f "$path" ] || fail nonregular-path
+        digest=$(sha256sum "$path" 2>/dev/null | $BB awk '{print $1}') || fail hash-read
+        valid_hash "$digest" || fail hash-read
+        printf '%s\n' "$digest"
+    else
+        printf '%s\n' none
+    fi
+}
+
+
+
+valid_id() {
+    case "$1" in ''|.|..|*[!A-Za-z0-9._+~:-]*) fail generation-id;; esac
+    [ "${#1}" -le 96 ] || fail generation-id
+}
+
+mount_matches() {
+    local target=$1 source=$2 record device mounted mount_root filesystem loop backing
+    [ -r "$MOUNTINFO_FILE" ] || fail mountinfo-unavailable
+    record=$($BB awk -v target="$target" '
+        $5 == target {
+            total++;
+            for (i=7; i<=NF; i++) if ($i == "-") {
+                row=$3 " " $4 " " $(i+1) " " $(i+2); break
+            }
+        }
+        END { if (total != 1 || row == "") exit 1; print row }
+    ' "$MOUNTINFO_FILE") || fail candidate-mount-identity
+    read -r device mount_root filesystem mounted <<EOF
+$record
+EOF
+    # Direct sources remain supported. Linux loop mounts instead report the
+    # block device; bind identity to its kernel-reported backing file, never
+    # merely accept any loop source at the expected target.
+    [ "$mounted" = "$source" ] && return 0
+    case "$device" in 7:[0-9]*) ;; *) fail candidate-mount-identity;; esac
+    case "${device#7:}" in *[!0-9]*|'') fail candidate-mount-identity;; esac
+    [ "$mounted" = "/dev/loop${device#7:}" ] &&
+        [ "$filesystem" = squashfs ] && [ "$mount_root" = / ] || fail candidate-mount-identity
+    loop=$LOOP_SYS_ROOT/$device/loop
+    backing=$($BB cat "$loop/backing_file" 2>/dev/null) || fail candidate-mount-identity
+    [ "$backing" = "$source" ] || fail candidate-mount-identity
+    regular "$source" candidate-mount-source
+    [ "$($BB cat "$loop/offset" 2>/dev/null)" = 0 ] &&
+        [ "$($BB cat "$loop/sizelimit" 2>/dev/null)" = 0 ] || fail candidate-mount-identity
+}
+
+
+read_pointer() {
+    regular "$ROOT/$1" "$1"
+    TX=$($BB cat "$ROOT/$1"); valid_id "$TX"
+    safe_path "$GENERATIONS/$TX"
+}
+
+validate_pending() {
+    local keys
+    regular "$PENDING" pending
+    keys=$($BB sed 's/=.*//' "$PENDING" | $BB tr '\n' ' ')
+    [ "$keys" = 'schema slot transaction_id manifest_sha256 ' ] || fail pending-grammar
+    [ "$(value schema "$PENDING")" = 3 ] || fail legacy_manifest_unsupported
+    SLOT=$(value slot "$PENDING"); case "$SLOT" in a|b) ;; *) fail pending-slot;; esac
+    TX=$(value transaction_id "$PENDING"); valid_id "$TX"
+    verify_generation
+    [ "$(value manifest_sha256 "$PENDING")" = "$(hash_state "$GENERATIONS/$TX/target.manifest")" ] || fail pending-manifest
+}
+verify_generation() {
+    safe_path "$GENERATIONS/$TX"
+    "$GENERATION_TOOL" verify "$GENERATIONS/$TX" || fail generation-invalid
+    MANIFEST=$GENERATIONS/$TX/target.manifest
+}
+
+read_bcb() {
+    local bcb running
+    bcb=$("$BOOTCTL" status) || fail boot-control-read
+    [ "$(printf '%s\n' "$bcb" | $BB grep -c '^selected_slot=')" = 1 ] || fail bcb-grammar
+    SELECTED=$(printf '%s\n' "$bcb" | $BB sed -n 's/^selected_slot=//p')
+    case "$SELECTED" in a|b) ;; *) fail bcb-selected;; esac
+    [ "$(printf '%s\n' "$bcb" | $BB grep -c "^slot_${SELECTED}_success=")" = 1 ] || fail bcb-grammar
+    SUCCESS=$(printf '%s\n' "$bcb" | $BB sed -n "s/^slot_${SELECTED}_success=//p")
+    case "$SUCCESS" in 0|1) ;; *) fail bcb-success;; esac
+    running=$($BB tr ' ' '\n' < "$CMDLINE_FILE" | $BB sed -n 's/^androidboot.slot_suffix=_//p')
+    # Measured Biscuit LK emits an empty suffix; absence has the same BCB fallback.
+    case "$running" in '') running=$SELECTED;; a|b) ;; *) fail running-slot;; esac
+    [ "$running" = "$SELECTED" ] || fail running-selected-mismatch
+}
+verify_boot() {
+    local device actual
+    if [ "$SLOT" = a ]; then device=$BOOT_A; else device=$BOOT_B; fi
+    safe_path "$device"
+    [ -b "$device" ] || [ -f "$device" ] || fail boot-device
+    actual=$($BB dd if="$device" bs=4096 count=4096 2>/dev/null | $BB sha256sum | $BB awk '{print $1}')
+    [ "$actual" = "$(value boot_sha256 "$MANIFEST")" ] || fail "${1:-boot-hash}"
+}
+
+activate_generation() {
+    local feature source target daemon
+    for feature in airplay2 tts wakeword stt assistant; do
+        source=$GENERATIONS/$TX/features/$feature/payload.squashfs
+        target=$RUN_ROOT/libreecho/features/$feature/root
+        safe_path "$target"
+        $BB mkdir -p "$target" || fail mount-directory
+        if ! $BB awk -v p="$target" '$5==p {found=1} END {exit !found}' "$MOUNTINFO_FILE"; then
+            "$MOUNT" -t squashfs -o ro,loop,nosuid,nodev "$source" "$target" || fail "feature-$feature-mount"
+        fi
+        mount_matches "$target" "$source"
+        $BB awk -v p="$target" '$5==p {n++; opt=","$6","; if (opt !~ /,ro,/ || opt !~ /,nosuid,/ || opt !~ /,nodev,/) bad=1} END {exit n!=1 || bad}' "$MOUNTINFO_FILE" || fail mount-options
+        daemon=$(value "feature_${feature}_daemon_path" "$MANIFEST")
+        regular "$target/$daemon" feature-daemon
+        [ "$(hash_state "$target/$daemon")" = "$(value "feature_${feature}_daemon_sha256" "$MANIFEST")" ] || fail "feature-$feature-daemon-hash"
+    done
+}
+
+# The only permitted link is the kernel executable handle for a numeric PID.
+# Parent paths and expected mounted daemon paths remain strictly link-free.
+process_executable() {
+    local pid=$1 expected_path=$2 expected_hash=$3 exe digest
+    case "$pid" in ''|0|*[!0-9]*) fail service-pid;; esac
+    safe_path "$PROC_ROOT/$pid"
+    safe_path "$expected_path"
+    exe=$PROC_ROOT/$pid/exe
+    [ -L "$exe" ] && [ -f "$exe" ] || fail service-exe
+    [ "$($BB readlink "$exe")" = "$expected_path" ] || fail service-exe-path
+    # Hash the opened proc handle, not the pathname's current file contents.
+    digest=$($BB sha256sum "$exe" 2>/dev/null | $BB awk '{print $1}')
+    valid_hash "$digest" && [ "$digest" = "$expected_hash" ] || fail service-exe-hash
+}
+
+service_probe() {
+    local feature=$1 service socket pidfile pid exe expected engine entry found controller
+    case "$feature" in
+        airplay2) service=airplayd; socket=$RUN_ROOT/libreecho/airplay.sock;;
+        tts) service=ttsd; socket=$RUN_ROOT/libreecho/tts.sock;;
+        wakeword) service=waked; socket=$RUN_ROOT/libreecho/wakeword.sock;;
+        stt) service=sttd; socket=$RUN_ROOT/libreecho/stt.sock;;
+        assistant) service=agentd; socket=$RUN_ROOT/libreecho/agent.sock;;
+        *) fail service-feature;;
+    esac
+    pidfile=$VAR_RUN_ROOT/libreecho-$service.pid
+    regular "$pidfile" service-pidfile
+    pid=$($BB sed -n '1p' "$pidfile")
+    case "$pid" in ''|*[!0-9]*) fail service-pid;; esac
+    exe=$PROC_ROOT/$pid/exe
+    [ -f "$exe" ] || fail service-exe
+    expected=$(value "feature_${feature}_daemon_sha256" "$MANIFEST")
+    if [ "$feature" = airplay2 ]; then
+        # AirPlay's pidfile/socket belong to the boot-resident controller.
+        # The signed feature daemon identity is the separate audio engine.
+        # verify_running has already authenticated the running boot image.
+        controller=/usr/local/sbin/libreecho-airplayd
+        regular "$controller" service-controller
+        process_executable "$pid" "$controller" "$(hash_state "$controller")"
+        engine=$RUN_ROOT/libreecho/features/airplay2/root/usr/local/sbin/libreecho-audio-engine
+        found=0
+        for entry in "$PROC_ROOT"/[0-9]*/exe; do
+            [ "$($BB readlink "$entry" 2>/dev/null)" = "$engine" ] || continue
+            engine_pid=${entry%/exe}; engine_pid=${engine_pid##*/}
+            process_executable "$engine_pid" "$engine" "$expected"
+            found=1
+        done
+        [ "$found" = 1 ] || fail service-engine-missing
+    else
+        process_executable "$pid" "$RUN_ROOT/libreecho/features/$feature/root/$(value "feature_${feature}_daemon_path" "$MANIFEST")" "$expected"
+    fi
+    [ -S "$socket" ] || fail service-socket
+    $BB awk -v socket="$socket" '$NF == socket { found=1 } END { exit found ? 0 : 1 }' "$PROC_NET_UNIX" >/dev/null 2>&1 || fail service-socket-owner
+}
+
+verify_required_services() {
+    local feature integrations=0
+    if [ -r "$CONFIG_FILE" ]; then
+        integrations=$($BB sed -n 's/.*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$CONFIG_FILE" | $BB head -n 1)
+        case "$integrations" in ''|*[!0-9]*) integrations=0;; esac
+    fi
+    [ "$(value service_profile "$MANIFEST")" = production ] || return 0
+    for feature in airplay2 tts wakeword stt assistant; do
+        case "$feature" in
+            airplay2) [ $((integrations & 16)) -ne 0 ] || continue;;
+            tts|stt|assistant) [ $((integrations & 1)) -eq 0 ] || continue;;
+        esac
+        service_probe "$feature"
+    done
+}
+verify_running() {
+    validate_pending
+    read_bcb
+    [ "$SELECTED" = "$SLOT" ] || fail candidate-bcb
+    verify_boot
+    activate_generation
+    verify_required_services
+}
+activate() {
+    validate_pending
+    read_bcb
+    [ "$SELECTED" = "$SLOT" ] && [ "$SUCCESS" = 0 ] || fail candidate-bcb
+    verify_boot
+    activate_generation
+}
+activate_committed() {
+    [ -e "$ROOT/current" ] || return 0
+    read_pointer current
+    verify_generation
+    read_bcb
+    SLOT=$SELECTED
+    verify_boot committed-boot-hash
+    activate_generation
+}
+write_result() {
+    printf 'schema=3\nslot=%s\ntransaction_id=%s\nversion=%s\nupdate_channel=%s\nmanifest_sha256=%s\n' \
+        "$SLOT" "$(value transaction_id "$MANIFEST")" "$(value version "$MANIFEST")" \
+        "$(value update_channel "$MANIFEST")" "$(hash_state "$MANIFEST")"
+}
+commit() {
+    [ -e "$PENDING" ] || return 0
+    validate_pending
+    read_bcb
+    [ "$SELECTED" = "$SLOT" ] && [ "$SUCCESS" = 1 ] || fail commit-bcb
+    verify_boot
+    candidate=$TX
+    if [ -e "$ROOT/current" ]; then
+        read_pointer current
+        if [ "$TX" != "$candidate" ]; then
+            atomic_write "$ROOT/previous" printf '%s\n' "$TX"
+            atomic_write "$ROOT/current" printf '%s\n' "$candidate"
+        fi
+    else
+        atomic_write "$ROOT/current" printf '%s\n' "$candidate"
+    fi
+    atomic_write "$ROOT/installed" write_result
+    safe_path "$GENERATIONS/$candidate.pin"
+    $BB rm -f "$GENERATIONS/$candidate.pin" || fail generation-unpin
+    $BB rm "$PENDING" || fail pending-clear
+    sync_file
+    gc
+}
+rollback() {
+    [ -e "$PENDING" ] || return 0
+    validate_pending
+    read_bcb
+    [ "$SELECTED" != "$SLOT" ] && [ "$SUCCESS" = 1 ] || fail rollback-bcb
+    atomic_write "$ROOT/rolled-back" write_result
+    safe_path "$GENERATIONS/$TX.pin"
+    $BB rm -f "$GENERATIONS/$TX.pin" || fail generation-unpin
+    $BB rm "$PENDING" || fail pending-clear
+    sync_file
+    gc
+}
+gc() {
+    local keep= id directory pin
+    # Snapshot pins BEFORE pointers: an installer can clear its pin only after
+    # publishing pending. This ordering closes concurrent unpin/publication gaps.
+    for pin in "$GENERATIONS"/*.pin; do
+        [ -e "$pin" ] || [ -L "$pin" ] || continue
+        regular "$pin" gc-pin
+        id=${pin##*/}; id=${id%.pin}; valid_id "$id"
+        [ "$($BB cat "$pin")" = "$id" ] || fail gc-pin-identity
+        keep="$keep $id"
+    done
+    for id in current previous; do
+        if [ -e "$ROOT/$id" ]; then read_pointer "$id"; keep="$keep $TX"; fi
+    done
+    if [ -e "$PENDING" ]; then validate_pending; keep="$keep $TX"; fi
+    # Validate the complete deletion set before deleting anything.
+    for directory in "$GENERATIONS"/*; do
+        [ -e "$directory" ] || [ -L "$directory" ] || continue
+        safe_path "$directory"
+        case "$directory" in *.pin) regular "$directory" gc-pin; continue;; esac
+        [ -d "$directory" ] && [ -z "$($BB find "$directory" -type l)" ] || fail gc-type
+        id=${directory##*/}; valid_id "$id"
+    done
+    for directory in "$GENERATIONS"/*; do
+        [ -d "$directory" ] || continue
+        id=${directory##*/}
+        case " $keep " in *" $id "*) continue;; esac
+        $BB find "$directory" -type d -exec $BB chmod 0700 '{}' ';' || fail gc-mode
+        $BB rm -rf "$directory" || fail gc-delete
+    done
+    sync_file
+}
+https_client() {
+    local directory feature kind file size digest
+    read_pointer current
+    directory=$GENERATIONS/$TX
+    MANIFEST=$directory/target.manifest
+    regular "$MANIFEST" https-target
+    regular "$directory/target.manifest.sig" https-signature
+    "${TARGET_MANIFEST:-/usr/local/sbin/libreecho-target-manifest}" check "$MANIFEST" "$directory/target.manifest.sig" || fail https-target-invalid
+    [ "$(value transaction_id "$MANIFEST")" = "$TX" ] || fail https-target-identity
+    # Repair transport authenticates only its own signed bytes; unrelated feature
+    # corruption is precisely what an update must be able to repair.
+    for kind in payload manifest; do
+        if [ "$kind" = payload ]; then file=payload.squashfs; size=size; digest=sha256
+        else file=manifest.json; size=manifest_size; digest=manifest_sha256; fi
+        regular "$directory/features/assistant/$file" https-transport
+        [ "$($BB stat -c %s "$directory/features/assistant/$file")" = "$(value "feature_assistant_$size" "$MANIFEST")" ] &&
+            [ "$(hash_state "$directory/features/assistant/$file")" = "$(value "feature_assistant_$digest" "$MANIFEST")" ] || fail https-transport-corrupt
+    done
+    source=$GENERATIONS/$TX/features/assistant/payload.squashfs
+    target=${CLIENT_ROOT:-$RUN_ROOT/libreecho/ota-client}
+    safe_path "$target"
+    $BB mkdir -p "$target" || fail mount-directory
+    if ! $BB awk -v p="$target" '$5==p {found=1} END {exit !found}' "$MOUNTINFO_FILE"; then
+        "$MOUNT" -t squashfs -o ro,loop,nosuid,nodev "$source" "$target" || fail https-client-mount
+    fi
+    mount_matches "$target" "$source"
+    $BB awk -v p="$target" '$5==p {n++; opt=","$6","; if (opt !~ /,ro,/ || opt !~ /,nosuid,/ || opt !~ /,nodev,/) bad=1} END {exit n!=1 || bad}' "$MOUNTINFO_FILE" || fail mount-options
+}
+provenance() {
+    local directory digest feature kind file field observed expected output initial
+    [ ! -e "$PENDING" ] && [ ! -L "$PENDING" ] || fail provenance-pending
+    read_pointer current
+    directory=$GENERATIONS/$TX
+    initial=$(hash_state "$ROOT/current")
+    MANIFEST=$directory/target.manifest
+    "${TARGET_MANIFEST:-/usr/local/sbin/libreecho-target-manifest}" check "$MANIFEST" "$directory/target.manifest.sig" || fail provenance-target-invalid
+    digest=$(hash_state "$MANIFEST")
+    regular "$directory/COMPLETE" provenance-complete
+    [ "$($BB cat "$directory/COMPLETE")" = "$digest" ] || fail provenance-complete-mismatch
+    [ "$(value transaction_id "$MANIFEST")" = "$TX" ] || fail provenance-installed-transaction-mismatch
+    output="schema=libreecho-feature-provenance-v3\ngeneration=$TX\ntarget_manifest_sha256=$digest"
+    for feature in airplay2 tts wakeword stt assistant; do
+        for kind in payload manifest; do
+            if [ "$kind" = payload ]; then file=payload.squashfs; field=sha256; else file=manifest.json; field=manifest_sha256; fi
+            regular "$directory/features/$feature/$file" "provenance-$feature-$kind"
+            observed=$(hash_state "$directory/features/$feature/$file")
+            expected=$(value "feature_${feature}_${field}" "$MANIFEST")
+            [ "$observed" = "$expected" ] || fail "provenance-$feature-$kind-mismatch"
+            output="$output\nfeature_${feature}_${kind}_sha256=$observed\nfeature_${feature}_target_${kind}_sha256=$expected"
+        done
+    done
+    "$GENERATION_TOOL" verify "$directory" >/dev/null || fail provenance-generation-invalid
+    [ "$(hash_state "$ROOT/current")" = "$initial" ] && [ ! -e "$PENDING" ] || fail provenance-observation-changed
+    printf '%b\n' "$output"
+}
+# Observation commands never acquire or create mutable control state.
+case "${1:-}" in
+    provenance) provenance; exit $?;;
+    status) [ ! -e "$ROOT/current" ] || { read_pointer current; printf 'generation=%s\n' "$TX"; }; exit 0;;
+esac
+safe_path "$ROOT"; safe_path "$GENERATIONS"
+$BB mkdir -p "$ROOT" || fail transaction-root
+generation_lock
+case "${1:-}" in
+    verify-running) verify_running;;
+    https-client) https_client;;
+    activate|activate-mounts) activate;;
+    activate-committed) activate_committed;;
+    commit|commit-after-confirm) commit;;
+    rollback|fallback) rollback;;
+    gc) [ ! -e "$ROOT/install.lock" ] || fail gc-install-busy; gc;;
+    *) fail usage;;
+esac

@@ -2,6 +2,12 @@
 # GitHub Releases transport for the signed LibreEcho OTA installer.
 
 BB=/bin/busybox
+# The explicit host/recovery assembly surface uses the same immutable engine
+# as the normal fetch path, before touching any legacy transport state.
+if [ "${1:-}" = assemble-generation ]; then
+    [ "$#" = 3 ] || exit 2
+    exec /bin/busybox sh "${GENERATION_TOOL:-/usr/local/sbin/libreecho-generation}" assemble "$2" "$3"
+fi
 UPDATE=/usr/local/sbin/libreecho-update
 CONFIG=/etc/libreecho/ota-source.conf
 PROFILE=/etc/libreecho/image-profile
@@ -29,8 +35,6 @@ FEATURE_ASSET_MAX_BYTES=67108864
 CURL_STDERR=/run/libreecho/ota-curl.stderr
 CURL_HEADERS=/run/libreecho/ota-curl.headers
 CURL_DIAGNOSTIC_MAX=160
-FEATURE_STAGE=$ROOT/staging/features
-FEATURE_TRANSACTION=/usr/local/sbin/libreecho-feature-transaction
 DATA_ROOT=/data
 PROC_ROOT=/proc
 RUN_ROOT=/run
@@ -59,7 +63,7 @@ candidate_release_tag()
 {
     value=$(sanitize_status_value "${1:-}")
     printf '%s\n' "$value" |
-        $BB grep -Eq '^radar-puffin-(build|nightly)-[a-f0-9]{7}-[a-f0-9]{16}-[a-f0-9]{16}$' ||
+        $BB grep -Eq '^(radar-puffin|biscuit)-(build|nightly)-[a-f0-9]{7}-[a-f0-9]{16}-[a-f0-9]{16}$' ||
         return 0
     printf '%s\n' "$value"
 }
@@ -236,7 +240,8 @@ validate_source()
     expected_channel=$(channel_value)
     [ "$expected_channel" = dev ] || [ "$expected_channel" = stable ] || die source_channel
     channel=$expected_channel
-    expected_url="https://github.com/aslater3/LibreEcho/releases/latest/download/libreecho-radar-puffin-$channel.ota.tar"
+    load_fetch_target
+    expected_url="https://github.com/aslater3/LibreEcho/releases/latest/download/libreecho-$TARGET_SLUG-$channel.ota.tar"
     url=$expected_url
 }
 
@@ -256,11 +261,22 @@ resolve_dev_release()
     url="https://github.com/aslater3/LibreEcho/releases/download/$DEV_RELEASE_TAG/libreecho-$DEV_RELEASE_TAG.ota.tar"
 }
 
+load_fetch_target()
+{
+    local file=${TARGET_FILE:-/etc/libreecho/target} id
+    TARGET_SLUG=
+    if [ ! -e "$file" ] && [ ! -L "$file" ]; then TARGET_SLUG=radar-puffin; return 0; fi
+    [ -f "$file" ] && [ ! -L "$file" ] && [ "$($BB grep -c '^target_id=' "$file")" = 1 ] || die source_target
+    id=$($BB sed -n 's/^target_id=//p' "$file")
+    case "$id" in radar_puffin) TARGET_SLUG=radar-puffin;; biscuit) TARGET_SLUG=biscuit;; *) die source_target;; esac
+}
+
 read_dev_release_pointer()
 {
     # Reuse the registered bounded-probe temporary lifecycle.
     pointer=$ROOT/.control-range-probe.$$
-    pointer_url=https://github.com/aslater3/LibreEcho/releases/download/radar-puffin-dev-channel/release-pointer.txt
+    load_fetch_target
+    pointer_url=https://github.com/aslater3/LibreEcho/releases/download/$TARGET_SLUG-dev-channel/release-pointer-v3.txt
     bounded_curl "$pointer" "$CURL_HEADERS" 257 60 "$pointer_url"
     curl_detail=$(downloader_stderr)
     parse_response_headers "$CURL_HEADERS" || die dev_discovery_headers
@@ -269,7 +285,7 @@ read_dev_release_pointer()
         [ "$STREAM_SIZE" -gt 0 ] && [ "$STREAM_SIZE" -le 256 ] || die dev_discovery_size
     DEV_RELEASE_TAG=$($BB sed -n '1p' "$pointer")
     DEV_OTA_SHA256=$($BB sed -n '2p' "$pointer")
-    printf '%s\n' "$DEV_RELEASE_TAG" | $BB grep -Eq '^radar-puffin-(build|nightly)-[a-f0-9]{7}-[a-f0-9]{16}-[a-f0-9]{16}$' || die dev_discovery_tag
+    printf '%s\n' "$DEV_RELEASE_TAG" | $BB grep -Eq "^$TARGET_SLUG-(build|nightly)-[a-f0-9]{7}-[a-f0-9]{16}-[a-f0-9]{16}$" || die dev_discovery_tag
     printf '%s\n' "$DEV_OTA_SHA256" | $BB grep -Eq '^[a-f0-9]{64}$' || die dev_discovery_hash
     [ "$(printf '%s\n%s\n' "$DEV_RELEASE_TAG" "$DEV_OTA_SHA256" | $BB wc -c)" -eq "$STREAM_SIZE" ] || die dev_discovery_format
     $BB rm -f "$pointer" "$CURL_HEADERS" "$CURL_STDERR"
@@ -324,68 +340,20 @@ manifest_payload_value()
 
 prepare_https_client()
 {
-    [ -f "$ASSISTANT_PAYLOAD" ] && [ ! -L "$ASSISTANT_PAYLOAD" ] &&
-        [ -f "$ASSISTANT_MANIFEST" ] && [ ! -L "$ASSISTANT_MANIFEST" ] ||
-        die https_payload_missing
-    [ "$($BB stat -c %u "$ASSISTANT_PAYLOAD" 2>/dev/null)" = 0 ] &&
-        [ "$($BB stat -c %u "$ASSISTANT_MANIFEST" 2>/dev/null)" = 0 ] ||
-        die https_payload_owner
-    # The manifest must not be group/world writable, or an unprivileged writer
-    # could redirect which payload we mount.  Feature installation has shipped
-    # these files as 0666 in practice, which used to abort the update check
-    # entirely -- before any network I/O -- and surfaced only as the opaque
-    # "https_payload_manifest_mode".  Both files are already confirmed to be
-    # root-owned regular files above, so tightening the mode ourselves is safe
-    # and strictly reduces exposure; only fail if we cannot.
-    manifest_mode=$($BB stat -c %a "$ASSISTANT_MANIFEST" 2>/dev/null)
-    case "$manifest_mode" in
-        600|640|644) ;;
-        *)
-            $BB chmod 0644 "$ASSISTANT_MANIFEST" 2>/dev/null || true
-            manifest_mode=$($BB stat -c %a "$ASSISTANT_MANIFEST" 2>/dev/null)
-            case "$manifest_mode" in
-                600|640|644) ;;
-                *) die feature_manifest_permissions ;;
-            esac
-            ;;
-    esac
-    # Same reasoning for the payload we are about to loop-mount: refuse it if
-    # anyone but root can rewrite it, but normalise rather than abort first.
-    payload_mode=$($BB stat -c %a "$ASSISTANT_PAYLOAD" 2>/dev/null)
-    case "$payload_mode" in
-        600|640|644) ;;
-        *)
-            $BB chmod 0644 "$ASSISTANT_PAYLOAD" 2>/dev/null || true
-            payload_mode=$($BB stat -c %a "$ASSISTANT_PAYLOAD" 2>/dev/null)
-            case "$payload_mode" in
-                600|640|644) ;;
-                *) die feature_payload_permissions ;;
-            esac
-            ;;
-    esac
-    expected_size=$(manifest_payload_value size)
-    expected_sha=$(manifest_payload_value sha256)
-    case "$expected_size" in
-        ''|*[!0-9]*) die https_payload_manifest ;;
-    esac
-    case "$expected_sha" in
-        ''|*[!0-9a-f]*) die https_payload_manifest ;;
-    esac
-    [ "${#expected_sha}" -eq 64 ] || die https_payload_manifest
-    [ "$($BB stat -c %s "$ASSISTANT_PAYLOAD" 2>/dev/null)" = "$expected_size" ] ||
-        die https_payload_size
-    actual_sha=$($BB sha256sum "$ASSISTANT_PAYLOAD" | $BB awk '{print $1}')
-    [ "$actual_sha" = "$expected_sha" ] || die https_payload_hash
-
-    $BB mkdir -p "$CLIENT_ROOT" || die https_mount_directory
-    if ! $BB grep -q " $CLIENT_ROOT " "$PROC_ROOT/mounts" 2>/dev/null; then
-        $BB mount -t squashfs -o loop,ro,nosuid,nodev,noatime \
-            "$ASSISTANT_PAYLOAD" "$CLIENT_ROOT" || die https_payload_mount
+    [ -f "$ROOT/current" ] && [ ! -L "$ROOT/current" ] || die legacy_manifest_unsupported
+    current=$($BB cat "$ROOT/current")
+    case "$current" in ''|.|..|*[!A-Za-z0-9._+~:-]*) die current_generation_invalid;; esac
+    generation="${GENERATIONS:-/data/libreecho/generations}/$current"
+    if ! ROOT="$ROOT" CLIENT_ROOT="$CLIENT_ROOT" "${GENERATION_TRANSACTION:-/usr/local/sbin/libreecho-generation-transaction}" https-client; then
+        # Optional boot-resident transport; do not depend on the damaged userdata.
+        CURL=/usr/bin/curl
+        CA=/etc/ssl/certs/ca-certificates.crt
+        [ -x "$CURL" ] && [ ! -L "$CURL" ] && [ -f "$CA" ] && [ ! -L "$CA" ] || die https_transport_unavailable
+        return 0
     fi
     CURL=$CLIENT_ROOT/usr/local/libexec/libreecho-curl
     CA=$CLIENT_ROOT/usr/local/share/libreecho/cacert.pem
-    [ -x "$CURL" ] && [ -f "$CA" ] && [ ! -L "$CURL" ] && [ ! -L "$CA" ] ||
-        die https_client_missing
+    [ -x "$CURL" ] && [ -f "$CA" ] && [ ! -L "$CURL" ] && [ ! -L "$CA" ] || die https_client_missing
 }
 
 record_channel()
@@ -701,7 +669,7 @@ bounded_curl()
     limit=$3
     deadline=$4
     shift 4
-    trap cleanup_download_artifacts EXIT
+    trap cleanup_locks EXIT
     trap 'download_signal INT' INT
     trap 'download_signal TERM' TERM
     fifo=$output.fifo
@@ -713,22 +681,32 @@ bounded_curl()
     register_temp_artifact "$CURL_STDERR" || return 70
     $BB rm -f "$output" "$fifo" "$capture" "$headers"
     $BB mkfifo "$fifo" || return 70
-    "$CURL" --fail --location --silent --show-error \
-        --proto '=https' --proto-redir '=https' --tlsv1.2 \
-        --cacert "$CA" --connect-timeout 20 --max-time "$deadline" \
-        --max-filesize "$MAX_BYTES" --dump-header "$headers" \
-        --stderr "$CURL_STDERR" --output "$fifo" "$@" &
-    transfer_pid=$!
-    TEMP_TRANSFER_PID=$transfer_pid
-    register_temp_pid "$transfer_pid" || { reap_owned_child "$transfer_pid"; return 70; }
+    # Start the bounded reader first, then hold a write-only FIFO descriptor.
+    # Opening it synchronizes with the reader's open; it prevents premature
+    # EOF for an empty/failed producer, but does not suppress SIGPIPE when the
+    # reader reaches its cap. Curl must not inherit the held writer.
     $BB head -c "$limit" "$fifo" > "$capture" &
     reader_pid=$!
     TEMP_READER_PID=$reader_pid
     register_temp_pid "$reader_pid" || { reap_owned_child "$reader_pid"; return 70; }
+    exec 9>"$fifo" || return 70
+    "$CURL" --fail --location --silent --show-error \
+        --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --cacert "$CA" --connect-timeout 20 --max-time "$deadline" \
+        --max-filesize "$MAX_BYTES" --dump-header "$headers" \
+        --stderr "$CURL_STDERR" --output "$fifo" "$@" 9>&- &
+    transfer_pid=$!
+    TEMP_TRANSFER_PID=$transfer_pid
+    register_temp_pid "$transfer_pid" || { reap_owned_child "$transfer_pid"; return 70; }
     wait "$transfer_pid"
     STREAM_CURL_RC=$?
+    exec 9>&-
     TEMP_TRANSFER_PID=
-    if $BB kill -0 "$reader_pid" 2>/dev/null; then $BB kill "$reader_pid" 2>/dev/null; fi
+    # A successful producer has closed its FIFO: allow the bounded reader to
+    # drain to EOF. Killing it here races its final read/exit (even a one-byte
+    # range probe), misclassifying valid responses as download_size/headers.
+    # Failed producers may never have opened the FIFO, so stop that reader.
+    if [ "$STREAM_CURL_RC" -ne 0 ] && $BB kill -0 "$reader_pid" 2>/dev/null; then $BB kill "$reader_pid" 2>/dev/null; fi
     wait "$reader_pid" 2>/dev/null
     reader_rc=$?
     TEMP_READER_PID=
@@ -1085,83 +1063,17 @@ download_and_inspect()
 
 download_feature_assets()
 {
-    [ "$(check_value_from_file "$ROOT/staging/manifest" format)" = libreecho-ota-v2 ] || return 0
-    [ -x "$FEATURE_TRANSACTION" ] || die feature_transaction_missing
-    $BB mkdir -p "$FEATURE_STAGE" || die feature_stage_create
-    "$FEATURE_TRANSACTION" preflight "$ROOT/staging/manifest" download ||
-        die download_space
-    ids=$(check_value_from_file "$ROOT/staging/manifest" feature_ids)
-    for feature in $(printf '%s' "$ids" | $BB tr ',' ' '); do
-        action=$(check_value_from_file "$ROOT/staging/manifest" "feature_${feature}_action")
-        case "$action" in
-            runtime|replace)
-                directory=$FEATURE_STAGE/$feature; $BB mkdir -p "$directory" || die feature_stage_create
-                for kind in asset manifest_asset; do
-                    asset=$(check_value_from_file "$ROOT/staging/manifest" "feature_${feature}_${kind}")
-                    case "$asset" in ''|*[!A-Za-z0-9._+:-]*|*/*|*\\*) die feature_asset_name;; esac
-                    expected_size=$(check_value_from_file "$ROOT/staging/manifest" "feature_${feature}_$([ "$kind" = asset ] && printf size || printf manifest_size)")
-                    expected_hash=$(check_value_from_file "$ROOT/staging/manifest" "feature_${feature}_$([ "$kind" = asset ] && printf sha256 || printf manifest_sha256)")
-                    part=$directory/$asset.part; final=$directory/$asset
- if [ -f "$final" ] && [ ! -L "$final" ] &&
-     [ "$(stat -c %s "$final" 2>/dev/null)" = "$expected_size" ] &&
-     [ "$(sha256sum "$final" | $BB awk '{print $1}')" = "$expected_hash" ]; then
-     continue
- fi
- [ ! -e "$final" ] || quarantine_file "$final" "$FEATURE_ASSET_MAX_BYTES"
- resume_args=
- if [ -L "$part" ]; then die download_asset_type; fi
- if [ -f "$part" ]; then
-                        part_size=$(stat -c %s "$part" 2>/dev/null)
-                        case "$part_size" in
-                            0) ;;
-                            ''|*[!0-9]*) quarantine_file "$part" "$FEATURE_ASSET_MAX_BYTES"; part_size=0 ;;
-                            *)
-                                if [ "$part_size" -eq "$expected_size" ]; then
-                                    if [ "$(sha256sum "$part" | $BB awk '{print $1}')" = "$expected_hash" ]; then
-                                        $BB mv "$part" "$final" || die download_asset_commit
-                                        continue
-                                    fi
-                                    quarantine_file "$part" "$FEATURE_ASSET_MAX_BYTES"
-                                    part_size=0
-                                elif [ "$part_size" -gt "$expected_size" ]; then
-                                    quarantine_file "$part" "$FEATURE_ASSET_MAX_BYTES"
-                                    part_size=0
-                                else
-                                    resume_args="--continue-at -"
-                                fi
-                                ;;
-                        esac
-                    fi
-                    asset_release="radar-puffin-v$version"
-                    [ "$channel" != dev ] || asset_release=$DEV_RELEASE_TAG
-                    asset_url="https://github.com/aslater3/LibreEcho/releases/download/$asset_release/$asset"
-                    http_code=$("$CURL" --fail --location --silent --show-error --proto '=https' --proto-redir '=https' \
-                        --tlsv1.2 --cacert "$CA" --connect-timeout 20 --max-time 1800 --max-filesize "$expected_size" \
-                        --output "$part" --stderr "$CURL_STDERR" --write-out '%{http_code}' $resume_args "$asset_url")
-                    curl_rc=$?; curl_detail=$(downloader_stderr); $BB rm -f "$CURL_STDERR"
-                    [ "$curl_rc" -eq 0 ] && case "$http_code" in 2??) ;; *) die download_asset_http true "$curl_rc" "$curl_detail" "$http_code";; esac ||
-                        die download_asset_transport false "$curl_rc" "$curl_detail" "$http_code"
-                    [ -f "$part" ] && [ ! -L "$part" ] || die download_asset_type
-                    [ "$(stat -c %s "$part" 2>/dev/null)" = "$expected_size" ] || { quarantine_file "$part" "$FEATURE_ASSET_MAX_BYTES"; die download_asset_size; }
-                    [ "$(sha256sum "$part" | $BB awk '{print $1}')" = "$expected_hash" ] || { quarantine_file "$part" "$FEATURE_ASSET_MAX_BYTES"; die download_asset_hash; }
-                    $BB mv "$part" "$final" || die download_asset_commit
-                done
-                ;;
-            preserve) ;;
-            *) die feature_action_rejected;;
-        esac
-    done
+    [ "$(check_value_from_file "$ROOT/staging/manifest" format)" = libreecho-ota-v3 ] || die legacy_manifest_unsupported
+    ROOT="$ROOT" CURL="$CURL" CA="$CA" "${GENERATION_TOOL:-/usr/local/sbin/libreecho-generation}" assemble "$ROOT/staging/manifest" "$ROOT/staging/manifest.sig" || die generation_assembly
 }
 
 cleanup_refused_install_artifacts()
 {
-    # Once a v2 journal or pending intent exists, the staged manifest, boot
-    # image, and feature records are authoritative rollback/diagnostic
+    # Once a pending intent exists, the staged manifest and boot image are authoritative rollback/diagnostic
     # evidence. Leave that transaction untouched; its recovery path owns it.
-    if [ -e "$ROOT/feature-commit" ] || [ -e "$PENDING" ]; then
+    if [ -e "$PENDING" ]; then
         return 0
     fi
-    $BB rm -rf "$FEATURE_STAGE" 2>/dev/null || return 1
     $BB rm -f "$PACKAGE" "$PART" "$ROOT"/.control-* \
         "$ROOT"/quarantine-*.bad "$CURL_HEADERS" "$CURL_STDERR" 2>/dev/null || return 1
     return 0
@@ -1169,19 +1081,22 @@ cleanup_refused_install_artifacts()
 
 candidate_matches_record()
 {
-    # Stable SemVer behavior stays unchanged. Dev revisions can share a version.
-    [ "$channel" = dev ] || return 0
-    if [ "$(check_value_from_file "$ROOT/staging/manifest" format)" = libreecho-ota-v2 ]; then
-        # The v2 installed writer records the manifest identity, which binds
-        # boot and features, rather than duplicating the boot hash.
-        candidate_manifest=$(sha256sum "$ROOT/staging/manifest" | $BB awk '{print $1}')
-        [ "$candidate_manifest" = "$(check_value_from_file "$1" manifest_sha256)" ]
-        return $?
+    local id directory candidate_manifest recorded
+    [ -f "$1" ] && [ ! -L "$1" ] || return 1
+    [ "$(check_value_from_file "$1" schema)" = 3 ] || return 1
+    id=$(check_value_from_file "$1" transaction_id)
+    case "$id" in ''|.|..|*[!A-Za-z0-9._+~:-]*) return 1;; esac
+    [ "${#id}" -le 96 ] || return 1
+    if [ "$1" = "$ROOT/installed" ]; then
+        [ -f "$ROOT/current" ] && [ ! -L "$ROOT/current" ] || return 1
+        [ "$($BB cat "$ROOT/current")" = "$id" ] || return 1
     fi
-    candidate_boot=$(check_value_from_file "$ROOT/staging/manifest" boot_sha256)
-    recorded_boot=$(check_value_from_file "$1" boot_sha256)
-    printf '%s\n' "$candidate_boot" | $BB grep -Eq '^[a-f0-9]{64}$' || return 1
-    [ "$candidate_boot" = "$recorded_boot" ]
+    directory=${GENERATIONS:-/data/libreecho/generations}/$id
+    "${GENERATION_TOOL:-/usr/local/sbin/libreecho-generation}" verify "$directory" >/dev/null 2>&1 || return 1
+    recorded=$(sha256sum "$directory/target.manifest" | $BB awk '{print $1}')
+    [ "$recorded" = "$(check_value_from_file "$1" manifest_sha256)" ] || return 1
+    candidate_manifest=$(sha256sum "$ROOT/staging/manifest" | $BB awk '{print $1}')
+    [ "$candidate_manifest" = "$recorded" ]
 }
 
 check_status_write_candidate()
@@ -1201,6 +1116,36 @@ check_status_write_candidate()
     fi
 }
 
+# Suppression metadata never authorizes bytes. The candidate has already passed
+# signed inspect; retained rollback identity must work even after candidate GC.
+automatic_replay_status()
+{
+    local candidate_id candidate_release pointer id directory old_release
+    candidate_id=$(check_value_from_file "$ROOT/staging/manifest" transaction_id)
+    if [ -n "$candidate_id" ] && [ "$(check_value_from_file "$ROOT/rolled-back" schema)" = 3 ] &&
+        [ "$candidate_id" = "$(check_value_from_file "$ROOT/rolled-back" transaction_id)" ]; then
+        printf '%s\n' update-held-after-rollback
+        return 0
+    fi
+    candidate_release=$(check_value_from_file "$ROOT/staging/manifest" release)
+    [ -n "$candidate_release" ] || return 1
+    for pointer in current previous; do
+        [ -f "$ROOT/$pointer" ] && [ ! -L "$ROOT/$pointer" ] || continue
+        id=$($BB cat "$ROOT/$pointer")
+        case "$id" in ''|.|..|*[!A-Za-z0-9._+~:-]*) return 1;; esac
+        [ "${#id}" -le 96 ] || return 1
+        directory=${GENERATIONS:-/data/libreecho/generations}/$id
+        "${TARGET_MANIFEST:-/usr/local/sbin/libreecho-target-manifest}" check "$directory/target.manifest" "$directory/target.manifest.sig" >/dev/null 2>&1 || continue
+        old_release=$(check_value_from_file "$directory/target.manifest" release)
+        if [ "$candidate_release" = "$old_release" ]; then
+            if [ "$pointer" = current ]; then printf '%s\n' up-to-date
+            else printf '%s\n' update-held-after-rollback; fi
+            return 0
+        fi
+    done
+    return 1
+}
+
 check_or_install()
 {
     requested_action=$1
@@ -1217,18 +1162,19 @@ check_or_install()
         [ "$(sha256sum "$PACKAGE" | $BB awk '{print $1}')" = "$DEV_OTA_SHA256" ] || { quarantine_file "$PACKAGE"; die dev_control_identity; }
         [ "$(check_value_from_file "$ROOT/staging/manifest" update_channel)" = dev ] || die dev_control_channel
     fi
+    if [ "$requested_action" != install ]; then
+        replay_status=$(automatic_replay_status)
+        if [ -n "$replay_status" ]; then
+            check_status_write_candidate "$replay_status" "$version"
+            echo "UPDATE_HELD version=$version"
+            return 0
+        fi
+    fi
     installed=$($BB sed -n 's/^version=//p' "$ROOT/installed" 2>/dev/null)
     installed_channel=$(record_channel "$ROOT/installed")
-    rolled_back=$($BB sed -n 's/^version=//p' "$ROOT/rolled-back" 2>/dev/null)
-    rolled_back_channel=$(record_channel "$ROOT/rolled-back")
-    if [ "$version" = "$installed" ] && [ "$channel" = "$installed_channel" ] && candidate_matches_record "$ROOT/installed"; then
+    if [ "$requested_action" != install ] && [ "$version" = "$installed" ] && [ "$channel" = "$installed_channel" ] && candidate_matches_record "$ROOT/installed"; then
         check_status_write_candidate up-to-date "$version"
         echo "UPDATE_CURRENT version=$version"
-        return 0
-    fi
-    if [ -n "$rolled_back" ] && [ "$version" = "$rolled_back" ] && [ "$channel" = "$rolled_back_channel" ] && candidate_matches_record "$ROOT/rolled-back"; then
-        check_status_write_candidate update-held-after-rollback "$version"
-        echo "UPDATE_HELD version=$version"
         return 0
     fi
     download_feature_assets
@@ -1237,19 +1183,11 @@ check_or_install()
         echo "UPDATE_AVAILABLE version=$version"
         return 0
     fi
-    if [ "$(check_value_from_file "$ROOT/staging/manifest" format)" = libreecho-ota-v2 ]; then
-        "$UPDATE" install "$PACKAGE" --feature-dir "$FEATURE_STAGE" || {
-            cleanup_refused_install_artifacts || true
-            check_status_write error "$version" install_failed true
-            return 1
-        }
-    else
-        "$UPDATE" install "$PACKAGE" || {
-            cleanup_refused_install_artifacts || true
-            check_status_write error "$version" install_failed true
-            return 1
-        }
-    fi
+    "$UPDATE" install "$PACKAGE" || {
+        cleanup_refused_install_artifacts || true
+        check_status_write error "$version" install_failed true
+        return 1
+    }
     check_status_write_candidate reboot-pending "$version"
 }
 
@@ -1267,7 +1205,7 @@ watch_updates()
             if "$0" check >/tmp/ota-check.log 2>&1 &&
                 automatic_updates_enabled &&
                 [ "$(check_value status)" = update-available ]; then
-                "$0" install >/tmp/ota-fetch.log 2>&1 || true
+                "$0" auto-install >/tmp/ota-fetch.log 2>&1 || true
             fi
         fi
         $BB sleep "$interval"
@@ -1275,7 +1213,7 @@ watch_updates()
 }
 
 case "${1:-}" in
-    check|install)
+    check|install|auto-install)
         [ "$#" -eq 1 ] || die usage
         check_or_install "$1"
         ;;

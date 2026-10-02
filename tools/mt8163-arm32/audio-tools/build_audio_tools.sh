@@ -94,7 +94,7 @@ make -C "$src/src" -j"${LIBREECHO_BUILD_JOBS:-2}" \
 make -C "$src/utils" -j"${LIBREECHO_BUILD_JOBS:-2}" \
   TINYALSA_VERSION=1.1.1 TINYALSA_VERSION_MAJOR=1 \
   CROSS_COMPILE="$wrapper_prefix" CFLAGS="$common_cflags" \
-  LDFLAGS='-static -no-pie -Wl,--build-id=none' \
+  LDFLAGS='-static -no-pie -Wl,--build-id=none -Wl,--strip-all' \
   tinyplay tinycap tinymix >/dev/null
 
 allowed_musl_provenance='/home/buildozer/aports/main/musl/src/musl-1.2.5'

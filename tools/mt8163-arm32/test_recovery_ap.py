@@ -2018,6 +2018,9 @@ class RecoveryApConnectivityPrerequisiteTests(unittest.TestCase):
             "--wmt-bt-on", "wmt_bt_on",
             "--wmt-stock-compat", "wmt_stock_compat",
             "--wmt-launcher", "wmt_launcher",
+            # Boot HTTPS repair is mandatory and checked before inputs are read.
+            "--boot-https-payload", "boot-https-payload.tar",
+            "--boot-https-payload-manifest", "boot-https-payload.json",
         )
         with mock.patch.object(sys, "argv", argv):
             with self.assertRaises(SystemExit) as caught:

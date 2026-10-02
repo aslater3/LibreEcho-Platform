@@ -1162,7 +1162,85 @@ finalize_validate() {
     return 0
 }
 
+# V3 recovery publishes the exact target tree. Recovery hash-pins uploads to
+# the browser's bundle anchor; the new boot image authenticates the signature
+# before executing any feature. TWRP has no cryptographic verifier.
+v3_value() { sed -n "s/^$1=//p" "$SRC_OTA_MANIFEST"; }
+validate_v3_target() {
+    v3_keys='format manifest_version board soc architecture image_profile transaction_type transaction_id release version update_channel service_profile minimum_updater_schema commit_policy boot_filename boot_size boot_sha256 feature_ids'
+    for v3_f in airplay2 tts wakeword stt assistant; do
+        for v3_field in asset size sha256 manifest_asset manifest_size manifest_sha256 daemon_path daemon_sha256; do
+            v3_keys="$v3_keys feature_${v3_f}_${v3_field}"
+        done
+    done
+    v3_keys="$v3_keys config_schema"
+    [ "$(sed 's/=.*//' "$SRC_OTA_MANIFEST" | tr '\n' ' ')" = "$v3_keys " ] || fail v3-manifest-noncanonical
+    awk -F= 'NF != 2 || $2 == "" || $2 ~ /[^A-Za-z0-9._+~,:\/-]/ {bad=1} END {exit bad}' "$SRC_OTA_MANIFEST" || fail v3-manifest-syntax
+    [ "$(v3_value manifest_version)" = 1 ] && [ "$(v3_value minimum_updater_schema)" = 3 ] || fail v3-manifest-version
+    [ "$(v3_value board)" = "$TARGET" ] && [ "$(v3_value soc)" = mt8163 ] && [ "$(v3_value architecture)" = armv7 ] || fail v3-manifest-target
+    [ "$(v3_value image_profile)" = ota ] && [ "$(v3_value transaction_type)" = system ] && [ "$(v3_value commit_policy)" = after-slot-confirm ] || fail v3-manifest-policy
+    [ "$(v3_value boot_filename)" = boot.img ] && [ "$(v3_value boot_size)" = 16777216 ] && [ "$(v3_value boot_sha256)" = "$(boot_sha)" ] || fail v3-manifest-boot
+    [ "$(v3_value feature_ids)" = airplay2,tts,wakeword,stt,assistant ] || fail v3-feature-set
+    v3_tx=$(v3_value transaction_id)
+    case "$v3_tx" in ''|.|..|*[!A-Za-z0-9._+~:-]*) fail v3-transaction-id;; esac
+    [ "${#v3_tx}" -le 96 ] || fail v3-transaction-id
+    int_ok "$(v3_value config_schema)" || fail v3-config-schema
+    case "$(v3_value update_channel)" in dev|stable) ;; *) fail v3-channel;; esac
+    case "$(v3_value service_profile)" in production|diagnostic) ;; *) fail v3-profile;; esac
+    case "$TARGET" in radar_puffin) v3_slug=radar-puffin;; biscuit) v3_slug=biscuit;; *) fail v3-target;; esac
+    printf '' > "$FEATURE_PLAN" || fail feature-plan-write
+    for v3_f in airplay2 tts wakeword stt assistant; do
+        v3_ph=$(v3_value "feature_${v3_f}_sha256"); v3_mh=$(v3_value "feature_${v3_f}_manifest_sha256")
+        hex64 "$v3_ph" && hex64 "$v3_mh" && hex64 "$(v3_value "feature_${v3_f}_daemon_sha256")" || fail v3-feature-hash
+        [ "$(v3_value "feature_${v3_f}_asset")" = "libreecho-$v3_slug-base-$v3_f-$v3_ph.payload.squashfs" ] || fail v3-asset-name
+        [ "$(v3_value "feature_${v3_f}_manifest_asset")" = "libreecho-$v3_slug-base-$v3_f-$v3_mh.manifest.json" ] || fail v3-asset-name
+        case "$v3_f:$(v3_value "feature_${v3_f}_daemon_path")" in
+            airplay2:usr/local/sbin/libreecho-audio-engine|tts:usr/local/sbin/libreecho-ttsd|wakeword:usr/local/sbin/libreecho-waked|stt:usr/local/sbin/libreecho-sttd|assistant:usr/local/sbin/libreecho-agentd) ;; *) fail v3-daemon-path;;
+        esac
+        [ "$(staging_sha_payload "$v3_f")" = "$v3_ph" ] && [ "$(staging_sha_manifest "$v3_f")" = "$v3_mh" ] || fail "signed-staging-digest-mismatch:$v3_f"
+        v3_psrc=$(find_upload "$v3_ph") || fail "missing-upload:feature-payload:$v3_f"
+        v3_msrc=$(find_upload "$v3_mh") || fail "missing-upload:feature-manifest:$v3_f"
+        [ "$(wc -c < "$v3_psrc" | tr -d ' ')" = "$(v3_value "feature_${v3_f}_size")" ] || fail "signed-payload-size:$v3_f"
+        [ "$(wc -c < "$v3_msrc" | tr -d ' ')" = "$(v3_value "feature_${v3_f}_manifest_size")" ] || fail "signed-manifest-size:$v3_f"
+        printf '%s|target|%s|%s|%s|%s||\n' "$v3_f" "$v3_psrc" "$v3_msrc" "$v3_ph" "$v3_mh" >> "$FEATURE_PLAN" || fail feature-plan-write
+    done
+    for v3_f in $STAGING_FEATURES; do
+        case "$v3_f" in airplay2|tts|wakeword|stt|assistant) ;; *) fail v3-feature-set;; esac
+    done
+    v3_partial=$DATA/libreecho/generations/$v3_tx.partial
+    v3_dest=$DATA/libreecho/generations/$v3_tx
+    no_symlink_ancestors "$v3_partial" && no_symlink_ancestors "$v3_dest" || fail v3-generation-path
+    [ ! -e "$v3_partial" ] && [ ! -e "$v3_dest" ] || fail v3-generation-exists
+}
+place_v3_generation() {
+    mkdir -p "$v3_partial/features" || fail v3-generation-create
+    place_linked "$SRC_OTA_MANIFEST" "$v3_partial/target.manifest" "$(transfer_sha ota-manifest)"
+    place_linked "$SRC_OTA_SIGNATURE" "$v3_partial/target.manifest.sig" "$(transfer_sha ota-signature)"
+    while IFS='|' read -r v3_f v3_kind v3_psrc v3_msrc v3_ph v3_mh v3_unused v3_unused2; do
+        place_linked "$v3_psrc" "$v3_partial/features/$v3_f/payload.squashfs" "$v3_ph"
+        place_linked "$v3_msrc" "$v3_partial/features/$v3_f/manifest.json" "$v3_mh"
+    done < "$FEATURE_PLAN"
+    # Only the complete, already hash-checked declared files were linked.
+    printf '%s\n' "$(sha256_of "$SRC_OTA_MANIFEST")" > "$v3_partial/COMPLETE.tmp" || fail v3-complete-write
+    sync || fail v3-sync
+    mv "$v3_partial/COMPLETE.tmp" "$v3_partial/COMPLETE" || fail v3-complete-rename
+    find "$v3_partial" -type f -exec chmod 0400 '{}' ';' || fail v3-file-mode
+    find "$v3_partial" -type d -exec chmod 0500 '{}' ';' || fail v3-dir-mode
+    sync || fail v3-sync
+    mv "$v3_partial" "$v3_dest" || fail v3-generation-publish
+    sync || fail v3-sync
+    printf '%s\n' "$v3_tx" > "$LIVE_UPDATE/current.tmp" || fail v3-current-write
+    chmod 0600 "$LIVE_UPDATE/current.tmp" || fail v3-current-mode
+    sync || fail v3-sync
+    mv "$LIVE_UPDATE/current.tmp" "$LIVE_UPDATE/current" || fail v3-current-publish
+    sync || fail v3-sync
+}
+
 validate_signed_features() {
+    if [ "$(v3_value format)" = libreecho-ota-v3 ]; then
+        validate_v3_target
+        return 0
+    fi
     # The signed OTA manifest is the authority for *semantics*; the bundle
     # staging lines are the authority for the bytes. Both must agree exactly:
     # feature set (no duplicates), action, payload/manifest digests and sizes.
@@ -1278,6 +1356,10 @@ place_signed_manifest() {
 }
 
 place_features() {
+    if [ "$(v3_value format)" = libreecho-ota-v3 ]; then
+        place_v3_generation
+        return 0
+    fi
     mkdir -p "$LIVE_FEATURES" 2>/dev/null || fail "features-dir-create"
     [ -d "$LIVE_FEATURES" ] && [ ! -L "$LIVE_FEATURES" ] || fail "features-dir-create"
     while IFS='|' read -r pf_f pf_action pf_psrc pf_msrc pf_psha pf_msha pf_asset pf_masset; do
