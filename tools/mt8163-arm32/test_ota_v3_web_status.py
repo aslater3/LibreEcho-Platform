@@ -37,8 +37,8 @@ class WebStatusTests(FailurePolicyTests):
         # The contract must accept that shape and reject any legacy mount.
         import importlib.util, tempfile, subprocess, sys
         ui = os.environ.get('LIBREECHO_OTA_UI_SOURCE')
-        if not ui:
-            self.skipTest('pinned companion UI source is not available')
+        if not ui or not (Path(ui) / 'init/libreecho-agentd.init').is_file():
+            self.skipTest('complete companion UI init scripts are not available')
         spec = importlib.util.spec_from_file_location('bri', TOOLS / 'build_recovery_image.py')
         bri = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(bri)

@@ -588,7 +588,12 @@ class RadarTreeDiffTests(unittest.TestCase):
             esphome_functions, esphome_base_functions = parse(esphome_raw), parse(esphome_base)
             esphome_changed = {n for n in esphome_functions if esphome_functions[n] != esphome_base_functions.get(n)}
             self.assertEqual(esphome_changed, {'add_ui_bundle'})
-            for name in old_functions.keys() & new_functions.keys() - {'main', 'add_overlay', 'add_ota_tools'}:
+            # OTA v3 moved feature payload mounting to the generation. The
+            # reviewed v3 startup contract is pinned to its exact source.
+            v3_reviewed = {'validate_ui_startup_contract': '8dd95bb9682fe8ddddc2f746a875354b76bb19af2bbefbcc2818d618ed0e18de'}
+            for name, digest in v3_reviewed.items():
+                self.assertEqual(hashlib.sha256(new_functions[name].encode()).hexdigest(), digest, name)
+            for name in old_functions.keys() & new_functions.keys() - {'main', 'add_overlay', 'add_ota_tools'} - v3_reviewed.keys():
                 expected = esphome_functions[name] if name in esphome_changed else old_functions[name]
                 self.assertEqual(expected, new_functions[name], name)
             summary = {'base': self.BASE, 'evidence_class': 'unit_staging_not_ARM_image',
