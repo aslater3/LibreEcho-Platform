@@ -86,6 +86,45 @@ def build_fixture(directory, omit=()):
     return directory, digest(manifest_path)
 
 
+
+class StripTests(unittest.TestCase):
+    """CI-enumerated builder regressions; no image or hardware execution."""
+
+    def test_static_builders_strip_at_link_before_metadata(self):
+        import re
+        compiler = shutil.which('cc')
+        assert compiler is not None, 'host C compiler required'
+        builders = (
+            ('adbd/build_adbd.sh', 'binary_sha='),
+            ('audio-tools/build_audio_tools.sh', 'python3 - "$OUTPUT/tinyalsa-source.json"'),
+            ('network-tools/build_wireless_tools.sh', 'binary_sha='),
+        )
+        with tempfile.TemporaryDirectory(prefix='le-strip-link-') as tmp:
+            root = Path(tmp)
+            source = root / 'probe.c'
+            source.write_text('#include <stdio.h>\nint main(void) { puts("runtime preserved"); return 0; }\n')
+            for relative, metadata in builders:
+                with self.subTest(builder=relative):
+                    script = (HERE.parent / relative).read_text()
+                    if relative.startswith('adbd/'):
+                        link = script.split('"$CC" "${CFLAGS[@]}" -static', 1)[1].split('chmod', 1)[0]
+                        flags = re.findall(r'-Wl,[a-zA-Z0-9_=,.-]+', link)
+                    else:
+                        match = re.search(r"LDFLAGS='([^']+)'", script)
+                        assert match is not None
+                        flags = shlex.split(match.group(1))
+                    binary = root / 'probe'
+                    result = subprocess.run([compiler, '-g', '-static', str(source), '-o', str(binary), *flags],
+                                            capture_output=True, text=True, timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    sections = subprocess.check_output(['readelf', '-SW', str(binary)], text=True, timeout=10)
+                    self.assertNotIn('.symtab', sections)
+                    self.assertNotIn('.debug_', sections)
+                    self.assertLess(script.index('--strip-all'), script.index(metadata))
+                    result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
+                    self.assertEqual((result.returncode, result.stdout), (0, 'runtime preserved\n'))
+
+
 class ContractTests(unittest.TestCase):
     def test_packaged_runtime_checks_native_port_and_txt_identity(self):
         runtime = load_module('mdns_packaged_acceptance', HERE / 'test_packaged_runtime.py')

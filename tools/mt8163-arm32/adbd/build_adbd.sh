@@ -126,7 +126,7 @@ for source in "${sources[@]}"; do
   objects+=("$object")
 done
 
-"$CC" "${CFLAGS[@]}" -static -Wl,--gc-sections -Wl,--build-id=none -Wl,-z,now \
+"$CC" "${CFLAGS[@]}" -static -Wl,--gc-sections -Wl,--build-id=none -Wl,-z,now -Wl,--strip-all \
   -o "$OUTPUT/adbd" "${objects[@]}" -lpthread
 chmod 0750 "$OUTPUT/adbd"
 
