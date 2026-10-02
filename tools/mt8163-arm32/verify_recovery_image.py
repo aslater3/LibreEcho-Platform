@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import argparse
-import gzip
 import hashlib
 import json
+import lzma
 import re
 import stat
 import struct
@@ -22,6 +22,10 @@ from libreecho_platform_targets import add_target_arguments, validate_target_arg
 
 
 ANDROID_MAGIC = b"ANDROID!"
+RAMDISK_COMPRESSION = "xz-crc32-lzma2-8m"
+RAMDISK_XZ_MAX_DICT_SIZE = 8 << 20
+XZ_MAGIC = b"\xfd7zXZ\x00"
+XZ_CHECK_CRC32 = b"\x00\x01"
 MKIMG_MAGIC = bytes.fromhex("88168858")
 FDT_MAGIC = bytes.fromhex("d00dfeed")
 PAGE = 0x800
@@ -327,6 +331,26 @@ class Entry:
     gid: int
     mtime: int
     data: bytes
+
+
+def decompress_ramdisk(ramdisk: bytes) -> bytes:
+    """Accept only a single-stream CRC32 xz the target kernel can unpack.
+
+    The Linux xz_dec used for initramfs rejects CRC64/SHA-256 checks, so an
+    archive Python can read may still fail at boot; enforce the subset here.
+    """
+    if ramdisk[:6] != XZ_MAGIC:
+        fail("ramdisk is not an xz stream")
+    if ramdisk[6:8] != XZ_CHECK_CRC32:
+        fail("ramdisk xz integrity check must be CRC32 for the kernel decoder")
+    decoder = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=RAMDISK_XZ_MAX_DICT_SIZE * 2)
+    try:
+        cpio = decoder.decompress(ramdisk)
+    except lzma.LZMAError as exc:
+        fail(f"ramdisk xz is invalid: {exc}")
+    if not decoder.eof or decoder.unused_data:
+        fail("ramdisk xz stream is truncated or has trailing data")
+    return cpio
 
 
 def parse_newc(data: bytes) -> dict[str, Entry]:
@@ -1303,12 +1327,7 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                        expected_target: str | None = None,
                        target_descriptor_sha256: str | None = None,
                        expected_boot_https_payload_sha256: str | None = None) -> bool:
-    if ramdisk[:4] != b"\x1f\x8b\x08\x00":
-        fail("ramdisk gzip header is not deterministic")
-    try:
-        cpio = gzip.decompress(ramdisk)
-    except gzip.BadGzipFile as exc:
-        fail(f"ramdisk gzip is invalid: {exc}")
+    cpio = decompress_ramdisk(ramdisk)
     entries = parse_newc(cpio)
     validate_archive_tree(entries)
     validate_symlinks(entries)
@@ -2549,8 +2568,10 @@ def main() -> None:
         fail("System.map hash mismatch")
     if manifest["inputs"].get("system_map", {}).get("sha256") != args.expected_system_map_sha256:
         fail("manifest System.map identity mismatch")
-    if sha256(ramdisk) != manifest["initramfs"]["gzip_sha256"]:
+    if sha256(ramdisk) != manifest["initramfs"]["ramdisk_sha256"]:
         fail("ramdisk hash differs from manifest")
+    if manifest["initramfs"].get("compression") != RAMDISK_COMPRESSION:
+        fail("ramdisk compression differs from the kernel-supported xz contract")
     if sha256(boot) != args.expected_boot_sha256 or manifest["output"]["sha256"] != args.expected_boot_sha256:
         fail("boot-image hash mismatch")
     if manifest.get("status") != "PREPARED_NOT_FLASHED":

@@ -144,7 +144,6 @@ class BootHttpsTransportTests(unittest.TestCase):
         import subprocess
         import hashlib
         import tempfile
-        import gzip
         import json
         from unittest.mock import patch
         payload = os.environ.get('LIBREECHO_BOOT_HTTPS_TEST_PAYLOAD')
@@ -165,8 +164,8 @@ class BootHttpsTransportTests(unittest.TestCase):
                  patch.object(verify, 'BOOT_HTTPS_CA_SHA256',
                               'c0c940a0e30d859783f7f130868d8082e79936ff0b41a0b1098ac7f98909263b'):
                 build.add_boot_https_transport(stage, input_payload, Path(source_manifest), manifest, qemu)
-                ramdisk = gzip.compress(build.build_cpio(stage, 0), mtime=0)
-                entries = verify.parse_newc(gzip.decompress(ramdisk))
+                ramdisk = build.compress_ramdisk(build.build_cpio(stage, 0))
+                entries = verify.parse_newc(verify.decompress_ramdisk(ramdisk))
                 verify.validate_boot_https_transport(
                     entries, manifest, hashlib.sha256(input_payload.read_bytes()).hexdigest(),
                 )

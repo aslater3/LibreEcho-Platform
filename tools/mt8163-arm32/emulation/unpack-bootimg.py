@@ -2,7 +2,7 @@
 """Extract the kernel and ramdisk rootfs from a LibreEcho Android boot image.
 
 The release boot.img is a standard Android boot image whose ramdisk is a
-gzip/cpio archive containing the full LibreEcho rootfs (statically-linked ARM
+xz (older images: gzip) cpio archive containing the full LibreEcho rootfs (statically-linked ARM
 daemons under /usr/local/sbin, the web bundle under
 /usr/local/share/libreecho/web, busybox at /bin/busybox). This unpacks that
 rootfs so the emulation container can be built from it.
@@ -10,7 +10,7 @@ rootfs so the emulation container can be built from it.
 Usage:
   python3 unpack-bootimg.py <boot.img> <output-rootfs-dir>
 """
-import gzip, io, os, struct, subprocess, sys
+import gzip, io, lzma, os, struct, subprocess, sys
 
 
 def main():
@@ -34,7 +34,12 @@ def main():
     with open(os.path.join(out_dir, "..", "kernel.img"), "wb") as f:
         f.write(data[koff:koff + kernel_size])
 
-    cpio = gzip.GzipFile(fileobj=io.BytesIO(ramdisk)).read()
+    if ramdisk[:6] == b"\xfd7zXZ\x00":
+        cpio = lzma.decompress(ramdisk, format=lzma.FORMAT_XZ)
+    elif ramdisk[:2] == b"\x1f\x8b":  # images built before the xz ramdisk
+        cpio = gzip.GzipFile(fileobj=io.BytesIO(ramdisk)).read()
+    else:
+        sys.exit("ramdisk is neither xz nor gzip")
     # busybox/GNU cpio, newc format
     subprocess.run(["cpio", "-idm", "--quiet"], input=cpio, cwd=out_dir, check=True)
     print(f"rootfs extracted to {out_dir} "

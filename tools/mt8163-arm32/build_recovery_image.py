@@ -4,10 +4,10 @@
 from __future__ import annotations
 
 import argparse
-import gzip
 import hashlib
 import importlib.util
 import json
+import lzma
 import os
 import re
 import shutil
@@ -46,6 +46,8 @@ MKIMG_MAGIC = bytes.fromhex("88168858")
 FDT_MAGIC = bytes.fromhex("d00dfeed")
 PAGE_SIZE = 0x800
 MKIMG_SIZE = 0x200
+RAMDISK_COMPRESSION = "xz-crc32-lzma2-8m"
+RAMDISK_XZ_DICT_SIZE = 8 << 20
 IMAGE_SIZE = 0x1000000
 KERNEL_ADDR = 0x40008000
 RAMDISK_ADDR = 0x43478000
@@ -2501,6 +2503,19 @@ def validate_stage(stage: Path) -> None:
         raise SystemExit("ERROR: auto-starting init.connectivity.rc is forbidden")
 
 
+def compress_ramdisk(cpio: bytes) -> bytes:
+    """Deterministic xz for the kernel's initramfs decoder (CONFIG_RD_XZ).
+
+    The in-kernel xz_dec verifies only CRC32/None checks, and the 8 MiB LZMA2
+    dictionary bounds its single-call memory. Plain LZMA2 (no BCJ filter):
+    a cpio of mixed text/ELF compresses smaller without the ARM filter.
+    """
+    return lzma.compress(cpio, format=lzma.FORMAT_XZ, check=lzma.CHECK_CRC32, filters=[
+        {"id": lzma.FILTER_LZMA2, "preset": 9 | lzma.PRESET_EXTREME,
+         "dict_size": RAMDISK_XZ_DICT_SIZE},
+    ])
+
+
 def build_cpio(stage: Path, epoch: int) -> bytes:
     for path in [stage, *sorted(stage.rglob("*"))]:
         os.utime(path, (epoch, epoch), follow_symlinks=False)
@@ -3032,7 +3047,7 @@ def main() -> None:
         raise SystemExit(f"ERROR: ARM user-mode emulator not found: {args.qemu_arm}")
 
     output = args.output.resolve()
-    ramdisk_output = (args.ramdisk_output or output.with_suffix(".ramdisk.cpio.gz")).resolve()
+    ramdisk_output = (args.ramdisk_output or output.with_suffix(".ramdisk.cpio.xz")).resolve()
     manifest_output = (args.manifest or output.with_suffix(".manifest.json")).resolve()
     for path in (output, ramdisk_output, manifest_output):
         if path.exists():
@@ -3248,9 +3263,9 @@ def main() -> None:
         )
         validate_stage(stage)
         cpio = build_cpio(stage, 0)
-    ramdisk = gzip.compress(cpio, compresslevel=9, mtime=0)
-    if ramdisk[:4] != b"\x1f\x8b\x08\x00" or gzip.decompress(ramdisk) != cpio:
-        raise SystemExit("ERROR: deterministic gzip round trip failed")
+    ramdisk = compress_ramdisk(cpio)
+    if lzma.decompress(ramdisk, format=lzma.FORMAT_XZ) != cpio:
+        raise SystemExit("ERROR: deterministic xz round trip failed")
 
     boot, package_record = package_boot(
         envelope, zimage, ramdisk, raw_dtb, args.ramdisk_address,
@@ -3261,8 +3276,9 @@ def main() -> None:
     manifest["initramfs"] = {
         "cpio_sha256": sha256(cpio),
         "cpio_size": len(cpio),
-        "gzip_sha256": sha256(ramdisk),
-        "gzip_size": len(ramdisk),
+        "compression": RAMDISK_COMPRESSION,
+        "ramdisk_sha256": sha256(ramdisk),
+        "ramdisk_size": len(ramdisk),
         "path": str(ramdisk_output),
     }
     manifest["package"] = package_record

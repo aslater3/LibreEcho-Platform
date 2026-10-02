@@ -5825,16 +5825,73 @@ class UiTlsPackagingTests(unittest.TestCase):
             self.assertIn("include", rejected.stderr)
 
 
+class RamdiskCompressionTests(unittest.TestCase):
+    """The boot ramdisk is xz (CRC32, LZMA2 8 MiB dictionary) so the
+    mandatory boot HTTPS closure fits the unchanged 16 MiB boot partition.
+    The target kernels set CONFIG_RD_XZ=y; the kernel decoder accepts only
+    CRC32/None checks, never CRC64/SHA-256."""
+
+    def test_builder_compression_is_deterministic_kernel_compatible_xz(self):
+        import lzma
+        payload = newc_archive() + os.urandom(4096)
+        first = builder.compress_ramdisk(payload)
+        self.assertEqual(first, builder.compress_ramdisk(payload))
+        self.assertEqual(first[:6], b"\xfd7zXZ\x00")
+        # Stream flags: check type 1 == CRC32 (kernel xz_dec has no CRC64).
+        self.assertEqual(first[6:8], b"\x00\x01")
+        self.assertEqual(lzma.decompress(first), payload)
+
+    def test_builder_dictionary_fits_kernel_preboot_budget(self):
+        stream = builder.compress_ramdisk(newc_archive())
+        # Parse the first block header (xz spec 3.1): size, flags, optional
+        # compressed/uncompressed sizes, then the single LZMA2 filter flags.
+        offset = 12 + 2
+        flags = stream[12 + 1]
+        self.assertEqual(flags & 0x03, 0, "exactly one filter (LZMA2, no BCJ)")
+        def varint(position):
+            value = shift = 0
+            while True:
+                byte = stream[position]
+                value |= (byte & 0x7F) << shift
+                position += 1
+                if not byte & 0x80:
+                    return value, position
+                shift += 7
+        for present in (flags & 0x40, flags & 0x80):
+            if present:
+                _, offset = varint(offset)
+        filter_id, offset = varint(offset)
+        size, offset = varint(offset)
+        self.assertEqual((filter_id, size), (0x21, 1))
+        bits = stream[offset]
+        dict_size = (2 | (bits & 1)) << (bits // 2 + 11)
+        self.assertLessEqual(dict_size, 8 << 20)
+
+    def test_verifier_accepts_xz_and_rejects_gzip_and_crc64(self):
+        import gzip
+        import lzma
+        archive = newc_archive()
+        self.assertEqual(verifier.decompress_ramdisk(builder.compress_ramdisk(archive)), archive)
+        with self.assertRaisesRegex(SystemExit, "xz"):
+            verifier.decompress_ramdisk(gzip.compress(archive, mtime=0))
+        crc64 = lzma.compress(archive, format=lzma.FORMAT_XZ, check=lzma.CHECK_CRC64)
+        with self.assertRaisesRegex(SystemExit, "CRC32"):
+            verifier.decompress_ramdisk(crc64)
+        corrupt = bytearray(builder.compress_ramdisk(archive))
+        corrupt[len(corrupt) // 2] ^= 0xFF
+        with self.assertRaises(SystemExit):
+            verifier.decompress_ramdisk(bytes(corrupt))
+
+
 class BootHttpsImageBoundaryTests(unittest.TestCase):
     def test_image_verifier_requires_boot_transport_before_optional_features(self):
-        import gzip
         import inspect
         # Exercise the actual image verifier entry point, not source text.
         options = {
             name: None for name, parameter in inspect.signature(verifier.validate_initramfs).parameters.items()
             if parameter.default is inspect.Parameter.empty
         }
-        options.update(ramdisk=gzip.compress(newc_archive(), mtime=0), manifest={}, schema_version=2)
+        options.update(ramdisk=builder.compress_ramdisk(newc_archive()), manifest={}, schema_version=2)
         with self.assertRaisesRegex(SystemExit, 'mandatory boot HTTPS transport'):
             verifier.validate_initramfs(**options)
 
