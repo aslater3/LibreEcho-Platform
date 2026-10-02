@@ -192,5 +192,81 @@ class ManifestAndBundleTests(unittest.TestCase):
             with tarfile.open(output, "r:") as archive:
                 self.assertEqual(archive.getnames(), ["manifest", "manifest.sig", "boot.img"])
 
+
+def shell_function_block(source: str, first: str, end_before: str) -> str:
+    start = source.index(first)
+    return source[start:source.index(f"{end_before}()", start)]
+
+
+class StaleDownloadRecoveryTests(unittest.TestCase):
+    def test_stale_manifest_recovery_never_signals_persisted_pids(self) -> None:
+        """A PID saved under /data before a power loss names nothing after it.
+
+        The manifest outlives the boot but the PID namespace does not: after a
+        reboot the same number can belong to any unrelated service. Recovery
+        must remove the inert artifacts and leave every process alone.
+        """
+        source = (TOOLS / "initramfs/libreecho-update-fetch").read_text()
+        helpers = shell_function_block(source, "MAX_STALE_MANIFESTS=", "download_signal")
+        with tempfile.TemporaryDirectory(prefix="ota-stale-pid-") as directory:
+            root = Path(directory) / "update"
+            root.mkdir()
+            harness = Path(directory) / "harness.sh"
+            harness.write_text(
+                "BB=/bin/busybox\n"
+                f"ROOT={shlex.quote(str(root))}\n"
+                f"CURL_HEADERS={shlex.quote(str(Path(directory) / 'headers'))}\n"
+                f"CURL_STDERR={shlex.quote(str(Path(directory) / 'stderr'))}\n"
+                + helpers
+                + "recover_stale_download_artifacts\n"
+            )
+            bystander = subprocess.Popen(["sleep", "60"])
+            try:
+                artifact = root / ".control-fresh.424250"
+                artifact.write_text("stale")
+                manifest_path = root / ".control-owned.424250"
+                manifest_path.write_text(f"{artifact}\npid:{bystander.pid}\n")
+                result = run(["/bin/busybox", "sh", str(harness)], timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                time.sleep(0.2)
+                self.assertIsNone(bystander.poll(), "stale recovery signalled an unrelated process")
+                self.assertFalse(artifact.exists())
+                self.assertFalse(manifest_path.exists())
+            finally:
+                bystander.kill()
+                bystander.wait(timeout=10)
+
+
+class UserdataCleanupSymlinkTests(unittest.TestCase):
+    def test_symlinked_feature_directory_is_rejected_before_any_deletion(self) -> None:
+        """Legacy residue removal must not follow a feature-directory symlink.
+
+        The contract check already refuses a symlinked feature directory, but
+        the residue loop ran first and its rm -rf resolved through the link.
+        """
+        with tempfile.TemporaryDirectory(prefix="cleanup-feature-link-") as directory:
+            root = Path(directory)
+            data = root / "data"
+            features = data / "libreecho/features"
+            features.mkdir(parents=True)
+            outside = root / "outside"
+            (outside / "staging").mkdir(parents=True)
+            (outside / "staging/must-survive").write_text("keep")
+            (outside / "payload.squashfs.previous").write_text("keep")
+            (features / "linked").symlink_to(outside, target_is_directory=True)
+            result = run(
+                ["/bin/sh", str(TOOLS / "initramfs/libreecho-data-cleanup")],
+                env={**os.environ, "LIBREECHO_DATA_TEST_MODE": "1", "DATA_ROOT": str(data)},
+                timeout=30,
+            )
+            output = result.stdout + result.stderr
+            self.assertTrue((outside / "staging/must-survive").exists(), output)
+            self.assertTrue((outside / "payload.squashfs.previous").exists(), output)
+            self.assertTrue((features / "linked").is_symlink())
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn("DATA_CLEANUP_UNKNOWN=libreecho/features/linked", output)
+            self.assertNotIn("DATA_CLEANUP_REMOVED=libreecho/features/linked", output)
+
+
 if __name__ == "__main__":
     unittest.main()
