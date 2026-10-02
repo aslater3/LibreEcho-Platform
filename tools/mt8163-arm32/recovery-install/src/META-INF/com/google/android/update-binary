@@ -60,6 +60,7 @@ DRY_RUN_FLAG=/cache/libreecho-install-dry-run
 LIVE_UPDATE=/data/libreecho/update
 STAGING=$LIVE_UPDATE/staging
 LIVE_FEATURES=/data/libreecho/features
+LIVE_GENERATIONS=/data/libreecho/generations
 # Where the release's OTA tar is left for the device-side local install. The OS
 # cannot read /cache, so this has to live on /data to survive into the boot that
 # completes the transaction.
@@ -392,6 +393,13 @@ preflight_features() {
         case " $preflight_seen " in *" $preflight_feature "*) die "duplicate signed feature" ;; esac
         preflight_seen="$preflight_seen $preflight_feature"
         preflight_action=$(sed -n "s/^feature_${preflight_feature}_action=//p" "$ota_manifest")
+        if [ "$(sed -n 's/^format=//p' "$ota_manifest")" = libreecho-ota-v3 ]; then
+            # A v3 target is a complete state: every feature is a full signed
+            # asset, and per-feature composition keys must not exist at all.
+            [ -z "$preflight_action" ] || die "v3 target carries a feature action: $preflight_feature"
+            grep -q "^feature_${preflight_feature}_base_" "$ota_manifest" && die "v3 target carries a base hash: $preflight_feature"
+            preflight_action=replace
+        fi
         case "$preflight_action" in
             preserve)
                 preflight_want=$(sed -n "s/^feature_${preflight_feature}_base_payload_sha256=//p" "$ota_manifest")
@@ -668,6 +676,10 @@ stage_features() {
         done
         return 0
     fi
+    if [ "$(sed -n 's/^format=//p' "$ota_manifest")" = libreecho-ota-v3 ]; then
+        stage_v3_generation
+        return 0
+    fi
     staging=$STAGING
     mkdir -p "$staging" || die "cannot create $staging"
     cp "$ota_manifest" "$staging/manifest" || die "cannot stage the manifest"
@@ -743,6 +755,58 @@ stage_features() {
     [ "$staged_count" -gt 0 ] || die "no features staged"
     sync
     ui_print "  $staged_count feature(s) staged for the transaction to commit"
+}
+
+stage_v3_generation() {
+    # Publish the signed target as one immutable generation, byte-identical to
+    # what OTA assembly and the browser helper publish for the same release:
+    #   generations/<tx>/target.manifest(.sig)
+    #   generations/<tx>/features/<f>/payload.squashfs + manifest.json
+    #   generations/<tx>/COMPLETE (sha256 of target.manifest)
+    # then point update/current at it. No legacy feature tree, no staging
+    # transaction: the booted OS verifies the signature before using any byte.
+    ota_manifest=$BUNDLE_DIR/manifest
+    v3_tx=$(sed -n 's/^transaction_id=//p' "$ota_manifest" | head -n 1)
+    case "$v3_tx" in ''|.|..|*[!A-Za-z0-9._+~:-]*) die "invalid v3 transaction id" ;; esac
+    [ "${#v3_tx}" -le 96 ] || die "invalid v3 transaction id"
+    v3_partial=$LIVE_GENERATIONS/$v3_tx.partial
+    v3_dest=$LIVE_GENERATIONS/$v3_tx
+    [ ! -e "$v3_partial" ] && [ ! -e "$v3_dest" ] || die "v3 generation already exists: $v3_tx"
+    index_feature_assets
+    mkdir -p "$v3_partial/features" || die "cannot create $v3_partial"
+    cp "$ota_manifest" "$v3_partial/target.manifest" || die "cannot place the target manifest"
+    cp "$BUNDLE_DIR/manifest.sig" "$v3_partial/target.manifest.sig" || die "cannot place the target signature"
+    v3_count=0
+    for fname in $(sed -n 's/^feature_ids=//p' "$ota_manifest" | head -n 1 | tr ',' ' '); do
+        want=$(sed -n "s/^feature_${fname}_sha256=//p" "$ota_manifest" | head -n 1)
+        mwant=$(sed -n "s/^feature_${fname}_manifest_sha256=//p" "$ota_manifest" | head -n 1)
+        pname=$(lookup_digest "$want")
+        mname=$(lookup_digest "$mwant")
+        [ -n "$pname" ] || die "no bundled payload matches $fname ($want)"
+        [ -n "$mname" ] || die "no bundled manifest matches $fname ($mwant)"
+        mkdir -p "$v3_partial/features/$fname" || die "cannot create the $fname generation directory"
+        cp "$BUNDLE_DIR/$pname" "$v3_partial/features/$fname/payload.squashfs" || die "cannot place $fname payload"
+        cp "$BUNDLE_DIR/$mname" "$v3_partial/features/$fname/manifest.json" || die "cannot place $fname manifest"
+        [ "$(sha256_of "$v3_partial/features/$fname/payload.squashfs")" = "$want" ] || die "$fname placed payload digest mismatch"
+        [ "$(sha256_of "$v3_partial/features/$fname/manifest.json")" = "$mwant" ] || die "$fname placed manifest digest mismatch"
+        v3_count=$((v3_count + 1))
+    done
+    [ "$v3_count" -gt 0 ] || die "no features in the v3 target"
+    sha256_of "$v3_partial/target.manifest" > "$v3_partial/COMPLETE.tmp" || die "cannot write COMPLETE"
+    sync
+    mv "$v3_partial/COMPLETE.tmp" "$v3_partial/COMPLETE" || die "cannot publish COMPLETE"
+    find "$v3_partial" -type f -exec chmod 0400 '{}' ';' || die "cannot seal generation files"
+    find "$v3_partial" -type d -exec chmod 0500 '{}' ';' || die "cannot seal generation directories"
+    sync
+    mv "$v3_partial" "$v3_dest" || die "cannot publish the v3 generation"
+    mkdir -p "$LIVE_UPDATE" || die "cannot create $LIVE_UPDATE"
+    printf '%s\n' "$v3_tx" > "$LIVE_UPDATE/current.tmp" || die "cannot write current"
+    chmod 0600 "$LIVE_UPDATE/current.tmp" || die "cannot set current mode"
+    sync
+    mv "$LIVE_UPDATE/current.tmp" "$LIVE_UPDATE/current" || die "cannot publish current"
+    sync
+    receipt_set "v3_generation=$v3_tx"
+    ui_print "  v3 generation $v3_tx published with $v3_count feature(s)"
 }
 
 stage_local_package() {
