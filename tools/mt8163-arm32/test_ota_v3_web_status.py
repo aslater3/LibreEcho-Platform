@@ -17,6 +17,18 @@ class WebStatusTests(FailurePolicyTests):
         self.assertLess(source.index('ota_v3_health.py'), source.index('"$MAKE_BIN" -C "$UI_SOURCE" clean'))
         self.assertIn('ui_ota_adapter_sha256', source)
 
+    def test_packager_publishes_snapshot_build_tree_to_caller_checkout(self):
+        # Product snapshots relink objects from "$UI_SOURCE/build" of the
+        # checkout it passed in, after this builder returns. The compile runs in
+        # a private snapshot that is deleted on exit, so the shipped build tree
+        # must be copied back to the caller's checkout once it is final.
+        source = (TOOLS / 'ui/build_ui_bundle.sh').read_text()
+        publish = 'cp -a -- "$UI_SOURCE/build" "$ui_input_source/build"'
+        self.assertIn(publish, source)
+        self.assertIn('rm -rf -- "$ui_input_source/build"', source)
+        self.assertLess(source.index('--strip-unneeded "$OUTPUT/sbin/$binary"'), source.index(publish))
+        self.assertLess(source.index(publish), source.index("printf 'ui_source=%s"))
+
     def test_private_snapshot_is_applied_without_modifying_companion(self):
         adapter = TOOLS / 'ui/ota_v3_health.py'
         spec = importlib.util.spec_from_file_location('health_copy', adapter)
