@@ -2320,8 +2320,11 @@ class PolicyTests(unittest.TestCase):
         self.assertNotIn("stop_disabled_airplay", source)
         self.assertNotIn("stop_service airplayd", source)
         self.assertIn('feature_service_ready "$service" "$socket"', source)
-        self.assertIn("$DATA_ROOT/libreecho/features/$feature/payload.squashfs", source)
-        self.assertIn("/staging", source)
+        # V3: the payload gate is the authenticated generation mount, never
+        # the legacy per-feature tree on /data.
+        self.assertIn('feature_runtime_mounted "$RUN_ROOT/libreecho/features/$feature/root"', source)
+        self.assertIn("FEATURE_RECONCILE_MOUNTINFO:-/proc/self/mountinfo", source)
+        self.assertNotIn("libreecho/features/$feature/payload.squashfs", source)
         self.assertIn('"$script" start', source)
         self.assertIn("feature-services-reconcile-failed", source)
         self.assertIn('return "$failed"', source)
@@ -2381,11 +2384,21 @@ class PolicyTests(unittest.TestCase):
             }
             proc_lines = []
             socket_paths = {}
+            mountinfo = root / "mountinfo"
+            mounted: set[str] = set()
+
+            def set_mounted(feature: str, present: bool) -> None:
+                (mounted.add if present else mounted.discard)(feature)
+                mountinfo.write_text("".join(
+                    f"{30 + i} 20 7:{i} / {run}/libreecho/features/{name}/root "
+                    "ro,nosuid,nodev,relatime - squashfs /dev/loop{i} ro\n"
+                    .replace("{i}", str(i))
+                    for i, name in enumerate(sorted(mounted))
+                ))
+
             for service, (feature, socket_name) in services.items():
                 if feature is not None:
-                    feature_dir = data / "libreecho/features" / feature
-                    feature_dir.mkdir(parents=True)
-                    (feature_dir / "payload.squashfs").write_bytes(b"verified-fixture")
+                    set_mounted(feature, True)
                 socket_path = run / "libreecho" / socket_name if socket_name else None
                 socket_paths[service] = socket_path
                 if socket_path is not None:
@@ -2434,6 +2447,7 @@ class PolicyTests(unittest.TestCase):
                 "FEATURE_RECONCILE_INIT_ROOT": str(init),
                 "FEATURE_RECONCILE_PROC_NET_UNIX": str(proc_unix),
                 "FEATURE_RECONCILE_PROC_ROOT": str(proc_root),
+                "FEATURE_RECONCILE_MOUNTINFO": str(mountinfo),
                 "FEATURE_RECONCILE_LOG_FILE": str(root / "reconcile.log"),
                 "FEATURE_RECONCILE_KMSG": "/dev/null",
                 "FEATURE_RECONCILE_CONSOLE": "/dev/null",
@@ -2452,17 +2466,41 @@ class PolicyTests(unittest.TestCase):
                     "libreecho-agentd.init:start",
                 ],
             )
+            # The fresh-v3 case measured on the Biscuit Dot: generation mounts
+            # present and no legacy $DATA_ROOT/libreecho/features tree at all.
+            self.assertFalse((data / "libreecho/features").exists())
+
+            # A stale v2 tree must never stand in for an unmounted generation.
+            stale = data / "libreecho/features/wakeword"
+            stale.mkdir(parents=True)
+            (stale / "payload.squashfs").write_bytes(b"legacy-v2")
+            set_mounted("wakeword", False)
+            stale_run = subprocess.run(["sh", str(helper)], env=env, check=False, timeout=10)
+            self.assertNotEqual(stale_run.returncode, 0)
+            self.assertIn("feature-reconcile-payload-missing:wakeword", (root / "reconcile.log").read_text())
+            shutil.rmtree(data / "libreecho/features")
+
+            # A writable or non-squashfs mount at the runtime root is rejected,
+            # matching the predicate every feature init applies.
+            mountinfo.write_text(mountinfo.read_text() + (
+                f"99 20 0:99 / {run}/libreecho/features/wakeword/root rw,relatime - tmpfs tmpfs rw\n"))
+            rw_run = subprocess.run(["sh", str(helper)], env=env, check=False, timeout=10)
+            self.assertNotEqual(rw_run.returncode, 0)
+            set_mounted("wakeword", True)
+
+            actions.write_text("")
+            subprocess.run(["sh", str(helper)], env=env, check=True)
 
             actions.write_text("")
             saved_config = '{"integrations":4,"voice_pipeline_mode":"custom"}\n'
             (data / "libreecho/config/web-config.json").write_text(saved_config)
             for feature in ("stt", "tts"):
-                (data / f"libreecho/features/{feature}/payload.squashfs").unlink()
+                set_mounted(feature, False)
             custom = subprocess.run(["sh", str(helper)], env=env, timeout=10)
             self.assertEqual(custom.returncode, 0)
             self.assertEqual((data / "libreecho/config/web-config.json").read_text(), saved_config)
             for feature in ("stt", "tts"):
-                (data / f"libreecho/features/{feature}/payload.squashfs").write_bytes(b"verified-fixture")
+                set_mounted(feature, True)
             actions.write_text("")
             (data / "libreecho/config/web-config.json").write_text('{"integrations":4}\n')
             subprocess.run(["sh", str(helper)], env=env, check=True)
@@ -2489,8 +2527,7 @@ class PolicyTests(unittest.TestCase):
 
             # Disabled protocol is not permission to skip payload or liveness
             # validation. These failures must still prevent successful setup.
-            airplay_payload = data / "libreecho/features/airplay2/payload.squashfs"
-            airplay_payload.unlink()
+            set_mounted("airplay2", False)
             missing_audio = subprocess.run(
                 ["sh", str(helper)], env=env, check=False, timeout=10
             )
@@ -2499,7 +2536,7 @@ class PolicyTests(unittest.TestCase):
                 "feature-reconcile-payload-missing:airplay2",
                 (root / "reconcile.log").read_text(),
             )
-            airplay_payload.write_bytes(b"verified-fixture")
+            set_mounted("airplay2", True)
             proc_unix.write_text("".join(
                 line for line in proc_lines
                 if not line.rstrip().endswith(str(socket_paths["airplayd"]))
@@ -2514,7 +2551,7 @@ class PolicyTests(unittest.TestCase):
             )
             proc_unix.write_text("".join(proc_lines))
 
-            (data / "libreecho/features/assistant/payload.squashfs").unlink()
+            set_mounted("assistant", False)
             failed = subprocess.run(["sh", str(helper)], env=env, check=False)
             self.assertNotEqual(failed.returncode, 0)
             self.assertIn(
@@ -2522,9 +2559,7 @@ class PolicyTests(unittest.TestCase):
                 (root / "reconcile.log").read_text(),
             )
 
-            (data / "libreecho/features/assistant/payload.squashfs").write_bytes(
-                b"verified-fixture"
-            )
+            set_mounted("assistant", True)
             airplay_socket = socket_paths["airplayd"]
             self.assertIsNotNone(airplay_socket)
             if not airplay_socket.exists():
