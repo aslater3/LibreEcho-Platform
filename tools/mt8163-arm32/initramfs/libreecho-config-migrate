@@ -63,7 +63,11 @@ elif [ -e "$config" ]; then
                         ws(); str(); k=token; ws()
                         if(substr(s,p++,1)!=":") bad()
                         ws(); t=p; val(depth+1); raw=substr(s,t,p-t)
-                        if(depth==0 && k=="schema") {
+                        # LibreEcho-UI has always persisted the root version
+                        # as "schema_version"; "schema" is the Platform name.
+                        # Either names the one root schema; both together are
+                        # a duplicate and fail closed like any repeated key.
+                        if(depth==0 && (k=="schema" || k=="schema_version")) {
                             if(seen++) bad()
                             if(type=="number" && raw ~ /^(0|[1-9][0-9]*)$/) schema=raw
                         }

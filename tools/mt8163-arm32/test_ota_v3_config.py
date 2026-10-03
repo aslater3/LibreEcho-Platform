@@ -23,6 +23,22 @@ class ConfigTests(grammar.SignedFixture):
         self.assertIn('config_error=\n', (self.root / 'update/config-status').read_text())
         self.assertEqual(sorted(p.name for p in (self.root / 'config').iterdir()), ['web-config.json'])
 
+    def test_ui_schema_version_key_is_the_same_root_schema(self):
+        # LibreEcho-UI persists "schema_version" (config/defaults.json and every
+        # save); a fresh install must not boot into config_error.
+        for text in ('{\n  "schema_version": 1,\n  "hostname_persisted": true,\n  "volume": 50\n}',
+                     '{"device_name":"LibreEcho","schema_version":1}'):
+            with self.subTest(text=text):
+                result = self.run_config(text)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('config_error=\n', (self.root / 'update/config-status').read_text())
+        for text in ('{"schema_version":2}', '{"schema_version":"1"}',
+                     '{"schema":1,"schema_version":1}', '{"nested":{"schema_version":1}}'):
+            with self.subTest(text=text):
+                result = self.run_config(text)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('config_error=unsupported_schema', (self.root / 'update/config-status').read_text())
+
     def test_unknown_newer_or_absent_schema_is_untouched_with_banner_flag(self):
         for text in ('{"schema":99,"secret":"keep"}', '{"hostname":"keep"}', '{"schema":"1"}', '{"schema":0}'):
             with self.subTest(text=text):
