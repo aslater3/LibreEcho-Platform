@@ -478,6 +478,10 @@ class RadarTreeDiffTests(unittest.TestCase):
     ESPHOME_COMMIT = '37de1c11109453194ce6170f360450f887a615d4'
     ESPHOME_BASE = '2715c573c15f982555b6b48264d75d468cf3af08'  # ESPHome branch point'
     ESPHOME_PINNED = {'usr/local/sbin/libreecho-reconcile-features': 'initramfs/libreecho-reconcile-features'}
+    # The reconciler was subsequently re-reviewed for v3: its payload gate is
+    # the authenticated generation mount, not the legacy v2 tree. Its staged
+    # bytes are pinned to that exact reviewed commit instead of ESPHome's.
+    PINNED_COMMIT = {'usr/local/sbin/libreecho-reconcile-features': '73e5ea7d1d3f87887be833b89772884aa91592f5'}
 
     @staticmethod
     def tree(stage):
@@ -567,7 +571,8 @@ class RadarTreeDiffTests(unittest.TestCase):
             changes = {name for name in left.keys() | right.keys() if left.get(name) != right.get(name)}
             for staged, source in self.ESPHOME_PINNED.items():
                 if staged in changes:
-                    reviewed = subprocess.run(['git', '-C', str(TOOLS), 'show', f'{self.ESPHOME_COMMIT}:tools/mt8163-arm32/{source}'],
+                    pinned = self.PINNED_COMMIT.get(staged, self.ESPHOME_COMMIT)
+                    reviewed = subprocess.run(['git', '-C', str(TOOLS), 'show', f'{pinned}:tools/mt8163-arm32/{source}'],
                                               check=True, capture_output=True).stdout
                     self.assertEqual(right[staged]['sha256'], hashlib.sha256(reviewed).hexdigest(), staged)
                     changes.discard(staged)
