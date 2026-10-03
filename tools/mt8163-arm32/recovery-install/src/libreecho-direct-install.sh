@@ -70,8 +70,11 @@ TRANSFER_OVERHEAD_BYTES=16777216
 LOCAL_PACKAGE_MAX_BYTES=33554432
 GPT_FIRST_USABLE=34
 GPT_BACKUP_RESERVE=34
-# 2^52 KiB ~ 4 EiB: anything larger is a parse artefact, not a device.
-DF_MAX_KB=4503599627370496
+# df figures longer than this many digits are a parse artefact, not a device.
+# TWRP's mksh compares integers in 32 bits, so a numeric bound such as 2^52
+# makes `[ n -lt BOUND ]` false for every real figure. Bound the digit count
+# instead: 9 digits (< 1e9 KiB, ~1 TB) can never overflow a 32-bit test.
+DF_MAX_KB_DIGITS=9
 
 LIVE_UPDATE=$DATA/libreecho/update
 STAGING=$LIVE_UPDATE/staging
@@ -1097,10 +1100,13 @@ phase_transfer() {
     int_ok "$tf_total_kb" || fail "free-space-unknown"
     int_ok "$tf_free_kb" || fail "free-space-unknown"
     [ "$tf_total_kb" -gt 0 ] || fail "free-space-unknown"
-    [ "$tf_total_kb" -lt "$DF_MAX_KB" ] || fail "free-space-unknown"
-    [ "$tf_free_kb" -lt "$DF_MAX_KB" ] || fail "free-space-unknown"
+    [ "${#tf_total_kb}" -le "$DF_MAX_KB_DIGITS" ] || fail "free-space-unknown"
+    [ "${#tf_free_kb}" -le "$DF_MAX_KB_DIGITS" ] || fail "free-space-unknown"
     tf_need=$((TRANSFER_BYTES_TOTAL + TRANSFER_OVERHEAD_BYTES))
-    [ "$((tf_free_kb * 1024))" -ge "$tf_need" ] || fail "insufficient-space"
+    # Compare in KiB: byte figures for a >2 GiB filesystem exceed TWRP's
+    # 32-bit `[` comparison range, KiB figures for any eMMC here do not.
+    tf_need_kb=$(((tf_need + 1023) / 1024))
+    [ "$tf_free_kb" -ge "$tf_need_kb" ] || fail "insufficient-space"
     tf_free_bytes=$((tf_free_kb * 1024))
     if [ "$DRY_RUN" != 1 ]; then
         mkdir -p "$INCOMING_DIR" 2>/dev/null || fail "incoming-create-failed"

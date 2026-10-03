@@ -66,7 +66,7 @@ jobs:
           # headers and startup objects the cross compiler cannot link anything,
           # so configure dies with "C compiler cannot create executables".
           sudo apt-get install --no-install-recommends -y \
-            device-tree-compiler espeak-ng-data squashfs-tools nodejs \
+            device-tree-compiler espeak-ng-data squashfs-tools nodejs mksh \
             gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf \
             libc6-dev-armhf-cross
           python -m pip install --disable-pip-version-check PyNaCl==1.5.0
