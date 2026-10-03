@@ -2343,6 +2343,20 @@ class PolicyTests(unittest.TestCase):
         )
         self.assertIn("libreecho-reconcile-features", builder_source)
         self.assertIn("libreecho-reconcile-features", verifier_source)
+        # The image verifier's required markers must exist in the shipped
+        # helper, or every signed build fails after the helper changes.
+        import ast
+        tree = ast.parse(verifier_source)
+        required: list[bytes] = []
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.For) and isinstance(node.iter, ast.Tuple)
+                    and "feature reconciliation helper lacks" in ast.unparse(ast.Module(body=node.body, type_ignores=[]))):
+                required = [ast.literal_eval(e) for e in node.iter.elts]
+        self.assertTrue(required, "verifier reconcile marker loop not found")
+        helper_bytes = helper.read_bytes()
+        for marker in required:
+            self.assertIn(marker, helper_bytes, marker)
+        self.assertIn(b"legacy v2 payload tree", verifier_source.encode())
         self.assertIn(
             'if init_script != read(stage / "libreecho-init"):',
             builder_source,

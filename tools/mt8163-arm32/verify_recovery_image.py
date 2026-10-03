@@ -2098,7 +2098,8 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         b"$ETC_ROOT/libreecho/feature-policy",
         b"integrations & 1",
         b"integrations & 16",
-        b"$DATA_ROOT/libreecho/features/$feature/payload.squashfs",
+        b'feature_runtime_mounted "$RUN_ROOT/libreecho/features/$feature/root"',
+        b"FEATURE_RECONCILE_MOUNTINFO:-/proc/self/mountinfo",
         b"\"$script\" start",
         b"feature-services-reconcile-failed",
         b"shared_discovery_active",
@@ -2107,6 +2108,10 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     ):
         if marker not in reconcile.data:
             fail(f"feature reconciliation helper lacks {marker!r}")
+    # V3 payloads exist only as authenticated generation mounts; a legacy v2
+    # tree on /data must never satisfy the reconciler's payload gate.
+    if b"libreecho/features/$feature/payload.squashfs" in reconcile.data:
+        fail("feature reconciliation helper is gated on the legacy v2 payload tree")
     mdns_entry = verified_overlay["libreecho-mdnsd"]
     for marker in (
         b"MDNS_RUNTIME_ROOT:-/usr/local/lib/libreecho-mdns/root",
