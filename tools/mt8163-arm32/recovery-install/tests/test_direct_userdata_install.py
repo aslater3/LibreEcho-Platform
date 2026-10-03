@@ -1388,6 +1388,26 @@ class RecoveryV2BlockerTests(_InstallFixture):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.h.receipt().get("error"), "free-space-unknown")
 
+    def test_df_gate_accepts_real_figures_under_32_bit_mksh(self) -> None:
+        """TWRP runs the helper under mksh, whose `[` compares integers in
+        32 bits. A 2^52 sanity bound made every real df figure fail with
+        free-space-unknown on hardware while dash passed the same test."""
+        mksh = shutil.which("mksh")
+        if mksh is None:
+            self.skipTest("mksh is not installed")
+        self.full_init()
+        self.h.free_file.write_text("1025664")      # observed Biscuit userdata
+        argv = self.h._argv(self.h.helper, "transfer", self.manifest(), ())
+        argv[0] = mksh
+        result = subprocess.run(argv, text=True, capture_output=True, env=self.h.helper_env())
+        self.assertEqual(result.returncode, 0, result.stderr + str(self.h.receipt()))
+        self.assertEqual(self.h.receipt().get("result"), "transferred")
+        # An absurdly long figure is still refused as a parse artefact.
+        self.h.free_file.write_text("1" * 10)
+        result = subprocess.run(argv, text=True, capture_output=True, env=self.h.helper_env())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.h.receipt().get("error"), "free-space-unknown")
+
     def test_reshape_range_checks_and_readback(self) -> None:
         part, _ = self.h.partitions["userdata"]
         size_file = self.h.sys / part / "size"
