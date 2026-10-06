@@ -21,7 +21,7 @@ from typing import Any
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 from generate_boot_envelope import generate as generate_boot_envelope
-from libreecho_platform_targets import add_target_arguments, validate_target_arguments, identity_bytes, get_target
+from libreecho_platform_targets import add_target_arguments, validate_target_arguments, identity_bytes, get_target, audio_profile_bytes
 from verify_target_dtb import verify_target_dtb
 
 
@@ -885,6 +885,13 @@ def add_target_identity(stage: Path, manifest: dict[str, object],
     identity.parent.mkdir(parents=True, exist_ok=True)
     identity.write_bytes(data)
     identity.chmod(0o644)
+    # Per-target speaker policy from the Platform target table; the audio
+    # engine follows it, so new hardware needs a table entry, not code.
+    profile = stage / "etc/libreecho/audio-profile"
+    profile_data = audio_profile_bytes(target)
+    profile.write_bytes(profile_data)
+    profile.chmod(0o644)
+    manifest["audio_profile"] = {"sha256": sha256(profile_data), "size": len(profile_data)}
     manifest["board"] = target
     if digest is not None:
         manifest["target_descriptor_sha256"] = digest

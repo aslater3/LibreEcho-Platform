@@ -18,7 +18,7 @@ from typing import Any, cast
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 from generate_boot_envelope import generate as generate_boot_envelope
-from libreecho_platform_targets import add_target_arguments, validate_target_arguments, identity_bytes, get_target
+from libreecho_platform_targets import add_target_arguments, validate_target_arguments, identity_bytes, get_target, audio_profile_bytes
 
 
 ANDROID_MAGIC = b"ANDROID!"
@@ -1182,6 +1182,11 @@ def validate_target_identity(entries: dict[str, Entry], manifest: dict[str, obje
     # the caller did not request one; it must agree bytewise with the image.
     require_member(entries, "etc/libreecho/target",
                    sha256(identity_bytes(target, recorded_digest)), 0o644)
+    # The speaker policy must be exactly the table rendering for this target.
+    profile_hash = sha256(audio_profile_bytes(target))
+    require_member(entries, "etc/libreecho/audio-profile", profile_hash, 0o644)
+    if manifest.get("audio_profile", {}).get("sha256") != profile_hash:
+        fail("image audio profile manifest mismatch")
 
 
 def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
