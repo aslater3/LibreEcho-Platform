@@ -120,9 +120,23 @@ class TargetCLITests(unittest.TestCase):
         import libreecho_platform_targets
         for target in ('radar_puffin', 'biscuit'):
             metadata = {'board': target, 'ota': {'board': target}, 'target_descriptor_sha256': 'a' * 64}
+            profile = libreecho_platform_targets.audio_profile_bytes(target)
+            metadata['audio_profile'] = {'sha256': hashlib.sha256(profile).hexdigest(), 'size': len(profile)}
             entries = {'etc/libreecho/target': verifier.Entry('etc/libreecho/target', stat.S_IFREG | 0o644, 0, 0, 0,
-                        libreecho_platform_targets.identity_bytes(target, 'a' * 64))}
+                        libreecho_platform_targets.identity_bytes(target, 'a' * 64)),
+                       'etc/libreecho/audio-profile': verifier.Entry('etc/libreecho/audio-profile',
+                        stat.S_IFREG | 0o644, 0, 0, 0, profile)}
             verifier.validate_target_identity(entries, metadata, target, 'a' * 64)
+            other_profile = libreecho_platform_targets.audio_profile_bytes(
+                'radar_puffin' if target == 'biscuit' else 'biscuit')
+            swapped = dict(entries)
+            swapped['etc/libreecho/audio-profile'] = verifier.Entry('etc/libreecho/audio-profile',
+                stat.S_IFREG | 0o644, 0, 0, 0, other_profile)
+            with self.assertRaises(SystemExit):
+                verifier.validate_target_identity(swapped, metadata, target, 'a' * 64)
+            missing = {k: v for k, v in entries.items() if k != 'etc/libreecho/audio-profile'}
+            with self.assertRaises(SystemExit):
+                verifier.validate_target_identity(missing, metadata, target, 'a' * 64)
             for other in ('unknown', 'radar_puffin' if target == 'biscuit' else 'biscuit'):
                 with self.assertRaises((SystemExit, ValueError)):
                     verifier.validate_target_identity(entries, metadata, other, 'a' * 64)
@@ -186,6 +200,31 @@ class TargetCLITests(unittest.TestCase):
             self.assertIn('ro.product.device=biscuit', (stage / 'default.prop').read_text())
             self.assertIn('hw_profile=biscuit@0', (stage / 'etc/libreecho/target').read_text())
             self.assertEqual(metadata['board'], 'biscuit')
+            profile = (stage / 'etc/libreecho/audio-profile').read_text()
+            self.assertIn('speaker_chain=biscuit\ncodec_profile=Flat\n', profile)
+            self.assertEqual(metadata['audio_profile']['sha256'],
+                             hashlib.sha256(profile.encode()).hexdigest())
+
+    def test_audio_profiles_render_per_target(self):
+        import libreecho_platform_targets as t
+        self.assertEqual(t.audio_profile_bytes('radar_puffin').decode(),
+                         'schema=1\ntarget_id=radar_puffin\nspeaker_chain=radar_puffin\n'
+                         'codec_profile=Radar\nhp_driver_gain=6\npre_gain_db=0.00\nbass_makeup_db=0.00\n')
+        self.assertEqual(t.audio_profile_bytes('biscuit').decode(),
+                         'schema=1\ntarget_id=biscuit\nspeaker_chain=biscuit\n'
+                         'codec_profile=Flat\nhp_driver_gain=6\npre_gain_db=6.00\nbass_makeup_db=2.50\n')
+        for target in t.TARGETS:
+            t.validate_audio(t.TARGETS[target]['audio'])
+        good = dict(t.TARGETS['biscuit']['audio'])
+        for key, bad in (('speaker_chain', 'woofer'), ('codec_profile', 'flat'),
+                         ('hp_driver_gain', 36), ('hp_driver_gain', 6.0), ('hp_driver_gain', True),
+                         ('pre_gain_db', 12.5), ('bass_makeup_db', -1.0), ('extra', 1)):
+            with self.subTest(key=key, bad=bad), self.assertRaises(ValueError):
+                t.validate_audio({**good, key: bad})
+        with self.assertRaises(ValueError):
+            t.validate_audio({k: v for k, v in good.items() if k != 'pre_gain_db'})
+        with self.assertRaises(ValueError):  # Radar chain takes no digital gains
+            t.validate_audio({**t.TARGETS['radar_puffin']['audio'], 'pre_gain_db': 3.0})
 
     def test_descriptor_digest_format_is_not_repaired(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -448,7 +487,7 @@ class RadarTreeDiffTests(unittest.TestCase):
     # libreecho-core licence set below are the batch integration's reviewed
     # additions (recovery-AP shell probes plus the Opus/recovery-AP licence
     # copies), which the combined tree necessarily stages on top of the base.
-    ALLOWED = {'etc/libreecho/target', 'usr/local/sbin/libreecho-update',
+    ALLOWED = {'etc/libreecho/target', 'etc/libreecho/audio-profile', 'usr/local/sbin/libreecho-update',
                'usr/local/sbin/libreecho-update-fetch',
                'usr/local/sbin/libreecho-feature-transaction', 'init', 'libreecho-init',
                'usr/local/sbin/libreecho-target-manifest',

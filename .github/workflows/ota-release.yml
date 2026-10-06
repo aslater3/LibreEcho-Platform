@@ -139,6 +139,8 @@ jobs:
           python tools/mt8163-arm32/airplay/test_audio_period_buffer.py
           bash tools/mt8163-arm32/airplay/test_speaker_dsp.sh
           bash tools/mt8163-arm32/airplay/test_speaker_mbcl.sh
+          bash tools/mt8163-arm32/airplay/test_biscuit_speaker_dsp.sh
+          python tools/mt8163-arm32/airplay/test_radar_speaker_equivalence.py
           bash tools/mt8163-arm32/airplay/test_music_features.sh
           bash tools/mt8163-arm32/airplay/test_music_session_id.sh
           bash tools/mt8163-arm32/airplay/test_music_feature_trace.sh
