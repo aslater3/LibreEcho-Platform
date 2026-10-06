@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import argparse
-import gzip
 import hashlib
 import importlib.util
 import json
+import lzma
 import os
 import re
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -45,6 +46,8 @@ MKIMG_MAGIC = bytes.fromhex("88168858")
 FDT_MAGIC = bytes.fromhex("d00dfeed")
 PAGE_SIZE = 0x800
 MKIMG_SIZE = 0x200
+RAMDISK_COMPRESSION = "xz-crc32-lzma2-8m"
+RAMDISK_XZ_DICT_SIZE = 8 << 20
 IMAGE_SIZE = 0x1000000
 KERNEL_ADDR = 0x40008000
 RAMDISK_ADDR = 0x43478000
@@ -58,7 +61,7 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "b9cb2d1075138259e44cf3fc67d3dc32ac9ca5a85ca719ec48c075525f23ca1d"
+RECOVERY_INIT_SHA256 = "7cea4e75f896767e314585726b683a132988d1d7d18db65ba8aea387172cbf3b"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
@@ -786,6 +789,10 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         "libreecho-feature-transaction": (
             "usr/local/sbin/libreecho-feature-transaction", 0o755,
         ),
+        "libreecho-target-manifest": ("usr/local/sbin/libreecho-target-manifest", 0o755),
+        "libreecho-generation": ("usr/local/sbin/libreecho-generation", 0o755),
+        "libreecho-config-migrate": ("usr/local/sbin/libreecho-config-migrate", 0o755),
+        "libreecho-generation-transaction": ("usr/local/sbin/libreecho-generation-transaction", 0o755),
         "ota-source.conf": ("etc/libreecho/ota-source.conf", 0o644),
         "libreecho-wifi": (RECOVERY_AP_WPA_SERVICE_PATH, 0o755),
         "udhcpc.script": ("etc/udhcpc.script", 0o755),
@@ -1187,10 +1194,8 @@ def validate_ui_startup_contract(bundle: Path) -> None:
             (
                 "AGENT_DEPENDENCY_TIMEOUT_SECONDS=${AGENT_DEPENDENCY_TIMEOUT_SECONDS:-90}",
                 "AGENT_DEPENDENCY_POLL_SECONDS=${AGENT_DEPENDENCY_POLL_SECONDS:-1}",
-                "PAYLOAD=",
                 "RUNTIME_ROOT=",
                 "mount_runtime()",
-                "mount -t squashfs",
                 "unmount_runtime()",
                 "mount_runtime || return 1",
                 "dependency_sockets_ready()",
@@ -1205,10 +1210,8 @@ def validate_ui_startup_contract(bundle: Path) -> None:
     )
     payload_contracts = {
         "etc/init.d/libreecho-airplayd.init": (
-            "PAYLOAD=",
             "RUNTIME_ROOT=",
             "mount_runtime()",
-            "mount -t squashfs",
             "unmount_runtime()",
             "mount_runtime || return 1",
             "start) start_service",
@@ -1219,28 +1222,22 @@ def validate_ui_startup_contract(bundle: Path) -> None:
             "persistent AirPlay disable",
         ),
         "etc/init.d/libreecho-sttd.init": (
-            "PAYLOAD=",
             "RUNTIME_ROOT=",
             "mount_runtime()",
-            "mount -t squashfs",
             "unmount_runtime()",
             "mount_runtime || return 1",
             "start) start_service",
         ),
         "etc/init.d/libreecho-ttsd.init": (
-            "PAYLOAD=",
             "RUNTIME_ROOT=",
             "mount_runtime()",
-            "mount -t squashfs",
             "unmount_runtime()",
             "mount_runtime || return 1",
             "start) start_service",
         ),
         "etc/init.d/libreecho-waked.init": (
-            "PAYLOAD=",
             "RUNTIME_ROOT=",
             "mount_runtime()",
-            "mount -t squashfs",
             "unmount_runtime()",
             "mount_runtime || return 1",
             "start) start_service",
@@ -1331,6 +1328,20 @@ def validate_ui_startup_contract(bundle: Path) -> None:
                 raise SystemExit(
                     "ERROR: agentd start case does not wait for dependencies"
                 )
+        if relative in payload_contracts or relative.endswith("libreecho-agentd.init"):
+            # OTA v3: Platform mounts the authenticated generation; a feature
+            # service only verifies that read-only squashfs mount and must never
+            # mount bytes itself or name the legacy feature tree.
+            mount_body = re.search(r"(?ms)^mount_runtime\(\) \{\n(.*?)^\}", text)
+            if not mount_body:
+                raise SystemExit(f"ERROR: feature service has no mount_runtime: {relative}")
+            if ("mount -t" in mount_body.group(1) or "$PAYLOAD" in text
+                    or "/data/libreecho/features" in text):
+                raise SystemExit(
+                    f"ERROR: feature service mounts legacy payload bytes: {relative}")
+            if "/proc/self/mountinfo" not in mount_body.group(1):
+                raise SystemExit(
+                    f"ERROR: feature service does not verify the generation mount: {relative}")
         if relative in payload_contracts:
             start_service_start = text.index("start_service()")
             dispatch_start = text.index('case "${1:-}" in')
@@ -2162,6 +2173,18 @@ def add_stt_external_payload(payload: Path, payload_manifest: Path,
     }
 
 
+def add_boot_https_transport(stage: Path, payload: Path, payload_manifest: Path,
+                             manifest: dict[str, object], qemu_arm: str = "qemu-arm") -> None:
+    """Ship authenticated repair transport independently of all feature payloads."""
+    from boot_https_transport import MEMBERS, stage_transport
+    digest, _size, files = read_external_feature(
+        "assistant", payload, payload_manifest, tuple(MEMBERS.values()),
+    )
+    manifest["boot_https_transport"] = stage_transport(
+        stage, payload, digest, sha256(read(payload_manifest)), files, qemu_arm,
+    )
+
+
 def add_assistant_external_payload(payload: Path, payload_manifest: Path,
                                    manifest: dict[str, object]) -> None:
     """Record the provider-neutral streamed voice-assistant runtime."""
@@ -2491,6 +2514,19 @@ def validate_stage(stage: Path) -> None:
         raise SystemExit("ERROR: auto-starting init.connectivity.rc is forbidden")
 
 
+def compress_ramdisk(cpio: bytes) -> bytes:
+    """Deterministic xz for the kernel's initramfs decoder (CONFIG_RD_XZ).
+
+    The in-kernel xz_dec verifies only CRC32/None checks, and the 8 MiB LZMA2
+    dictionary bounds its single-call memory. Plain LZMA2 (no BCJ filter):
+    a cpio of mixed text/ELF compresses smaller without the ARM filter.
+    """
+    return lzma.compress(cpio, format=lzma.FORMAT_XZ, check=lzma.CHECK_CRC32, filters=[
+        {"id": lzma.FILTER_LZMA2, "preset": 9 | lzma.PRESET_EXTREME,
+         "dict_size": RAMDISK_XZ_DICT_SIZE},
+    ])
+
+
 def build_cpio(stage: Path, epoch: int) -> bytes:
     for path in [stage, *sorted(stage.rglob("*"))]:
         os.utime(path, (epoch, epoch), follow_symlinks=False)
@@ -2724,6 +2760,10 @@ def main() -> None:
                         help="external SquashFS English streaming STT feature payload")
     parser.add_argument("--stt-payload-manifest", type=Path,
                         help="manifest for the external English STT feature payload")
+    parser.add_argument("--boot-https-payload", type=Path,
+                        help="verified assistant transport input for images without an assistant feature")
+    parser.add_argument("--boot-https-payload-manifest", type=Path,
+                        help="manifest for the build-time boot HTTPS transport input")
     parser.add_argument("--assistant-payload", type=Path,
                         help="external SquashFS streamed assistant feature payload")
     parser.add_argument("--assistant-payload-manifest", type=Path,
@@ -2931,6 +2971,13 @@ def main() -> None:
         raise SystemExit(
             f"ERROR: STT payload inputs are all-or-nothing; missing {missing}"
         )
+    boot_https_payload = args.boot_https_payload or args.assistant_payload
+    boot_https_manifest = args.boot_https_payload_manifest or args.assistant_payload_manifest
+    if ((args.boot_https_payload is None) != (args.boot_https_payload_manifest is None)):
+        raise SystemExit("ERROR: boot HTTPS payload and manifest inputs are all-or-nothing")
+    if boot_https_payload is None or boot_https_manifest is None:
+        raise SystemExit("ERROR: mandatory boot HTTPS transport input is missing")
+
     assistant_payload_options = {
         "assistant_payload": args.assistant_payload,
         "assistant_payload_manifest": args.assistant_payload_manifest,
@@ -3011,7 +3058,7 @@ def main() -> None:
         raise SystemExit(f"ERROR: ARM user-mode emulator not found: {args.qemu_arm}")
 
     output = args.output.resolve()
-    ramdisk_output = (args.ramdisk_output or output.with_suffix(".ramdisk.cpio.gz")).resolve()
+    ramdisk_output = (args.ramdisk_output or output.with_suffix(".ramdisk.cpio.xz")).resolve()
     manifest_output = (args.manifest or output.with_suffix(".manifest.json")).resolve()
     for path in (output, ramdisk_output, manifest_output):
         if path.exists():
@@ -3222,11 +3269,14 @@ def main() -> None:
                 stage, args.wpa_supplicant.resolve(), args.wpa_source_metadata.resolve(),
                 args.wifi_config.resolve(), manifest,
             )
+        add_boot_https_transport(
+            stage, boot_https_payload, boot_https_manifest, manifest, args.qemu_arm,
+        )
         validate_stage(stage)
         cpio = build_cpio(stage, 0)
-    ramdisk = gzip.compress(cpio, compresslevel=9, mtime=0)
-    if ramdisk[:4] != b"\x1f\x8b\x08\x00" or gzip.decompress(ramdisk) != cpio:
-        raise SystemExit("ERROR: deterministic gzip round trip failed")
+    ramdisk = compress_ramdisk(cpio)
+    if lzma.decompress(ramdisk, format=lzma.FORMAT_XZ) != cpio:
+        raise SystemExit("ERROR: deterministic xz round trip failed")
 
     boot, package_record = package_boot(
         envelope, zimage, ramdisk, raw_dtb, args.ramdisk_address,
@@ -3237,8 +3287,9 @@ def main() -> None:
     manifest["initramfs"] = {
         "cpio_sha256": sha256(cpio),
         "cpio_size": len(cpio),
-        "gzip_sha256": sha256(ramdisk),
-        "gzip_size": len(ramdisk),
+        "compression": RAMDISK_COMPRESSION,
+        "ramdisk_sha256": sha256(ramdisk),
+        "ramdisk_size": len(ramdisk),
         "path": str(ramdisk_output),
     }
     manifest["package"] = package_record

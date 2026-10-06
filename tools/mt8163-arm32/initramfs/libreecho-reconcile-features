@@ -17,6 +17,7 @@ VAR_RUN_ROOT=${FEATURE_RECONCILE_VAR_RUN_ROOT:-/var/run}
 INIT_ROOT=${FEATURE_RECONCILE_INIT_ROOT:-/etc/init.d}
 PROC_NET_UNIX=${FEATURE_RECONCILE_PROC_NET_UNIX:-/proc/net/unix}
 PROC_ROOT=${FEATURE_RECONCILE_PROC_ROOT:-/proc}
+MOUNTINFO_FILE=${FEATURE_RECONCILE_MOUNTINFO:-/proc/self/mountinfo}
 LOG_FILE=${FEATURE_RECONCILE_LOG_FILE:-/tmp/init.log}
 KMSG=${FEATURE_RECONCILE_KMSG:-/dev/kmsg}
 CONSOLE=${FEATURE_RECONCILE_CONSOLE:-/dev/console}
@@ -302,6 +303,21 @@ reconcile_topology()
     return 0
 }
 
+# Exactly one read-only, nosuid, nodev squashfs mount at the runtime root: the
+# same predicate the feature init scripts apply before launching a daemon.
+feature_runtime_mounted()
+{
+    [ -r "$MOUNTINFO_FILE" ] || return 1
+    $BB awk -v p="$1" '
+        $5 == p {
+            n++
+            opts = "," $6 ","
+            if (opts !~ /,ro,/ || opts !~ /,nosuid,/ || opts !~ /,nodev,/) bad = 1
+            for (i = 7; i <= NF; i++) if ($i == "-" && $(i + 1) != "squashfs") bad = 1
+        }
+        END { exit n != 1 || bad }' "$MOUNTINFO_FILE"
+}
+
 start_feature()
 {
     feature=$1
@@ -328,14 +344,16 @@ start_feature()
     case "$voice_mode:$feature" in
         custom:stt|custom:tts) ;;
         *)
-            payload=$DATA_ROOT/libreecho/features/$feature/payload.squashfs
-            if [ ! -f "$payload" ]; then
+            # V3 payloads live in the signed whole generation, and the
+            # generation transaction mounts each one read-only at
+            # $RUN_ROOT/libreecho/features/<feature>/root before services
+            # start.  Each feature init refuses anything but exactly that
+            # mount, so it is the payload this graph can actually start.  The
+            # legacy $DATA_ROOT/libreecho/features tree is not consulted: a
+            # fresh v3 install never has one, and a stale v2 tree must not
+            # stand in for an unmounted generation.
+            if ! feature_runtime_mounted "$RUN_ROOT/libreecho/features/$feature/root"; then
                 log "feature-reconcile-payload-missing:$feature"
-                return 1
-            fi
-            feature_root=${payload%/payload.squashfs}
-            if [ -d "$feature_root/staging" ]; then
-                log "feature-reconcile-staging-present:$feature"
                 return 1
             fi
             ;;

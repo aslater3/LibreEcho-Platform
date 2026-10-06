@@ -139,7 +139,9 @@ done
 # never every file under a feature directory.
 if [ -d "$DATA_ROOT/libreecho/features" ]; then
     for feature_dir in "$DATA_ROOT/libreecho/features"/*; do
-        [ -d "$feature_dir" ] || continue
+        # -d follows symlinks; a linked feature directory is rejected by the
+        # contract check below and must not be deleted through first.
+        [ ! -L "$feature_dir" ] && [ -d "$feature_dir" ] || continue
         remove_path "$feature_dir/payload.squashfs.previous"
         remove_path "$feature_dir/staging"
     done
@@ -260,7 +262,17 @@ TOLERATE_UNKNOWN_FILES=0
 # Steady-state allowlist.  Feature IDs are checked separately below because
 # they are extensible; the files inside each feature remain fixed.
 check_children "$DATA_ROOT" libreecho lost+found
-check_children "$DATA_ROOT/libreecho" config secrets features update data-manifest.json
+# OTA v3: generations/ holds the immutable target trees, owned and garbage-
+# collected by libreecho-generation-transaction; incoming/ is the recovery
+# direct-install landing zone whose files are hardlinked into a generation.
+# Neither is descended into here -- the transaction tool verifies them.
+check_children "$DATA_ROOT/libreecho" config secrets features update data-manifest.json \
+    generations incoming
+for v3_directory in "$DATA_ROOT/libreecho/generations" "$DATA_ROOT/libreecho/incoming"; do
+    if [ -e "$v3_directory" ] || [ -L "$v3_directory" ]; then
+        [ ! -L "$v3_directory" ] && [ -d "$v3_directory" ] || unknown_item "$v3_directory"
+    fi
+done
 # /data is shared between the A and B slots, so a configuration file written
 # by a newer image is still present after a rollback to an older one.  With a
 # strict allowlist that file is an unknown item and the older image blocks
@@ -297,7 +309,9 @@ TOLERATE_UNKNOWN_FILES=1
 check_children "$DATA_ROOT/libreecho/update" \
     channel incoming staging state pending installed rolled-back check-status \
     automatic-updates install.lock bootctl.confirm bootctl.confirmed feature-commit committed-manifest committed-manifest.sig restart-record first-install.pending \
-    first-install.confirmed
+    first-install.confirmed \
+    current previous generation.lock asset-cache fetch.lock \
+    config-status features-status transaction-slot
 TOLERATE_UNKNOWN_FILES=0
 
 if [ -d "$DATA_ROOT/libreecho/features" ]; then

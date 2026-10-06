@@ -1,0 +1,110 @@
+#!/bin/busybox sh
+# Config schema gate shipped as code in the new boot image. There are no
+# deployed vN->vN+1 transforms yet: never invent a lossy migration. Schema 1
+# is an identity operation; unknown/newer data remains byte-for-byte untouched.
+BB=/bin/busybox
+ROOT=${ROOT:-/data/libreecho/update}
+CONFIG_ROOT=${CONFIG_ROOT:-/data/libreecho/config}
+TARGET_SCHEMA=${1:-1}
+error=
+case "$ROOT:$CONFIG_ROOT" in *'/../'*|*'/./'*|*[!A-Za-z0-9._/+:-]*) exit 1;; esac
+for path in "$ROOT" "$CONFIG_ROOT"; do
+    case "$path" in /|''|[!/]*) exit 1;; esac
+    current=/
+    remainder=${path#/}
+    old_ifs=$IFS; IFS=/; set -f; set -- $remainder; set +f; IFS=$old_ifs
+    for component do
+        current=${current%/}/$component
+        [ ! -L "$current" ] || exit 1
+    done
+done
+$BB mkdir -p "$ROOT" || exit 1
+[ ! -L "$ROOT/config-status" ] && [ ! -L "$ROOT/config-status.tmp" ] || exit 1
+config=$CONFIG_ROOT/web-config.json
+if [ "$TARGET_SCHEMA" != 1 ]; then
+    error=unsupported_target_schema
+elif [ -L "$config" ]; then
+    error=config_symlink
+elif [ -e "$config" ]; then
+    if [ ! -f "$config" ] || [ "$($BB stat -c %s "$config")" -gt 65536 ]; then
+        error=invalid_config
+    else
+        schema=$($BB awk '
+            function ws() { while (substr(s,p,1) ~ /[ \t\r\n]/ && p<=length(s)) p++ }
+            function bad() { failed=1; exit 1 }
+            function str(   c,e,h,n,i) {
+                if (substr(s,p++,1)!="\"") bad()
+                token=""
+                while (p<=length(s)) {
+                    c=substr(s,p++,1)
+                    if (c=="\"") return
+                    if (c ~ /[[:cntrl:]]/) bad()
+                    if (c=="\\") {
+                        e=substr(s,p++,1)
+                        if (e=="u") {
+                            h=substr(s,p,4); if (h !~ /^[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]$/) bad()
+                            n=0; for(i=1;i<=4;i++) n=n*16+index("0123456789abcdef",tolower(substr(h,i,1)))-1
+                            p+=4
+                            c=(n>=32 && n<127) ? sprintf("%c",n) : "?"
+                        } else if (e ~ /^["\\\/bfnrt]$/) c=e
+                        else bad()
+                    }
+                    token=token c
+                }
+                bad()
+            }
+            function val(depth,   c,k,raw,start,t) {
+                if(depth>32 || ++nodes>8192) bad()
+                ws(); c=substr(s,p,1); start=p
+                if(c=="{") {
+                    p++; ws()
+                    if(substr(s,p,1)=="}") {p++; type="object"; return}
+                    while(1) {
+                        ws(); str(); k=token; ws()
+                        if(substr(s,p++,1)!=":") bad()
+                        ws(); t=p; val(depth+1); raw=substr(s,t,p-t)
+                        # LibreEcho-UI has always persisted the root version
+                        # as "schema_version"; "schema" is the Platform name.
+                        # Either names the one root schema; both together are
+                        # a duplicate and fail closed like any repeated key.
+                        if(depth==0 && (k=="schema" || k=="schema_version")) {
+                            if(seen++) bad()
+                            if(type=="number" && raw ~ /^(0|[1-9][0-9]*)$/) schema=raw
+                        }
+                        ws(); c=substr(s,p++,1)
+                        if(c=="}") break
+                        if(c!=",") bad()
+                    }
+                    type="object"
+                } else if(c=="[") {
+                    p++; ws()
+                    if(substr(s,p,1)=="]") {p++; type="array"; return}
+                    while(1) {
+                        val(depth+1); ws(); c=substr(s,p++,1)
+                        if(c=="]") break
+                        if(c!=",") bad()
+                    }
+                    type="array"
+                } else if(c=="\"") {str(); type="string"}
+                else if(match(substr(s,p),/^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/)) {p+=RLENGTH; type="number"}
+                else if(substr(s,p,4)=="true" || substr(s,p,4)=="null") {p+=4; type="literal"}
+                else if(substr(s,p,5)=="false") {p+=5; type="literal"}
+                else bad()
+            }
+            { s=s $0 "\n" }
+            END {
+                if(failed) exit 1
+                p=1; ws(); if(substr(s,p,1)!="{") exit 1
+                val(0); ws(); if(p<=length(s) || !seen || schema=="") exit 1
+                print schema
+            }
+        ' "$config") || schema=unknown
+        [ "$schema" = 1 ] || error=unsupported_schema
+    fi
+fi
+printf 'config_schema=%s\nconfig_error=%s\n' "$TARGET_SCHEMA" "$error" > "$ROOT/config-status.tmp" || exit 1
+$BB chmod 0600 "$ROOT/config-status.tmp" || exit 1
+$BB sync
+$BB mv "$ROOT/config-status.tmp" "$ROOT/config-status" || exit 1
+$BB sync
+[ -z "$error" ]

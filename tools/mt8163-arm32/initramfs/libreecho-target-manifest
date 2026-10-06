@@ -1,0 +1,175 @@
+#!/bin/busybox sh
+# Immutable signed target grammar. This checker never writes device state.
+BB=/bin/busybox
+VERIFY=${VERIFY:-/usr/local/libexec/libreecho-update-verify}
+PUBLIC_KEY=${PUBLIC_KEY:-/etc/libreecho/ota-public-key.hex}
+load_image_target()
+{
+    local target_file=${TARGET_FILE:-/etc/libreecho/target} target_count
+    TARGET_ID=
+    TARGET_SLUG=
+    if [ ! -e "$target_file" ] && [ ! -L "$target_file" ]; then
+        TARGET_ID=radar_puffin
+        TARGET_SLUG=radar-puffin
+        printf '%s\n' 'target-file=missing fallback=radar_puffin' >&2
+        return 0
+    fi
+    [ -f "$target_file" ] && [ ! -L "$target_file" ] && [ -r "$target_file" ] || return 1
+    target_count=$($BB grep -c '^target_id=' "$target_file")
+    [ "$target_count" = 1 ] || return 1
+    TARGET_ID=$($BB sed -n 's/^target_id=//p' "$target_file")
+    case "$TARGET_ID" in
+        radar_puffin) TARGET_SLUG=radar-puffin ;;
+        biscuit) TARGET_SLUG=biscuit ;;
+        *) TARGET_ID=; return 1 ;;
+    esac
+}
+
+fail() { printf 'ERROR:%s\n' "$1" >&2; exit 1; }
+value() { $BB sed -n "s/^$1=//p" "$2" 2>/dev/null | $BB head -n 1; }
+valid_hash() { [ "${#1}" -eq 64 ] || return 1; case "$1" in *[!0-9a-f]*|'') return 1;; esac; }
+valid_uint() {
+    local value=$1
+    case "$value" in 0|[1-9]|[1-9][0-9]*) ;; *) return 1;; esac
+    [ "${#value}" -lt 19 ] ||
+        { [ "${#value}" -eq 19 ] && [ "$value" \< "9223372036854775808" ]; } ||
+        return 1
+}
+valid_token() { [ -n "$1" ] && [ "${#1}" -le 96 ] || return 1; case "$1" in [A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._+~:-]*) ;; *) return 1;; esac; }
+valid_commit() { [ "${#1}" -eq 40 ] || return 1; case "$1" in *[!0-9a-f]*|'') return 1;; esac; }
+valid_asset() { [ -n "$1" ] && [ "${#1}" -le 128 ] || return 1; case "$1" in [A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._+:-]*) ;; *) return 1;; esac; case "$1" in *[!A-Za-z0-9._+:-]*|*/*|*\\*) return 1;; esac; }
+
+safe_path() {
+    local path=$1 current remainder old_ifs IFS
+    case "$path" in *[!A-Za-z0-9._/+:-]*) fail invalid-path ;; esac
+    case "$path" in
+        /|*//*|*/./*|*/../*|*/..|*/.) fail invalid-path ;;
+        /*) ;;
+        *) fail nonabsolute-path ;;
+    esac
+    [ "$path" != / ] || fail root-path
+    current=/
+    remainder=${path#/}
+    old_ifs=$IFS
+    IFS=/
+    set -f
+    set -- $remainder
+    set +f
+    IFS=$old_ifs
+    for component do
+        [ -n "$component" ] || continue
+        if [ "$current" = / ]; then current=/$component; else current=$current/$component; fi
+        [ ! -L "$current" ] || fail symlink-path
+    done
+}
+
+regular() {
+    safe_path "$1"
+    [ -f "$1" ] && [ ! -L "$1" ] || fail "$2-not-regular"
+}
+sync_file() { $BB sync 2>/dev/null || fail sync-failed; }
+atomic_write() {
+    local target=$1 tmp=$1.tmp; shift
+    safe_path "$target"; safe_path "$tmp"
+    [ ! -L "$tmp" ] || fail journal-temp-symlink
+    { "$@"; } > "$tmp" || fail journal-write
+    $BB chmod 0600 "$tmp" 2>/dev/null || fail journal-mode
+    $BB mv "$tmp" "$target" || fail journal-rename
+    sync_file
+}
+atomic_copy() {
+    local source=$1 target=$2 tmp=$2.tmp
+    regular "$source" intent-source
+    safe_path "$target"; safe_path "$tmp"
+    [ ! -L "$tmp" ] || fail journal-temp-symlink
+    $BB cp "$source" "$tmp" || fail journal-copy
+    $BB chmod 0600 "$tmp" 2>/dev/null || fail journal-mode
+    $BB mv "$tmp" "$target" || fail journal-rename
+    sync_file
+}
+
+# Return a content hash or the explicit absence marker.  Anything other than a
+# regular file is an ambiguity, never an absent file.
+hash_state() {
+    local path=$1 digest
+    safe_path "$path"
+    [ ! -L "$path" ] || fail symlink-path
+    if [ -e "$path" ]; then
+        [ -f "$path" ] || fail nonregular-path
+        digest=$(sha256sum "$path" 2>/dev/null | $BB awk '{print $1}') || fail hash-read
+        valid_hash "$digest" || fail hash-read
+        printf '%s\n' "$digest"
+    else
+        printf '%s\n' none
+    fi
+}
+
+
+check_manifest() {
+    local manifest=$1 signature=$2 key field_value seen expected feature suffix path hash
+    regular "$manifest" manifest; regular "$signature" signature
+    [ "$($BB stat -c %s "$manifest")" -le 32768 ] || fail manifest-size
+    "$VERIFY" "$PUBLIC_KEY" "$manifest" "$signature" >/dev/null 2>&1 || fail manifest-signature
+    case "$(value format "$manifest")" in libreecho-ota-v1|libreecho-ota-v2) fail legacy_manifest_unsupported;; esac
+    expected='format manifest_version board soc architecture image_profile transaction_type transaction_id release version update_channel service_profile minimum_updater_schema commit_policy boot_filename boot_size boot_sha256 feature_ids'
+    for feature in airplay2 tts wakeword stt assistant; do
+        for suffix in asset size sha256 manifest_asset manifest_size manifest_sha256 daemon_path daemon_sha256; do
+            expected="$expected feature_${feature}_${suffix}"
+        done
+    done
+    expected="$expected config_schema"
+    seen=
+    while IFS='=' read -r key field_value; do
+        [ -n "$key" ] && [ -n "$field_value" ] || fail manifest-syntax
+        case "$field_value" in *=*|*[!A-Za-z0-9._+~,:/-]*) fail manifest-value;; esac
+        case " $expected " in *" $key "*) ;; *) fail manifest-unknown-key;; esac
+        case " $seen " in *" $key "*) fail manifest-duplicate-key;; esac
+        seen="${seen}${key} "
+    done < "$manifest"
+    [ "$seen" = "$expected " ] || fail manifest-noncanonical
+    [ "$(value format "$manifest")" = libreecho-ota-v3 ] || fail manifest-format
+    [ "$(value manifest_version "$manifest")" = 1 ] || fail manifest-version
+    load_image_target || fail image-target
+    [ "$(value board "$manifest")" = "$TARGET_ID" ] || fail manifest-board
+    [ "$(value soc "$manifest")" = mt8163 ] || fail manifest-soc
+    [ "$(value architecture "$manifest")" = armv7 ] || fail manifest-architecture
+    [ "$(value image_profile "$manifest")" = ota ] || fail manifest-profile
+    [ "$(value transaction_type "$manifest")" = system ] || fail transaction-type
+    [ "$(value minimum_updater_schema "$manifest")" = 3 ] || fail updater-schema
+    [ "$(value commit_policy "$manifest")" = after-slot-confirm ] || fail commit-policy
+    for key in transaction_id release version; do
+        field_value=$(value "$key" "$manifest")
+        valid_token "$field_value" || fail manifest-token
+        case "$field_value" in *[!A-Za-z0-9._+~:-]*|.|..) fail manifest-token;; esac
+    done
+    case "$(value update_channel "$manifest")" in dev|stable) ;; *) fail manifest-channel;; esac
+    case "$(value service_profile "$manifest")" in production|diagnostic) ;; *) fail service-profile;; esac
+    [ "$(value boot_filename "$manifest")" = boot.img ] || fail boot-filename
+    [ "$(value boot_size "$manifest")" = 16777216 ] || fail boot-size
+    valid_hash "$(value boot_sha256 "$manifest")" || fail boot-hash
+    valid_uint "$(value config_schema "$manifest")" || fail config-schema
+    [ "$(value feature_ids "$manifest")" = airplay2,tts,wakeword,stt,assistant ] || fail feature-set
+    for feature in airplay2 tts wakeword stt assistant; do
+        for suffix in size manifest_size; do
+            field_value=$(value "feature_${feature}_${suffix}" "$manifest")
+            valid_uint "$field_value" && [ "$field_value" -gt 0 ] || fail feature-size
+            case "$field_value" in *[!0-9]*) fail feature-size;; esac
+        done
+        for suffix in sha256 manifest_sha256 daemon_sha256; do
+            valid_hash "$(value "feature_${feature}_${suffix}" "$manifest")" || fail feature-hash
+        done
+        hash=$(value "feature_${feature}_sha256" "$manifest")
+        [ "$(value "feature_${feature}_asset" "$manifest")" = "libreecho-$TARGET_SLUG-base-$feature-$hash.payload.squashfs" ] || fail feature-asset-identity
+        hash=$(value "feature_${feature}_manifest_sha256" "$manifest")
+        [ "$(value "feature_${feature}_manifest_asset" "$manifest")" = "libreecho-$TARGET_SLUG-base-$feature-$hash.manifest.json" ] || fail feature-asset-identity
+        path=$(value "feature_${feature}_daemon_path" "$manifest")
+        case "$feature:$path" in
+            airplay2:usr/local/sbin/libreecho-audio-engine|tts:usr/local/sbin/libreecho-ttsd|wakeword:usr/local/sbin/libreecho-waked|stt:usr/local/sbin/libreecho-sttd|assistant:usr/local/sbin/libreecho-agentd) ;;
+            *) fail daemon-path;;
+        esac
+    done
+}
+case "${1:-}" in
+    check) [ "$#" = 3 ] || fail usage; check_manifest "$2" "$3";;
+    *) fail usage;;
+esac

@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import argparse
-import gzip
 import hashlib
 import json
+import lzma
 import re
 import stat
 import struct
@@ -22,6 +22,10 @@ from libreecho_platform_targets import add_target_arguments, validate_target_arg
 
 
 ANDROID_MAGIC = b"ANDROID!"
+RAMDISK_COMPRESSION = "xz-crc32-lzma2-8m"
+RAMDISK_XZ_MAX_DICT_SIZE = 8 << 20
+XZ_MAGIC = b"\xfd7zXZ\x00"
+XZ_CHECK_CRC32 = b"\x00\x01"
 MKIMG_MAGIC = bytes.fromhex("88168858")
 FDT_MAGIC = bytes.fromhex("d00dfeed")
 PAGE = 0x800
@@ -54,7 +58,7 @@ WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-INIT_SHA256 = "b9cb2d1075138259e44cf3fc67d3dc32ac9ca5a85ca719ec48c075525f23ca1d"
+INIT_SHA256 = "7cea4e75f896767e314585726b683a132988d1d7d18db65ba8aea387172cbf3b"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -76,6 +80,10 @@ OVERLAY_FILES = {
     "libreecho-update": 0o755,
     "libreecho-update-fetch": 0o755,
     "libreecho-feature-transaction": 0o755,
+    "libreecho-target-manifest": 0o755,
+    "libreecho-generation": 0o755,
+    "libreecho-config-migrate": 0o755,
+    "libreecho-generation-transaction": 0o755,
     "ota-source.conf": 0o644,
     "regulatory.db": 0o644,
     "regulatory.db.p7s": 0o644,
@@ -102,6 +110,10 @@ OVERLAY_TARGETS = {
     "libreecho-update": "usr/local/sbin/libreecho-update",
     "libreecho-update-fetch": "usr/local/sbin/libreecho-update-fetch",
     "libreecho-feature-transaction": "usr/local/sbin/libreecho-feature-transaction",
+    "libreecho-target-manifest": "usr/local/sbin/libreecho-target-manifest",
+    "libreecho-generation": "usr/local/sbin/libreecho-generation",
+    "libreecho-config-migrate": "usr/local/sbin/libreecho-config-migrate",
+    "libreecho-generation-transaction": "usr/local/sbin/libreecho-generation-transaction",
     "ota-source.conf": "etc/libreecho/ota-source.conf",
     "regulatory.db": "lib/firmware/regulatory.db",
     "regulatory.db.p7s": "lib/firmware/regulatory.db.p7s",
@@ -319,6 +331,26 @@ class Entry:
     gid: int
     mtime: int
     data: bytes
+
+
+def decompress_ramdisk(ramdisk: bytes) -> bytes:
+    """Accept only a single-stream CRC32 xz the target kernel can unpack.
+
+    The Linux xz_dec used for initramfs rejects CRC64/SHA-256 checks, so an
+    archive Python can read may still fail at boot; enforce the subset here.
+    """
+    if ramdisk[:6] != XZ_MAGIC:
+        fail("ramdisk is not an xz stream")
+    if ramdisk[6:8] != XZ_CHECK_CRC32:
+        fail("ramdisk xz integrity check must be CRC32 for the kernel decoder")
+    decoder = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=RAMDISK_XZ_MAX_DICT_SIZE * 2)
+    try:
+        cpio = decoder.decompress(ramdisk)
+    except lzma.LZMAError as exc:
+        fail(f"ramdisk xz is invalid: {exc}")
+    if not decoder.eof or decoder.unused_data:
+        fail("ramdisk xz stream is truncated or has trailing data")
+    return cpio
 
 
 def parse_newc(data: bytes) -> dict[str, Entry]:
@@ -1170,6 +1202,75 @@ def validate_connectivity(entries: dict[str, Entry], manifest: dict[str, object]
     return True
 
 
+BOOT_HTTPS_CA_SHA256 = "c0c940a0e30d859783f7f130868d8082e79936ff0b41a0b1098ac7f98909263b"
+
+
+def validate_boot_https_transport(entries: dict[str, Entry], manifest: dict[str, object],
+                                 expected_payload_sha256: str | None) -> None:
+    # Independently enforce paths, ABI, mode, CA pin and closure; not presence-only.
+    sources = {
+        "usr/bin/curl": "usr/local/libexec/libreecho-curl",
+        "etc/ssl/certs/ca-certificates.crt": "usr/local/share/libreecho/cacert.pem",
+        "usr/local/share/licenses/curl/COPYING": "usr/local/share/licenses/curl/COPYING",
+        "usr/local/share/licenses/ca-certificates/copyright": "usr/local/share/licenses/ca-certificates/copyright",
+    }
+    for name in ("THIRD_PARTY_NOTICES.txt", "OpenSSL-copyright", "glibc-copyright",
+                 "gcc-runtime-copyright", "LGPL-2.1.txt", "GPL-3.0.txt"):
+        path = "usr/local/share/licenses/libreecho-assistant/" + name
+        sources[path] = path
+    record = manifest.get("boot_https_transport")
+    if (not isinstance(record, dict) or
+            record.get("schema") != "libreecho-boot-https-transport/v1" or
+            record.get("payload_dependency") is not False or
+            record.get("userdata_dependency") is not False or
+            record.get("client") != "/usr/bin/curl" or
+            record.get("ca") != "/etc/ssl/certs/ca-certificates.crt" or
+            record.get("curl_source_sha256") != "aa1b66a70eace83dc624508745646c08ae561de512ab403adffb93ac87fc72e6"):
+        fail("mandatory boot HTTPS transport manifest is missing or invalid")
+    assert isinstance(record, dict)
+    if (expected_payload_sha256 is None or
+            not re.fullmatch(r"[0-9a-f]{64}", expected_payload_sha256) or
+            record.get("source_payload_sha256") != expected_payload_sha256 or
+            not re.fullmatch(r"[0-9a-f]{64}", str(record.get("source_manifest_sha256", "")))):
+        fail("boot HTTPS transport source identity is not trusted")
+    if record.get("capabilities") != {
+            "curl": "8.21.0", "tls": "OpenSSL/3.0.13", "protocols": ["http", "https"]}:
+        fail("boot HTTPS client capability record is missing or invalid")
+    files = record.get("files")
+    if not isinstance(files, dict) or set(files) != set(sources):
+        fail("boot HTTPS transport closure is incomplete")
+    assert isinstance(files, dict)
+    for name, source in sources.items():
+        item = files[name]
+        mode = 0o755 if name == "usr/bin/curl" else 0o644
+        if (not isinstance(item, dict) or
+                set(item) != {"source_member", "sha256", "size", "mode"} or
+                item.get("source_member") != source or item.get("mode") != f"{mode:04o}" or
+                type(item.get("size")) is not int or item["size"] <= 0 or
+                not re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256", "")))):
+            fail(f"boot HTTPS transport record is invalid: {name}")
+        assert isinstance(item, dict)
+        member = require_member(entries, name, item["sha256"], mode)
+        if len(member.data) != item["size"]:
+            fail(f"boot HTTPS transport member size mismatch: {name}")
+        if name == "usr/bin/curl" and elf_info(member.data) != (1, 40, 0x05000400, None, (), False):
+            fail("boot HTTPS curl is not static ARM32 hard-float")
+        if name.startswith("etc/ssl/") and sha256(member.data) != BOOT_HTTPS_CA_SHA256:
+            fail("boot HTTPS CA identity changed")
+    assistant = manifest.get("assistant", {})
+    if isinstance(assistant, dict) and assistant.get("enabled"):
+        payload = assistant.get("payload", {})
+        if isinstance(payload, dict) and payload.get("sha256") == expected_payload_sha256:
+            for name, source in sources.items():
+                originals = payload.get("files")
+                if not isinstance(originals, dict) or not isinstance(originals.get(source), dict):
+                    fail(f"boot HTTPS source member is missing: {source}")
+                assert isinstance(originals, dict)
+                original = originals[source]
+                if any(original.get(key) != files[name][key] for key in ("sha256", "size", "mode")):
+                    fail(f"boot HTTPS transport differs from verified assistant input: {name}")
+
+
 def validate_target_identity(entries: dict[str, Entry], manifest: dict[str, object],
                              target: str, digest: str | None = None) -> None:
     get_target(target)
@@ -1229,16 +1330,15 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                        expected_wpa_supplicant_sha256: str | None = None,
                        expected_mdns_runtime_manifest_sha256: str | None = None,
                        expected_target: str | None = None,
-                       target_descriptor_sha256: str | None = None) -> bool:
-    if ramdisk[:4] != b"\x1f\x8b\x08\x00":
-        fail("ramdisk gzip header is not deterministic")
-    try:
-        cpio = gzip.decompress(ramdisk)
-    except gzip.BadGzipFile as exc:
-        fail(f"ramdisk gzip is invalid: {exc}")
+                       target_descriptor_sha256: str | None = None,
+                       expected_boot_https_payload_sha256: str | None = None) -> bool:
+    cpio = decompress_ramdisk(ramdisk)
     entries = parse_newc(cpio)
     validate_archive_tree(entries)
     validate_symlinks(entries)
+    validate_boot_https_transport(
+        entries, manifest, expected_boot_https_payload_sha256 or expected_assistant_payload_sha256,
+    )
     validate_no_connectivity_autostart(entries)
     if expected_target is not None:
         validate_target_identity(entries, manifest, expected_target, target_descriptor_sha256)
@@ -2003,7 +2103,8 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         b"$ETC_ROOT/libreecho/feature-policy",
         b"integrations & 1",
         b"integrations & 16",
-        b"$DATA_ROOT/libreecho/features/$feature/payload.squashfs",
+        b'feature_runtime_mounted "$RUN_ROOT/libreecho/features/$feature/root"',
+        b"FEATURE_RECONCILE_MOUNTINFO:-/proc/self/mountinfo",
         b"\"$script\" start",
         b"feature-services-reconcile-failed",
         b"shared_discovery_active",
@@ -2012,6 +2113,10 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     ):
         if marker not in reconcile.data:
             fail(f"feature reconciliation helper lacks {marker!r}")
+    # V3 payloads exist only as authenticated generation mounts; a legacy v2
+    # tree on /data must never satisfy the reconciler's payload gate.
+    if b"libreecho/features/$feature/payload.squashfs" in reconcile.data:
+        fail("feature reconciliation helper is gated on the legacy v2 payload tree")
     mdns_entry = verified_overlay["libreecho-mdnsd"]
     for marker in (
         b"MDNS_RUNTIME_ROOT:-/usr/local/lib/libreecho-mdns/root",
@@ -2441,6 +2546,8 @@ def main() -> None:
                         help="require this external English STT SquashFS payload")
     parser.add_argument("--expected-stt-payload-size", type=int,
                         help="require this external English STT payload size")
+    parser.add_argument("--expected-boot-https-payload-sha256",
+                        help="trusted boot transport input hash (defaults to assistant payload hash)")
     parser.add_argument("--expected-assistant-payload-sha256",
                         help="require this external streamed assistant SquashFS payload")
     parser.add_argument("--expected-assistant-payload-size", type=int,
@@ -2471,8 +2578,10 @@ def main() -> None:
         fail("System.map hash mismatch")
     if manifest["inputs"].get("system_map", {}).get("sha256") != args.expected_system_map_sha256:
         fail("manifest System.map identity mismatch")
-    if sha256(ramdisk) != manifest["initramfs"]["gzip_sha256"]:
+    if sha256(ramdisk) != manifest["initramfs"]["ramdisk_sha256"]:
         fail("ramdisk hash differs from manifest")
+    if manifest["initramfs"].get("compression") != RAMDISK_COMPRESSION:
+        fail("ramdisk compression differs from the kernel-supported xz contract")
     if sha256(boot) != args.expected_boot_sha256 or manifest["output"]["sha256"] != args.expected_boot_sha256:
         fail("boot-image hash mismatch")
     if manifest.get("status") != "PREPARED_NOT_FLASHED":
@@ -2583,6 +2692,7 @@ def main() -> None:
         args.expected_mdns_runtime_manifest_sha256,
         expected_target=args.target,
         target_descriptor_sha256=args.target_descriptor_sha256,
+        expected_boot_https_payload_sha256=args.expected_boot_https_payload_sha256,
     )
     expected_connectivity = args.expected_connectivity_bundle != "none"
     if connectivity_enabled != expected_connectivity:

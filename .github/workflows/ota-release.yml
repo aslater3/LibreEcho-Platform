@@ -24,6 +24,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       GITHUB_TOKEN: ${{ github.token }}
+      LIBREECHO_OTA_UI_SOURCE: ${{ github.workspace }}/.test-ui
     steps:
       - name: Check out Platform source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
@@ -38,7 +39,10 @@ jobs:
           ref: 17604803f4682826f3fdb6f0af0c52bb064dd853
           path: .test-ui
           persist-credentials: false
-          sparse-checkout: src/adapter/sleep_generator.h
+          sparse-checkout: |
+            src/adapter/sleep_generator.h
+            src/api.c
+            web/js/app.js
           sparse-checkout-cone-mode: false
 
       - name: Verify sleep media arbitration with companion UI
@@ -62,7 +66,7 @@ jobs:
           # headers and startup objects the cross compiler cannot link anything,
           # so configure dies with "C compiler cannot create executables".
           sudo apt-get install --no-install-recommends -y \
-            device-tree-compiler espeak-ng-data squashfs-tools \
+            device-tree-compiler espeak-ng-data squashfs-tools nodejs mksh \
             gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf \
             libc6-dev-armhf-cross
           python -m pip install --disable-pip-version-check PyNaCl==1.5.0
@@ -163,7 +167,19 @@ jobs:
             test_source_offer_tools.py \
             recovery-install/tests/test_build_install_bundle.py \
             recovery-install/tests/test_installer_boot_write.py \
+            recovery-install/tests/test_direct_userdata_install.py \
+            recovery-install/tests/test_direct_nonce.py \
             ota/test_ota_v2_implementation.py \
+            test_ota_v3_activation.py \
+            test_ota_v3_config.py \
+            test_ota_v3_convergence.py \
+            test_ota_v3_failure_policy.py \
+            test_ota_v3_integration.py \
+            test_ota_v3_manifest.py \
+            test_ota_v3_packaging.py \
+            test_ota_v3_recovery.py \
+            test_ota_v3_transport.py \
+            test_ota_v3_web_status.py \
             ota/test_feature_provenance.py \
             ota/test_service_identity.py \
             ota/test_dev_discovery.py

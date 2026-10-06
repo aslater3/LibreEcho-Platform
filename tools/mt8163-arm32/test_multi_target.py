@@ -234,71 +234,41 @@ class TargetCLITests(unittest.TestCase):
 
 
 class RuntimeTargetTests(unittest.TestCase):
-    def check(self, target, board, *, consumer='libreecho-update', v2=False, mutate=None):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            target_file = root / 'target'
-            if target is not None:
-                target_file.write_text('target_id=' + target + '\n')
-            staging = root / 'staging'; staging.mkdir()
-            if v2:
-                data = manifest([feature('assistant', 'replace')])
-                raw = feature_manifest.serialize_manifest(data).decode().replace('board=radar_puffin', 'board=' + board)
-                if board == 'biscuit': raw = raw.replace('libreecho-radar-puffin-', 'libreecho-biscuit-')
-            else:
-                raw = ('format=libreecho-ota-v1\nmanifest_version=1\nboard=' + board +
-                       '\nsoc=mt8163\narchitecture=armv7\nversion=0.14.0\nboot_filename=boot.img\nboot_size=16777216\nboot_sha256=' + 'a' * 64 +
-                       '\nfeature_policy=exclude\nimage_profile=ota\nservice_profile=diagnostic\nupdate_channel=dev\n')
+    def check(self, target, board, *, consumer='libreecho-update', mutate=None):
+        import test_ota_v3_integration as fixtures
+        fixture = fixtures.UpdaterTests()
+        fixture.setUp()
+        try:
+            target_file = fixture.root / 'target'
+            if target is None: target_file.unlink()
+            else: target_file.write_text('target_id=' + target + '\n')
+            raw = fixture.text.replace('board=radar_puffin', 'board=' + board)
+            if board == 'biscuit': raw = raw.replace('libreecho-radar-puffin-', 'libreecho-biscuit-')
             if mutate: raw = mutate(raw)
-            (staging / 'manifest').write_text(raw)
-            source = (TOOLS / 'initramfs' / consumer).read_text()
             if consumer == 'libreecho-update':
-                source = source.split('\ncase "${1:-}" in', 1)[0]
-                invocation = 'verify_manifest'
-            else:
-                # Only pure manifest validation plus real immutable target loader;
-                # cryptography is covered by the maintained transaction suite.
-                names = ['value', 'valid_hash', 'valid_uint', 'valid_token', 'valid_commit', 'valid_asset', 'key_allowed', 'check_manifest']
-                if 'load_image_target()' in source: names.insert(0, 'load_image_target')
-                source = '\n'.join(function(source, name) for name in names)
-                source = 'BB=/bin/busybox\n' + source
-                invocation = 'check_manifest "$STAGING/manifest"'
-            source = source.replace('/etc/libreecho/target', str(target_file))
-            harness = root / 'check.sh'
-            harness.write_text(source + '\n' +
-                f'STAGING={shlex.quote(str(staging))}\n' +
-                'channel_value() { echo dev; }\n'
-                'die() { echo "ERROR:$1" >&2; exit 1; }\n'
-                'fail() { echo "ERROR:$1" >&2; exit 1; }\n'
-                'verify_signed_manifest() { :; }\n' +
-                invocation + '\n')
-            return run(['/bin/busybox', 'sh', str(harness)])
+                return fixture.inspect(raw)
+            p, sig = fixture.signed(raw)
+            return run(['/bin/busybox', 'sh', str(TOOLS / 'initramfs/libreecho-feature-transaction'),
+                        'preflight', str(p), str(sig)], env=fixture.env)
+        finally:
+            fixture.doCleanups()
 
-    def test_missing_identity_accepts_radar_v1_and_logs(self):
+    def test_missing_identity_accepts_radar_v3_and_logs(self):
         result = self.check(None, 'radar_puffin')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('target-file=missing fallback=radar_puffin', result.stderr)
 
-    def test_same_target_v1_acceptance(self):
+    def test_same_target_v3_acceptance(self):
         for target in ('radar_puffin', 'biscuit'):
             result = self.check(target, target)
             self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_cross_target_v1_refused(self):
-        for target, board in (('radar_puffin', 'biscuit'), ('biscuit', 'radar_puffin'), (None, 'biscuit')):
-            result = self.check(target, board)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn('manifest_board', result.stderr)
-
-    def test_same_and_cross_target_v2_updater_and_transaction(self):
+    def test_cross_target_v3_refused(self):
         for consumer in ('libreecho-update', 'libreecho-feature-transaction'):
-            for target in ('radar_puffin', 'biscuit'):
-                with self.subTest(consumer=consumer, target=target):
-                    result = self.check(target, target, consumer=consumer, v2=True,
-                                        mutate=lambda raw: raw.replace('update_channel=stable', 'update_channel=dev'))
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    other = 'biscuit' if target == 'radar_puffin' else 'radar_puffin'
-                    self.assertNotEqual(self.check(target, other, consumer=consumer, v2=True).returncode, 0)
+            for target, board in (('radar_puffin', 'biscuit'), ('biscuit', 'radar_puffin'), (None, 'biscuit')):
+                result = self.check(target, board, consumer=consumer)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('manifest-board', result.stderr)
 
     def test_unknown_or_duplicate_runtime_identity_fails_closed(self):
         for target in ('unknown', '', 'radar_puffin\ntarget_id=biscuit'):
@@ -318,38 +288,13 @@ class RuntimeTargetTests(unittest.TestCase):
             self.assertEqual(self.check(None, 'radar_puffin').returncode, 0)
             self.assertNotEqual(self.check(None, 'biscuit').returncode, 0)
 
-    def test_missing_v2_identity_accepts_radar_and_logs_for_both_consumers(self):
+    def test_legacy_formats_are_refused_for_both_consumers(self):
         for consumer in ('libreecho-update', 'libreecho-feature-transaction'):
-            result = self.check(None, 'radar_puffin', consumer=consumer, v2=True,
-                                mutate=lambda raw: raw.replace('update_channel=stable', 'update_channel=dev'))
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn('target-file=missing fallback=radar_puffin', result.stderr)
-
-    def test_signed_cross_target_ota_refused_without_slot_or_bcb_writes(self):
-        import test_ota_v2_implementation as fixtures
-        for target, board in [('radar_puffin', 'biscuit'), ('biscuit', 'radar_puffin')]:
-            fixture = fixtures.RuntimeHarnessTests()
-            fixture.setUp()
-            try:
-                fixture.manifest['board'] = board
-                if board == 'biscuit':
-                    for record in fixture.manifest['features']:
-                        for field in ('asset', 'manifest_asset'):
-                            if field in record: record[field] = record[field].replace('radar-puffin', 'biscuit')
-                fixture.package.write_bytes(feature_manifest.build_control_tar(fixture.manifest, fixture.boot, fixtures.KEY))
-                identity = fixture.root / 'target'
-                identity.write_text('target_id=' + target + '\n')
-                transaction = fixtures.transaction_fixture(fixture.root, fixture.env)
-                updater = fixtures.updater_fixture(fixture.root, fixture.env, transaction)
-                updater.write_text(updater.read_text().replace('/etc/libreecho/target', str(identity)))
-                before = [(fixture.parts / f'boot_{slot}').read_bytes() for slot in ('a', 'b')]
-                result = run(['/bin/busybox', 'sh', str(updater), 'install', str(fixture.package)], env=fixture.env)
-                self.assertNotEqual(result.returncode, 0, result.stderr)
-                self.assertIn('ERROR:v2_board', result.stderr)
-                self.assertEqual(before, [(fixture.parts / f'boot_{slot}').read_bytes() for slot in ('a', 'b')])
-                self.assertFalse(fixture.bootctl_log.exists())
-            finally:
-                fixture.tearDown()
+            for fmt in ('v1', 'v2'):
+                result = self.check('radar_puffin', 'radar_puffin', consumer=consumer,
+                                    mutate=lambda raw: raw.replace('libreecho-ota-v3', 'libreecho-ota-' + fmt))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('legacy_manifest_unsupported', result.stderr)
 
     def test_first_install_marker_target_matching(self):
         source = (TOOLS / 'initramfs/libreecho-init').read_text()
@@ -543,7 +488,16 @@ class RadarTreeDiffTests(unittest.TestCase):
     # additions (recovery-AP shell probes plus the Opus/recovery-AP licence
     # copies), which the combined tree necessarily stages on top of the base.
     ALLOWED = {'etc/libreecho/target', 'etc/libreecho/audio-profile', 'usr/local/sbin/libreecho-update',
+               'usr/local/sbin/libreecho-update-fetch',
                'usr/local/sbin/libreecho-feature-transaction', 'init', 'libreecho-init',
+               'usr/local/sbin/libreecho-target-manifest',
+               'usr/local/sbin/libreecho-generation',
+               'usr/local/sbin/libreecho-config-migrate',
+               # Feature-directory symlink skip in legacy residue cleanup.
+               'usr/local/sbin/libreecho-data-cleanup',
+               # mDNS wrapper status resolves the live supervisor, not a pidfile.
+               'etc/init.d/libreecho-mdnsd.init',
+               'usr/local/sbin/libreecho-generation-transaction',
                'usr/local/sbin/libreecho-bootctl',
                'usr/local/sbin/libreecho-recovery-ap-probe',
                'usr/local/sbin/libreecho-recovery-ap-ready',
@@ -563,6 +517,10 @@ class RadarTreeDiffTests(unittest.TestCase):
     ESPHOME_COMMIT = '37de1c11109453194ce6170f360450f887a615d4'
     ESPHOME_BASE = '2715c573c15f982555b6b48264d75d468cf3af08'  # ESPHome branch point'
     ESPHOME_PINNED = {'usr/local/sbin/libreecho-reconcile-features': 'initramfs/libreecho-reconcile-features'}
+    # The reconciler was subsequently re-reviewed for v3: its payload gate is
+    # the authenticated generation mount, not the legacy v2 tree. Its staged
+    # bytes are pinned to that exact reviewed commit instead of ESPHome's.
+    PINNED_COMMIT = {'usr/local/sbin/libreecho-reconcile-features': '73e5ea7d1d3f87887be833b89772884aa91592f5'}
 
     @staticmethod
     def tree(stage):
@@ -625,12 +583,17 @@ class RadarTreeDiffTests(unittest.TestCase):
             prior_bundle, next_bundle = root / 'before-bundle', root / 'after-bundle'
             old_bundle.assemble(assets, prior_bundle, base_tools / 'recovery-install/src', '', 2153472)
             bundle.assemble(assets, next_bundle, TOOLS / 'recovery-install/src', '', 2153472)
+            # Target identity plus the additive direct-userdata protocol-v2
+            # controls are the only manifest lines allowed to differ.
             self.assertEqual((prior_bundle / 'bundle.manifest').read_text(),
                              '\n'.join(line for line in (next_bundle / 'bundle.manifest').read_text().splitlines()
-                                       if not line.startswith(('target=', 'fastboot_products='))) + '\n')
+                                       if not line.startswith(('target=', 'fastboot_products=', 'protocol=',
+                                                               'transfer=', 'transfer_bytes_total='))) + '\n')
             import zipfile
             with zipfile.ZipFile(prior_bundle / 'libreecho-install.zip') as prior, zipfile.ZipFile(next_bundle / 'libreecho-install.zip') as next_zip:
-                self.assertEqual(prior.namelist(), next_zip.namelist())
+                # Protocol v2 adds exactly one member: the direct-userdata helper.
+                self.assertEqual(sorted(set(next_zip.namelist()) - set(prior.namelist())), [bundle.DIRECT_HELPER])
+                self.assertEqual([n for n in next_zip.namelist() if n != bundle.DIRECT_HELPER], prior.namelist())
                 for name in prior.namelist():
                     self.assertEqual(prior.getinfo(name).external_attr, next_zip.getinfo(name).external_attr)
                     if name != 'META-INF/com/google/android/update-binary':
@@ -647,7 +610,8 @@ class RadarTreeDiffTests(unittest.TestCase):
             changes = {name for name in left.keys() | right.keys() if left.get(name) != right.get(name)}
             for staged, source in self.ESPHOME_PINNED.items():
                 if staged in changes:
-                    reviewed = subprocess.run(['git', '-C', str(TOOLS), 'show', f'{self.ESPHOME_COMMIT}:tools/mt8163-arm32/{source}'],
+                    pinned = self.PINNED_COMMIT.get(staged, self.ESPHOME_COMMIT)
+                    reviewed = subprocess.run(['git', '-C', str(TOOLS), 'show', f'{pinned}:tools/mt8163-arm32/{source}'],
                                               check=True, capture_output=True).stdout
                     self.assertEqual(right[staged]['sha256'], hashlib.sha256(reviewed).hexdigest(), staged)
                     changes.discard(staged)
@@ -670,7 +634,12 @@ class RadarTreeDiffTests(unittest.TestCase):
             esphome_functions, esphome_base_functions = parse(esphome_raw), parse(esphome_base)
             esphome_changed = {n for n in esphome_functions if esphome_functions[n] != esphome_base_functions.get(n)}
             self.assertEqual(esphome_changed, {'add_ui_bundle'})
-            for name in old_functions.keys() & new_functions.keys() - {'main', 'add_overlay', 'add_ota_tools'}:
+            # OTA v3 moved feature payload mounting to the generation. The
+            # reviewed v3 startup contract is pinned to its exact source.
+            v3_reviewed = {'validate_ui_startup_contract': '8dd95bb9682fe8ddddc2f746a875354b76bb19af2bbefbcc2818d618ed0e18de'}
+            for name, digest in v3_reviewed.items():
+                self.assertEqual(hashlib.sha256(new_functions[name].encode()).hexdigest(), digest, name)
+            for name in old_functions.keys() & new_functions.keys() - {'main', 'add_overlay', 'add_ota_tools'} - v3_reviewed.keys():
                 expected = esphome_functions[name] if name in esphome_changed else old_functions[name]
                 self.assertEqual(expected, new_functions[name], name)
             summary = {'base': self.BASE, 'evidence_class': 'unit_staging_not_ARM_image',
