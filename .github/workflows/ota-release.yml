@@ -169,6 +169,7 @@ jobs:
             recovery-install/tests/test_direct_nonce.py \
             ota/test_ota_v2_implementation.py \
             test_ota_v3_activation.py \
+            test_issue_231_fixed_boot_store.py \
             test_ota_v3_config.py \
             test_ota_v3_convergence.py \
             test_ota_v3_failure_policy.py \

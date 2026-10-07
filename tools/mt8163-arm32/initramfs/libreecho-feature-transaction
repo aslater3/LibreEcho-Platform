@@ -14,7 +14,7 @@ case "${1:-}" in
     preflight) check_manifest "$2" "${3:-$2.sig}";;
     prepare-boot|recover-installed|abort-before-activation|rollback-evidence)
         fail legacy_manifest_unsupported;;
-    activate|activate-mounts|activate-committed|commit|commit-after-confirm|rollback|fallback|gc|https-client|provenance|status|verify-running)
+    activate|activate-mounts|activate-committed|restore-boot-store|commit|commit-after-confirm|rollback|fallback|gc|https-client|provenance|status|verify-running)
         export ROOT
         exec /bin/busybox sh "${GENERATION_TRANSACTION:-/usr/local/sbin/libreecho-generation-transaction}" "$@";;
     *) fail usage;;

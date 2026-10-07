@@ -3736,8 +3736,12 @@ start_feature_service_if_enabled
         self.assertIn('= "$BOOT_SECTORS"', updater)
         self.assertLess(
             updater.index("target_device_for_slot \"$target\""),
-            updater.index('dd if="$STAGING/boot.img" of="$target_device"'),
+            updater.index('dd if="$STAGING/boot.img" of="$write_device"'),
         )
+        # Issue #231: every store the write can reach is identity-checked first.
+        status = updater[updater.index("bootctl_status()"):updater.index("backup_running_boot()")]
+        self.assertIn("write_device=$target_device", status)
+        self.assertNotIn("of=", status)
         confirm = updater[updater.index('confirm_pending()'):]
         self.assertLess(confirm.index('target_device_for_slot "$slot"'),
                         confirm.index('"$FEATURE_TRANSACTION" verify-running'))

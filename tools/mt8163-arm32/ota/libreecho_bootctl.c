@@ -248,14 +248,24 @@ static void print_status(const uint8_t *bcb, int running_slot)
            slot_priority(bcb, 0), slot_tries(bcb, 0), slot_success(bcb, 0));
     printf("slot_b_priority=%u\nslot_b_tries=%u\nslot_b_success=%u\n",
            slot_priority(bcb, 1), slot_tries(bcb, 1), slot_success(bcb, 1));
-    printf("slot_a_image=/dev/mmcblk0p10\n");
-    printf("slot_b_image=/dev/mmcblk0p11\n");
     printf("boot_layout=%s\n", boot_layout);
-    if (!strcmp(boot_layout, "pinned"))
+    if (!strcmp(boot_layout, "pinned")) {
+        /* Measured on the pinned chain (issue #231): LK always loads boot_a and
+         * the BCB only chooses the slot suffix it reports and the tries
+         * accounting. Both slots therefore execute the boot_a store; boot_b
+         * is only a recovery copy of the previously running image. */
+        printf("boot_store_mode=fixed-a\n");
+        printf("slot_a_image=/dev/mmcblk0p10\n");
+        printf("slot_b_image=/dev/mmcblk0p10\n");
+        printf("backup_image=/dev/mmcblk0p11\n");
         /* The pinned chain has no Amonet wrapper partitions. */
         printf("wrapper_a=-\nwrapper_b=-\n");
-    else
+    } else {
+        printf("boot_store_mode=slotted\n");
+        printf("slot_a_image=/dev/mmcblk0p10\n");
+        printf("slot_b_image=/dev/mmcblk0p11\n");
         printf("wrapper_a=/dev/mmcblk0p17\nwrapper_b=/dev/mmcblk0p18\n");
+    }
 }
 
 static int parse_slot(const char *value)

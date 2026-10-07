@@ -1687,6 +1687,31 @@ commit_fresh_install()
     return 0
 }
 
+# Issue #231: on the pinned chain LK always loads boot_a, so a rolled-back or
+# interrupted candidate can leave its image there while the committed
+# generation's image waits in the boot_b recovery copy. The transaction restores
+# it only on an exact signed-hash match; this boot is then running the wrong
+# kernel, so reboot once into the restored image instead of activating features
+# against it. The restored store matches on the next boot, so this cannot loop.
+restore_committed_boot_store()
+{
+    restore_output=$("$1" restore-boot-store 2>&1) || {
+        log "boot-store-restore-failed:$(printf '%s\n' "$restore_output" |
+            $BB sed -n 's/^ERROR://p' | $BB head -n 1 | $BB tr -cd 'A-Za-z0-9_:-')"
+        return 0
+    }
+    case "$restore_output" in
+        *BOOT_STORE_RESTORED*)
+            log boot-store-restored-rebooting
+            pmsg_marker boot-store-restored
+            $BB sync
+            $BB sleep 1
+            $BB reboot -f
+            ;;
+    esac
+    return 0
+}
+
 activate_feature_transaction()
 {
     transaction=/usr/local/sbin/libreecho-feature-transaction
@@ -1711,6 +1736,7 @@ activate_feature_transaction()
                 fi
             fi
         fi
+        restore_committed_boot_store "$transaction"
         "$transaction" activate-committed
         return $?
     fi
