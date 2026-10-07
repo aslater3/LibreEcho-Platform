@@ -200,6 +200,21 @@ verify_generation() {
     MANIFEST=$GENERATIONS/$TX/target.manifest
 }
 
+# Where LK actually loads each slot from (issue #231). The pinned chain always
+# loads boot_a and uses the BCB only for the reported suffix and the tries
+# accounting, so both slots execute BOOT_A there and BOOT_B is the recovery
+# copy. An absent key is the historical slotted contract.
+read_store_mode() {
+    STORE_MODE=$(printf '%s\n' "$1" | $BB sed -n 's/^boot_store_mode=//p')
+    [ "$(printf '%s\n' "$1" | $BB grep -c '^boot_store_mode=')" -le 1 ] || fail bcb-grammar
+    case "$STORE_MODE" in '') STORE_MODE=slotted;; slotted|fixed-a) ;; *) fail boot-store-mode;; esac
+}
+slot_image() {
+    if [ "$1" = a ] || [ "$STORE_MODE" = fixed-a ]; then printf '%s\n' "$BOOT_A"; else printf '%s\n' "$BOOT_B"; fi
+}
+image_hash() {
+    $BB dd if="$1" bs=4096 count=4096 2>/dev/null | $BB sha256sum | $BB awk '{print $1}'
+}
 read_bcb() {
     local bcb running
     bcb=$("$BOOTCTL" status) || fail boot-control-read
@@ -209,6 +224,7 @@ read_bcb() {
     [ "$(printf '%s\n' "$bcb" | $BB grep -c "^slot_${SELECTED}_success=")" = 1 ] || fail bcb-grammar
     SUCCESS=$(printf '%s\n' "$bcb" | $BB sed -n "s/^slot_${SELECTED}_success=//p")
     case "$SUCCESS" in 0|1) ;; *) fail bcb-success;; esac
+    read_store_mode "$bcb"
     running=$($BB tr ' ' '\n' < "$CMDLINE_FILE" | $BB sed -n 's/^androidboot.slot_suffix=_//p')
     # Measured Biscuit LK emits an empty suffix; absence has the same BCB fallback.
     case "$running" in '') running=$SELECTED;; a|b) ;; *) fail running-slot;; esac
@@ -216,10 +232,10 @@ read_bcb() {
 }
 verify_boot() {
     local device actual
-    if [ "$SLOT" = a ]; then device=$BOOT_A; else device=$BOOT_B; fi
+    device=$(slot_image "$SLOT")
     safe_path "$device"
     [ -b "$device" ] || [ -f "$device" ] || fail boot-device
-    actual=$($BB dd if="$device" bs=4096 count=4096 2>/dev/null | $BB sha256sum | $BB awk '{print $1}')
+    actual=$(image_hash "$device")
     [ "$actual" = "$(value boot_sha256 "$MANIFEST")" ] || fail "${1:-boot-hash}"
 }
 
@@ -363,6 +379,32 @@ commit() {
     sync_file
     gc
 }
+# Converge a fixed-a boot store onto the committed generation before it is
+# activated. The updater copies the running image to BOOT_B before replacing
+# BOOT_A, so a rolled-back or interrupted candidate -- and a unit that took an
+# OTA before issue #231, whose committed image only ever reached BOOT_B --
+# leaves the committed image in BOOT_B. Copy it back only on an exact hash
+# match; the caller reboots so LK loads the restored image. Candidate boots
+# (a live pending record) are owned by the transaction and are never touched.
+restore_boot_store() {
+    local bcb want
+    [ -e "$ROOT/current" ] || return 0
+    [ ! -e "$PENDING" ] && [ ! -L "$PENDING" ] || return 0
+    bcb=$("$BOOTCTL" status) || fail boot-control-read
+    read_store_mode "$bcb"
+    [ "$STORE_MODE" = fixed-a ] || return 0
+    read_pointer current
+    verify_generation
+    want=$(value boot_sha256 "$MANIFEST")
+    valid_hash "$want" || fail committed-boot-hash
+    safe_path "$BOOT_A"; safe_path "$BOOT_B"
+    [ "$(image_hash "$BOOT_A")" = "$want" ] && return 0
+    [ "$(image_hash "$BOOT_B")" = "$want" ] || fail boot-store-unrecoverable
+    $BB dd if="$BOOT_B" of="$BOOT_A" bs=4096 count=4096 conv=fsync 2>/dev/null || fail boot-store-restore-write
+    sync_file
+    [ "$(image_hash "$BOOT_A")" = "$want" ] || fail boot-store-restore-hash
+    printf 'BOOT_STORE_RESTORED\n'
+}
 rollback() {
     [ -e "$PENDING" ] || return 0
     validate_pending
@@ -475,6 +517,7 @@ case "${1:-}" in
     https-client) https_client;;
     activate|activate-mounts) activate;;
     activate-committed) activate_committed;;
+    restore-boot-store) restore_boot_store;;
     commit|commit-after-confirm) commit;;
     rollback|fallback) rollback;;
     gc) [ ! -e "$ROOT/install.lock" ] || fail gc-install-busy; gc;;

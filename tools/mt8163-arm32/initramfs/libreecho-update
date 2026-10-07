@@ -327,6 +327,46 @@ bootctl_status()
     [ "$selected_success" = 1 ] || die current_slot_not_confirmed
     target=$inactive
     target_device_for_slot "$target"
+    write_device=$target_device
+    backup_device=
+    store_mode=$($BB sed -n 's/^boot_store_mode=//p' "$STAGING/bootctl.status")
+    case "$store_mode" in
+        ''|slotted) ;;
+        fixed-a)
+            # Issue #231: the pinned chain's LK always loads boot_a; the BCB
+            # selects only the reported suffix and the tries accounting. The
+            # candidate must therefore replace boot_a, and the running image is
+            # kept in boot_b as the copy the boot path restores after a rollback.
+            target_device_for_slot b
+            backup_device=$target_device
+            target_device_for_slot a
+            write_device=$target_device
+            ;;
+        *) die boot_store_mode ;;
+    esac
+}
+
+# Preserve the running image before a fixed-a store is overwritten. It must be
+# the committed generation's signed image (the boot path converges boot_a onto
+# it), so an unrecognised image is never promoted to the recovery copy.
+backup_running_boot()
+{
+    [ -n "$backup_device" ] || return 0
+    running_sha=$($BB dd if="$write_device" bs=4096 count=4096 2>/dev/null |
+        $BB sha256sum | $BB awk '{print $1}')
+    if [ -r "$UPDATE_ROOT/current" ]; then
+        committed=$($BB cat "$UPDATE_ROOT/current")
+        case "$committed" in ''|.|..|*[!A-Za-z0-9._+~:-]*) die boot_store_committed_pointer;; esac
+        committed_sha=$($BB sed -n 's/^boot_sha256=//p' \
+            "$GENERATIONS/$committed/target.manifest" 2>/dev/null | $BB head -n 1)
+        [ -n "$committed_sha" ] && [ "$running_sha" = "$committed_sha" ] ||
+            die boot_store_not_committed
+    fi
+    $BB dd if="$write_device" of="$backup_device" bs=4096 count=4096 \
+        conv=fsync 2>"$STAGING/boot-backup.log" || die boot_backup_write
+    backup_sha=$($BB dd if="$backup_device" bs=4096 count=4096 2>/dev/null |
+        $BB sha256sum | $BB awk '{print $1}')
+    [ "$backup_sha" = "$running_sha" ] || die boot_backup_hash
 }
 
 feature_file_sha256()
@@ -442,10 +482,11 @@ install_package()
     bootctl_status
 
     state_write writing 30 "$target"
-    $BB dd if="$STAGING/boot.img" of="$target_device" bs=4096 \
+    backup_running_boot
+    $BB dd if="$STAGING/boot.img" of="$write_device" bs=4096 \
         conv=fsync 2>"$STAGING/boot-write.log" || die boot_write
     state_write verifying-write 75 "$target"
-    written=$($BB dd if="$target_device" bs=4096 count=4096 2>/dev/null |
+    written=$($BB dd if="$write_device" bs=4096 count=4096 2>/dev/null |
         $BB sha256sum | $BB awk '{print $1}')
     [ "$written" = "$boot_sha" ] || die boot_write_hash
 

@@ -39,11 +39,18 @@ static int fixture_open(const char *path, int flags, ...)
 
 int main(int argc, char **argv)
 {
-    if (argc != 2)
+    uint8_t fixture_bcb[BCB_SIZE] = {0, 'A', 'B', 'B', 1, 0x8f, 0x0e};
+
+    if (argc != 2 && !(argc == 3 && !strcmp(argv[2], "status")))
         return 2;
     fixture_root = argv[1];
     if (validate_layout())
         return 1;
+    if (argc == 3) {
+        /* The real status printer, over a fixed confirmed-slot-a BCB. */
+        print_status(fixture_bcb, -1);
+        return 0;
+    }
     printf("boot_layout=%s\n", boot_layout);
     return 0;
 }

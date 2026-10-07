@@ -218,14 +218,20 @@ def main() -> None:
         print(f"old engine radar PCM sha256 {base_hash}")
         print(f"pcm bytes {(work / 'old.pcm').stat().st_size}")
         failures = 0
+
+        def mixer_writes(log: str) -> list[str]:
+            # Diagnostics are not mixer writes. Filter both sides alike: once the
+            # baseline is itself a profile-driven engine it logs them too.
+            return [l for l in log.splitlines() if not l.startswith(("profile rc", "lookup-missing"))]
+
+        base_writes = mixer_writes(base_log)
         for label, have_ctl, profile in (
             ("new, Radar profile, new kernel", 1, str(radar_profile)),
             ("new, Radar profile, old kernel", 0, str(radar_profile)),
             ("new, no profile (legacy image)", 0, ""),
         ):
             h, log = run(new, work, label.replace(" ", "_").replace(",", ""), have_ctl, profile)
-            writes = [l for l in log.splitlines() if not l.startswith(("profile rc", "lookup-missing"))]
-            base_writes = base_log.splitlines()
+            writes = mixer_writes(log)
             extra = [w for w in writes if w not in base_writes]
             missing = [w for w in base_writes if w not in writes]
             pcm_ok = h == base_hash
