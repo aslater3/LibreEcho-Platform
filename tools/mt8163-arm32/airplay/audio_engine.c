@@ -35,6 +35,7 @@
 #include "playback_status.h"
 #include "puffin_downmix.h"
 #include "speaker_dsp.h"
+#include "biscuit_speaker_dsp.h"
 
 #define DEFAULT_ROOT "/run/libreecho-audio"
 #define AIRPLAY_ACTIVE_FILE "airplay.active"
@@ -43,6 +44,14 @@
 #define AIRPLAY_RESET_FILE "airplay.reset"
 #define AIRPLAY_RESET_ACK_FILE "airplay.reset-ack"
 #define MASTER_VOLUME_FILE "master.volume"
+#define IMAGE_TARGET_FILE "/etc/libreecho/target"
+/* airplayd chroots the engine into the feature root, which does not carry
+ * the image identity; the host /proc is mounted there, so PID 1's root is. */
+#define IMAGE_TARGET_FILE_HOST "/proc/1/root/etc/libreecho/target"
+/* Per-target speaker policy rendered by the image build from the Platform
+ * target table (libreecho_platform_targets.py); same chroot rule applies. */
+#define AUDIO_PROFILE_FILE "/etc/libreecho/audio-profile"
+#define AUDIO_PROFILE_FILE_HOST "/proc/1/root/etc/libreecho/audio-profile"
 #define LED_SOCKET "/run/libreecho/led.sock"
 #define DEFAULT_CARD 0U
 #define DEFAULT_DEVICE 23U
@@ -140,6 +149,23 @@ static int set_single_control(struct mixer *mixer, const char *name, int value)
     return mixer_ctl_set_value(control, 0, value);
 }
 
+/*
+ * Per-target speaker policy.  The zero-argument defaults are Radar's, so a
+ * missing or rejected profile never changes Radar behaviour.
+ */
+struct speaker_profile {
+	int biscuit_chain;      /* 0 = radar_puffin chain, 1 = biscuit chain */
+	int codec_flat;         /* kernel "Speaker Codec Profile": 0 Radar, 1 Flat */
+	int hp_driver_gain;     /* codec "HP Driver Gain Volume" index */
+	float pre_gain;         /* linear, biscuit chain only */
+	float bass_makeup_db;   /* biscuit chain only */
+};
+
+static struct speaker_profile speaker_profile = {
+	.biscuit_chain = 0, .codec_flat = 0, .hp_driver_gain = 6,
+	.pre_gain = 1.0f, .bass_makeup_db = 0.0f,
+};
+
 /* Arm the output while keeping the codec muted.  This is used before a
  * stream exists, so enabling the physical amplifier cannot produce a pop. */
 static int arm_output_controls(unsigned int card)
@@ -170,8 +196,15 @@ static int arm_output_controls(unsigned int card)
         result = -1;
     if (set_single_control(mixer, "HPR Output Mixer IN1_R Switch", 0) < 0)
         result = -1;
-    if (set_stereo_control(mixer, "HP Driver Gain Volume", 6) < 0)
+    if (set_stereo_control(mixer, "HP Driver Gain Volume",
+                           speaker_profile.hp_driver_gain) < 0)
         result = -1;
+    /* Radar is the kernel default, so kernels without the control keep
+     * working; a Flat request on such a kernel is reported, not fatal. */
+    if (set_enum_control(mixer, "Speaker Codec Profile",
+                         speaker_profile.codec_flat ? "Flat" : "Radar") < 0 &&
+        speaker_profile.codec_flat)
+        fprintf(stderr, "audio-engine: Speaker Codec Profile Flat unavailable\n");
     mixer_close(mixer);
     return result;
 }
@@ -1020,6 +1053,182 @@ static int32_t mix_sources_frame(const struct source_bus *sources, size_t frame)
 	return mixed;
 }
 
+/*
+ * Speaker chain selection.  The Radar EQ/MBCL tuning is for Radar's woofer
+ * and codec crossover; the Echo Dot (biscuit) has one small driver and its own
+ * stock loudness EQ and MBCL, reproduced in biscuit_speaker_dsp.h.  The policy
+ * comes from /etc/libreecho/audio-profile, read once (the first existing file
+ * wins).  The profile must be complete and valid or it is rejected whole and
+ * Radar defaults stay.  Images that predate the profile fall back to the
+ * exact target_id=biscuit identity for the chain and flat codec only.
+ */
+static struct biscuit_dsp biscuit_storage;
+static struct biscuit_dsp *biscuit_chain;
+
+static int read_small_file(const char *path, char *text, size_t size)
+{
+	int fd, n;
+
+	fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0)
+		return errno == ENOENT || errno == ENOTDIR ? -1 : 0;
+	n = (int)read(fd, text, size - 1);
+	close(fd);
+	if (n <= 0 || (size_t)n >= size - 1)
+		return 0;
+	text[n] = '\0';
+	return 1;
+}
+
+static int image_target_is_biscuit(const char *path)
+{
+	char text[512], *line, *save = NULL;
+	int matches = 0, biscuit = 0, rc = read_small_file(path, text, sizeof(text));
+
+	if (rc <= 0)
+		return rc;
+	for (line = strtok_r(text, "\n", &save); line;
+	     line = strtok_r(NULL, "\n", &save)) {
+		if (strncmp(line, "target_id=", 10) != 0)
+			continue;
+		++matches;
+		biscuit = strcmp(line + 10, "biscuit") == 0;
+	}
+	return matches == 1 && biscuit;
+}
+
+static int parse_db(const char *text, float low, float high, float *out)
+{
+	char *end;
+	double value;
+
+	errno = 0;
+	value = strtod(text, &end);
+	if (errno || end == text || *end || !(value >= low && value <= high))
+		return -1;
+	*out = (float)value;
+	return 0;
+}
+
+/* Returns 1 parsed, -1 missing, 0 present but rejected. */
+static int load_audio_profile(const char *path, struct speaker_profile *out)
+{
+	enum { K_SCHEMA, K_TARGET, K_CHAIN, K_CODEC, K_GAIN, K_PRE, K_BASS, K_N };
+	static const char *const keys[K_N] = {
+		"schema", "target_id", "speaker_chain", "codec_profile",
+		"hp_driver_gain", "pre_gain_db", "bass_makeup_db",
+	};
+	char text[1024], *line, *save = NULL;
+	int seen[K_N] = { 0 }, k, rc = read_small_file(path, text, sizeof(text));
+	struct speaker_profile p = speaker_profile;
+	float pre_db = 0.0f;
+
+	if (rc <= 0)
+		return rc;
+	for (line = strtok_r(text, "\n", &save); line;
+	     line = strtok_r(NULL, "\n", &save)) {
+		char *value = strchr(line, '=');
+		char *end;
+		long gain;
+
+		if (!value)
+			return 0;
+		*value++ = '\0';
+		for (k = 0; k < K_N && strcmp(line, keys[k]); ++k)
+			;
+		if (k == K_N || seen[k]++)
+			return 0;
+		switch (k) {
+		case K_SCHEMA:
+			if (strcmp(value, "1"))
+				return 0;
+			break;
+		case K_TARGET:
+			if (!*value)
+				return 0;
+			break;
+		case K_CHAIN:
+			if (!strcmp(value, "biscuit"))
+				p.biscuit_chain = 1;
+			else if (!strcmp(value, "radar_puffin"))
+				p.biscuit_chain = 0;
+			else
+				return 0;
+			break;
+		case K_CODEC:
+			if (!strcmp(value, "Flat"))
+				p.codec_flat = 1;
+			else if (!strcmp(value, "Radar"))
+				p.codec_flat = 0;
+			else
+				return 0;
+			break;
+		case K_GAIN:
+			errno = 0;
+			gain = strtol(value, &end, 10);
+			if (errno || end == value || *end || gain < 0 || gain > 35)
+				return 0;
+			p.hp_driver_gain = (int)gain;
+			break;
+		case K_PRE:
+			if (parse_db(value, 0.0f, 12.0f, &pre_db))
+				return 0;
+			break;
+		case K_BASS:
+			if (parse_db(value, 0.0f, 6.0f, &p.bass_makeup_db))
+				return 0;
+			break;
+		}
+	}
+	for (k = 0; k < K_N; ++k)
+		if (!seen[k])
+			return 0;
+	/* Digital gains belong to the biscuit chain; Radar's chain is fixed. */
+	if (!p.biscuit_chain && (pre_db != 0.0f || p.bass_makeup_db != 0.0f))
+		return 0;
+	p.pre_gain = powf(10.0f, pre_db / 20.0f);
+	*out = p;
+	return 1;
+}
+
+static void select_speaker_profile(void)
+{
+	int rc = load_audio_profile(AUDIO_PROFILE_FILE, &speaker_profile);
+
+	if (rc < 0)
+		rc = load_audio_profile(AUDIO_PROFILE_FILE_HOST, &speaker_profile);
+	if (rc == 0)
+		fprintf(stderr, "audio-engine: audio profile rejected; "
+			"using radar-puffin defaults\n");
+	if (rc < 0) {
+		int target = image_target_is_biscuit(IMAGE_TARGET_FILE);
+
+		if (target < 0)
+			target = image_target_is_biscuit(IMAGE_TARGET_FILE_HOST);
+		if (target > 0) {
+			speaker_profile.biscuit_chain = 1;
+			speaker_profile.codec_flat = 1;
+		}
+	}
+	if (speaker_profile.biscuit_chain)
+		biscuit_chain = &biscuit_storage;
+}
+
+static int16_t biscuit_render_s16(struct biscuit_dsp *dsp, int32_t mixed)
+{
+	/* The Dot chain has no OutputTrim; its own full-band limiter already
+	 * holds -0.1 dBFS, so only the S16 conversion guard remains.  The
+	 * profile pre-gain lifts the shared -12 dB volume cap for this chain
+	 * only, ahead of that limiter. */
+	float y = biscuit_dsp_process(dsp, (float)mixed * speaker_profile.pre_gain);
+
+	if (y > 32767.0f)
+		y = 32767.0f;
+	else if (y < -32767.0f)
+		y = -32767.0f;
+	return (int16_t)lrintf(y);
+}
+
 static void render_period(struct source_bus *sources, int16_t *output,
 			  struct puffin_dynamics *dynamics,
 			  struct speaker_dsp *speaker,
@@ -1034,8 +1243,12 @@ static void render_period(struct source_bus *sources, int16_t *output,
 		mixed = (int32_t)(((int64_t)mixed * *current_master_q15) >> 15);
 		/* All producer buses meet here: mono EQ, then multiband
 		 * protection, then the +3 dB trim and final PCM safety limiter. */
-		mixed = speaker_dsp_process(speaker, mixed);
-		rendered = puffin_render_mono(dynamics, mixed);
+		if (biscuit_chain) {
+			rendered = biscuit_render_s16(biscuit_chain, mixed);
+		} else {
+			mixed = speaker_dsp_process(speaker, mixed);
+			rendered = puffin_render_mono(dynamics, mixed);
+		}
 
 		output[frame * OUTPUT_CHANNELS] = rendered;
 		output[frame * OUTPUT_CHANNELS + 1] = rendered;
@@ -1159,6 +1372,11 @@ static int prepare_initial_period(struct source_bus *sources, const char *root,
 	}
 	puffin_dynamics_init(dynamics);
 	speaker_dsp_init(speaker, speaker_volume_percent(sources, master_volume));
+	if (biscuit_chain) {
+		biscuit_dsp_init(biscuit_chain,
+			speaker_volume_percent(sources, master_volume));
+		biscuit_dsp_configure(biscuit_chain, speaker_profile.bass_makeup_db);
+	}
 	*master_gain = logical_master_gain(master_volume);
 	render_period(sources, output, dynamics, speaker, *master_gain, master_gain);
 	if (activity_mask)
@@ -1241,6 +1459,14 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	output = malloc(bytes);
 	if (!output)
 		goto out;
+	select_speaker_profile();
+	fprintf(stderr, "audio-engine: speaker chain %s codec %s hp-gain %d "
+		"pre %.2f bass %+.1f dB\n",
+		biscuit_chain ? "biscuit" : "radar-puffin",
+		speaker_profile.codec_flat ? "Flat" : "Radar",
+		speaker_profile.hp_driver_gain,
+		(double)speaker_profile.pre_gain,
+		(double)speaker_profile.bass_makeup_db);
 	fprintf(stderr,
 		"audio-engine: ready (root=%s, input=S16_LE/48000/stereo, "
 		"output=S16_LE/48000/duplicated-stereo, PCM %u,%u)\n",
@@ -1356,6 +1582,9 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			int master = logical_master_volume(root);
 			speaker_dsp_set_volume(&speaker,
 				speaker_volume_percent(sources, master));
+			if (biscuit_chain)
+				biscuit_dsp_set_volume(biscuit_chain,
+					speaker_volume_percent(sources, master));
 			render_period(sources, output, &dynamics, &speaker,
 				logical_master_gain(master), &master_gain);
 			if (write_period(pcm, output, &reference,
