@@ -511,6 +511,80 @@ class SupervisorReadinessTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("rc=0 ready=yes", result.stdout)
             self.assertIn("mdns-supervisor-ready:", log_path.read_text())
+
+    @staticmethod
+    def _function(source: str, marker: str) -> str:
+        start = source.index(marker)
+        depth = 0
+        for offset, char in enumerate(source[start:], start):
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[start:offset + 1]
+        raise AssertionError(f"{marker!r} is unterminated")
+
+    def test_supervisor_path_prepares_chroot_device_nodes_first(self) -> None:
+        """dbus-daemon in the chroot needs /dev/null whichever owner starts it.
+
+        On hardware the UI supervisor path ran dbus-daemon in a runtime root
+        with no dev nodes ("Failed to open /dev/null"), so the supervisor never
+        became ready, the fallback pair ran instead and ESPHome discovery was
+        never published.
+        """
+        source = self.INIT.read_text()
+        start_body = self._function(source, "start() {\n")
+        self.assertIn("prepare_runtime", start_body)
+        self.assertLess(start_body.index("prepare_runtime"),
+                        start_body.index("start_supervisor"))
+        pair_body = self._function(source, "start_daemon_pair() {\n")
+        self.assertLess(pair_body.index("prepare_runtime"),
+                        pair_body.index("dbus-daemon"))
+
+    def test_prepare_runtime_creates_machine_id_and_bus_dirs(self) -> None:
+        busybox = shutil.which("busybox") or ""
+        if not busybox:
+            self.skipTest("busybox unavailable")
+        source = self.INIT.read_text()
+        function = self._function(source, "prepare_runtime() {\n")
+        with tempfile.TemporaryDirectory(prefix="le-mdns-prepare-") as tmp:
+            root = Path(tmp) / "root"
+            bindir = Path(tmp) / "bin"
+            bindir.mkdir()
+            # mknod needs privilege; record the requests instead.
+            calls = Path(tmp) / "mknod.calls"
+            fake = bindir / "bb"
+            fake.write_text(
+                "#!/bin/sh\n"
+                f"if [ \"$1\" = mknod ]; then shift; echo \"$*\" >> {shlex.quote(str(calls))}; : > \"$1\"; exit 0; fi\n"
+                f"exec {shlex.quote(busybox)} \"$@\"\n"
+            )
+            fake.chmod(0o755)
+            harness = Path(tmp) / "harness.sh"
+            harness.write_text("\n".join([
+                "#!/bin/sh",
+                "set -u",
+                f"BB={shlex.quote(str(fake))}",
+                f"RUNTIME_ROOT={shlex.quote(str(root))}",
+                'BUS_DIR=$RUNTIME_ROOT/run/dbus',
+                'SERVICES_DIR=$RUNTIME_ROOT/run/services',
+                'STATE_ROOT=$RUNTIME_ROOT/var/lib/dbus',
+                'MACHINE_ID=$STATE_ROOT/machine-id',
+                function,
+                "prepare_runtime",
+                'echo "rc=$?"',
+                "",
+            ]))
+            result = subprocess.run([busybox, "sh", str(harness)], text=True,
+                                    capture_output=True, timeout=10)
+            self.assertIn("rc=0", result.stdout, result.stderr)
+            self.assertTrue((root / "run/dbus").is_dir())
+            self.assertTrue((root / "var/lib/dbus/machine-id").read_text().strip())
+            requested = calls.read_text().split("\n")
+            for node in ("null c 1 3", "random c 1 8", "urandom c 1 9"):
+                self.assertTrue(any(line.endswith(node) for line in requested), node)
+
     def test_unready_supervisor_is_stopped_before_fallback(self) -> None:
         busybox = shutil.which("busybox") or ""
         if not busybox:
