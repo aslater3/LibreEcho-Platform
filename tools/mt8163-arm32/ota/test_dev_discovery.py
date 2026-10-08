@@ -65,13 +65,72 @@ printf '%s\\n' "$url" "${DEV_RELEASE_TAG:-}" "${DEV_OTA_SHA256:-}"
         self.assertIn('/download/'+TAG+'/libreecho-'+TAG+'.ota.tar',result.stdout)
 
     def test_discovery_namespace_follows_image_target(self):
+        # Product publishes one combined radar-puffin-* release for every
+        # target; each target reads its own pointer and fetches its own asset.
+        build_id = TAG.removeprefix('radar-puffin-')
         for target, slug in (('radar_puffin', 'radar-puffin'), ('biscuit', 'biscuit')):
-            tag = TAG.replace('radar-puffin', slug)
-            result = self.run_resolver((tag + '\n' + SHA256 + '\n').encode(), target=target)
+            result = self.run_resolver((TAG + '\n' + SHA256 + '\n').encode(), target=target)
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             self.assertIn(f'/download/{slug}-dev-channel/release-pointer-v3.txt', result.stderr)
-            self.assertIn('/download/' + tag + '/libreecho-' + tag + '.ota.tar', result.stdout)
-        self.assertNotEqual(self.run_resolver((TAG + '\n' + SHA256 + '\n').encode(), target='biscuit').returncode, 0)
+            self.assertIn(f'/download/{TAG}/libreecho-{slug}-{build_id}.ota.tar', result.stdout)
+            self.assertIn(TAG, result.stdout.splitlines())
+        # No per-target release tag namespace exists, so none is accepted.
+        biscuit_tag = TAG.replace('radar-puffin', 'biscuit')
+        for target in ('radar_puffin', 'biscuit'):
+            result = self.run_resolver((biscuit_tag + '\n' + SHA256 + '\n').encode(), target=target)
+            self.assertNotEqual(result.returncode, 0, target)
+            self.assertNotIn('/download/', result.stdout)
+
+    def test_pointer_read_does_not_release_the_callers_locks(self):
+        """The real bounded_curl installs cleanup_locks as an EXIT trap inside
+        the pointer-read subshell; the caller's locks must survive it."""
+        locks = (source_region('cleanup_locks()\n', '\nfetch_lock()')
+                 + source_region('install_lock()\n', '\ndownloader_stderr()'))
+        function = SOURCE.read_text().split('resolve_dev_release()\n', 1)[1].split('\nset_channel()', 1)[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root/'fixture').write_bytes((TAG + '\n' + SHA256 + '\n').encode())
+            (root/'target').write_text('target_id=biscuit\n')
+            script = '''
+BB="$TEST_BB"
+ROOT="$TEST_ROOT"
+LOCK="$ROOT/fetch.lock"
+INSTALL_LOCK="$ROOT/install.lock"
+CURL_HEADERS="$ROOT/headers"
+CURL_STDERR="$ROOT/stderr"
+TARGET_FILE="$ROOT/target"
+channel=dev
+FETCH_LOCK_HELD=0
+INSTALL_LOCK_HELD=0
+cleanup_download_artifacts() { :; }
+bounded_curl() {
+    trap cleanup_locks EXIT
+    cp "$ROOT/fixture" "$1"
+    STREAM_SIZE=$(wc -c < "$1")
+    STREAM_CURL_RC=0
+}
+downloader_stderr() { :; }
+parse_response_headers() { RESPONSE_HTTP_CODE=200; RESPONSE_RANGE_KIND=none; }
+die() { printf 'ERROR:%s\\n' "$1"; exit 1; }
+curl_failure() { die transport; }
+''' + locks + '''
+mkdir "$LOCK" && FETCH_LOCK_HELD=1
+trap cleanup_locks EXIT
+install_lock
+resolve_dev_release()
+''' + function + '''
+resolve_dev_release || exit 1
+[ -d "$LOCK" ] || die fetch_lock_lost
+[ -d "$INSTALL_LOCK" ] || die install_lock_lost
+install_unlock
+[ ! -e "$INSTALL_LOCK" ] || die install_lock_kept
+printf 'OK %s\\n' "$DEV_RELEASE_TAG"
+'''
+            env = os.environ | dict(TEST_ROOT=tmp, TEST_BB=BUSYBOX)
+            result = subprocess.run(['sh', '-c', script], env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn('OK ' + TAG, result.stdout)
+            self.assertFalse((root/'fetch.lock').exists(), 'caller EXIT trap must still release its lock')
 
     def test_stable_does_not_fetch_pointer(self):
         result=self.run_resolver(b'invalid','stable')
