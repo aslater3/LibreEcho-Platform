@@ -254,11 +254,17 @@ resolve_dev_release()
     DEV_RELEASE_TAG=
     DEV_OTA_SHA256=
     [ "$channel" = dev ] || return 0
-    # bounded_curl owns a download-only EXIT trap; isolate it from lock cleanup.
-    pointer_identity=$(read_dev_release_pointer) || return 1
+    # bounded_curl installs cleanup_locks as the EXIT trap, and that trap runs
+    # when the command-substitution subshell exits.  The subshell inherits the
+    # held-lock flags, so clear them there: the locks belong to this process
+    # and only this process may release them.
+    pointer_identity=$(FETCH_LOCK_HELD=0; INSTALL_LOCK_HELD=0; read_dev_release_pointer) || return 1
     DEV_RELEASE_TAG=$(printf '%s\n' "$pointer_identity" | $BB sed -n '1p')
     DEV_OTA_SHA256=$(printf '%s\n' "$pointer_identity" | $BB sed -n '2p')
-    url="https://github.com/aslater3/LibreEcho/releases/download/$DEV_RELEASE_TAG/libreecho-$DEV_RELEASE_TAG.ota.tar"
+    # Product releases are combined: one radar-puffin-* tag carries every
+    # target, and each target's assets are named libreecho-<slug>-<build id>.
+    load_fetch_target
+    url="https://github.com/aslater3/LibreEcho/releases/download/$DEV_RELEASE_TAG/libreecho-$TARGET_SLUG-${DEV_RELEASE_TAG#radar-puffin-}.ota.tar"
 }
 
 load_fetch_target()
@@ -285,7 +291,7 @@ read_dev_release_pointer()
         [ "$STREAM_SIZE" -gt 0 ] && [ "$STREAM_SIZE" -le 256 ] || die dev_discovery_size
     DEV_RELEASE_TAG=$($BB sed -n '1p' "$pointer")
     DEV_OTA_SHA256=$($BB sed -n '2p' "$pointer")
-    printf '%s\n' "$DEV_RELEASE_TAG" | $BB grep -Eq "^$TARGET_SLUG-(build|nightly)-[a-f0-9]{7}-[a-f0-9]{16}-[a-f0-9]{16}$" || die dev_discovery_tag
+    printf '%s\n' "$DEV_RELEASE_TAG" | $BB grep -Eq '^radar-puffin-(build|nightly)-[a-f0-9]{7}-[a-f0-9]{16}-[a-f0-9]{16}$' || die dev_discovery_tag
     printf '%s\n' "$DEV_OTA_SHA256" | $BB grep -Eq '^[a-f0-9]{64}$' || die dev_discovery_hash
     [ "$(printf '%s\n%s\n' "$DEV_RELEASE_TAG" "$DEV_OTA_SHA256" | $BB wc -c)" -eq "$STREAM_SIZE" ] || die dev_discovery_format
     $BB rm -f "$pointer" "$CURL_HEADERS" "$CURL_STDERR"
