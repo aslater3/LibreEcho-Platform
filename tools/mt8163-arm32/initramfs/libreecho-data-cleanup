@@ -311,7 +311,11 @@ check_children "$DATA_ROOT/libreecho/update" \
     automatic-updates install.lock bootctl.confirm bootctl.confirmed feature-commit committed-manifest committed-manifest.sig restart-record first-install.pending \
     first-install.confirmed \
     current previous generation.lock asset-cache fetch.lock \
-    config-status features-status transaction-slot
+    config-status features-status transaction-slot \
+    ping-last-week ping-last-month ping-last-year ping-next-payload ping-status \
+    ping-install-counted \
+    ping-last-week.tmp ping-last-month.tmp ping-last-year.tmp ping-next-payload.tmp ping-status.tmp \
+    ping-install-counted.tmp
 TOLERATE_UNKNOWN_FILES=0
 
 if [ -d "$DATA_ROOT/libreecho/features" ]; then

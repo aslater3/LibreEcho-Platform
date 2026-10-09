@@ -75,7 +75,7 @@ class ActiveDevicePingTests(unittest.TestCase):
         return body, args
 
     def state(self, name: str) -> str:
-        path = self.tmp / "state" / name
+        path = self.tmp / "state" / f"ping-{name}"
         return path.read_text().strip() if path.exists() else ""
 
     def test_dev_payload_is_exact_and_anonymous(self) -> None:
@@ -125,8 +125,8 @@ class ActiveDevicePingTests(unittest.TestCase):
         for code in ("000", "500", "404", "429"):
             self.set_http(code)
             self.assertEqual(self.run_ping("run").returncode, 1, code)
-            self.assertFalse((self.tmp / "state/last-week").exists(), code)
-            self.assertIn("result=failed", (self.tmp / "state/status").read_text())
+            self.assertFalse((self.tmp / "state/ping-last-week").exists(), code)
+            self.assertIn("result=failed", (self.tmp / "state/ping-status").read_text())
         self.set_http("204")
         self.run_ping("run")
         body, _ = self.sent()
@@ -138,7 +138,7 @@ class ActiveDevicePingTests(unittest.TestCase):
         self.set_http("400")
         self.assertEqual(self.run_ping("run").returncode, 0)
         self.assertEqual(self.state("last-week"), "")
-        self.assertIn("result=rejected", (self.tmp / "state/status").read_text())
+        self.assertIn("result=rejected", (self.tmp / "state/ping-status").read_text())
         self.set_http("204")
         self.run_ping("run")
         body, _ = self.sent()
@@ -174,7 +174,7 @@ class ActiveDevicePingTests(unittest.TestCase):
         # still owes one install count: it is sent alone, with w/m/y all 0.
         state = self.tmp / "state"
         state.mkdir()
-        for name, value in (("last-week", "2026-W41"), ("last-month", "2026-10"), ("last-year", "2026")):
+        for name, value in (("ping-last-week", "2026-W41"), ("ping-last-month", "2026-10"), ("ping-last-year", "2026")):
             (state / name).write_text(value + "\n")
         self.assertEqual(self.run_ping("run").returncode, 0)
         body, _ = self.sent()
@@ -187,6 +187,7 @@ class ActiveDevicePingTests(unittest.TestCase):
         self.run_ping("run")
         self.sent()
         shutil.rmtree(self.tmp / "state")      # what a /data wipe does
+        (self.tmp / "state").mkdir()
         self.run_ping("run", "2026-10-20 08:00:00")
         body, _ = self.sent()
         self.assertEqual(body["i"], 1)

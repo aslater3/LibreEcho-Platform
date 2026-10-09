@@ -9,13 +9,19 @@
 # MAC, hostname, install date or timestamp.  Every device on the same
 # hardware/version/channel/build sends a byte-identical body in a given period.
 #
-# The device de-duplicates itself: persistent markers under
-# /data/libreecho/telemetry record the last period that was counted, and are
-# only advanced after the server answers 204.  This helper is independent of the OTA updater; a ping failure never
-# touches update state, and it never blocks boot.
+# The device de-duplicates itself: persistent markers
+# /data/libreecho/update/ping-last-{week,month,year} record the last period
+# that was counted, and are only advanced after the server answers 204.
+#
+# The state lives as plain files directly under update/ on purpose: the boot
+# data contract (libreecho-data-cleanup) rejects any unknown directory under
+# /data/libreecho and blocks the whole service graph, but tolerates unknown
+# regular files in update/.  A new directory would brick networking on any
+# older slot after a rollback.  This helper is independent of the OTA updater;
+# a ping failure never touches update state, and it never blocks boot.
 #
 # The first ping ever accepted from this install also carries "i":1, so the
-# server can estimate installs ever.  The `install-counted` marker lives on
+# server can estimate installs ever.  The `ping-install-counted` marker lives on
 # /data, so it survives OTA updates and is cleared only by a factory reset
 # (which is then counted again; the published figure is an estimate).  No
 # install date or identifier is stored or sent.
@@ -29,7 +35,7 @@
 BB=${BB:-/bin/busybox}
 URL=${LIBREECHO_PING_URL:-https://stats.libreecho.org/v1/ping}
 USER_AGENT=libreecho-ping/1
-STATE=${LIBREECHO_PING_STATE:-/data/libreecho/telemetry}
+STATE=${LIBREECHO_PING_STATE:-/data/libreecho/update}
 TARGET_FILE=${LIBREECHO_PING_TARGET:-/etc/libreecho/target}
 INSTALLED=${LIBREECHO_PING_INSTALLED:-/data/libreecho/update/installed}
 UPDATE_ROOT=${LIBREECHO_PING_UPDATE_ROOT:-/data/libreecho/update}
@@ -134,10 +140,10 @@ compose()
     MO=$(utc +%Y-%m)
     YR=$(utc +%Y)
     W=0; M=0; Y=0; I=0
-    [ "$($BB cat "$STATE/last-week" 2>/dev/null)" = "$WK" ] || W=1
-    [ "$($BB cat "$STATE/last-month" 2>/dev/null)" = "$MO" ] || M=1
-    [ "$($BB cat "$STATE/last-year" 2>/dev/null)" = "$YR" ] || Y=1
-    [ -e "$STATE/install-counted" ] || I=1
+    [ "$($BB cat "$STATE/ping-last-week" 2>/dev/null)" = "$WK" ] || W=1
+    [ "$($BB cat "$STATE/ping-last-month" 2>/dev/null)" = "$MO" ] || M=1
+    [ "$($BB cat "$STATE/ping-last-year" 2>/dev/null)" = "$YR" ] || Y=1
+    [ -e "$STATE/ping-install-counted" ] || I=1
     # "i" is only present while it is 1, so a counted install sends exactly
     # the same bytes as every other device on its hardware/version/period.
     I_FIELD=
@@ -150,7 +156,7 @@ compose()
 record()
 {
     # record RESULT [HTTP]: the UI's "last ping" panel reads this file.
-    atomic_write "$STATE/status" "schema=1
+    atomic_write "$STATE/ping-status" "schema=1
 result=$1
 http=${2:-}
 period=$WK
@@ -159,10 +165,10 @@ payload=$PAYLOAD"
 
 advance_markers()
 {
-    if [ "$W" = 1 ]; then atomic_write "$STATE/last-week" "$WK"; fi
-    if [ "$M" = 1 ]; then atomic_write "$STATE/last-month" "$MO"; fi
-    if [ "$Y" = 1 ]; then atomic_write "$STATE/last-year" "$YR"; fi
-    if [ "$I" = 1 ]; then atomic_write "$STATE/install-counted" 1; fi
+    if [ "$W" = 1 ]; then atomic_write "$STATE/ping-last-week" "$WK"; fi
+    if [ "$M" = 1 ]; then atomic_write "$STATE/ping-last-month" "$MO"; fi
+    if [ "$Y" = 1 ]; then atomic_write "$STATE/ping-last-year" "$YR"; fi
+    if [ "$I" = 1 ]; then atomic_write "$STATE/ping-install-counted" 1; fi
     $BB sync 2>/dev/null || :
 }
 
@@ -173,7 +179,7 @@ run_once()
     rc=$?
     # Keep the "next payload" preview current for the Privacy page even when
     # nothing is due, so the user always sees the exact bytes.
-    [ -n "${PAYLOAD:-}" ] && atomic_write "$STATE/next-payload" "$PAYLOAD"
+    [ -n "${PAYLOAD:-}" ] && atomic_write "$STATE/ping-next-payload" "$PAYLOAD"
     case $rc in
         1) log "skipped: $REASON"; return 1 ;;
         2) return 0 ;;
