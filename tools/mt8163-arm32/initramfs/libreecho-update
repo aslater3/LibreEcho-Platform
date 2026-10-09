@@ -514,6 +514,26 @@ install_package()
     echo "UPDATE_READY slot=$target version=$version"
 }
 
+# The installer's check record ends at `reboot-pending`, which the web UI shows
+# as "Ready to restart".  Once the candidate is confirmed that is no longer
+# true: the device is running the release that check resolved.  Relabel only
+# that exact record, keeping its release identity, so the UI reports the
+# confirmed install as current instead of asking for a restart that already
+# happened.  Best effort: the slot is already confirmed, and the next check
+# rewrites the record whole anyway.
+publish_confirmed_check_status()
+{
+    check=$UPDATE_ROOT/check-status
+    [ "$($BB sed -n 's/^status=//p' "$check" 2>/dev/null)" = reboot-pending ] || return 0
+    if $BB sed 's/^status=reboot-pending$/status=up-to-date/' "$check" > "$check.confirm.tmp" &&
+       $BB mv "$check.confirm.tmp" "$check"; then
+        $BB sync
+        return 0
+    fi
+    $BB rm -f "$check.confirm.tmp"
+    return 0
+}
+
 confirm_pending()
 {
     require_userdata
@@ -527,6 +547,7 @@ confirm_pending()
         "$BOOTCTL" confirm "$slot" > "$UPDATE_ROOT/bootctl.confirm" || die boot_control_confirm
         ROOT="$UPDATE_ROOT" "$FEATURE_TRANSACTION" commit || die generation_commit_pending
         state_write installed 100 "$slot"
+        publish_confirmed_check_status
         echo "UPDATE_CONFIRMED slot=$slot"
         return 0
     fi
