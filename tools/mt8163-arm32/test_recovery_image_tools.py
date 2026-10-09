@@ -4258,6 +4258,58 @@ start_feature_service_if_enabled
             self.assertEqual(channel.read_text(), "stable\\n")
             self.assertIn("DATA_CLEANUP_OK", result.stdout)
 
+    def test_data_contract_accepts_real_ping_state(self) -> None:
+        # Hardware regression: the first ping build kept its markers in a new
+        # /data/libreecho/telemetry/ directory.  The boot data contract rejects
+        # unknown directories, so the next boot blocked every service, the OTA
+        # health check failed and both boards rolled back.  Run the real sender
+        # against the real default state path and the real contract.
+        busybox = shutil.which("busybox")
+        if not busybox:
+            self.skipTest("busybox is not installed")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data = root / "data"
+            (data / "libreecho/update").mkdir(parents=True)
+            (root / "target").write_text("target_id=biscuit\n")
+            (root / "installed").write_text("schema=3\nversion=0.14.0\nupdate_channel=stable\n")
+            (root / "time.status").write_text("synchronized=1\n")
+            (root / "ca.pem").write_text("x\n")
+            curl = root / "curl"
+            curl.write_text("#!/bin/sh\nprintf 204\n")
+            curl.chmod(0o755)
+            sender = TOOLS_DIR / "initramfs/libreecho-ping"
+            default_state = re.search(r"^STATE=\$\{LIBREECHO_PING_STATE:-(/data/[^}]+)\}$",
+                                      sender.read_text(), re.M)
+            self.assertIsNotNone(default_state)
+            assert default_state is not None
+            state = data / default_state.group(1).removeprefix("/data/")
+            ping = subprocess.run(
+                [busybox, "sh", str(sender), "run"],
+                env={"PATH": os.environ["PATH"], "BB": busybox,
+                     "LIBREECHO_PING_STATE": str(state),
+                     "LIBREECHO_PING_TARGET": str(root / "target"),
+                     "LIBREECHO_PING_INSTALLED": str(root / "installed"),
+                     "LIBREECHO_PING_UPDATE_ROOT": str(root / "none"),
+                     "LIBREECHO_PING_GENERATIONS": str(root / "none"),
+                     "LIBREECHO_PING_CHANNEL_FILE": str(root / "none"),
+                     "LIBREECHO_TIME_STATUS": str(root / "time.status"),
+                     "LIBREECHO_PING_CURL": str(curl),
+                     "LIBREECHO_PING_CA": str(root / "ca.pem"),
+                     "LIBREECHO_PING_NOW": "2026-10-09 12:00:00"},
+                text=True, capture_output=True, timeout=30)
+            self.assertEqual(ping.returncode, 0, ping.stdout + ping.stderr)
+            written = sorted(p.name for p in state.iterdir() if p.name.startswith("ping-"))
+            self.assertIn("ping-last-week", written)
+            # Leftover temp files from a power cut must not break boot either.
+            for name in written:
+                (state / f"{name}.tmp").write_text("x\n")
+            result = self._run_cleanup(data)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("DATA_CLEANUP_OK", result.stdout)
+            self.assertNotIn("DATA_CLEANUP_UNKNOWN", result.stderr)
+            self.assertNotIn("DATA_CLEANUP_TOLERATED", result.stderr)
+
     def _run_cleanup(self, data: Path):
         return subprocess.run(
             ["/bin/sh", str(TOOLS_DIR / "initramfs/libreecho-data-cleanup")],
