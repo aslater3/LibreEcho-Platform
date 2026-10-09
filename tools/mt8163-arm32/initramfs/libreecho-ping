@@ -20,6 +20,12 @@
 # older slot after a rollback.  This helper is independent of the OTA updater;
 # a ping failure never touches update state, and it never blocks boot.
 #
+# The first ping ever accepted from this install also carries "i":1, so the
+# server can estimate installs ever.  The `ping-install-counted` marker lives on
+# /data, so it survives OTA updates and is cleared only by a factory reset
+# (which is then counted again; the published figure is an estimate).  No
+# install date or identifier is stored or sent.
+#
 #   libreecho-ping payload   print the body the next attempt would send
 #   libreecho-ping run       one attempt now (exit 0 sent/nothing-due, 1 failed)
 #   libreecho-ping loop      background scheduler started by libreecho-init
@@ -133,12 +139,17 @@ compose()
     WK=$(utc +%G-W%V)
     MO=$(utc +%Y-%m)
     YR=$(utc +%Y)
-    W=0; M=0; Y=0
+    W=0; M=0; Y=0; I=0
     [ "$($BB cat "$STATE/ping-last-week" 2>/dev/null)" = "$WK" ] || W=1
     [ "$($BB cat "$STATE/ping-last-month" 2>/dev/null)" = "$MO" ] || M=1
     [ "$($BB cat "$STATE/ping-last-year" 2>/dev/null)" = "$YR" ] || Y=1
-    PAYLOAD="{\"v\":1,\"hw\":\"$HW\",\"ver\":\"$VER\",\"ch\":\"$CH\"$BUILD_FIELD,\"wk\":\"$WK\",\"mo\":\"$MO\",\"yr\":\"$YR\",\"w\":$W,\"m\":$M,\"y\":$Y}"
-    [ "$W$M$Y" != 000 ] || { REASON=already-counted; return 2; }
+    [ -e "$STATE/ping-install-counted" ] || I=1
+    # "i" is only present while it is 1, so a counted install sends exactly
+    # the same bytes as every other device on its hardware/version/period.
+    I_FIELD=
+    [ "$I" = 0 ] || I_FIELD=',"i":1'
+    PAYLOAD="{\"v\":1,\"hw\":\"$HW\",\"ver\":\"$VER\",\"ch\":\"$CH\"$BUILD_FIELD,\"wk\":\"$WK\",\"mo\":\"$MO\",\"yr\":\"$YR\",\"w\":$W,\"m\":$M,\"y\":$Y$I_FIELD}"
+    [ "$W$M$Y$I" != 0000 ] || { REASON=already-counted; return 2; }
     return 0
 }
 
@@ -157,6 +168,7 @@ advance_markers()
     if [ "$W" = 1 ]; then atomic_write "$STATE/ping-last-week" "$WK"; fi
     if [ "$M" = 1 ]; then atomic_write "$STATE/ping-last-month" "$MO"; fi
     if [ "$Y" = 1 ]; then atomic_write "$STATE/ping-last-year" "$YR"; fi
+    if [ "$I" = 1 ]; then atomic_write "$STATE/ping-install-counted" 1; fi
     $BB sync 2>/dev/null || :
 }
 
@@ -186,7 +198,7 @@ run_once()
         204)
             advance_markers
             record sent "$code"
-            log "counted $WK w=$W m=$M y=$Y"
+            log "counted $WK w=$W m=$M y=$Y i=$I"
             return 0
             ;;
         400)

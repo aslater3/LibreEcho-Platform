@@ -4301,6 +4301,7 @@ start_feature_service_if_enabled
             self.assertEqual(ping.returncode, 0, ping.stdout + ping.stderr)
             written = sorted(p.name for p in state.iterdir() if p.name.startswith("ping-"))
             self.assertIn("ping-last-week", written)
+            self.assertIn("ping-install-counted", written)
             # Leftover temp files from a power cut must not break boot either.
             for name in written:
                 (state / f"{name}.tmp").write_text("x\n")

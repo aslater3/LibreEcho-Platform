@@ -82,7 +82,7 @@ class ActiveDevicePingTests(unittest.TestCase):
         self.assertEqual(self.run_ping("run").returncode, 0)
         body, args = self.sent()
         self.assertEqual(body, {"v": 1, "hw": "radar", "ver": "0.14.0", "ch": "dev", "build": "cc238ba",
-                                "wk": "2026-W41", "mo": "2026-10", "yr": "2026", "w": 1, "m": 1, "y": 1})
+                                "wk": "2026-W41", "mo": "2026-10", "yr": "2026", "w": 1, "m": 1, "y": 1, "i": 1})
         self.assertFalse(FORBIDDEN_KEYS & set(body))
         self.assertEqual(args[args.index("-A") + 1], "libreecho-ping/1")
         self.assertIn("Content-Type: application/json", args)
@@ -106,10 +106,11 @@ class ActiveDevicePingTests(unittest.TestCase):
         # Same week: nothing is sent at all.
         self.assertEqual(self.run_ping("run", "2026-10-11 23:00:00").returncode, 0)
         self.assertFalse(self.curl_log.exists())
-        # Next week, same month and year: only w.
+        # Next week, same month and year: only w (the install was already counted).
         self.run_ping("run", "2026-10-12 08:00:00")
         body, _ = self.sent()
         self.assertEqual((body["wk"], body["w"], body["m"], body["y"]), ("2026-W42", 1, 0, 0))
+        self.assertNotIn("i", body)
 
     def test_month_rollover_inside_a_counted_week(self) -> None:
         # Tue 29 Sep 2026 is W40; Thu 1 Oct is still W40 but a new month.
@@ -118,6 +119,7 @@ class ActiveDevicePingTests(unittest.TestCase):
         self.run_ping("run", "2026-10-01 10:00:00")
         body, _ = self.sent()
         self.assertEqual((body["wk"], body["mo"], body["w"], body["m"], body["y"]), ("2026-W40", "2026-10", 0, 1, 0))
+        self.assertNotIn("i", body)
 
     def test_failure_does_not_advance_markers(self) -> None:
         for code in ("000", "500", "404", "429"):
@@ -142,6 +144,53 @@ class ActiveDevicePingTests(unittest.TestCase):
         body, _ = self.sent()
         self.assertEqual((body["w"], body["m"], body["y"]), (1, 1, 1))
         self.assertEqual(self.state("last-week"), "2026-W41")
+
+    def test_install_is_counted_exactly_once(self) -> None:
+        self.assertEqual(self.run_ping("run").returncode, 0)
+        body, _ = self.sent()
+        self.assertEqual(body["i"], 1)
+        self.assertEqual(self.state("install-counted"), "1")
+        # Every later period omits "i" entirely, so counted installs send the
+        # same bytes as any other device on that hardware/version/period.
+        for when in ("2026-10-19 08:00:00", "2026-11-02 08:00:00", "2027-01-05 08:00:00"):
+            self.run_ping("run", when)
+            body, _ = self.sent()
+            self.assertNotIn("i", body, when)
+
+    def test_install_flag_survives_failures_and_rejection(self) -> None:
+        # Neither a transport failure nor a 400 may consume the install count.
+        for code in ("000", "500", "400"):
+            self.set_http(code)
+            self.run_ping("run")
+            self.assertEqual(self.state("install-counted"), "", code)
+        self.set_http("204")
+        self.run_ping("run")
+        body, _ = self.sent()
+        self.assertEqual(body["i"], 1)
+        self.assertEqual(self.state("install-counted"), "1")
+
+    def test_existing_device_is_counted_as_install_once(self) -> None:
+        # A device that already reported this week on a sender without "i"
+        # still owes one install count: it is sent alone, with w/m/y all 0.
+        state = self.tmp / "state"
+        state.mkdir()
+        for name, value in (("ping-last-week", "2026-W41"), ("ping-last-month", "2026-10"), ("ping-last-year", "2026")):
+            (state / name).write_text(value + "\n")
+        self.assertEqual(self.run_ping("run").returncode, 0)
+        body, _ = self.sent()
+        self.assertEqual((body["w"], body["m"], body["y"], body["i"]), (0, 0, 0, 1))
+        # Afterwards nothing is due until the next week.
+        self.run_ping("run", "2026-10-11 23:00:00")
+        self.assertFalse(self.curl_log.exists())
+
+    def test_factory_reset_counts_install_again(self) -> None:
+        self.run_ping("run")
+        self.sent()
+        shutil.rmtree(self.tmp / "state")      # what a /data wipe does
+        (self.tmp / "state").mkdir()
+        self.run_ping("run", "2026-10-20 08:00:00")
+        body, _ = self.sent()
+        self.assertEqual(body["i"], 1)
 
     def test_unsynchronised_clock_sends_nothing(self) -> None:
         env_time = self.tmp / "time.status"
