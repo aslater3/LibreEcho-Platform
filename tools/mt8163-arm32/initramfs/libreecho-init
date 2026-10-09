@@ -3074,6 +3074,13 @@ ota_health_confirm_worker()
 if [ "$IMAGE_PROFILE" = ota ]; then
     ota_health_confirm_worker &
     log ota-background-worker-started
+    # Anonymous weekly active-device count (telemetry Tier 0).  Independent of
+    # the updater and never blocks boot: the sender sleeps 5-30 minutes before
+    # its first attempt and only sends once the clock is NTP-synchronised.
+    if [ -x /usr/local/sbin/libreecho-ping ]; then
+        /usr/local/sbin/libreecho-ping loop >/dev/null 2>&1 &
+        log active-device-ping-started
+    fi
 else
     log ota-background-workers-disabled-for-non-ota-profile
 fi
