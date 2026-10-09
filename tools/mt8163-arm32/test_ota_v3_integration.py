@@ -217,6 +217,55 @@ class UpdaterTests(grammar.SignedFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls.read_text().splitlines(), ['transaction:verify-running', 'bootctl:confirm:b', 'transaction:commit'])
 
+    def confirm_with_check_status(self, check_text, transaction_rc=0):
+        self.control_file('pending').write_text('schema=3\nslot=b\ntransaction_id=test-target\nmanifest_sha256=' + 'a' * 64 + '\n')
+        check = self.control_file('check-status')
+        if check_text is not None:
+            check.write_text(check_text)
+        helper = self.root / 'transaction'
+        helper.write_text('#!/bin/sh\n[ "$1" = commit ] && exit %d\nexit 0\n' % transaction_rc)
+        helper.chmod(0o755)
+        bootctl = self.root / 'bootctl'
+        bootctl.write_text('#!/bin/sh\nexit 0\n')
+        bootctl.chmod(0o755)
+        script = self.script('target_device_for_slot() { :; }\nconfirm_pending')
+        script.write_text(script.read_text().replace('FEATURE_TRANSACTION=/usr/local/sbin/libreecho-feature-transaction', 'FEATURE_TRANSACTION=' + str(helper)).replace('BOOTCTL=/usr/local/sbin/libreecho-bootctl', 'BOOTCTL=' + str(bootctl)))
+        return subprocess.run(['/bin/busybox', 'sh', str(script)], env=self.env, capture_output=True, text=True), check
+
+    CHECK_RECORD = ('schema=1\nsource=github-releases\nchannel=dev\nstatus={}\nsource_reachable=true\n'
+                    'latest_version=0.14.0\nlast_check_epoch=100\nlast_success_epoch=100\nerror=\n'
+                    'resolved_release_tag=radar-puffin-build-cc238ba-' + 'a' * 16 + '-' + 'b' * 16 + '\n'
+                    'ota_sha256=' + 'c' * 64 + '\n')
+
+    def test_confirm_relabels_reboot_pending_check_record_as_up_to_date(self):
+        # After a confirmed install the web UI must stop showing "Ready to
+        # restart": the restart already happened.  The release identity the
+        # check resolved is kept, so the UI still names the running release.
+        result, check = self.confirm_with_check_status(self.CHECK_RECORD.format('reboot-pending'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('UPDATE_CONFIRMED slot=b', result.stdout)
+        self.assertEqual(check.read_text(), self.CHECK_RECORD.format('up-to-date'))
+        self.assertFalse((self.update / 'check-status.confirm.tmp').exists())
+
+    def test_confirm_leaves_other_check_records_alone(self):
+        # A newer check result (another update found, an error) is not the
+        # installer's record and must survive the confirmation untouched.
+        for status in ('update-available', 'error', 'up-to-date', 'update-held-after-rollback'):
+            result, check = self.confirm_with_check_status(self.CHECK_RECORD.format(status))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(check.read_text(), self.CHECK_RECORD.format(status), status)
+
+    def test_confirm_without_check_record_does_not_create_one(self):
+        result, check = self.confirm_with_check_status(None)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(check.exists())
+
+    def test_failed_confirm_keeps_reboot_pending_check_record(self):
+        # The record is only relabelled once the candidate is really confirmed.
+        result, check = self.confirm_with_check_status(self.CHECK_RECORD.format('reboot-pending'), transaction_rc=1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(check.read_text(), self.CHECK_RECORD.format('reboot-pending'))
+
     def control_file(self, name):
         return self.update / name
 
