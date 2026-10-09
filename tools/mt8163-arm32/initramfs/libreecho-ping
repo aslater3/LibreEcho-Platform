@@ -1,0 +1,235 @@
+#!/bin/busybox sh
+# LibreEcho anonymous active-device ping (telemetry Tier 0).
+#
+# Once per UTC ISO week / calendar month / calendar year the device sends one
+# small JSON document to stats.libreecho.org so the project can count how many
+# devices are running and on which version.  The payload contains only the
+# hardware codename, product version, update channel (plus the short build
+# hash on dev builds) and the period strings.  There is no device ID, serial,
+# MAC, hostname, install date or timestamp.  Every device on the same
+# hardware/version/channel/build sends a byte-identical body in a given period.
+#
+# The device de-duplicates itself: persistent markers under
+# /data/libreecho/telemetry record the last period that was counted, and are
+# only advanced after the server answers 204.  This helper is independent of the OTA updater; a ping failure never
+# touches update state, and it never blocks boot.
+#
+#   libreecho-ping payload   print the body the next attempt would send
+#   libreecho-ping run       one attempt now (exit 0 sent/nothing-due, 1 failed)
+#   libreecho-ping loop      background scheduler started by libreecho-init
+#
+# Specification: libreecho-stats docs/SPEC.md section 3 (Tier 0).
+
+BB=${BB:-/bin/busybox}
+URL=${LIBREECHO_PING_URL:-https://stats.libreecho.org/v1/ping}
+USER_AGENT=libreecho-ping/1
+STATE=${LIBREECHO_PING_STATE:-/data/libreecho/telemetry}
+TARGET_FILE=${LIBREECHO_PING_TARGET:-/etc/libreecho/target}
+INSTALLED=${LIBREECHO_PING_INSTALLED:-/data/libreecho/update/installed}
+UPDATE_ROOT=${LIBREECHO_PING_UPDATE_ROOT:-/data/libreecho/update}
+GENERATIONS=${LIBREECHO_PING_GENERATIONS:-/data/libreecho/generations}
+CHANNEL_FILE=${LIBREECHO_PING_CHANNEL_FILE:-/etc/libreecho/update-channel}
+TIME_STATUS=${LIBREECHO_TIME_STATUS:-/run/libreecho/time.status}
+CURL=${LIBREECHO_PING_CURL:-/usr/bin/curl}
+CA=${LIBREECHO_PING_CA:-/etc/ssl/certs/ca-certificates.crt}
+# Only for host tests: a fixed "now" (any value `date -d` accepts).
+NOW=${LIBREECHO_PING_NOW:-}
+
+log()
+{
+    $BB logger -t libreecho-ping "$*" 2>/dev/null || :
+}
+
+utc()
+{
+    if [ -n "$NOW" ]; then
+        $BB date -u -d "$NOW" "$1"
+    else
+        $BB date -u "$1"
+    fi
+}
+
+value_of()
+{
+    # value_of KEY FILE: the first KEY=value line, or nothing.
+    $BB sed -n "s/^$1=//p" "$2" 2>/dev/null | $BB head -n 1
+}
+
+atomic_write()
+{
+    # atomic_write FILE CONTENT: replace FILE in one rename so a power cut
+    # leaves either the old or the new value, never a torn one.
+    $BB printf '%s\n' "$2" > "$1.tmp" && $BB mv -f "$1.tmp" "$1"
+}
+
+hardware()
+{
+    case $(value_of target_id "$TARGET_FILE") in
+        radar_puffin) echo radar ;;
+        biscuit) echo biscuit ;;
+        *) return 1 ;;
+    esac
+}
+
+version()
+{
+    ver=$(value_of version "$INSTALLED")
+    case "$ver" in
+        ''|*[!0-9.]*) return 1 ;;
+    esac
+    case "$ver" in
+        *.*.*) echo "$ver" ;;
+        *) return 1 ;;
+    esac
+}
+
+channel()
+{
+    ch=$(value_of update_channel "$INSTALLED")
+    [ "$ch" = dev ] || [ "$ch" = stable ] || ch=$($BB cat "$CHANNEL_FILE" 2>/dev/null)
+    case "$ch" in
+        dev|stable) echo "$ch" ;;
+        *) return 1 ;;
+    esac
+}
+
+build()
+{
+    # Short product commit of the running generation, from its signed
+    # release tag: radar-puffin-{build,nightly}-<7 hex>-<16 hex>-<16 hex>.
+    current=$($BB cat "$UPDATE_ROOT/current" 2>/dev/null)
+    case "$current" in ''|.|..|*[!A-Za-z0-9._+~:-]*) return 1 ;; esac
+    tag=$(value_of release "$GENERATIONS/$current/target.manifest")
+    short=$(printf '%s\n' "$tag" |
+        $BB sed -nE 's/^radar-puffin-(build|nightly)-([0-9a-f]{7})-[0-9a-f]{16}-[0-9a-f]{16}$/\2/p')
+    [ -n "$short" ] || return 1
+    echo "$short"
+}
+
+clock_synced()
+{
+    [ -n "$NOW" ] && return 0
+    [ "$(value_of synchronized "$TIME_STATUS")" = 1 ]
+}
+
+# Build the payload into PAYLOAD and the flags into W/M/Y.  Returns 1 when the
+# device identity is unreadable (nothing is sent), 2 when nothing is due.
+compose()
+{
+    HW=$(hardware) || { REASON=hardware-unknown; return 1; }
+    VER=$(version) || { REASON=version-unknown; return 1; }
+    CH=$(channel) || { REASON=channel-unknown; return 1; }
+    BUILD_FIELD=
+    if [ "$CH" = dev ]; then
+        BUILD=$(build) || { REASON=build-unknown; return 1; }
+        BUILD_FIELD=",\"build\":\"$BUILD\""
+    fi
+    WK=$(utc +%G-W%V)
+    MO=$(utc +%Y-%m)
+    YR=$(utc +%Y)
+    W=0; M=0; Y=0
+    [ "$($BB cat "$STATE/last-week" 2>/dev/null)" = "$WK" ] || W=1
+    [ "$($BB cat "$STATE/last-month" 2>/dev/null)" = "$MO" ] || M=1
+    [ "$($BB cat "$STATE/last-year" 2>/dev/null)" = "$YR" ] || Y=1
+    PAYLOAD="{\"v\":1,\"hw\":\"$HW\",\"ver\":\"$VER\",\"ch\":\"$CH\"$BUILD_FIELD,\"wk\":\"$WK\",\"mo\":\"$MO\",\"yr\":\"$YR\",\"w\":$W,\"m\":$M,\"y\":$Y}"
+    [ "$W$M$Y" != 000 ] || { REASON=already-counted; return 2; }
+    return 0
+}
+
+record()
+{
+    # record RESULT [HTTP]: the UI's "last ping" panel reads this file.
+    atomic_write "$STATE/status" "schema=1
+result=$1
+http=${2:-}
+period=$WK
+payload=$PAYLOAD"
+}
+
+advance_markers()
+{
+    if [ "$W" = 1 ]; then atomic_write "$STATE/last-week" "$WK"; fi
+    if [ "$M" = 1 ]; then atomic_write "$STATE/last-month" "$MO"; fi
+    if [ "$Y" = 1 ]; then atomic_write "$STATE/last-year" "$YR"; fi
+    $BB sync 2>/dev/null || :
+}
+
+run_once()
+{
+    $BB mkdir -p "$STATE" || return 1
+    compose
+    rc=$?
+    # Keep the "next payload" preview current for the Privacy page even when
+    # nothing is due, so the user always sees the exact bytes.
+    [ -n "${PAYLOAD:-}" ] && atomic_write "$STATE/next-payload" "$PAYLOAD"
+    case $rc in
+        1) log "skipped: $REASON"; return 1 ;;
+        2) return 0 ;;
+    esac
+    if ! clock_synced; then
+        log "skipped: clock not synchronised"
+        return 1
+    fi
+    [ -x "$CURL" ] && [ -f "$CA" ] || { log "skipped: https client unavailable"; return 1; }
+    code=$("$CURL" --proto =https --tlsv1.2 --cacert "$CA" \
+        --connect-timeout 20 --max-time 45 --max-filesize 4096 \
+        -s -o /dev/null -w '%{http_code}' \
+        -A "$USER_AGENT" -H 'Content-Type: application/json' \
+        --data-binary "$PAYLOAD" "$URL" 2>/dev/null)
+    case "$code" in
+        204)
+            advance_markers
+            record sent "$code"
+            log "counted $WK w=$W m=$M y=$Y"
+            return 0
+            ;;
+        400)
+            # The server will not accept this body yet (for example a version
+            # not yet in the allow-list).  Leave the markers alone so the
+            # device is counted once it is accepted, but return success so the
+            # next try is a day away rather than a few hours.
+            record rejected "$code"
+            log "rejected by server (400); retry tomorrow"
+            return 0
+            ;;
+        *)
+            record failed "$code"
+            log "failed (http ${code:-none}); will retry"
+            return 1
+            ;;
+    esac
+}
+
+random_between()
+{
+    # random_between LOW HIGH seconds, from /dev/urandom.
+    n=$($BB od -An -N2 -tu2 /dev/urandom 2>/dev/null | $BB tr -d ' ')
+    [ -n "$n" ] || n=0
+    echo $(( $1 + n % ($2 - $1 + 1) ))
+}
+
+loop()
+{
+    # A random start offset spreads the fleet out instead of every device
+    # pinging at the same moment after a power cut.
+    $BB sleep "$(random_between 300 1800)"
+    while :; do
+        if run_once; then
+            delay=$(random_between 72000 100800)    # 20-28 h
+        else
+            delay=$(random_between 7200 14400)      # 2-4 h
+        fi
+        $BB sleep "$delay"
+    done
+}
+
+case "${1:-}" in
+    payload)
+        compose
+        [ $? -ne 1 ] || { echo "unavailable: $REASON" >&2; exit 1; }
+        printf '%s\n' "$PAYLOAD"
+        ;;
+    run) run_once ;;
+    loop) loop ;;
+    *) echo "usage: libreecho-ping payload|run|loop" >&2; exit 2 ;;
+esac

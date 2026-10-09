@@ -61,7 +61,7 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "40eb6573a8418ddd2452cbf6c5aa256cba1aee0404e5ae0245c689c955425e08"
+RECOVERY_INIT_SHA256 = "488cfcd9feae444ffe248b9248d0c97075b171ca49acf6c561f167f48447a748"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
@@ -786,6 +786,7 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         ),
         "libreecho-update": ("usr/local/sbin/libreecho-update", 0o755),
         "libreecho-update-fetch": ("usr/local/sbin/libreecho-update-fetch", 0o755),
+        "libreecho-ping": ("usr/local/sbin/libreecho-ping", 0o755),
         "libreecho-feature-transaction": (
             "usr/local/sbin/libreecho-feature-transaction", 0o755,
         ),

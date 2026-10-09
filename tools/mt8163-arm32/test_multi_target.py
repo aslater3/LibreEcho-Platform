@@ -489,6 +489,8 @@ class RadarTreeDiffTests(unittest.TestCase):
     # copies), which the combined tree necessarily stages on top of the base.
     ALLOWED = {'etc/libreecho/target', 'etc/libreecho/audio-profile', 'usr/local/sbin/libreecho-update',
                'usr/local/sbin/libreecho-update-fetch',
+               # Anonymous active-device ping (telemetry Tier 0).
+               'usr/local/sbin/libreecho-ping',
                'usr/local/sbin/libreecho-feature-transaction', 'init', 'libreecho-init',
                'usr/local/sbin/libreecho-target-manifest',
                'usr/local/sbin/libreecho-generation',
