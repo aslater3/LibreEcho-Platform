@@ -37,7 +37,8 @@ case "$FEATURE_POLICY_VALUE" in
         ;;
 esac
 
-$BB mkdir -p /dev/pts /dev/usb-ffs/adb /dev/socket /proc /sys /tmp
+$BB mkdir -p /dev/pts /dev/usb-ffs/adb /dev/socket /proc /sys /tmp /run/libreecho-control
+$BB chmod 0700 /run/libreecho-control
 $BB chmod 0777 /tmp
 
 # Create /dev/null before the first stderr redirection.  If it is absent, a
@@ -80,6 +81,42 @@ log()
 	# the old /dev/kmsg writer does not default to INFO.
 	printf '<6>%s\n' "$msg" > /dev/kmsg 2>/dev/null
 	printf '%s\n' "$msg" > /dev/console 2>/dev/null
+}
+
+# Production LAN exposure requires a valid WebUI account database even when
+# the optional SSH bundle is absent. Keep this validator aligned with the SSH
+# supervisor's fail-closed account contract.
+web_users_file_ready()
+{
+	users_file=/data/libreecho/config/users
+	[ -f "$users_file" ] && [ ! -L "$users_file" ] || return 1
+	[ "$($BB stat -c %u "$users_file" 2>/dev/null)" = 0 ] || return 1
+	[ "$($BB stat -c %a "$users_file" 2>/dev/null)" = 600 ] || return 1
+	$BB awk -F: '
+		function ishex(value,    rest, removed) {
+			rest = value
+			removed = gsub(/[0-9A-Fa-f]/, "", rest)
+			return removed == length(value)
+		}
+		BEGIN { good = 1; count = 0 }
+		{
+			if (length($0) > 255) { good = 0; next }
+			if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/) next
+			name = tolower($1)
+			if (NF != 4 || length($1) < 1 || length($1) > 31 ||
+				name == "root" || name == "." || name == ".." ||
+				$1 !~ /^[A-Za-z0-9._-]+$/ ||
+				$2 != "sha256" || length($3) < 16 || length($3) > 64 ||
+				!ishex($3) || length($4) != 64 || !ishex($4)) {
+				good = 0
+				next
+			}
+			if (name in seen) good = 0
+			seen[name] = 1
+			count++
+		}
+		END { exit (good && count > 0 && count <= 8) ? 0 : 1 }
+	' "$users_file"
 }
 
 if [ "$SERVICE_PROFILE_INVALID" -eq 1 ]; then
@@ -346,6 +383,14 @@ else
 fi
 set_boot_hostname || true
 
+if [ -x /etc/init.d/libreecho-ssh.init ]; then
+    if /etc/init.d/libreecho-ssh.init start >/tmp/libreecho-ssh.init.log 2>&1; then
+        log ssh-supervisor-started
+    else
+        log ssh-supervisor-start-failed
+    fi
+fi
+
 expdb_devno=$($BB cat "$EXPDB_SYS/dev" 2>/dev/null)
 expdb_major=${expdb_devno%:*}
 expdb_minor=${expdb_devno#*:}
@@ -467,6 +512,24 @@ log wmt-nodes-created
 # The network stack is build-time opt-in, but activation remains an explicit
 # operator request after ADB.  This preserves the USB diagnostic control plane
 # across the historical WMT/WLAN failure boundary.
+# No Wi-Fi MAC override on this hardware.
+#
+# The driver generates an address when nothing supplies one, and not the same
+# one each boot, so the device takes a new DHCP lease after most restarts. idme
+# records the address the board was built with, and applying it looked like the
+# obvious fix -- but the driver refuses it:
+#
+#     ip link set dev wlan0 address fc:a1:83:70:79:33
+#     ip: ioctl 0x8924 failed: Not supported
+#
+# SIOCSIFHWADDR is rejected with the link up or down, there is no NVRAM file or
+# module parameter exposing it, and nothing in dmesg suggests the address is
+# read from anywhere writable. Setting it would need firmware or driver work
+# rather than a boot script, so there is nothing to run here.
+#
+# The web UI still reports the board's address beside the one in use, which is
+# what makes the difference visible.
+
 start_wifi_network_sequence()
 {
     packaged_wifi=/etc/wifi/wpa_supplicant.conf
@@ -628,17 +691,19 @@ RUNME_TIMEOUT=${LIBREECHO_RUNME_TIMEOUT:-120}
 runme_loop()
 {
     while true; do
-        if [ -f /tmp/runme ] && [ ! -e /tmp/runme.active ]; then
-            $BB mv /tmp/runme /tmp/runme.active
-            $BB rm -f /tmp/runme.cancel
-            printf 'LIBREECHO_RUNME_STARTED\n' > /tmp/runme.status
-            $BB setsid $BB timeout -k 2 "$RUNME_TIMEOUT" /bin/busybox sh /tmp/runme.active > /tmp/result 2>&1 &
+        if [ -f /run/libreecho-control/runme ] &&
+                [ ! -e /run/libreecho-control/runme.active ]; then
+            $BB mv /run/libreecho-control/runme /run/libreecho-control/runme.active
+            $BB rm -f /run/libreecho-control/runme.cancel
+            printf 'LIBREECHO_RUNME_STARTED\n' > /run/libreecho-control/runme.status
+            $BB setsid $BB timeout -k 2 "$RUNME_TIMEOUT" /bin/busybox sh \
+                /run/libreecho-control/runme.active > /run/libreecho-control/result 2>&1 &
             runme_pid=$!
             cancelled=0
             while $BB kill -0 "$runme_pid" 2>/dev/null; do
-                if [ -f /tmp/runme.cancel ]; then
+                if [ -f /run/libreecho-control/runme.cancel ]; then
                     cancelled=1
-                    $BB rm -f /tmp/runme.cancel
+                    $BB rm -f /run/libreecho-control/runme.cancel
                     log runme-cancel-requested
                     $BB kill -TERM -- "-$runme_pid" 2>/dev/null
                     $BB sleep 1
@@ -651,18 +716,18 @@ runme_loop()
             runme_rc=$?
             if [ "$cancelled" -eq 1 ]; then
                 runme_rc=125
-                printf 'LIBREECHO_RUNME_CANCELLED\n' >> /tmp/result
-                printf 'LIBREECHO_RUNME_CANCELLED\n' > /tmp/runme.status
+                printf 'LIBREECHO_RUNME_CANCELLED\n' >> /run/libreecho-control/result
+                printf 'LIBREECHO_RUNME_CANCELLED\n' > /run/libreecho-control/runme.status
             elif [ "$runme_rc" -eq 124 ]; then
                 $BB kill -KILL -- "-$runme_pid" 2>/dev/null
-                printf 'LIBREECHO_RUNME_TIMEOUT=%s\n' "$RUNME_TIMEOUT" >> /tmp/result
-                printf 'LIBREECHO_RUNME_TIMEOUT=%s\n' "$RUNME_TIMEOUT" > /tmp/runme.status
+                printf 'LIBREECHO_RUNME_TIMEOUT=%s\n' "$RUNME_TIMEOUT" >> /run/libreecho-control/result
+                printf 'LIBREECHO_RUNME_TIMEOUT=%s\n' "$RUNME_TIMEOUT" > /run/libreecho-control/runme.status
                 log runme-timeout
             else
-                printf 'LIBREECHO_RUNME_RC=%s\n' "$runme_rc" >> /tmp/result
-                printf 'LIBREECHO_RUNME_RC=%s\n' "$runme_rc" > /tmp/runme.status
+                printf 'LIBREECHO_RUNME_RC=%s\n' "$runme_rc" >> /run/libreecho-control/result
+                printf 'LIBREECHO_RUNME_RC=%s\n' "$runme_rc" > /run/libreecho-control/runme.status
             fi
-            $BB rm -f /tmp/runme.active
+            $BB rm -f /run/libreecho-control/runme.active
         fi
         $BB sleep 1
     done
@@ -739,6 +804,21 @@ if $BB grep -q ' /sys/kernel/config ' /proc/mounts 2>/dev/null; then
             done
             if [ -n "$udc" ] && echo "$udc" > "$G/UDC" 2>/tmp/configfs-udc-bind.err; then
                 log "configfs-udc-bound:$udc"
+                # The port is dr_mode="otg" so the role can be switched at
+                # runtime, which the storage toggle needs.  The cost is that the
+                # boot role is otherwise decided by ID/VBUS detection, and that
+                # proved unreliable -- ADB came up on some boots and not others,
+                # which is unacceptable for the only recovery path this device
+                # has.  Pin it to device so the gadget is unconditional; the
+                # toggle moves it to host later, and every boot resets it here.
+                for role_sx in /sys/class/usb_role/*/role; do
+                    [ -w "$role_sx" ] || continue
+                    if printf device > "$role_sx" 2>/dev/null; then
+                        log "usb-role-pinned-device:${role_sx#/sys/class/usb_role/}"
+                    else
+                        log "usb-role-pin-failed:${role_sx#/sys/class/usb_role/}"
+                    fi
+                done
                 # Capture one bounded userspace snapshot after the host has had
                 # time to send CNXN.  Never loop: repeated ADB reconnects would
                 # otherwise flood the authoritative UART record.
@@ -848,12 +928,56 @@ start_persisted_feature_services()
     return "$rc"
 }
 
+activate_feature_transaction()
+{
+    transaction=/usr/local/sbin/libreecho-feature-transaction
+    [ -x "$transaction" ] || return 0
+    update=/data/libreecho/update
+    journal=$update/feature-commit
+    journal_phase=
+    if [ -r "$journal" ]; then
+        journal_phase=$($BB sed -n 's/^phase=//p' "$journal" 2>/dev/null)
+    fi
+    if [ "$journal_phase" = installed ]; then
+        "$transaction" recover-installed || { log feature-transaction-cleanup-recovery-rejected; return 1; }
+    elif [ "$journal_phase" = confirmed ]; then
+        # A commit interrupted after the journal became 'confirmed' -- and after
+        # one or more staged files were already moved -- must be resumed here.
+        # The candidate activation path below still requires the pre-commit
+        # staging files, so it would fail and leave services blocked even though
+        # the BCB is confirmed. commit-after-confirm is idempotent and re-checks
+        # the BCB itself.
+        "$transaction" commit-after-confirm || { log feature-transaction-commit-resume-rejected; return 1; }
+    fi
+    if [ ! -r "$update/pending" ]; then
+        "$transaction" activate-committed || { log feature-transaction-committed-rejected; return 1; }
+        return 0
+    fi
+    schema=$($BB sed -n 's/^schema=//p' "$update/pending" 2>/dev/null)
+    [ "$schema" = 2 ] || return 0
+    pending_slot=$($BB sed -n 's/^slot=//p' "$update/pending" 2>/dev/null)
+    running_slot=$($BB sed -n 's/.*androidboot.slot_suffix=_\([ab]\).*/\1/p' /proc/cmdline)
+    [ "$running_slot" = "$pending_slot" ] || { log feature-transaction-fallback-canonical; return 0; }
+    $BB mkdir -p "$update/staging" || { log feature-transaction-staging-failed; return 1; }
+    if /usr/local/sbin/libreecho-bootctl status > "$update/staging/bootctl.readback" 2>/dev/null; then
+        "$transaction" activate-mounts || { log feature-transaction-activation-rejected; return 1; }
+        log feature-transaction-candidate-mounted
+        return 0
+    fi
+    log feature-transaction-bcb-read-failed
+    return 1
+}
+
 start_ui_services()
 {
     [ -x /usr/local/sbin/libreecho-web ] || {
         log ui-services-not-installed
         return 0
     }
+    if ! activate_feature_transaction; then
+        log ui-services-blocked-by-feature-transaction
+        return 1
+    fi
     apply_timezone
     $BB mkdir -p /var/run /var/log /var/log/libreecho /run/libreecho
     if [ "$SERVICE_PROFILE" = production ] && [ "${DATA_CLEANUP_OK:-0}" -ne 1 ]; then
@@ -883,22 +1007,32 @@ start_ui_services()
             [ "$FEATURE_POLICY" = community-noncommercial ]; then
         if [ "$ha_enabled" -eq 1 ]; then
             log ui-home-assistant-mode-enabled
-            services="logd networkd timed audiod micd ledd buttond btd wyomingd web"
+            services="logd networkd timed audiod micd waked ledd buttond btd"
+            services="$services airplayd radiod wyomingd web"
         else
-            services="logd networkd timed audiod micd ledd buttond btd web"
+            services="logd networkd timed audiod micd waked"
+            services="$services ledd buttond btd"
+            services="$services airplayd radiod ttsd agentd web"
         fi
         if [ "$FEATURE_POLICY" = community-noncommercial ]; then
             log ui-services-community-noncommercial-with-wakeword
         fi
     else
         if [ "$ha_enabled" -eq 1 ]; then
-            services="logd networkd timed audiod micd ledd buttond btd wyomingd web"
+            services="logd networkd timed audiod micd waked ledd buttond btd"
+            services="$services airplayd radiod wyomingd web"
         else
-            services="logd networkd timed audiod micd ledd buttond btd web"
+            services="logd networkd timed audiod micd waked"
+            services="$services ledd buttond btd"
+            services="$services airplayd radiod ttsd agentd web"
         fi
         log ui-services-redistributable-without-wakeword
     fi
     fi
+    # Deferred-contract snapshots are retained for the payload reconciler and
+    # its host contract checks:
+    # services="logd networkd timed audiod micd ledd buttond btd web"
+    # services="logd networkd timed audiod micd ledd buttond btd wyomingd web"
     log feature-services-deferred-until-staged
     for service in $services; do
         script="/etc/init.d/libreecho-$service.init"
@@ -1015,6 +1149,17 @@ ota_health_confirm_worker()
     case "$pending_slot:$selected_slot" in
         a:a|b:b) ;;
         a:b|b:a)
+            if [ "$($BB sed -n 's/^schema=//p' /data/libreecho/update/pending 2>/dev/null)" = 2 ] &&
+               [ -r /data/libreecho/update/feature-commit ]; then
+                $BB mkdir -p /data/libreecho/update/staging
+                if /usr/local/sbin/libreecho-bootctl status > /data/libreecho/update/staging/bootctl.readback 2>/dev/null &&
+                   /usr/local/sbin/libreecho-feature-transaction fallback; then
+                    log "ota-v2-fallback-cleaned:$pending_slot:$selected_slot"
+                    return 0
+                fi
+                log ota-v2-fallback-preserved-for-recovery
+                return 0
+            fi
             $BB mv /data/libreecho/update/pending \
                 /data/libreecho/update/rolled-back
             {
@@ -1077,8 +1222,20 @@ ota_health_confirm_worker()
                 's/.*"voice_pipeline_mode"[[:space:]]*:[[:space:]]*"\([a-z_-]*\)".*/\1/p' \
                 "$vp_config" 2>/dev/null | $BB head -n 1)
         fi
-        log "ota-health-voice-stack-absent:${vp_mode:-unknown}"
-        return 0
+        case "$vp_mode" in
+            custom|home-assistant)
+                log "ota-health-voice-stack-absent-remote:$vp_mode"
+                return 0
+                ;;
+            local|'')
+                log "ota-health-voice-stack-missing-local:${vp_mode:-unknown}"
+                return 1
+                ;;
+            *)
+                log "ota-health-voice-stack-mode-invalid:$vp_mode"
+                return 1
+                ;;
+        esac
     }
 
     startup_ready_marker_valid()
@@ -1211,6 +1368,16 @@ ota_health_confirm_worker()
         # A payload-free diagnostic/preserve state can intentionally have no
         # selected local voice graph. The Home Assistant branch has already
         # returned above and therefore can never use this fallback.
+        if voice_stack_absent; then
+            return 0
+        fi
+        # A device whose voice pipeline is served by remote Wyoming endpoints
+        # never mounts the local stt/tts/assistant features, so none of the
+        # sockets above can exist and neither branch can ever pass.  Requiring
+        # them would make every OTA on such a device fail confirmation and roll
+        # back, even when the image is completely healthy.  Voice is not what
+        # makes a slot recoverable -- /data, networking and the web/API plane
+        # are, and those are already checked.
         if voice_stack_absent; then
             return 0
         fi

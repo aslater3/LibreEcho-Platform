@@ -969,6 +969,14 @@ class SourceTests(unittest.TestCase):
         init_hash = hashlib.sha256(
             (TOOLS_DIR / "initramfs/libreecho-init").read_bytes()
         ).hexdigest()
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        self.assertIn("/run/libreecho-control/runme", init)
+        self.assertIn('b"/run/libreecho-control/runme"', builder)
+        self.assertNotIn('b"/tmp/runme"', builder)
+        self.assertIn('b"/run/libreecho-control/runme"', verifier)
+        self.assertNotIn('b"/tmp/runme"', verifier)
         pins = {
             "build_recovery_image.py": "RECOVERY_INIT_SHA256",
             "verify_recovery_image.py": "INIT_SHA256",
@@ -1614,27 +1622,58 @@ class SourceTests(unittest.TestCase):
         self.assertIn("wireless-tools-COPYING", image_builder)
         self.assertIn("wireless-tools-COPYING", verifier)
 
-    def test_ssh_password_hash_is_salted_and_private(self) -> None:
+    def test_ssh_uses_deferred_webui_auth_and_packages_scp_server(self) -> None:
         dropbear_builder = TOOLS_DIR / "ssh/build_dropbear.sh"
-        self.assertIn("-DUSE_DEV_PTMX", dropbear_builder.read_text())
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            valid = root / "hash"
-            valid.write_text("$6$LibreEchoTest$0123456789012345678901234567890123456789012\n")
-            valid.chmod(0o600)
-            self.assertEqual(
-                builder.read_ssh_password_hash(valid),
-                "$6$LibreEchoTest$0123456789012345678901234567890123456789012",
-            )
-            for value in ("password\n", "!locked\n", "\n", "$6$missing-checksum\n"):
-                invalid = root / ("invalid-" + str(len(value)))
-                invalid.write_text(value)
-                invalid.chmod(0o600)
-                with self.subTest(value=value), self.assertRaises(SystemExit):
-                    builder.read_ssh_password_hash(invalid)
-            valid.chmod(0o622)
-            with self.assertRaises(SystemExit):
-                builder.read_ssh_password_hash(valid)
+        image_builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        image_verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        supervisor = (TOOLS_DIR / "ssh/libreecho-ssh.init").read_text()
+        recovery_init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        auth_source = (TOOLS_DIR / "ssh/libreecho-auth.c").read_text()
+        localoptions = (TOOLS_DIR / "ssh/localoptions.h").read_text()
+        patch_source = (TOOLS_DIR / "ssh/patches/0002-webui-users-password-auth.patch").read_text()
+        self.assertIn('PROGRAMS="dropbear dropbearkey scp"', dropbear_builder.read_text())
+        self.assertIn("dbutil.o", patch_source)
+        self.assertIn("scp_sha256", dropbear_builder.read_text())
+        self.assertIn('"usr/bin/scp"', image_builder)
+        self.assertIn('"usr/bin/scp"', image_verifier)
+        self.assertIn("--expected-scp-sha256", image_verifier)
+        self.assertNotIn("--ssh-root-password-hash", image_builder)
+        self.assertNotIn("/etc/shadow", image_builder)
+        self.assertNotIn('"root_login": True', image_builder)
+        self.assertIn('"authentication": "webui-users-sha256"', image_builder)
+        self.assertIn('"privilege_policy": "non-root-ephemeral-users"', image_builder)
+        self.assertIn("/data/libreecho/config/users", supervisor)
+        self.assertIn("waiting-for-valid-webui-users", supervisor)
+        self.assertIn("stop_dropbear", supervisor)
+        self.assertIn("-t ed25519", supervisor)
+        self.assertIn('name == "root"', supervisor)
+        self.assertIn('name == "."', supervisor)
+        self.assertIn('name == ".."', supervisor)
+        self.assertIn('STATE_ROOT=/run/libreecho-ssh', supervisor)
+        self.assertIn('chmod 0700 "$STATE_ROOT"', supervisor)
+        self.assertIn('uid_map="$STATE_ROOT/uids"', supervisor)
+        self.assertIn('known[tolower($1)] = $2', supervisor)
+        self.assertIn('printf "%s:%d\\n", tolower($1), known[tolower($1)] >> map', supervisor)
+        self.assertIn('>/run/libreecho-ssh/keygen.log 2>&1', supervisor)
+        self.assertIn('>/run/libreecho-ssh/dropbear.log 2>&1', supervisor)
+        self.assertIn('/run/libreecho-control/runme', recovery_init)
+        self.assertNotIn('/tmp/runme.active', recovery_init)
+        self.assertNotIn('/tmp/result', recovery_init)
+        self.assertIn('chmod 0700 /run/libreecho-control', recovery_init)
+        self.assertIn('strcmp(folded, "root") == 0', auth_source)
+        self.assertIn('strcmp(folded, ".") == 0', auth_source)
+        self.assertIn('memset(&users[users_count]', auth_source)
+        self.assertIn("digest[i] =", auth_source)
+        self.assertIn("web_users_file_ready()", recovery_init)
+        self.assertIn("web_listen=0.0.0.0:8080", recovery_init)
+        self.assertNotIn("[ ! -x /etc/init.d/libreecho-ssh.init ] ||", recovery_init)
+        sync_accounts = supervisor.split("sync_accounts()", 1)[1].split("dropbear_running()", 1)[0]
+        self.assertIn('chmod 0711 "$HOME_ROOT"', sync_accounts)
+        self.assertIn('cmp -s "$account_tmp" "$account_list"', sync_accounts)
+        self.assertIn("old_username", sync_accounts)
+        self.assertNotIn('$BB rm -rf "$HOME_ROOT"', sync_accounts)
+        self.assertIn("scp", image_verifier)
+        self.assertIn("DROPBEAR_SVR_PUBKEY_AUTH 0", localoptions)
 
 
 class VendorAssetContractTests(unittest.TestCase):
@@ -1686,6 +1725,67 @@ class VendorAssetContractTests(unittest.TestCase):
         self.assertIn("not distributed", text)
         self.assertIn("does not grant redistribution rights", text)
         self.assertIn("read-only system_a", text)
+
+    def test_data_contract_file_allowlist_rejects_directories(self) -> None:
+        cleanup = TOOLS_DIR / "initramfs/libreecho-data-cleanup"
+        file_only = (
+            "https-cert.pem", "https-key.pem", "users.sessions",
+            "radio-stations.json",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            data_root = Path(temporary) / "data"
+            config = data_root / "libreecho/config"
+            config.mkdir(parents=True)
+            environment = {
+                **os.environ,
+                "LIBREECHO_DATA_TEST_MODE": "1",
+                "DATA_ROOT": str(data_root),
+            }
+            for name in file_only:
+                path = config / name
+                path.mkdir()
+                result = subprocess.run(
+                    ["/bin/sh", str(cleanup)], env=environment,
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                self.assertEqual(result.returncode, 2, name)
+                path.rmdir()
+                path.write_text("file")
+                result = subprocess.run(
+                    ["/bin/sh", str(cleanup)], env=environment,
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                self.assertEqual(result.returncode, 0, name)
+
+    def test_ui_startup_services_are_built_packaged_and_verified(self) -> None:
+        bundle = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        verifier_source = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        for binary, script, service in (
+            ("libreecho-buttond", "libreecho-buttond.init", "buttond"),
+            ("libreecho-radiod", "libreecho-radiod.init", "radiod"),
+        ):
+            for source in (bundle, builder, verifier_source):
+                self.assertIn(binary, source)
+                self.assertIn(script, source)
+            self.assertIn(f" {service} ", init)
+
+    def test_missing_local_voice_stack_cannot_confirm_ota(self) -> None:
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        health = init[init.index("    voice_stack_absent()"):init.index(
+            "    ota_health_services_ready()"
+        )]
+        self.assertIn("custom|home-assistant)", health)
+        self.assertIn(
+            'log "ota-health-voice-stack-absent-remote:$vp_mode"', health
+        )
+        self.assertIn("local|'')", health)
+        self.assertIn(
+            'log "ota-health-voice-stack-missing-local:${vp_mode:-unknown}"',
+            health,
+        )
+        self.assertIn("ota-health-voice-stack-mode-invalid", health)
 
     def test_verifier_requires_wlan_firmware_compatibility_path(self) -> None:
         expected = {"etc/firmware": "../lib/firmware"}
@@ -1791,12 +1891,57 @@ class PolicyTests(unittest.TestCase):
         self.assertNotIn("--startup-audio", init_script)
         self.assertIn("log audio-startup-disabled", init_script)
 
+    def test_ui_bundle_ships_buttond_and_action_sounds(self) -> None:
+        bundle = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
+        image_builder = (TOOLS_DIR / "build_recovery_image.py").read_text()
+        image_verifier = (TOOLS_DIR / "verify_recovery_image.py").read_text()
+        self.assertIn("libreecho-buttond", bundle)
+        self.assertIn("libreecho-buttond.init", bundle)
+        self.assertIn('"share/libreecho/sounds/"', image_builder)
+        self.assertIn("libreecho-buttond", image_builder)
+        self.assertIn("libreecho-buttond", image_verifier)
+        for sound in ("action-1.raw", "action-2.raw", "action-3.raw"):
+            self.assertIn(sound, bundle)
+            self.assertIn(f"usr/local/share/libreecho/sounds/{sound}", image_verifier)
+
+    def test_ui_verifier_rejects_missing_button_members(self) -> None:
+        required = (
+            "usr/local/sbin/libreecho-buttond",
+            "etc/init.d/libreecho-buttond.init",
+            "usr/local/share/libreecho/sounds/action-1.raw",
+            "usr/local/share/libreecho/sounds/action-2.raw",
+            "usr/local/share/libreecho/sounds/action-3.raw",
+        )
+        for missing in required:
+            with self.subTest(missing=missing):
+                names = (verifier.UI_FIXED_NAMES | {"usr/local/share/libreecho/web/index.html"}) - {missing}
+                entries = {name: verifier.Entry(name, stat.S_IFREG | 0o644, 0, 0, 0, b"fixture") for name in names}
+                ui = {
+                    "enabled": True, "activation": "automatic-after-loopback",
+                    "autostart": True, "hardware_ownership": "existing-control-plane",
+                    "commit": "a" * 40, "diff_sha256": "b" * 64,
+                    "manifest_sha256": "c" * 64, "files": {name: {} for name in names},
+                }
+                with self.assertRaisesRegex(SystemExit, "UI file set changed"):
+                    verifier.validate_ui(entries, {"ui": ui}, "c" * 64, "a" * 40, "b" * 64)
+
     def test_ui_bundle_startup_contract_is_fail_closed(self) -> None:
         valid_led = "\n".join((
             "DAEMON=/usr/local/sbin/libreecho-ledd",
             "PIDFILE=/var/run/libreecho-ledd.pid",
             "STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}",
             "ARGS=${ARGS:---foreground --socket $SOCKET --startup-animation --startup-ready $STARTUP_READY}",
+            "start_service() {",
+            '    start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- $ARGS',
+            "}",
+            "case \"${1:-}\" in",
+            "    start) start_service ;;",
+            "esac",
+        )) + "\n"
+        valid_buttond = "\n".join((
+            "DAEMON=${DAEMON:-/usr/local/sbin/libreecho-buttond}",
+            "PIDFILE=${PIDFILE:-/var/run/libreecho-buttond.pid}",
+            "ARGS=${ARGS:---foreground}",
             "start_service() {",
             '    start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- $ARGS',
             "}",
@@ -1911,10 +2056,12 @@ class PolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             bundle = Path(temporary)
             led = bundle / "etc/init.d/libreecho-ledd.init"
+            buttond = bundle / "etc/init.d/libreecho-buttond.init"
             web = bundle / "etc/init.d/libreecho-web.init"
             agentd = bundle / "etc/init.d/libreecho-agentd.init"
             led.parent.mkdir(parents=True)
             led.write_text(valid_led)
+            buttond.write_text(valid_buttond)
             web.write_text(valid_web)
             agentd.write_text(valid_agentd)
             feature_script = "\n".join((
@@ -2671,7 +2818,8 @@ feature_daemon_required tts
         self.assertIn("reboot-supervisor-started", source)
         self.assertIn("/tmp/reboot.request", source)
         self.assertIn("runme-timeout", source)
-        self.assertIn("/tmp/runme.cancel", source)
+        self.assertIn("/run/libreecho-control/runme.cancel", source)
+        self.assertNotIn("/tmp/runme.cancel", source)
         self.assertIn("wmt_stock_compat", source)
         self.assertIn("--no-function-on", source)
         self.assertIn("--ok --once", source)
@@ -2891,7 +3039,13 @@ feature_daemon_required tts
             ("assistant", "libreecho-agentd"),
         ):
             self.assertIn(f"{feature}) daemon={daemon}", updater)
-        self.assertIn("feature_root=/data/libreecho/features/$feature", updater)
+        # The shipped updater keeps the production data root immutable and
+        # derives the feature path only from that local constant.  The host
+        # fixture rewrites this literal in its generated copy; production does
+        # not accept a caller-selected feature root.
+        self.assertIn("DATA_ROOT=/data", updater)
+        self.assertIn("FEATURE_ROOT=$DATA_ROOT/libreecho/features", updater)
+        self.assertIn("feature_root=$FEATURE_ROOT/$feature", updater)
         self.assertIn("payload=$feature_root/payload.squashfs", updater)
         self.assertIn("manifest=$feature_root/manifest.json", updater)
         for field in (
@@ -3177,7 +3331,7 @@ feature_daemon_required tts
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
         self.assertIn("version=$(download_and_inspect) || return 1", fetcher)
         self.assertIn(
-            'if [ -n "$rolled_back" ] && [ "$version" = "$rolled_back" ] && [ "$channel" = "$rolled_back_channel" ]; then',
+            'if [ -n "$rolled_back" ] && [ "$version" = "$rolled_back" ] && [ "$channel" = "$rolled_back_channel" ] && candidate_matches_record "$ROOT/rolled-back"; then',
             fetcher,
         )
         self.assertIn("check_status_write error", fetcher)
@@ -3258,7 +3412,11 @@ feature_daemon_required tts
         self.assertIn("cleanup_locks\n    trap - EXIT", fetcher)
         self.assertIn("record_channel()", fetcher)
         self.assertIn("record_channel \"$ROOT/installed\"", fetcher)
-        self.assertIn("install_lock\n    seed_channel\n    validate_source\n    install_unlock", fetcher)
+        self.assertIn(
+            "install_lock\n    seed_channel\n    validate_source\n"
+            "    prepare_https_client\n    resolve_dev_release || return 1\n    install_unlock",
+            fetcher,
+        )
         automatic = fetcher[fetcher.index("set_automatic_updates()"):fetcher.index("die()")]
         self.assertIn("fetch_lock\n    install_lock", automatic)
 
@@ -3281,6 +3439,53 @@ feature_daemon_required tts
             'check_children "$DATA_ROOT/libreecho/update" \\\n    channel incoming',
             cleanup,
         )
+
+    def test_fetch_quarantine_survives_current_and_prior_cleanup(self) -> None:
+        """Run the real writer, then boot cleanup on its persistent output."""
+        fetch = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
+        function = 'quarantine_file()\n' + fetch.split('quarantine_file()\n', 1)[1].split('\ninspect_control_part()', 1)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            data = Path(temporary) / 'data'
+            root = data / 'libreecho/update'
+            root.mkdir(parents=True)
+            package = root / 'github-update.ota.tar'
+            package.write_bytes(b'previous verified candidate')
+            script = 'BB=busybox\ndie() { exit 1; }\n' + function + '\nquarantine_file "$ROOT/github-update.ota.tar"\n'
+            result = subprocess.run(['/bin/sh', '-c', script], env={**os.environ, 'ROOT': str(root)}, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            retained = list(root.glob('quarantine-*.bad'))
+            self.assertEqual(len(retained), 1)
+            self.assertEqual(retained[0].read_bytes(), b'previous verified candidate')
+            self.assertFalse((root / 'quarantine').exists())
+            for _ in range(2):  # candidate boot and fallback share userdata
+                result = self._run_cleanup(data)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(retained[0].read_bytes(), b'previous verified candidate')
+
+            # Repeated identical evidence is deduplicated, never overwritten.
+            package.write_bytes(b'previous verified candidate')
+            result = subprocess.run(['/bin/sh', '-c', script], env={**os.environ, 'ROOT': str(root)}, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(package.exists())
+            self.assertEqual(len(list(root.glob('quarantine-*.bad'))), 1)
+            # Reject a substituted target while preserving both source and link.
+            retained[0].unlink()
+            outside = Path(temporary) / 'outside'
+            outside.write_bytes(b'untouched')
+            retained[0].symlink_to(outside)
+            package.write_bytes(b'previous verified candidate')
+            result = subprocess.run(['/bin/sh', '-c', script], env={**os.environ, 'ROOT': str(root)}, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(outside.read_bytes(), b'untouched')
+            self.assertTrue(package.exists())
+            retained[0].unlink()
+            # Capacity exhaustion is explicit and does not evict history.
+            for i in range(8):
+                (root / ('quarantine-' + str(i) * 64 + '.bad')).write_bytes(b'history')
+            result = subprocess.run(['/bin/sh', '-c', script], env={**os.environ, 'ROOT': str(root)}, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(package.exists())
+            self.assertEqual(len(list(root.glob('quarantine-*.bad'))), 8)
 
     def test_userdata_cleanup_preserves_persisted_ota_channel(self) -> None:
         cleanup = TOOLS_DIR / "initramfs/libreecho-data-cleanup"

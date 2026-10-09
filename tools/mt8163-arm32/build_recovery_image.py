@@ -39,12 +39,12 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "fdf851a563b291ab0440b196e46a06905c2beaa1494dadd4f4a0b8eb95042e5a"
+RECOVERY_INIT_SHA256 = "bdba03753c9e2cee45e40c3cd50002d83695de27220b4406255c834e1fcf82d5"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
 CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
-CONNECTIVITY_IMPORTER_SHA256 = "7601145a15750abce6a4c21d20326ecbdc1e4dc36e5670c0ca3cc9d1bf1f1326"
+CONNECTIVITY_IMPORTER_SHA256 = "e9d98d059d7f0082d28bad134bf72fa6b6c4318a104d7de4001d9984df0e0854"
 WPA_SUPPLICANT_VERSION = "2.10"
 WPA_SOURCE_SHA256 = "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f"
 WPA_SOURCE_URL = "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz"
@@ -58,9 +58,6 @@ LIBNL_SOURCE_URL = (
 WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
-SSH_PASSWORD_HASH_RE = re.compile(
-    r"\$(?:1|5|6|2[abxy]?|y|gy)\$[^$:\r\n]{1,64}\$[^:\r\n]{1,512}\Z"
-)
 
 CONNECTIVITY_ASSET_REQUIREMENTS: dict[str, dict[str, str | int]] = {
     "ROMv2_lm_patch_1_0_hdr.bin": {
@@ -407,8 +404,14 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         "vendor-assets/mt8163-v181-stock-v1.tsv": (
             "etc/libreecho/vendor-assets/mt8163-v181-stock-v1.tsv", 0o644,
         ),
+        "vendor-assets/mt8163-v181-stock-v2.tsv": (
+            "etc/libreecho/vendor-assets/mt8163-v181-stock-v2.tsv", 0o644,
+        ),
         "libreecho-update": ("usr/local/sbin/libreecho-update", 0o755),
         "libreecho-update-fetch": ("usr/local/sbin/libreecho-update-fetch", 0o755),
+        "libreecho-feature-transaction": (
+            "usr/local/sbin/libreecho-feature-transaction", 0o755,
+        ),
         "ota-source.conf": ("etc/libreecho/ota-source.conf", 0o644),
         "libreecho-wifi": ("sbin/libreecho-wifi", 0o755),
         "udhcpc.script": ("etc/udhcpc.script", 0o755),
@@ -739,6 +742,14 @@ def validate_ui_startup_contract(bundle: Path) -> None:
             ),
         ),
         (
+            "etc/init.d/libreecho-buttond.init",
+            (
+                "DAEMON=${DAEMON:-/usr/local/sbin/libreecho-buttond}",
+                'start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- $ARGS',
+                "start) start_service",
+            ),
+        ),
+        (
             "etc/init.d/libreecho-web.init",
             (
                 "STARTUP_READY_TIMEOUT_TICKS=${STARTUP_READY_TIMEOUT_TICKS:-600}",
@@ -1023,7 +1034,7 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
     for binary in (
         "libreecho-web", "libreecho-logd", "libreecho-networkd",
         "libreecho-timed", "libreecho-audiod", "libreecho-micd",
-        "libreecho-ledd", "libreecho-btd",
+        "libreecho-ledd", "libreecho-buttond", "libreecho-radiod", "libreecho-btd",
         "libreecho-airplayd", "libreecho-wyomingd",
         "libreecho-sttd-wyoming", "libreecho-ttsd-wyoming",
     ):
@@ -1031,7 +1042,8 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
     for script in (
         "libreecho-web.init", "libreecho-logd.init", "libreecho-networkd.init",
         "libreecho-timed.init", "libreecho-audiod.init",
-        "libreecho-micd.init", "libreecho-ledd.init", "libreecho-btd.init",
+        "libreecho-micd.init", "libreecho-ledd.init", "libreecho-buttond.init",
+        "libreecho-radiod.init", "libreecho-btd.init",
         "libreecho-airplayd.init", "libreecho-ttsd.init", "libreecho-waked.init",
         "libreecho-sttd.init", "libreecho-agentd.init", "libreecho-wyomingd.init",
     ):
@@ -1045,7 +1057,8 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
             raise SystemExit("ERROR: UI users file must be private and non-empty")
         copy_file("etc/libreecho/users", "etc/libreecho/users", 0o600)
     for relative in sorted(bundled_files):
-        if not relative.startswith("share/libreecho/web/"):
+        if not relative.startswith("share/libreecho/web/") and not relative.startswith(
+                "share/libreecho/sounds/"):
             continue
         target_name = "usr/local/" + relative
         copy_file(relative, target_name, 0o644)
@@ -1575,89 +1588,69 @@ def add_assistant_external_payload(payload: Path, payload_manifest: Path,
     }
 
 
-def read_ssh_password_hash(path: Path) -> str:
-    """Read one build-local crypt(3) hash without accepting a plaintext secret."""
-    if path.is_symlink() or not path.is_file():
-        raise SystemExit(f"ERROR: SSH password hash is not a regular file: {path}")
-    if path.stat().st_mode & 0o022:
-        raise SystemExit(f"ERROR: SSH password hash is group/world-writable: {path}")
-    data = read(path)
-    if data.endswith(b"\n"):
-        data = data[:-1]
-    if not data or b"\n" in data or b"\r" in data:
-        raise SystemExit("ERROR: SSH password hash must be exactly one line")
-    try:
-        value = data.decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise SystemExit("ERROR: SSH password hash is not ASCII") from exc
-    if not SSH_PASSWORD_HASH_RE.fullmatch(value):
-        raise SystemExit("ERROR: SSH password hash is not a supported salted crypt(3) hash")
-    return value
-
-
-def add_ssh_bundle(stage: Path, dropbear: Path, dropbearkey: Path,
-                   password_hash: Path, manifest: dict[str, object]) -> None:
-    """Install the opt-in password-only root SSH bundle."""
-    hash_value = read_ssh_password_hash(password_hash)
+def add_ssh_bundle(stage: Path, dropbear: Path, dropbearkey: Path, scp: Path,
+                   manifest: dict[str, object]) -> None:
+    """Install the opt-in deferred WebUI-account SSH bundle."""
     files: dict[str, object] = {}
-
-    (stage / "root").mkdir(parents=True, exist_ok=True)
-    (stage / "root").chmod(0o755)
-    (stage / "etc/dropbear").mkdir(parents=True, exist_ok=True)
-    (stage / "etc/dropbear").chmod(0o700)
+    ssh_init = Path(__file__).resolve().parent / "ssh/libreecho-ssh.init"
+    if ssh_init.is_symlink() or not ssh_init.is_file():
+        raise SystemExit(f"ERROR: SSH supervisor is not a regular file: {ssh_init}")
 
     account_files = {
         "etc/passwd": (b"root:x:0:0:root:/root:/bin/sh\n", 0o644),
-        "etc/group": (b"root:x:0:\n", 0o644),
+        "etc/group": (b"root:x:0:\nlibreecho-ssh:x:1000:\n", 0o644),
         "etc/shells": (b"/bin/sh\n", 0o644),
-        "etc/shadow": (f"root:{hash_value}:0:0:99999:7:::\n".encode("ascii"), 0o600),
     }
     for relative, (data, mode) in account_files.items():
         target = stage / relative
         if target.exists() or target.is_symlink():
             raise SystemExit(f"ERROR: SSH account file collides with {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
         target.chmod(mode)
-        record: dict[str, object] = {
+        files[relative] = {
             "path": "/" + relative,
+            "sha256": sha256(data),
             "size": len(data),
             "mode": f"{mode:04o}",
         }
-        if relative == "etc/shadow":
-            record["secret_content_not_recorded"] = True
-        else:
-            record["sha256"] = sha256(data)
-        files[relative] = record
 
     for relative, source in (
         ("sbin/dropbear", dropbear),
         ("sbin/dropbearkey", dropbearkey),
+        ("usr/bin/scp", scp),
+        ("etc/init.d/libreecho-ssh.init", ssh_init),
     ):
         if source.is_symlink() or not source.is_file():
-            raise SystemExit(f"ERROR: SSH binary is not a regular file: {source}")
+            raise SystemExit(f"ERROR: SSH asset is not a regular file: {source}")
         data = read(source)
-        if b"authorized_keys" in data:
+        if relative in {"sbin/dropbear", "sbin/dropbearkey", "usr/bin/scp"} and b"authorized_keys" in data:
             raise SystemExit(f"ERROR: public-key authorization marker found in {source}")
         target = stage / relative
         if target.exists() or target.is_symlink():
-            raise SystemExit(f"ERROR: SSH binary collides with {target}")
+            raise SystemExit(f"ERROR: SSH asset collides with {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
         target.chmod(0o755)
-        files[relative] = {
+        record: dict[str, object] = {
             "path": str(source.resolve()),
             "sha256": sha256(data),
             "size": len(data),
             "mode": "0755",
-            "elf": require_elf_contract(target, 0x05000400, None, (), False),
         }
+        if relative in {"sbin/dropbear", "sbin/dropbearkey", "usr/bin/scp"}:
+            record["elf"] = require_elf_contract(target, 0x05000400, None, (), False)
+        files[relative] = record
 
     manifest["ssh"] = {
         "enabled": True,
-        "activation": "manual-only",
-        "autostart": False,
-        "authentication": "password-only",
+        "activation": "deferred-after-webui-bootstrap",
+        "autostart": True,
+        "authentication": "webui-users-sha256",
+        "account_source": "/data/libreecho/config/users",
+        "privilege_policy": "non-root-ephemeral-users",
         "public_key_auth": False,
-        "root_login": True,
+        "root_login": False,
         "host_keys": "generated-ephemerally-under-/tmp/dropbear",
         "files": files,
     }
@@ -1826,7 +1819,7 @@ def validate_stage(stage: Path) -> None:
 
     init_script = read(stage / "libreecho-init")
     for marker in (
-        b"FASTBOOT_PLEASE", b"/tmp/runme", b"functionfs", b"/dev/stpwmt", b"/dev/stpbt",
+        b"FASTBOOT_PLEASE", b"/run/libreecho-control/runme", b"functionfs", b"/dev/stpwmt", b"/dev/stpbt",
         b"PARTNAME=expdb", b"/sys/class/block/mmcblk0p7", b"20480", b"bs=15 count=1",
         b"stat -c '%t:%T'",
     ):
@@ -2113,13 +2106,13 @@ def main() -> None:
                         help="manifest for the external assistant feature payload")
 
     parser.add_argument("--ssh-enabled", action="store_true",
-                        help="explicitly enable the password-only root SSH bundle")
+                        help="explicitly enable deferred WebUI-account SSH")
     parser.add_argument("--dropbear", type=Path,
-                        help="static ARM32 password-only Dropbear server")
+                        help="static ARM32 Dropbear server with WebUI auth")
     parser.add_argument("--dropbearkey", type=Path,
                         help="static ARM32 Dropbear host-key utility")
-    parser.add_argument("--ssh-root-password-hash", type=Path,
-                        help="build-local salted root crypt(3) hash file")
+    parser.add_argument("--scp", type=Path,
+                        help="static ARM32 scp server-side transfer executable")
 
     parser.add_argument("--wmt-config-helper", type=Path,
                         help="reviewed static ARM32 configure-only WMT helper")
@@ -2198,7 +2191,7 @@ def main() -> None:
     ssh_options = {
         "dropbear": args.dropbear,
         "dropbearkey": args.dropbearkey,
-        "ssh_root_password_hash": args.ssh_root_password_hash,
+        "scp": args.scp,
     }
     ssh_enabled = args.ssh_enabled
     if ssh_enabled and not all(value is not None for value in ssh_options.values()):
@@ -2416,11 +2409,13 @@ def main() -> None:
         },
         "ssh": {
             "enabled": False,
-            "activation": "manual-only",
-            "autostart": False,
-            "authentication": "password-only",
+            "activation": "deferred-after-webui-bootstrap",
+            "autostart": True,
+            "authentication": "webui-users-sha256",
+            "account_source": "/data/libreecho/config/users",
+            "privilege_policy": "non-root-ephemeral-users",
             "public_key_auth": False,
-            "root_login": True,
+            "root_login": False,
             "host_keys": "generated-ephemerally-under-/tmp/dropbear",
             "files": {},
         },
@@ -2530,7 +2525,7 @@ def main() -> None:
         if ssh_enabled:
             add_ssh_bundle(
                 stage, args.dropbear.resolve(), args.dropbearkey.resolve(),
-                args.ssh_root_password_hash.resolve(), manifest,
+                args.scp.resolve(), manifest,
             )
         if connectivity_enabled:
             add_connectivity_bundle(

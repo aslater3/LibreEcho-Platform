@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run one script as root through the deliberate LibreEcho /tmp/runme runner.
+# Run one script as root through the deliberate LibreEcho /run/libreecho-control/runme runner.
 set -euo pipefail
 
 usage() {
@@ -11,7 +11,7 @@ Environment:
   ADB_BIN      adb executable (default: adb)
 
 The development OS intentionally does not depend on an interactive adb shell.
-This helper pushes a nonce-marked script to /tmp/runme, waits for /tmp/result,
+This helper pushes a nonce-marked script to /run/libreecho-control/runme, waits for /run/libreecho-control/result,
 prints the command output, and returns the remote script's exit status.
 EOF
 }
@@ -47,11 +47,11 @@ result="$work/result"
   printf '\n# ---- user script ends ----\n'
 } > "$wrapper"
 
-"$adb_bin" -s "$serial" push "$wrapper" /tmp/runme >/dev/null
+"$adb_bin" -s "$serial" push "$wrapper" /run/libreecho-control/runme >/dev/null
 
 deadline=$((SECONDS + timeout))
 while ((SECONDS < deadline)); do
-  if "$adb_bin" -s "$serial" pull /tmp/result "$result" >/dev/null 2>&1 &&
+  if "$adb_bin" -s "$serial" pull /run/libreecho-control/result "$result" >/dev/null 2>&1 &&
      grep -Fxq "$nonce" "$result" &&
      grep -Eq '^LIBREECHO_RUNME_RC=[0-9]+$' "$result"; then
     rc_line=$(grep '^LIBREECHO_RUNME_RC=[0-9][0-9]*$' "$result" | tail -1 || true)
@@ -69,5 +69,5 @@ done
 
 echo "ERROR: timed out after ${timeout}s waiting for root result" >&2
 printf 'cancel\n' > "$work/cancel"
-"$adb_bin" -s "$serial" push "$work/cancel" /tmp/runme.cancel >/dev/null 2>&1 || true
+"$adb_bin" -s "$serial" push "$work/cancel" /run/libreecho-control/runme.cancel >/dev/null 2>&1 || true
 exit 124
