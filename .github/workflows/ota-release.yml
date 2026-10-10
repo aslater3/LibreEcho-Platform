@@ -184,6 +184,7 @@ jobs:
             ota/test_feature_provenance.py \
             ota/test_service_identity.py \
             ota/test_dev_discovery.py \
+            ota/test_release_source.py \
             test_active_device_ping.py
 
       - name: Run pinned Opus decode provenance suites

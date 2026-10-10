@@ -4132,7 +4132,7 @@ start_feature_service_if_enabled
 
     def test_ota_source_uses_product_release_repository(self) -> None:
         expected = (
-            "https://github.com/aslater3/LibreEcho/releases/latest/download/"
+            "https://dl.libreecho.org/latest/download/"
             "libreecho-radar-puffin-dev.ota.tar"
         )
         source = (TOOLS_DIR / "initramfs/ota-source.conf").read_text()
@@ -4146,11 +4146,19 @@ start_feature_service_if_enabled
         self.assertIn('f"libreecho-radar-puffin-{expected_update_channel}.ota.tar"', verifier)
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
         self.assertIn(expected, source)
+        self.assertIn("RELEASE_MIRROR=https://dl.libreecho.org\n", fetcher)
         self.assertIn(
-            'expected_url="https://github.com/aslater3/LibreEcho/releases/latest/download/libreecho-$TARGET_SLUG-$channel.ota.tar"',
+            "RELEASE_GITHUB=https://github.com/LibreEcho/LibreEcho/releases\n", fetcher,
+        )
+        self.assertIn(
+            'url="$RELEASE_BASE/latest/download/libreecho-$TARGET_SLUG-$channel.ota.tar"',
             fetcher,
         )
         self.assertNotIn("LibreEcho-Platform/releases", source + fetcher)
+        # The transport must not be bound to a personal account: a repository
+        # transfer would otherwise depend on GitHub's redirect forever.
+        generation = (TOOLS_DIR / "initramfs/libreecho-generation").read_text()
+        self.assertNotIn("aslater3", source + fetcher + generation)
 
     def test_ota_channel_persistence_selection_and_cleanup_contract(self) -> None:
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
@@ -4163,7 +4171,8 @@ start_feature_service_if_enabled
         self.assertIn("record_channel \"$ROOT/installed\"", fetcher)
         self.assertIn(
             "install_lock\n    seed_channel\n    validate_source\n"
-            "    prepare_https_client\n    resolve_dev_release || return 1\n    install_unlock",
+            "    prepare_https_client\n    select_release_source\n"
+            "    resolve_dev_release || return 1\n    install_unlock",
             fetcher,
         )
         automatic = fetcher[fetcher.index("set_automatic_updates()"):fetcher.index("die()")]
@@ -4171,12 +4180,14 @@ start_feature_service_if_enabled
 
         self.assertLess(fetcher.index("seed_channel"), fetcher.index("check_or_install()"))
 
-        expected_url = (
-            'expected_url="https://github.com/aslater3/LibreEcho/releases/latest/download/'
-            'libreecho-$TARGET_SLUG-$channel.ota.tar"'
+        self.assertIn(
+            "    validate_source\n    prepare_https_client\n    select_release_source\n",
+            fetcher,
         )
-        self.assertIn(expected_url, fetcher)
-        self.assertIn("url=$expected_url", fetcher)
+        self.assertIn(
+            'url="$RELEASE_BASE/latest/download/libreecho-$TARGET_SLUG-$channel.ota.tar"',
+            fetcher,
+        )
         self.assertNotIn('url=$(config_value url)', fetcher)
 
         self.assertIn('set-channel)', fetcher)

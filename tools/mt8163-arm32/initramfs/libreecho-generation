@@ -7,6 +7,13 @@ TARGET_MANIFEST=${TARGET_MANIFEST:-/usr/local/sbin/libreecho-target-manifest}
 CURL=${CURL:-/usr/bin/curl}
 CA=${CA:-/etc/ssl/certs/ca-certificates.crt}
 SPACE_RESERVE_BYTES=${SPACE_RESERVE_BYTES:-262144}
+# Feature asset transport chosen by libreecho-update-fetch. Only the two
+# project transports are accepted; anything else falls back to GitHub. Every
+# asset is still size- and hash-checked against the signed manifest.
+case "${RELEASE_BASE:-}" in
+    https://dl.libreecho.org|https://github.com/LibreEcho/LibreEcho/releases) release_base=$RELEASE_BASE ;;
+    *) release_base=https://github.com/LibreEcho/LibreEcho/releases ;;
+esac
 fail() {
     printf 'ERROR:%s\n' "$1" >&2
     # Only a pin created by this assembly belongs to its ordinary error path.
@@ -264,7 +271,7 @@ assemble() {
                 http=$("$CURL" --fail --location --silent --show-error --proto '=https' --proto-redir '=https' \
                     --tlsv1.2 --cacert "$CA" --connect-timeout 20 --max-time 1800 --max-filesize "$size" \
                     --output "$part" --write-out '%{http_code}' --continue-at - \
-                    "https://github.com/aslater3/LibreEcho/releases/download/$(value release "$manifest")/$asset")
+                    "$release_base/download/$(value release "$manifest")/$asset")
                 rc=$?
                 [ "$rc" = 0 ] || fail download-asset-transport
                 case "$http" in 2??) ;; *) fail download-asset-http;; esac
