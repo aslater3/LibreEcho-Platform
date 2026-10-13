@@ -172,6 +172,8 @@ jobs:
             ota/test_ota_v2_implementation.py \
             test_ota_v3_activation.py \
             test_issue_231_fixed_boot_store.py \
+            test_reboot_bootloader.py \
+            test_issue_195_no_expdb_marker.py \
             test_ota_v3_config.py \
             test_ota_v3_convergence.py \
             test_ota_v3_failure_policy.py \
