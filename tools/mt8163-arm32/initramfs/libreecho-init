@@ -1023,9 +1023,9 @@ fi
 IMAGE_PROFILE=$($BB cat /etc/libreecho/image-profile 2>/dev/null)
 case "$IMAGE_PROFILE" in
     development)
-        # amonet v2.0.0 stores the LK-stage kaeru payload in expdb.  The
-        # development image must not arm a marker there; the fastboot escape
-        # request is rejected below rather than silently corrupting expdb.
+        # amonet v2.0.0 stores the LK-stage kaeru payload in expdb.  No marker
+        # is ever armed there; a fastboot request is honoured below only as
+        # Kaeru's one-shot misc command, after the payload is proven.
         log automatic-fastboot-marker-disabled
         ;;
     ota)
@@ -1048,7 +1048,16 @@ reboot_request_loop()
             $BB rm -f /tmp/reboot.request
             case "$request" in
                 fastboot)
-                    log reboot-request-fastboot-rejected-expdb-protected
+                    # Kaeru one-shot command in misc only (bootctl proves the
+                    # Kaeru payload in expdb read-only first; Platform #195).
+                    if /usr/local/sbin/libreecho-bootctl reboot-bootloader \
+                           >/dev/null 2>&1; then
+                        log reboot-request-fastboot-accepted
+                        $BB sync
+                        $BB reboot -f
+                    else
+                        log reboot-request-fastboot-refused
+                    fi
                     ;;
                 reboot)
                     log reboot-request-reboot-accepted

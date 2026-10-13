@@ -31,7 +31,10 @@ class Issue195ExpdbSafetyTests(unittest.TestCase):
         self.assertNotIn("FASTBOOT_PLEASE", init)
         self.assertNotIn("$EXPDB", init)
         self.assertNotIn("printf FASTBOOT_PLEASE", init)
-        self.assertIn("reboot-request-fastboot-rejected-expdb-protected", init)
+        # Fastboot requests now go through Kaeru's one-shot misc command
+        # (test_reboot_bootloader.py); init itself still never names expdb.
+        self.assertIn("libreecho-bootctl reboot-bootloader", init)
+        self.assertIn("reboot-request-fastboot-refused", init)
         # Removing the marker must not remove block-node creation: userdata
         # and the A/B slots are opened through these /dev/mmcblk0pN nodes.
         self.assertIn('$BB mknod "/dev/$name" b "$major" "$minor"', init)
@@ -41,13 +44,12 @@ class Issue195ExpdbSafetyTests(unittest.TestCase):
         self.assertNotIn("clear_exact_development_marker", update)
         self.assertNotIn("expdb-sector.after", update)
 
-    def test_fastboot_helper_fails_closed_without_issuing_request(self) -> None:
+    def test_fastboot_helper_only_issues_the_device_request(self) -> None:
         helper = HELPER.read_text()
-        self.assertIn("fastboot escape is disabled on amonet v2.0.0", helper)
-        self.assertIn("No partition write or reboot request was issued", helper)
-        self.assertNotIn("printf FASTBOOT_PLEASE", helper)
-        self.assertNotIn("reboot.request", helper)
-        self.assertNotIn("ADB_BIN", helper)
+        self.assertNotIn("FASTBOOT_PLEASE", helper)
+        self.assertNotIn("mmcblk0p", helper)
+        self.assertNotIn("dd ", helper)
+        self.assertIn("printf fastboot > /tmp/reboot.request", helper)
 
     def test_kernel_contract_keeps_bcb_driver_but_forbids_expdb_marker(self) -> None:
         kconfig = KCONFIG.read_text()

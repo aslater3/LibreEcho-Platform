@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# Fastboot escape is intentionally unavailable on amonet v2.0.0: expdb contains
-# the LK-stage kaeru payload and must never receive FASTBOOT_PLEASE.
+# Restart a running LibreEcho device into Kaeru fastboot over ADB.
+#
+# The device performs the only flash write: libreecho-bootctl proves the Kaeru
+# payload in expdb (read-only) and writes Kaeru's one-shot misc command
+# "bootonce-bootloader".  expdb is never written (Platform #195).  From fastboot
+# a plain `fastboot reboot` returns to LibreEcho.
 set -euo pipefail
 
-cat >&2 <<'EOF'
-ERROR: fastboot escape is disabled on amonet v2.0.0; expdb is protected.
-No partition write or reboot request was issued.
-EOF
-exit 2
+ADB_BIN=${ADB_BIN:-adb}
+serial=${1:-}
+[[ -n "$serial" ]] || { echo "usage: $0 <adb-serial>" >&2; exit 2; }
+
+"$ADB_BIN" -s "$serial" shell 'printf fastboot > /tmp/reboot.request'
+echo "Requested restart to fastboot on $serial; wait for: fastboot devices"
