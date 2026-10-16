@@ -12,6 +12,40 @@ ROOT = Path(__file__).resolve().parent
 
 
 class SSHRuntimeTests(unittest.TestCase):
+    def test_saved_ssh_switch_is_fail_closed(self):
+        source = (ROOT / 'ssh/libreecho-ssh.init').read_text()
+        function = source[source.index('ssh_config_enabled()'):source.index('write_static_accounts()')]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / 'web-config.json'
+            wrapper = root / 'bb'
+            wrapper.write_text('''#!/bin/sh
+if [ "$1" = stat ]; then
+    case "$3" in
+        %u) printf '0\\n'; exit 0;;
+        %a) printf '600\\n'; exit 0;;
+        %s) printf '128\\n'; exit 0;;
+    esac
+fi
+exec "$@"
+''')
+            wrapper.chmod(0o755)
+            env = dict(os.environ, BB=str(wrapper), CONFIG_FILE=str(config))
+
+            def enabled(content):
+                config.write_text(content)
+                result = subprocess.run(['sh', '-c', function + '\nssh_config_enabled'],
+                                        env=env, capture_output=True, text=True, timeout=5)
+                return result.returncode == 0
+
+            self.assertTrue(enabled('{"ssh":true,"api_lan":false}'))
+            self.assertFalse(enabled('{"ssh":false,"api_lan":false}'))
+            self.assertFalse(enabled('{"api_lan":false}'))
+            self.assertFalse(enabled('{"ssh":true,"ssh":false}'))
+            config.unlink()
+            self.assertFalse(subprocess.run(['sh', '-c', function + '\nssh_config_enabled'],
+                                            env=env, timeout=5).returncode == 0)
+
     def test_web_binding_survives_first_account_lifecycle(self):
         source = (ROOT / 'initramfs/libreecho-init').read_text()
         start = source.index('                # The control plane is intentionally')
