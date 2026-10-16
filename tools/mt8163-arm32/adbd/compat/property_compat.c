@@ -1,5 +1,9 @@
 #include <string.h>
 
+#ifndef LIBREECHO_ADB_TCP_PORT
+#define LIBREECHO_ADB_TCP_PORT 0
+#endif
+
 int property_get(const char *name, char *value, const char *default_value)
 {
     const char *result = default_value ? default_value : "";
@@ -8,7 +12,13 @@ int property_get(const char *name, char *value, const char *default_value)
     else if (!strcmp(name, "ro.adb.secure")) result = "0";
     else if (!strcmp(name, "ro.kernel.qemu")) result = "0";
     else if (!strcmp(name, "service.adb.root")) result = "";
-    else if (!strcmp(name, "service.adb.tcp.port")) result = "0";
+    else if (!strcmp(name, "service.adb.tcp.port")) {
+#if LIBREECHO_ADB_TCP_PORT == 5555
+        result = "5555";
+#else
+        result = "0";
+#endif
+    }
     if (value) {
         strncpy(value, result, 91);
         value[91] = '\0';

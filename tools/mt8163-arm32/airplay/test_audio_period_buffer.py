@@ -98,10 +98,12 @@ int main(void)
 {
     struct source_bus sources[SOURCE_COUNT];
     struct puffin_dynamics dynamics;
+    struct speaker_dsp speaker;
     int pipes[SOURCE_COUNT][2];
     int16_t half[PERIOD_SIZE * INPUT_CHANNELS / 2];
     int16_t output[PERIOD_SIZE * OUTPUT_CHANNELS];
     unsigned int activity_mask = 0;
+    int32_t master_gain = 32768;
     size_t period_bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
     size_t i;
 
@@ -143,10 +145,13 @@ int main(void)
         return fail("ready source was blocked by partial source");
 
     puffin_dynamics_init(&dynamics);
-    render_period(sources, output, &dynamics);
+    speaker_dsp_init(&speaker, 100);
+    render_period(sources, output, &dynamics, &speaker, 32768, &master_gain);
+    /* A new LR4 filterbank has a measured three-frame startup delay. */
     for (i = 0; i < PERIOD_SIZE; ++i) {
-        if (output[i * OUTPUT_CHANNELS] == 0 ||
-            output[i * OUTPUT_CHANNELS] != output[i * OUTPUT_CHANNELS + 1])
+        if (output[i * OUTPUT_CHANNELS] != output[i * OUTPUT_CHANNELS + 1] ||
+            (i < 3 && output[i * OUTPUT_CHANNELS] != 0) ||
+            (i >= 3 && output[i * OUTPUT_CHANNELS] == 0))
             return fail("ready source did not render while another was partial");
     }
     consume_period(sources);
@@ -200,16 +205,60 @@ int main(void)
         return fail("one-period startup write failed");
     if (read_sources(sources, "/tmp") < 0 ||
         prepare_initial_period(sources, "/tmp", output, &dynamics,
-                               &activity_mask) != 1 ||
+                               &speaker, &activity_mask, 100, &master_gain) != 1 ||
         activity_mask == 0)
         return fail("one complete period was not accepted at startup");
-    for (i = 0; i < PERIOD_SIZE; ++i) {
-        if (output[i * OUTPUT_CHANNELS] == 0 ||
-            output[i * OUTPUT_CHANNELS] != output[i * OUTPUT_CHANNELS + 1])
-            return fail("one-period startup render contains a gap");
+    /* A gap is a run of zero samples (a zero-filled half period would be
+     * 1024).  A single zero is a legitimate crossing of the DSP's step
+     * response to this DC fixture at the -12 dB master ceiling. */
+    {
+        size_t run = 0;
+        for (i = 0; i < PERIOD_SIZE; ++i) {
+            if (output[i * OUTPUT_CHANNELS] != output[i * OUTPUT_CHANNELS + 1])
+                return fail("one-period startup render contains a gap");
+            run = (i >= 3 && output[i * OUTPUT_CHANNELS] == 0) ? run + 1 : 0;
+            if (run >= 8)
+                return fail("one-period startup render contains a gap");
+        }
     }
 
     consume_period(sources);
+
+    /* Every producer reaches the same mono EQ/MBCL/output path.  Reset DSP
+     * state for each solo bus and demand identical final PCM bytes. */
+    {
+        int16_t reference[PERIOD_SIZE * OUTPUT_CHANNELS];
+        size_t bus, frame;
+        for (bus = 0; bus < SOURCE_COUNT; ++bus) {
+            for (i = 0; i < SOURCE_COUNT; ++i) {
+                sources[i].idle_periods = 0;
+                sources[i].received = 0;
+                sources[i].gain_q15 = 32768;
+            }
+            for (frame = 0; frame < PERIOD_SIZE; ++frame) {
+                int16_t value = (frame % 600 < 300) ? 4000 : -4000;
+                sources[bus].samples[frame * INPUT_CHANNELS] = value;
+                sources[bus].samples[frame * INPUT_CHANNELS + 1] = value;
+            }
+            sources[bus].received = period_bytes;
+            sources[bus].airplay_volume_missing = 0;
+            master_gain = 32768;
+            puffin_dynamics_init(&dynamics);
+            speaker_dsp_init(&speaker, 60);
+            render_period(sources, output, &dynamics, &speaker, 32768, &master_gain);
+            if (bus == 0)
+                memcpy(reference, output, sizeof(reference));
+            else if (memcmp(reference, output, sizeof(reference)) != 0)
+                return fail("source bus bypassed the common EQ/MBCL output");
+        }
+    }
+
+    /* AirPlay admission, invalid-ack, and two-session FIFO checks live in
+     * test_airplay_session_dsp.py; this fixture checks generic period continuity. */
+    if (speaker_volume_percent_for_mix(60, 3277, 1, 1) !=
+        speaker_volume_percent_for_mix(60, 32768, 1, 1) ||
+        speaker_volume_percent_for_mix(100, 3277, 1, 0) >= 100)
+        return fail("logical master preset followed wrong bus attenuation");
 
     for (i = 0; i < SOURCE_COUNT; ++i) {
         close(pipes[i][0]);
@@ -340,7 +389,7 @@ def main() -> None:
         raise SystemExit("audio engine must not zero-fill a short source period")
     run_start = engine.index("static int run_engine")
     run_engine = engine[run_start:]
-    if "int poll_timeout = period_ready(sources) ? 20 : -1;" not in run_engine:
+    if "int poll_timeout = 20;" not in run_engine:
         raise SystemExit("retained periods need a timed state recheck")
     if "if (read_or_retain_sources(sources, root) <= 0)" not in run_engine:
         raise SystemExit("retained periods must advance without a new FIFO read")

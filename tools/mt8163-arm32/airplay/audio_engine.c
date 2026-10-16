@@ -22,6 +22,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <tinyalsa/mixer.h>
@@ -30,12 +31,27 @@
 #include "aec_reference.h"
 #include "audio_period_buffer.h"
 #include "audio_visualizer.h"
+#include "music_session_id.h"
 #include "playback_status.h"
 #include "puffin_downmix.h"
+#include "speaker_dsp.h"
+#include "biscuit_speaker_dsp.h"
 
 #define DEFAULT_ROOT "/run/libreecho-audio"
 #define AIRPLAY_ACTIVE_FILE "airplay.active"
 #define AIRPLAY_VOLUME_FILE "airplay.volume"
+#define AIRPLAY_MASTER_FILE "airplay.master"
+#define AIRPLAY_RESET_FILE "airplay.reset"
+#define AIRPLAY_RESET_ACK_FILE "airplay.reset-ack"
+#define MASTER_VOLUME_FILE "master.volume"
+#define IMAGE_TARGET_FILE "/etc/libreecho/target"
+/* airplayd chroots the engine into the feature root, which does not carry
+ * the image identity; the host /proc is mounted there, so PID 1's root is. */
+#define IMAGE_TARGET_FILE_HOST "/proc/1/root/etc/libreecho/target"
+/* Per-target speaker policy rendered by the image build from the Platform
+ * target table (libreecho_platform_targets.py); same chroot rule applies. */
+#define AUDIO_PROFILE_FILE "/etc/libreecho/audio-profile"
+#define AUDIO_PROFILE_FILE_HOST "/proc/1/root/etc/libreecho/audio-profile"
 #define LED_SOCKET "/run/libreecho/led.sock"
 #define DEFAULT_CARD 0U
 #define DEFAULT_DEVICE 23U
@@ -45,8 +61,9 @@
 #define PERIOD_SIZE 2048U
 #define PERIOD_COUNT 2U
 #define AMP_SETTLE_US 30000U
-#define SOURCE_COUNT 4U
+#define SOURCE_COUNT 5U
 #define SOURCE_IDLE_PERIODS 8U
+#define AIRPLAY_ACK_GRACE_READS 24U
 #define MEDIA_DUCK_Q15 8231
 #define VISUALIZER_FRAME_PERIODS 2U
 #define VISUALIZER_SILENT_PERIODS 24U
@@ -56,7 +73,8 @@ enum source_role {
 	SOURCE_MEDIA,
 	SOURCE_SYSTEM,
 	SOURCE_ANNOUNCEMENT,
-	SOURCE_ALARM
+	SOURCE_ALARM,
+	SOURCE_AIRPLAY
 };
 
 struct source_bus {
@@ -66,6 +84,16 @@ struct source_bus {
 	int fd;
 	unsigned int idle_periods;
 	int32_t gain_q15;
+	int airplay_volume_missing;
+	int airplay_session_seen;
+	int airplay_idle_drained;
+	int airplay_reset_ready;
+	int airplay_reset_pending;
+	char airplay_reset_token[33];
+	struct stat airplay_marker;
+	int airplay_admitted;
+	int32_t airplay_last_gain;
+	unsigned int airplay_invalid_reads;
 	int16_t *samples;
 	size_t capacity;
 	size_t received;
@@ -74,6 +102,9 @@ struct source_bus {
 struct music_visualizer {
 	struct audio_visualizer analyzer;
 	uint8_t levels[AUDIO_VISUALIZER_BANDS];
+	struct music_features features;
+	struct music_feature_transport transport;
+	unsigned int feature_version;
 	unsigned int frame_periods;
 	unsigned int silent_periods;
 	int active;
@@ -108,15 +139,6 @@ static int set_stereo_control(struct mixer *mixer, const char *name, int value)
     return mixer_ctl_set_value(control, 1, value);
 }
 
-static int get_stereo_control(struct mixer *mixer, const char *name, int *value)
-{
-    struct mixer_ctl *control = mixer_get_ctl_by_name(mixer, name);
-
-    if (!control || mixer_ctl_get_num_values(control) < 1)
-        return -1;
-    *value = mixer_ctl_get_value(control, 0);
-    return *value < 0 ? -1 : 0;
-}
 
 static int set_single_control(struct mixer *mixer, const char *name, int value)
 {
@@ -127,25 +149,35 @@ static int set_single_control(struct mixer *mixer, const char *name, int value)
     return mixer_ctl_set_value(control, 0, value);
 }
 
+/*
+ * Per-target speaker policy.  The zero-argument defaults are Radar's, so a
+ * missing or rejected profile never changes Radar behaviour.
+ */
+struct speaker_profile {
+	int biscuit_chain;      /* 0 = radar_puffin chain, 1 = biscuit chain */
+	int codec_flat;         /* kernel "Speaker Codec Profile": 0 Radar, 1 Flat */
+	int hp_driver_gain;     /* codec "HP Driver Gain Volume" index */
+	float pre_gain;         /* linear, biscuit chain only */
+	float bass_makeup_db;   /* biscuit chain only */
+};
+
+static struct speaker_profile speaker_profile = {
+	.biscuit_chain = 0, .codec_flat = 0, .hp_driver_gain = 6,
+	.pre_gain = 1.0f, .bass_makeup_db = 0.0f,
+};
+
 /* Arm the output while keeping the codec muted.  This is used before a
  * stream exists, so enabling the physical amplifier cannot produce a pop. */
-static int arm_output_controls(unsigned int card, int volume,
-                               int *saved_volume)
+static int arm_output_controls(unsigned int card)
 {
     struct mixer *mixer;
     int result = 0;
-
-    if (saved_volume)
-        *saved_volume = -1;
 
     mixer = mixer_open(card);
     if (!mixer) {
         fprintf(stderr, "audio-engine: mixer %u unavailable\n", card);
         return -1;
     }
-    if (saved_volume &&
-        get_stereo_control(mixer, "PCM Playback Volume", saved_volume) < 0)
-        *saved_volume = -1;
     if (set_enum_control(mixer, "MFP Gpio Mute", "On") < 0)
         result = -1;
     if (set_enum_control(mixer, "Ext_Speaker_Amp_Switch", "Off") < 0)
@@ -164,18 +196,40 @@ static int arm_output_controls(unsigned int card, int volume,
         result = -1;
     if (set_single_control(mixer, "HPR Output Mixer IN1_R Switch", 0) < 0)
         result = -1;
-    if (set_stereo_control(mixer, "HP Driver Gain Volume", 6) < 0)
+    if (set_stereo_control(mixer, "HP Driver Gain Volume",
+                           speaker_profile.hp_driver_gain) < 0)
         result = -1;
-    if (volume >= 0 &&
-        set_stereo_control(mixer, "PCM Playback Volume", volume) < 0)
-        result = -1;
+    /* Radar is the kernel default, so kernels without the control keep
+     * working; a Flat request on such a kernel is reported, not fatal. */
+    if (set_enum_control(mixer, "Speaker Codec Profile",
+                         speaker_profile.codec_flat ? "Flat" : "Radar") < 0 &&
+        speaker_profile.codec_flat)
+        fprintf(stderr, "audio-engine: Speaker Codec Profile Flat unavailable\n");
     mixer_close(mixer);
     return result;
 }
 
+/* Audiod alone writes PCM Playback Volume. Never compensate for a missing or
+ * mismatched reference by changing the codec from this PCM owner. */
+static int verify_codec_reference(unsigned int card)
+{
+	struct mixer *mixer = mixer_open(card);
+	struct mixer_ctl *control;
+	int result = -1;
+	if (!mixer)
+		return -1;
+	control = mixer_get_ctl_by_name(mixer, "PCM Playback Volume");
+	/* MT8163 PCM Playback Volume uses -127..48; raw index 127 = 0 dB. */
+	if (control && mixer_ctl_get_num_values(control) >= 2 &&
+	    mixer_ctl_get_value(control, 0) == 127 &&
+	    mixer_ctl_get_value(control, 1) == 127)
+		result = 0;
+	mixer_close(mixer);
+	return result;
+}
+
 /* Enable the physical amplifier while keeping the codec muted, then let its
- * power rail settle.  The first PCM period is queued only after this delay so
- * a short clip is still present when the codec is unmuted. */
+ * power rail settle before queuing the first PCM period. */
 static int power_output_controls(unsigned int card)
 {
     struct mixer *mixer;
@@ -215,7 +269,7 @@ static int unmute_output_controls(unsigned int card)
     return result;
 }
 
-static int disable_output_controls(unsigned int card, int restore_volume)
+static int disable_output_controls(unsigned int card)
 {
     struct mixer *mixer;
     int result = 0;
@@ -229,9 +283,6 @@ static int disable_output_controls(unsigned int card, int restore_volume)
     if (set_enum_control(mixer, "MFP Gpio Mute", "On") < 0)
         result = -1;
     if (set_enum_control(mixer, "Ext_Speaker_Amp_Switch", "Off") < 0)
-        result = -1;
-    if (restore_volume >= 0 &&
-        set_stereo_control(mixer, "PCM Playback Volume", restore_volume) < 0)
         result = -1;
     mixer_close(mixer);
     if (result < 0)
@@ -321,6 +372,32 @@ static void set_announcement_led(int active)
 	(void)send_led_request(active ? request_on : request_off);
 }
 
+/*
+ * The producer session id is nonzero and stable for one engine lifetime.  It
+ * is reseeded only when the engine process starts (or is restarted by the
+ * supervisor), which is the producer reset boundary.  music_session_id.h makes
+ * the value collision-resistant across two rapid restarts (full monotonic ns,
+ * pid and kernel entropy) while keeping the frozen uint32 wire field.
+ */
+static uint32_t music_visualizer_seed(void)
+{
+	return music_session_id_seed();
+}
+
+/*
+ * Compatibility switch.  Version 2 (the frozen perceptual contract) is the
+ * default; LIBREECHO_AUDIO_VISUALIZER_VERSION=1 keeps the legacy twelve-level
+ * frame for a consumer that has not migrated yet.
+ */
+static unsigned int music_visualizer_feature_version(void)
+{
+	const char *value = getenv("LIBREECHO_AUDIO_VISUALIZER_VERSION");
+
+	if (value && value[0] == '1' && value[1] == '\0')
+		return 1U;
+	return MUSIC_FEATURES_VERSION;
+}
+
 static void release_music_visualizer(struct music_visualizer *visualizer)
 {
 	const char *request =
@@ -343,25 +420,17 @@ static void stop_music_visualizer(struct music_visualizer *visualizer)
 
 static int send_music_visualizer_frame(struct music_visualizer *visualizer)
 {
-	static const char hexadecimal[] = "0123456789abcdef";
-	char levels_hex[AUDIO_VISUALIZER_BANDS * 2U + 1U];
-	char request[192];
-	unsigned int band;
+	char request[MUSIC_FEATURES_FRAME_MAX];
+	uint32_t seq = music_feature_transport_next_seq(&visualizer->transport);
+	uint32_t timestamp =
+		music_feature_transport_timestamp_ms(&visualizer->transport);
 	int length;
 
-	for (band = 0; band < AUDIO_VISUALIZER_BANDS; ++band) {
-		levels_hex[band * 2U] =
-			hexadecimal[visualizer->levels[band] >> 4];
-		levels_hex[band * 2U + 1U] =
-			hexadecimal[visualizer->levels[band] & 0x0f];
-	}
-	levels_hex[AUDIO_VISUALIZER_BANDS * 2U] = '\0';
-	length = snprintf(request, sizeof(request),
-		"{\"v\":1,\"id\":2,\"cmd\":\"visualizer\",\"args\":"
-		"{\"action\":\"frame\",\"levels\":\"%s\","
-		"\"brightness\":%u,\"owner\":\"music\"}}\n",
-		levels_hex, VISUALIZER_BRIGHTNESS);
-	if (length < 0 || (size_t)length >= sizeof(request))
+	length = music_features_format_frame(request, sizeof(request),
+		&visualizer->features, visualizer->levels,
+		VISUALIZER_BRIGHTNESS, visualizer->feature_version,
+		visualizer->transport.session, seq, timestamp);
+	if (length < 0)
 		return -1;
 	return send_led_request(request);
 }
@@ -383,13 +452,25 @@ static void process_music_visualizer(struct music_visualizer *visualizer,
 	int audible = 0;
 
 	if (higher_priority_active(sources) ||
-	    sources[SOURCE_MEDIA].received == 0) {
+	    (sources[SOURCE_MEDIA].received == 0 &&
+	     sources[SOURCE_AIRPLAY].received == 0)) {
 		stop_music_visualizer(visualizer);
 		return;
 	}
 
-	audio_visualizer_process(&visualizer->analyzer, rendered, PERIOD_SIZE,
-				 OUTPUT_CHANNELS, visualizer->levels);
+	/*
+	 * Advance the producer clock.  begin_tick rotates to a fresh session
+	 * (from music_visualizer_seed) when the cumulative analysed-music clock
+	 * would wrap the frozen 32-bit timestamp_ms, so a consumer never sees a
+	 * backward timestamp inside one session; seq and the clock restart with
+	 * the new id.  The seed is only taken at that multi-week boundary.
+	 */
+	(void)music_feature_transport_begin_tick(&visualizer->transport,
+						 music_visualizer_seed);
+	audio_visualizer_process_features(&visualizer->analyzer, rendered,
+					  PERIOD_SIZE, OUTPUT_CHANNELS,
+					  visualizer->levels,
+					  &visualizer->features);
 	for (band = 0; band < AUDIO_VISUALIZER_BANDS; ++band)
 		if (visualizer->levels[band] != 0) {
 			audible = 1;
@@ -427,7 +508,9 @@ static unsigned int source_activity_mask(const struct source_bus *sources)
 {
 	unsigned int mask = 0;
 
-	if (sources[SOURCE_MEDIA].idle_periods > 0)
+	if (sources[SOURCE_MEDIA].idle_periods > 0 ||
+	    (sources[SOURCE_AIRPLAY].idle_periods > 0 &&
+	     !sources[SOURCE_AIRPLAY].airplay_volume_missing))
 		mask |= PLAYBACK_BUS_MEDIA;
 	if (sources[SOURCE_SYSTEM].idle_periods > 0)
 		mask |= PLAYBACK_BUS_SYSTEM;
@@ -485,60 +568,98 @@ static int airplay_is_active(const char *root)
 	if (snprintf(path, sizeof(path), "%s/%s", root,
 		     AIRPLAY_ACTIVE_FILE) < 0)
 		return 0;
-	return access(path, F_OK) == 0;
+	{
+		struct stat st;
+		return lstat(path, &st) == 0 && S_ISREG(st.st_mode);
+	}
 }
 
 static int airplay_volume_to_mixer(const char *root)
 {
-	char path[256];
-	char buffer[64];
+	char path[256], marker[256], ack_path[256];
+	char buffer[64], ack_text[160];
 	char *end;
 	double db;
 	int fd;
 	ssize_t n;
+	struct stat active, callback, current, ack_stat;
+	unsigned long long md, mi, vd, vi;
+	long long ms, vs;
+	long mn, vn;
 
-	if (snprintf(path, sizeof(path), "%s/%s", root,
-		     AIRPLAY_VOLUME_FILE) < 0)
+	if (snprintf(marker, sizeof(marker), "%s/%s", root,
+		     AIRPLAY_ACTIVE_FILE) >= (int)sizeof(marker) ||
+	    snprintf(path, sizeof(path), "%s/%s", root,
+		     AIRPLAY_VOLUME_FILE) >= (int)sizeof(path) ||
+	    snprintf(ack_path, sizeof(ack_path), "%s/%s", root,
+		     AIRPLAY_MASTER_FILE) >= (int)sizeof(ack_path) ||
+	    lstat(marker, &active) < 0 || !S_ISREG(active.st_mode))
 		return -1;
-	fd = open(path, O_RDONLY | O_CLOEXEC);
+	fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
 	if (fd < 0)
 		return -1;
+	if (fstat(fd, &callback) < 0 || !S_ISREG(callback.st_mode) ||
+	    callback.st_size <= 0 || callback.st_size >= (off_t)sizeof(buffer)) {
+		close(fd);
+		return -1;
+	}
 	n = read(fd, buffer, sizeof(buffer) - 1);
 	close(fd);
-	if (n <= 0)
+	if (n <= 0 || stat(path, &current) < 0 ||
+	    current.st_dev != callback.st_dev || current.st_ino != callback.st_ino)
 		return -1;
 	buffer[n] = '\0';
 	errno = 0;
 	db = strtod(buffer, &end);
-	if (end == buffer || errno == ERANGE || !isfinite(db))
+	if (end == buffer || errno == ERANGE || !isfinite(db) ||
+	    (db != -144.0 && (db < -30.0 || db > 0.0)))
 		return -1;
-	while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')
+	while (*end == ' ' || *end == '	' || *end == '\n' || *end == '\r')
 		end++;
 	if (*end != '\0')
 		return -1;
-	if (db <= -63.5)
-		return 0;
-	if (db >= 0.0)
-		return 127;
-	return (int)lround(127.0 + (db * 2.0));
+	/* Open without following links or waiting for a FIFO writer. Only bounded
+	 * regular ack files can enter the PCM loop's parser. */
+	fd = open(ack_path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0)
+		return -1;
+	if (fstat(fd, &ack_stat) < 0 || !S_ISREG(ack_stat.st_mode) ||
+	    ack_stat.st_size <= 0 || ack_stat.st_size >= (off_t)sizeof(ack_text)) {
+		close(fd);
+		return -1;
+	}
+	n = read(fd, ack_text, (size_t)ack_stat.st_size);
+	close(fd);
+	if (n != ack_stat.st_size)
+		return -1;
+	ack_text[n] = '\0';
+	n = sscanf(ack_text, "%llu %llu %lld %ld %llu %llu %lld %ld",
+		   &md, &mi, &ms, &mn, &vd, &vi, &vs, &vn);
+	if (n != 8 || md != (unsigned long long)active.st_dev ||
+	    mi != (unsigned long long)active.st_ino ||
+	    ms != (long long)active.st_ctim.tv_sec || mn != active.st_ctim.tv_nsec ||
+	    vd != (unsigned long long)callback.st_dev ||
+	    vi != (unsigned long long)callback.st_ino ||
+	    vs != (long long)callback.st_ctim.tv_sec || vn != callback.st_ctim.tv_nsec ||
+	    stat(marker, &current) < 0 || current.st_dev != active.st_dev ||
+	    current.st_ino != active.st_ino ||
+	    current.st_ctim.tv_sec != active.st_ctim.tv_sec ||
+	    current.st_ctim.tv_nsec != active.st_ctim.tv_nsec ||
+	    stat(path, &current) < 0 || current.st_dev != callback.st_dev ||
+	    current.st_ino != callback.st_ino ||
+	    current.st_ctim.tv_sec != callback.st_ctim.tv_sec ||
+	    current.st_ctim.tv_nsec != callback.st_ctim.tv_nsec)
+		return -1;
+	return db <= -144.0 ? 0 : 127;
 }
 
-static int set_pcm_volume(unsigned int card, int volume)
+static int32_t airplay_media_gain(int raw)
 {
-	struct mixer *mixer;
-	int result;
-
-	if (volume < 0 || volume > 127)
-		return -1;
-	mixer = mixer_open(card);
-	if (!mixer)
-		return -1;
-	result = set_stereo_control(mixer, "PCM Playback Volume", volume);
-	mixer_close(mixer);
-	return result;
+	/* Only explicit sender mute affects media; audiod owns the level. */
+	return raw <= 0 ? 0 : 32768;
 }
 
-static int read_media_gain(const char *root)
+static int32_t read_media_gain(const char *root)
 {
 	char path[256];
 	char buffer[64];
@@ -566,7 +687,7 @@ static int read_media_gain(const char *root)
 static int setup_sources(struct source_bus *sources, const char *root)
 {
 	static const char *const names[SOURCE_COUNT] = {
-		"media", "system", "announcement", "alarm"
+		"media", "system", "announcement", "alarm", "airplay-media"
 	};
 	unsigned int i;
 	const size_t period_bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
@@ -626,15 +747,145 @@ static int poll_sources(struct source_bus *sources, int timeout_ms)
 	return result;
 }
 
+/* The dedicated AirPlay FIFO is never reclassified as generic media. */
+static int discard_disconnected_media(struct source_bus *media)
+{
+	unsigned char input[4096];
+	size_t drained = 0;
+
+	media->received = 0;
+	media->idle_periods = 0;
+	for (;;) {
+		ssize_t n = read(media->fd, input, sizeof(input));
+		if (n > 0) {
+			drained += (size_t)n;
+			if (drained > media->capacity * 4)
+				return -1; /* fail closed if a producer never quiesces */
+			continue;
+		}
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n == 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)))
+			return 0;
+		return -1;
+	}
+}
+
+static int same_marker(const struct stat *a, const struct stat *b)
+{
+	return a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
+	       a->st_ctim.tv_sec == b->st_ctim.tv_sec &&
+	       a->st_ctim.tv_nsec == b->st_ctim.tv_nsec;
+}
+
+static int airplay_marker_stat(const char *root, struct stat *marker)
+{
+	char path[256];
+	int n = snprintf(path, sizeof(path), "%s/%s", root, AIRPLAY_ACTIVE_FILE);
+	return n > 0 && n < (int)sizeof(path) &&
+	       lstat(path, marker) == 0 && S_ISREG(marker->st_mode);
+}
+
+/* Hooks hold the forwarding lock until this exact-token acknowledgement.
+ * Drain queued periods and the dedicated FIFO before releasing the hook. */
+static int service_airplay_reset(struct source_bus *ap, const char *root)
+{
+	char request[256], ack[256], temporary[256], token[33];
+	struct stat st;
+	int fd, n, i;
+	if (snprintf(request, sizeof(request), "%s/%s", root, AIRPLAY_RESET_FILE) >= (int)sizeof(request) ||
+	    snprintf(ack, sizeof(ack), "%s/%s", root, AIRPLAY_RESET_ACK_FILE) >= (int)sizeof(ack))
+		return -1;
+	fd = open(request, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0)
+		return errno == ENOENT ? 0 : -1;
+	if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size != 33) {
+		close(fd); return -1;
+	}
+	n = (int)read(fd, token, 33);
+	close(fd);
+	if (n != 33 || token[32] != '\n') return -1;
+	for (i = 0; i < 32; ++i)
+		if (!((token[i] >= '0' && token[i] <= '9') ||
+		      (token[i] >= 'a' && token[i] <= 'f'))) return -1;
+	/* An ack surviving an engine restart does not prove this process has
+	 * drained its inherited FIFO. Only this process's completed reset does. */
+	if (ap->airplay_reset_ready &&
+	    !memcmp(ap->airplay_reset_token, token, sizeof(token))) return 0;
+	ap->airplay_reset_ready = 0;
+	ap->airplay_session_seen = 0;
+	ap->airplay_admitted = 0;
+	ap->airplay_last_gain = 0;
+	ap->airplay_invalid_reads = 0;
+	if (discard_disconnected_media(ap) < 0) return -1;
+	ap->airplay_idle_drained = 1;
+	if (snprintf(temporary, sizeof(temporary), "%s.tmp.XXXXXX", ack) >= (int)sizeof(temporary)) return -1;
+	fd = mkstemp(temporary);
+	if (fd < 0) return -1;
+	if (fchmod(fd, 0640) < 0 || write(fd, token, 33) != 33) {
+		close(fd); unlink(temporary); return -1;
+	}
+	if (close(fd) < 0) { unlink(temporary); return -1; }
+	if (rename(temporary, ack) < 0) { unlink(temporary); return -1; }
+	memcpy(ap->airplay_reset_token, token, sizeof(token));
+	ap->airplay_reset_ready = 1;
+	ap->airplay_reset_pending = 1;
+	return 0;
+}
+
 static int read_sources(struct source_bus *sources, const char *root)
 {
 	const size_t period_bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
+	struct source_bus *ap = &sources[SOURCE_AIRPLAY];
+	struct stat marker;
+	int airplay;
+	int phone;
 	unsigned int i;
 	int received_any = 0;
+
+	if (service_airplay_reset(ap, root) < 0)
+		ap->airplay_reset_ready = 0; /* fail only AirPlay, not priority buses */
+	airplay = ap->airplay_reset_ready && airplay_marker_stat(root, &marker);
+	if (airplay && (!ap->airplay_session_seen ||
+	                !same_marker(&marker, &ap->airplay_marker)) &&
+	    !ap->airplay_reset_pending)
+		airplay = 0; /* replacement without a reset is not a generation */
+
+	if (!airplay || !ap->airplay_session_seen ||
+	    !same_marker(&marker, &ap->airplay_marker)) {
+		/* A completed reset is the authority to retain first PCM. */
+		int discard = !airplay || !ap->airplay_reset_ready;
+		/* Reset already drained queued predecessor bytes before ack. A
+		 * replacement without an ack is refused above; do not drop B's
+		 * first queued period merely because idle was never observed. */
+		ap->airplay_session_seen = airplay;
+		ap->airplay_admitted = 0;
+		ap->airplay_last_gain = 0;
+		ap->airplay_invalid_reads = 0;
+		if (airplay) {
+			ap->airplay_marker = marker;
+			ap->airplay_reset_pending = 0;
+		}
+		if (discard && discard_disconnected_media(ap) < 0)
+			return -1;
+		ap->airplay_idle_drained = !airplay;
+	}
+	phone = airplay ? airplay_volume_to_mixer(root) : -1;
+	if (phone >= 0) {
+		ap->airplay_admitted = 1;
+		ap->airplay_last_gain = airplay_media_gain(phone);
+		ap->airplay_invalid_reads = 0;
+	} else if (ap->airplay_admitted &&
+		   ++ap->airplay_invalid_reads > AIRPLAY_ACK_GRACE_READS) {
+		/* A stalled/rejected replacement cannot keep playing at a stale gain. */
+		ap->airplay_last_gain = 0;
+	}
 
 	for (i = 0; i < SOURCE_COUNT; ++i) {
 		unsigned char *cursor = (unsigned char *)sources[i].samples;
 		size_t new_bytes = 0;
+		if (i == SOURCE_AIRPLAY && !airplay)
+			continue;
 
 		while (sources[i].received < sources[i].capacity) {
 			size_t read_bytes = sources[i].capacity - sources[i].received;
@@ -675,11 +926,11 @@ static int read_sources(struct source_bus *sources, const char *root)
 		    sources[i].received < period_bytes)
 			sources[i].received = 0;
 	}
-	/* During an AirPlay session the codec volume is the authoritative phone
-	 * volume.  Do not attenuate the media bus a second time. */
-	sources[SOURCE_MEDIA].gain_q15 = airplay_is_active(root)
-		? (airplay_volume_to_mixer(root) >= 0 ? 32768 : 0)
-		: read_media_gain(root);
+	/* Admit once: only the first matching callback/ack holds AirPlay PCM.
+	 * Replacement callbacks keep the previous gain until their ack arrives. */
+	ap->airplay_volume_missing = airplay && !ap->airplay_admitted;
+	ap->gain_q15 = ap->airplay_last_gain;
+	sources[SOURCE_MEDIA].gain_q15 = read_media_gain(root);
 	return received_any;
 }
 
@@ -741,10 +992,13 @@ static void consume_period(struct source_bus *sources)
 	const size_t period_bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
 	unsigned int i;
 
-	for (i = 0; i < SOURCE_COUNT; ++i)
+	for (i = 0; i < SOURCE_COUNT; ++i) {
+		if (i == SOURCE_AIRPLAY && sources[i].airplay_volume_missing)
+			continue;
 		le_audio_period_buffer_consume(
 			(unsigned char *)sources[i].samples, &sources[i].received,
 			period_bytes);
+	}
 }
 
 static unsigned int ready_activity_mask(const struct source_bus *sources)
@@ -752,6 +1006,9 @@ static unsigned int ready_activity_mask(const struct source_bus *sources)
 	unsigned int mask = 0;
 
 	if (source_period_ready(&sources[SOURCE_MEDIA]))
+		mask |= PLAYBACK_BUS_MEDIA;
+	if (source_period_ready(&sources[SOURCE_AIRPLAY]) &&
+	    !sources[SOURCE_AIRPLAY].airplay_volume_missing)
 		mask |= PLAYBACK_BUS_MEDIA;
 	if (source_period_ready(&sources[SOURCE_SYSTEM]))
 		mask |= PLAYBACK_BUS_SYSTEM;
@@ -762,56 +1019,366 @@ static unsigned int ready_activity_mask(const struct source_bus *sources)
 	return mask;
 }
 
-static void render_period(struct source_bus *sources, int16_t *output,
-			  struct puffin_dynamics *dynamics)
+static int32_t mix_sources_frame(const struct source_bus *sources, size_t frame)
 {
-	size_t frame;
 	int higher_priority =
 		source_period_ready(&sources[SOURCE_SYSTEM]) ||
 		source_period_ready(&sources[SOURCE_ANNOUNCEMENT]) ||
 		source_period_ready(&sources[SOURCE_ALARM]);
 	int alarm_active = source_period_ready(&sources[SOURCE_ALARM]);
+	int32_t mixed = 0;
+	unsigned int source;
 
-	for (frame = 0; frame < PERIOD_SIZE; ++frame) {
-		int32_t mixed = 0;
-		unsigned int source;
+	for (source = 0; source < SOURCE_COUNT; ++source) {
+		int32_t mono;
+		int32_t gain;
 
-		for (source = 0; source < SOURCE_COUNT; ++source) {
-			int32_t mono;
-			int32_t gain;
+		if (!source_period_ready(&sources[source]) ||
+		    (source == SOURCE_AIRPLAY &&
+		     sources[source].airplay_volume_missing))
+			continue;
+		mono = (int32_t)sources[source].samples[
+			frame * INPUT_CHANNELS] +
+		       (int32_t)sources[source].samples[
+				frame * INPUT_CHANNELS + 1];
+		mono /= 2;
+		gain = sources[source].gain_q15;
+		if ((source == SOURCE_MEDIA || source == SOURCE_AIRPLAY) && alarm_active)
+			gain = 0;
+		else if ((source == SOURCE_MEDIA || source == SOURCE_AIRPLAY) &&
+			 higher_priority)
+			gain = (gain * MEDIA_DUCK_Q15) >> 15;
+		mixed += (int32_t)(((int64_t)mono * gain) >> 15);
+	}
+	return mixed;
+}
 
-			if (!source_period_ready(&sources[source]))
-				continue;
-			mono = (int32_t)sources[source].samples[
-				frame * INPUT_CHANNELS] +
-			       (int32_t)sources[source].samples[
-					frame * INPUT_CHANNELS + 1];
-			mono /= 2;
-			gain = sources[source].gain_q15;
-			if (source == SOURCE_MEDIA && alarm_active)
-				gain = 0;
-			else if (source == SOURCE_MEDIA && higher_priority)
-				gain = (gain * MEDIA_DUCK_Q15) >> 15;
-			mixed += (int32_t)(((int64_t)mono * gain) >> 15);
+/*
+ * Speaker chain selection.  The Radar EQ/MBCL tuning is for Radar's woofer
+ * and codec crossover; the Echo Dot (biscuit) has one small driver and its own
+ * stock loudness EQ and MBCL, reproduced in biscuit_speaker_dsp.h.  The policy
+ * comes from /etc/libreecho/audio-profile, read once (the first existing file
+ * wins).  The profile must be complete and valid or it is rejected whole and
+ * Radar defaults stay.  Images that predate the profile fall back to the
+ * exact target_id=biscuit identity for the chain and flat codec only.
+ */
+static struct biscuit_dsp biscuit_storage;
+static struct biscuit_dsp *biscuit_chain;
+
+static int read_small_file(const char *path, char *text, size_t size)
+{
+	int fd, n;
+
+	fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0)
+		return errno == ENOENT || errno == ENOTDIR ? -1 : 0;
+	n = (int)read(fd, text, size - 1);
+	close(fd);
+	if (n <= 0 || (size_t)n >= size - 1)
+		return 0;
+	text[n] = '\0';
+	return 1;
+}
+
+static int image_target_is_biscuit(const char *path)
+{
+	char text[512], *line, *save = NULL;
+	int matches = 0, biscuit = 0, rc = read_small_file(path, text, sizeof(text));
+
+	if (rc <= 0)
+		return rc;
+	for (line = strtok_r(text, "\n", &save); line;
+	     line = strtok_r(NULL, "\n", &save)) {
+		if (strncmp(line, "target_id=", 10) != 0)
+			continue;
+		++matches;
+		biscuit = strcmp(line + 10, "biscuit") == 0;
+	}
+	return matches == 1 && biscuit;
+}
+
+static int parse_db(const char *text, float low, float high, float *out)
+{
+	char *end;
+	double value;
+
+	errno = 0;
+	value = strtod(text, &end);
+	if (errno || end == text || *end || !(value >= low && value <= high))
+		return -1;
+	*out = (float)value;
+	return 0;
+}
+
+/* Returns 1 parsed, -1 missing, 0 present but rejected. */
+static int load_audio_profile(const char *path, struct speaker_profile *out)
+{
+	enum { K_SCHEMA, K_TARGET, K_CHAIN, K_CODEC, K_GAIN, K_PRE, K_BASS, K_N };
+	static const char *const keys[K_N] = {
+		"schema", "target_id", "speaker_chain", "codec_profile",
+		"hp_driver_gain", "pre_gain_db", "bass_makeup_db",
+	};
+	char text[1024], *line, *save = NULL;
+	int seen[K_N] = { 0 }, k, rc = read_small_file(path, text, sizeof(text));
+	struct speaker_profile p = speaker_profile;
+	float pre_db = 0.0f;
+
+	if (rc <= 0)
+		return rc;
+	for (line = strtok_r(text, "\n", &save); line;
+	     line = strtok_r(NULL, "\n", &save)) {
+		char *value = strchr(line, '=');
+		char *end;
+		long gain;
+
+		if (!value)
+			return 0;
+		*value++ = '\0';
+		for (k = 0; k < K_N && strcmp(line, keys[k]); ++k)
+			;
+		if (k == K_N || seen[k]++)
+			return 0;
+		switch (k) {
+		case K_SCHEMA:
+			if (strcmp(value, "1"))
+				return 0;
+			break;
+		case K_TARGET:
+			if (!*value)
+				return 0;
+			break;
+		case K_CHAIN:
+			if (!strcmp(value, "biscuit"))
+				p.biscuit_chain = 1;
+			else if (!strcmp(value, "radar_puffin"))
+				p.biscuit_chain = 0;
+			else
+				return 0;
+			break;
+		case K_CODEC:
+			if (!strcmp(value, "Flat"))
+				p.codec_flat = 1;
+			else if (!strcmp(value, "Radar"))
+				p.codec_flat = 0;
+			else
+				return 0;
+			break;
+		case K_GAIN:
+			errno = 0;
+			gain = strtol(value, &end, 10);
+			if (errno || end == value || *end || gain < 0 || gain > 35)
+				return 0;
+			p.hp_driver_gain = (int)gain;
+			break;
+		case K_PRE:
+			if (parse_db(value, 0.0f, 12.0f, &pre_db))
+				return 0;
+			break;
+		case K_BASS:
+			if (parse_db(value, 0.0f, 6.0f, &p.bass_makeup_db))
+				return 0;
+			break;
 		}
-		int16_t rendered = puffin_render_mono(dynamics, mixed);
+	}
+	for (k = 0; k < K_N; ++k)
+		if (!seen[k])
+			return 0;
+	/* Digital gains belong to the biscuit chain; Radar's chain is fixed. */
+	if (!p.biscuit_chain && (pre_db != 0.0f || p.bass_makeup_db != 0.0f))
+		return 0;
+	p.pre_gain = powf(10.0f, pre_db / 20.0f);
+	*out = p;
+	return 1;
+}
+
+static void select_speaker_profile(void)
+{
+	int rc = load_audio_profile(AUDIO_PROFILE_FILE, &speaker_profile);
+
+	if (rc < 0)
+		rc = load_audio_profile(AUDIO_PROFILE_FILE_HOST, &speaker_profile);
+	if (rc == 0)
+		fprintf(stderr, "audio-engine: audio profile rejected; "
+			"using radar-puffin defaults\n");
+	if (rc < 0) {
+		int target = image_target_is_biscuit(IMAGE_TARGET_FILE);
+
+		if (target < 0)
+			target = image_target_is_biscuit(IMAGE_TARGET_FILE_HOST);
+		if (target > 0) {
+			speaker_profile.biscuit_chain = 1;
+			speaker_profile.codec_flat = 1;
+		}
+	}
+	if (speaker_profile.biscuit_chain)
+		biscuit_chain = &biscuit_storage;
+}
+
+static int16_t biscuit_render_s16(struct biscuit_dsp *dsp, int32_t mixed)
+{
+	/* The Dot chain has no OutputTrim; its own full-band limiter already
+	 * holds -0.1 dBFS, so only the S16 conversion guard remains.  The
+	 * profile pre-gain lifts the shared -12 dB volume cap for this chain
+	 * only, ahead of that limiter. */
+	float y = biscuit_dsp_process(dsp, (float)mixed * speaker_profile.pre_gain);
+
+	if (y > 32767.0f)
+		y = 32767.0f;
+	else if (y < -32767.0f)
+		y = -32767.0f;
+	return (int16_t)lrintf(y);
+}
+
+static void render_period(struct source_bus *sources, int16_t *output,
+			  struct puffin_dynamics *dynamics,
+			  struct speaker_dsp *speaker,
+			  int32_t target_master_q15, int32_t *current_master_q15)
+{
+	size_t frame;
+	for (frame = 0; frame < PERIOD_SIZE; ++frame) {
+		int32_t mixed = mix_sources_frame(sources, frame);
+		int16_t rendered;
+		*current_master_q15 += (target_master_q15 - *current_master_q15) /
+			(int32_t)(PERIOD_SIZE - frame);
+		mixed = (int32_t)(((int64_t)mixed * *current_master_q15) >> 15);
+		/* All producer buses meet here: mono EQ, then multiband
+		 * protection, then the +3 dB trim and final PCM safety limiter. */
+		if (biscuit_chain) {
+			rendered = biscuit_render_s16(biscuit_chain, mixed);
+		} else {
+			mixed = speaker_dsp_process(speaker, mixed);
+			rendered = puffin_render_mono(dynamics, mixed);
+		}
 
 		output[frame * OUTPUT_CHANNELS] = rendered;
 		output[frame * OUTPUT_CHANNELS + 1] = rendered;
 	}
 }
 
+/* Shared codec-equivalent mapping: logical 1..100 spans -60..-12 dB on a
+ * concave taper, -12 - 48 * (1 - x)^1.3 dB.  Owner listening put logical 50
+ * at "uncomfortable in the same room", and on-device microphone captures
+ * showed limiter and speaker distortion from about logical 65 of the 0 dB
+ * curve upward, so full-scale pre-DSP gain is no longer reachable.  Logical
+ * zero remains mute in the callers. */
+static int logical_master_raw(int percent)
+{
+	double x = (double)(percent - 1) / 99.0;
+	return 103 - (int)floor(96.0 * pow(1.0 - x, 1.3) + 0.5);
+}
+
+/* All sources share the hardware master.  Index the equaliser using the
+ * currently audible bus, never a device-wide sender-volume override. */
+static int speaker_volume_percent_for_mix(int master, int32_t media_gain,
+					   int media_ready, int priority_ready)
+{
+	int raw;
+	double db;
+
+	if (master <= 0 || master > 100)
+		return 0;
+	raw = logical_master_raw(master);
+	db = ((double)raw - 127.0) / 2.0;
+	if (media_ready && !priority_ready) {
+		if (media_gain <= 0)
+			return 0;
+		db += 20.0 * log10((double)media_gain / 32768.0);
+	}
+	raw = (int)lround(127.0 + 2.0 * db);
+	if (raw < 0)
+		raw = 0;
+	if (raw > 127)
+		raw = 127;
+	return (raw * 100 + 63) / 127;
+}
+
+static int logical_master_volume(const char *root)
+{
+	char path[256], text[16], *end;
+	struct stat st;
+	int fd, n;
+	long value;
+	n = snprintf(path, sizeof(path), "%s/%s", root, MASTER_VOLUME_FILE);
+	if (n < 0 || n >= (int)sizeof(path))
+		return 0;
+	fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0)
+		return 0;
+	if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) ||
+	    st.st_size <= 0 || st.st_size >= (off_t)sizeof(text)) {
+		close(fd);
+		return 0;
+	}
+	n = (int)read(fd, text, (size_t)st.st_size);
+	close(fd);
+	if (n != st.st_size)
+		return 0;
+	text[n] = '\0';
+	errno = 0;
+	value = strtol(text, &end, 10);
+	if (errno || end == text || (*end != '\n' && *end != '\0') ||
+	    (*end == '\n' && end[1] != '\0') || value < 0 || value > 100)
+		return 0;
+	return (int)value;
+}
+
+static int32_t logical_master_gain(int percent)
+{
+	int raw;
+	if (percent <= 0)
+		return 0;
+	raw = logical_master_raw(percent);
+	return db_to_q15(((double)raw - 127.0) / 2.0);
+}
+
+static int speaker_volume_percent(const struct source_bus *sources, int master)
+{
+	int media_ready = source_period_ready(&sources[SOURCE_MEDIA]);
+	int airplay_ready = source_period_ready(&sources[SOURCE_AIRPLAY]) &&
+		!sources[SOURCE_AIRPLAY].airplay_volume_missing;
+	int32_t gain = 0;
+
+	/* Both media buses sum before the shared EQ. A muted producer must not
+	 * select the preset for another producer that is actually audible. */
+	if (media_ready)
+		gain = sources[SOURCE_MEDIA].gain_q15;
+	if (airplay_ready && sources[SOURCE_AIRPLAY].gain_q15 > gain)
+		gain = sources[SOURCE_AIRPLAY].gain_q15;
+	return speaker_volume_percent_for_mix(master, gain,
+		media_ready || airplay_ready, higher_priority_active(sources));
+}
+
 static int prepare_initial_period(struct source_bus *sources, const char *root,
 				  int16_t *output,
 				  struct puffin_dynamics *dynamics,
-				  unsigned int *activity_mask)
+				  struct speaker_dsp *speaker,
+				  unsigned int *activity_mask,
+				  int master_volume, int32_t *master_gain)
 {
 	int ready = wait_for_period(sources, root);
 
 	if (ready <= 0)
 		return ready;
+	/* The FIFO read may precede the first sender-volume callback.  Decide
+	 * whether to defer before rendering, then refresh the media gain using
+	 * that callback; an already-rendered zero-gain period cannot be fixed
+	 * by a later startup gate.  Priority sources remain independently live. */
+	if (airplay_is_active(root)) {
+		if (sources[SOURCE_AIRPLAY].airplay_volume_missing &&
+		    source_period_ready(&sources[SOURCE_AIRPLAY]) &&
+		    !higher_priority_active(sources) &&
+		    !source_period_ready(&sources[SOURCE_MEDIA]))
+			return 2;
+	}
 	puffin_dynamics_init(dynamics);
-	render_period(sources, output, dynamics);
+	speaker_dsp_init(speaker, speaker_volume_percent(sources, master_volume));
+	if (biscuit_chain) {
+		biscuit_dsp_init(biscuit_chain,
+			speaker_volume_percent(sources, master_volume));
+		biscuit_dsp_configure(biscuit_chain, speaker_profile.bass_makeup_db);
+	}
+	*master_gain = logical_master_gain(master_volume);
+	render_period(sources, output, dynamics, speaker, *master_gain, master_gain);
 	if (activity_mask)
 		*activity_mask = ready_activity_mask(sources);
 	return 1;
@@ -849,16 +1416,14 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	const size_t bytes = PERIOD_SIZE * OUTPUT_CHANNELS * sizeof(int16_t);
 	struct source_bus sources[SOURCE_COUNT];
 	struct puffin_dynamics dynamics;
+	struct speaker_dsp speaker;
 	struct music_visualizer visualizer;
 	struct playback_status status;
 	struct le_aec_reference_sender reference;
 	int16_t *output = NULL;
 	int result = -1;
 	int announcement_led_active = 0;
-	int saved_volume = -1;
-	int airplay_volume = -1;
-	int airplay_session = 0;
-	int airplay_volume_applied = 0;
+	int32_t master_gain = 0;
 	unsigned int i;
 
 	memset(sources, 0, sizeof(sources));
@@ -867,6 +1432,11 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	reference.fd = -1;
 	audio_visualizer_init(&visualizer.analyzer);
 	memset(visualizer.levels, 0, sizeof(visualizer.levels));
+	memset(&visualizer.features, 0, sizeof(visualizer.features));
+	music_feature_transport_init(&visualizer.transport,
+				     music_visualizer_seed(), PERIOD_SIZE,
+				     DEFAULT_RATE);
+	visualizer.feature_version = music_visualizer_feature_version();
 	visualizer.frame_periods = 0;
 	visualizer.silent_periods = 0;
 	visualizer.active = 0;
@@ -889,6 +1459,14 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	output = malloc(bytes);
 	if (!output)
 		goto out;
+	select_speaker_profile();
+	fprintf(stderr, "audio-engine: speaker chain %s codec %s hp-gain %d "
+		"pre %.2f bass %+.1f dB\n",
+		biscuit_chain ? "biscuit" : "radar-puffin",
+		speaker_profile.codec_flat ? "Flat" : "Radar",
+		speaker_profile.hp_driver_gain,
+		(double)speaker_profile.pre_gain,
+		(double)speaker_profile.bass_makeup_db);
 	fprintf(stderr,
 		"audio-engine: ready (root=%s, input=S16_LE/48000/stereo, "
 		"output=S16_LE/48000/duplicated-stereo, PCM %u,%u)\n",
@@ -898,7 +1476,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		struct pcm *pcm = NULL;
 		unsigned int first_activity;
 		int ready;
-		int poll_timeout = period_ready(sources) ? 20 : -1;
+		int poll_timeout = 20; /* service resets even when all buses are idle */
 
 		if (poll_sources(sources, poll_timeout) < 0)
 			break;
@@ -907,27 +1485,29 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		if (read_or_retain_sources(sources, root) <= 0)
 			continue;
 		ready = prepare_initial_period(sources, root, output, &dynamics,
-					      &first_activity);
+					      &speaker, &first_activity,
+					      logical_master_volume(root), &master_gain);
 		if (ready <= 0) {
 			if (ready < 0 || stopping)
 				break;
 			continue;
 		}
+		if (ready == 2) {
+			/* Keep the buffered media period until its first valid callback. */
+			continue;
+		}
 		sync_announcement_led(sources, &announcement_led_active);
 		sync_playback_status(sources, &status);
 
-		saved_volume = -1;
-		airplay_volume_applied = 0;
-		airplay_session = airplay_is_active(root);
-		airplay_volume = airplay_session
-			? airplay_volume_to_mixer(root) : -1;
-		if (airplay_session && airplay_volume < 0) {
-			if (!higher_priority_active(sources)) {
+		if (sources[SOURCE_AIRPLAY].airplay_volume_missing &&
+		    source_period_ready(&sources[SOURCE_AIRPLAY])) {
+			if (!higher_priority_active(sources) &&
+			    !source_period_ready(&sources[SOURCE_MEDIA])) {
 				/* Defer only AirPlay media.  Do not clear priority buses while
 				 * waiting for the sender's first volume callback. */
 				fprintf(stderr,
 					"audio-engine: airplay volume unavailable; deferring media\n");
-				sources[SOURCE_MEDIA].idle_periods = 0;
+				sources[SOURCE_AIRPLAY].idle_periods = 0;
 				stop_music_visualizer(&visualizer);
 				sync_playback_status(sources, &status);
 				continue;
@@ -938,7 +1518,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				"audio-engine: priority audio continues while AirPlay "
 				"volume is unavailable\n");
 		}
-		if (arm_output_controls(card, -1, &saved_volume) < 0) {
+		if (arm_output_controls(card) < 0) {
 			fprintf(stderr, "audio-engine: output arm failed\n");
 			clear_source_activity(sources, &announcement_led_active,
 					      &visualizer, &status);
@@ -951,62 +1531,27 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				pcm ? pcm_get_error(pcm) : "open failed");
 			if (pcm)
 				pcm_close(pcm);
-			(void)disable_output_controls(card,
-				airplay_volume_applied ? saved_volume : -1);
+			(void)disable_output_controls(card);
 			clear_source_activity(sources, &announcement_led_active,
 					      &visualizer, &status);
 			usleep(250000);
 			continue;
 		}
-		/*
-		 * The sender's volume applies to AirPlay media, not to everything
-		 * the device plays.  Applying it unconditionally meant a system
-		 * tone, an announcement or a spoken assistant reply was played at
-		 * the AirPlay sender's level: with a sender at 0 dB that is a raw
-		 * 127, the codec's unity point, so any local playback silently
-		 * pushed the device to full volume and left it there.
-		 *
-		 * Observed on hardware with a plain test tone -- no AirPlay
-		 * streaming involved -- via audiod's guard:
-		 *
-		 *   volume changed underneath us: requested 25%, control now
-		 *   reads 100% (raw 127 of 0..175)
-		 *
-		 * 127 is only ever produced by airplay_volume_to_mixer(), which
-		 * returns it for any sender volume at or above 0 dB.  Use the
-		 * sender's level only when AirPlay media is actually one of the
-		 * sources being rendered; otherwise keep the level the device was
-		 * already at, which is what audiod and the physical buttons set.
-		 */
-		int airplay_media_playing =
-			(first_activity & PLAYBACK_BUS_MEDIA) != 0;
-		int startup_volume = saved_volume;
+		/* The codec stays at its safe fixed reference; software owns gain. */
 		int playback_start_failed = 0;
-		int airplay_volume_attempted = 0;
-		if (airplay_volume >= 0 && airplay_media_playing)
-			startup_volume = airplay_volume;
 
 		if (pcm_prepare(pcm) < 0)
 			playback_start_failed = 1;
 		else {
-			if (startup_volume >= 0) {
-				if (airplay_volume >= 0 && airplay_media_playing)
-					airplay_volume_attempted = 1;
-				if (set_pcm_volume(card, startup_volume) < 0)
-					playback_start_failed = 1;
-			}
-			if (!playback_start_failed &&
-			    power_output_controls(card) < 0)
+			if (verify_codec_reference(card) < 0)
+				playback_start_failed = 1;
+			if (!playback_start_failed && power_output_controls(card) < 0)
 				playback_start_failed = 1;
 			if (!playback_start_failed) {
-				/* Mark ownership immediately after a successful sender write so
-				 * any later start failure can restore exactly what we changed. */
-				if (airplay_volume >= 0 && airplay_media_playing)
-					airplay_volume_applied = 1;
 				/* Queue the first period only after amp settle.  The PCM starts
-				 * with mute still asserted, and unmute follows this write so a
-				 * one-period clip is not consumed during the settle delay. */
+				 * muted, and unmute follows this write. */
 				if (write_period(pcm, output, &reference, first_activity) < 0 ||
+				    verify_codec_reference(card) < 0 ||
 				    unmute_output_controls(card) < 0)
 					playback_start_failed = 1;
 			}
@@ -1014,11 +1559,8 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		if (playback_start_failed) {
 			fprintf(stderr, "audio-engine: playback start failed: %s\n",
 				pcm_get_error(pcm));
-			(void)disable_output_controls(card, -1);
+			(void)disable_output_controls(card);
 			pcm_close(pcm);
-			if (airplay_volume_attempted || airplay_volume_applied)
-				if (saved_volume >= 0)
-					(void)set_pcm_volume(card, saved_volume);
 			clear_source_activity(sources, &announcement_led_active,
 					      &visualizer, &status);
 			continue;
@@ -1027,26 +1569,6 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		consume_period(sources);
 
 		while (!stopping && sources_active(sources)) {
-			/* Same scoping for live volume changes from the sender. */
-			if (airplay_session && airplay_is_active(root) &&
-			    (ready_activity_mask(sources) & PLAYBACK_BUS_MEDIA)) {
-				int requested = airplay_volume_to_mixer(root);
-
-				if (requested >= 0 &&
-				    (!airplay_volume_applied || requested != airplay_volume))
-				{
-					int previous_airplay_volume =
-						airplay_volume_applied ? airplay_volume : -1;
-					if (set_pcm_volume(card, requested) == 0) {
-						airplay_volume = requested;
-						airplay_volume_applied = 1;
-					} else if (previous_airplay_volume >= 0) {
-						(void)set_pcm_volume(card, previous_airplay_volume);
-					} else if (saved_volume >= 0) {
-						(void)set_pcm_volume(card, saved_volume);
-					}
-				}
-			}
 			if (poll_sources(sources, 20) < 0 ||
 			    read_sources(sources, root) < 0) {
 				stopping = 1;
@@ -1056,7 +1578,15 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				break;
 			sync_announcement_led(sources, &announcement_led_active);
 			sync_playback_status(sources, &status);
-			render_period(sources, output, &dynamics);
+			/* Read the atomic logical master each period, not codec readback. */
+			int master = logical_master_volume(root);
+			speaker_dsp_set_volume(&speaker,
+				speaker_volume_percent(sources, master));
+			if (biscuit_chain)
+				biscuit_dsp_set_volume(biscuit_chain,
+					speaker_volume_percent(sources, master));
+			render_period(sources, output, &dynamics, &speaker,
+				logical_master_gain(master), &master_gain);
 			if (write_period(pcm, output, &reference,
 					 ready_activity_mask(sources)) < 0) {
 				fprintf(stderr,
@@ -1069,11 +1599,8 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		}
 		clear_source_activity(sources, &announcement_led_active,
 				      &visualizer, &status);
-		(void)disable_output_controls(card, -1);
+		(void)disable_output_controls(card);
 		pcm_close(pcm);
-		/* Only undo a level this engine actually imposed. */
-		if (airplay_session && airplay_volume_applied && saved_volume >= 0)
-			(void)set_pcm_volume(card, saved_volume);
 	}
 	result = stopping ? 0 : -1;
 out:
@@ -1088,8 +1615,6 @@ out:
 	le_aec_reference_close(&reference);
 	free(output);
 	close_sources(sources);
-	if (airplay_volume_applied && saved_volume >= 0)
-		(void)disable_output_controls(card, saved_volume);
 	return result;
 }
 

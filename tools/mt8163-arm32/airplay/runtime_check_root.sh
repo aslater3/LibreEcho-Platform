@@ -6,6 +6,12 @@ ROOT=/run/libreecho/features/airplay2/root
 PAYLOAD=/data/libreecho/features/airplay2/payload.squashfs
 MANIFEST=/data/libreecho/features/airplay2/manifest.json
 CONFIG=/data/libreecho/config/web-config.json
+# Discovery is owned by the boot-contained shared runtime.  The legacy
+# Avahi/D-Bus bytes are retained inside the payload for old-slot compatibility,
+# but this check must not require the payload's private responder sockets: that
+# would demand two responders on a shared-runtime image.
+SHARED=/run/libreecho/mdns
+SHARED_BUS=$SHARED/dbus/system_bus_socket
 
 mount_line=$(/bin/busybox grep ' /data ' /proc/mounts)
 case "$mount_line" in
@@ -27,11 +33,13 @@ for path in \
     "$ROOT/etc/libreecho/airplay2.conf" \
     "$ROOT/etc/dbus-1/system.conf" \
     "$ROOT/dev/shm/nqptp" \
-    "$ROOT/run/dbus/system_bus_socket" \
-    "$ROOT/run/avahi-daemon/socket" \
     "$ROOT/run/libreecho/led.sock"; do
     [ -e "$path" ] || { echo "AIRPLAY_RUNTIME_MISSING:$path"; exit 1; }
 done
+# Shared discovery must be live and singular: the payload bytes are inert.
+[ -S "$SHARED_BUS" ] || { echo AIRPLAY_RUNTIME_SHARED_BUS_MISSING; exit 1; }
+responders=$(/bin/busybox ps | /bin/busybox grep -c '[a]vahi-daemon')
+[ "$responders" -le 1 ] || { echo AIRPLAY_RUNTIME_DUPLICATE_RESPONDER; exit 1; }
 for bus in media system announcement alarm; do
     [ -p "/run/libreecho-audio/$bus.pcm" ] || {
         echo "AIRPLAY_RUNTIME_AUDIO_BUS_MISSING:$bus"; exit 1;

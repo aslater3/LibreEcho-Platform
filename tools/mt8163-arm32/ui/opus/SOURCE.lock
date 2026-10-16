@@ -1,0 +1,58 @@
+{
+  "name": "libreecho-opus-decode-stack",
+  "target": "arm-linux-gnueabihf-static",
+  "config": "static,no-http,no-tls,no-examples,no-doc",
+  "components": {
+    "libogg": {
+      "version": "1.3.5",
+      "license": "BSD-3-Clause",
+      "license_file": "COPYING",
+      "license_copy": "libogg-1.3.5-COPYING.txt",
+      "license_sha256": "d2ab5758336489da61c12cc5bb757da5339c4ae9001f9bb0562b4370249af814",
+      "source_url": "https://downloads.xiph.org/releases/ogg/libogg-1.3.5.tar.gz",
+      "source_sha256": "0eb4b4b9420a0f51db142ba3f9c64b333f826532dc0f48c6410ae51f4799b664",
+      "archive_root": "libogg-1.3.5"
+    },
+    "opus": {
+      "version": "1.4",
+      "license": "BSD-3-Clause",
+      "license_file": "COPYING",
+      "license_copy": "opus-1.4-COPYING.txt",
+      "license_sha256": "8338ce8d922bb4416ce3dd1e5680173332435e3f0755007ac7801ccd674fe682",
+      "source_url": "https://downloads.xiph.org/releases/opus/opus-1.4.tar.gz",
+      "source_sha256": "c9b32b4253be5ae63d1ff16eea06b94b5f0f2951b7a02aceef58e3a3ce49c51f",
+      "archive_root": "opus-1.4"
+    },
+    "opusfile": {
+      "version": "0.12",
+      "license": "BSD-3-Clause",
+      "license_file": "COPYING",
+      "license_copy": "opusfile-0.12-COPYING.txt",
+      "license_sha256": "0267ae795ab744c4e0f9c45e249440fdf2e75dac8c804f36066b28649bf74aaf",
+      "source_url": "https://github.com/xiph/opusfile/archive/refs/tags/v0.12.tar.gz",
+      "source_sha256": "a20a1dff1cdf0719d1e995112915e9966debf1470ee26bb31b2f510ccf00ef40",
+      "archive_root": "opusfile-0.12"
+    }
+  },
+  "outputs": [
+    "include/ogg/ogg.h",
+    "include/ogg/os_types.h",
+    "include/ogg/config_types.h",
+    "include/opus/opus.h",
+    "include/opus/opus_multistream.h",
+    "include/opus/opus_types.h",
+    "include/opus/opus_defines.h",
+    "include/opus/opus_projection.h",
+    "include/opus/opusfile.h",
+    "lib/libogg.a",
+    "lib/libopus.a",
+    "lib/libopusfile.a"
+  ],
+  "build_command": "ui/build_opus.sh --ogg-archive <libogg-1.3.5.tar.gz> --opus-archive <opus-1.4.tar.gz> --opusfile-archive <v0.12.tar.gz> --output <prefix> [--cc <arm-linux-gnueabihf-gcc>]",
+  "notes": [
+    "Source acquisition stays outside this repository: the caller supplies the three upgrade archives recorded above and the builder fails closed on any byte mismatch before it extracts anything.",
+    "libopusfile is a static, HTTP/TLS-free build: only src/info.c, src/internal.c, src/opusfile.c and src/stream.c are compiled, so the HTTP/URL API (src/http.c, the op_open_url/op_open_callbacks family) and its libcurl + OpenSSL/TLS dependencies are absent by construction. A verification step fails the build if any http symbol or URL entry point is present.",
+    "--output is mandatory and a pre-existing prefix is only accepted as an identity-cache hit when its recorded target, config and the three source hashes all match the request; any mismatch is refused.",
+    "libogg 1.3.5 and libopus 1.4 are built from their release tarballs' own configure scripts (-Os, static only); libopusfile is compiled directly from its source list with no configure step and no autotools dependency."
+  ]
+}

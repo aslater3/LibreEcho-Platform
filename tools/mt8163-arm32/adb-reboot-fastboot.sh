@@ -1,51 +1,15 @@
 #!/usr/bin/env bash
-# Request fastboot from the running LibreEcho development OS via /tmp/runme.
+# Restart a running LibreEcho device into Kaeru fastboot over ADB.
+#
+# The device performs the only flash write: libreecho-bootctl proves the Kaeru
+# payload in expdb (read-only) and writes Kaeru's one-shot misc command
+# "bootonce-bootloader".  expdb is never written (Platform #195).  From fastboot
+# a plain `fastboot reboot` returns to LibreEcho.
 set -euo pipefail
 
-usage() {
-  cat <<'EOF'
-Usage: adb-reboot-fastboot.sh [TIMEOUT_SECONDS]
+ADB_BIN=${ADB_BIN:-adb}
+serial=${1:-}
+[[ -n "$serial" ]] || { echo "usage: $0 <adb-serial>" >&2; exit 2; }
 
-Environment:
-  ADB_SERIAL    target serial (must be supplied by the operator)
-  ADB_BIN       adb executable (default: adb)
-  FASTBOOT_BIN  fastboot executable (default: fastboot)
-
-The target script verifies Linux partition 7 is the 20,480-sector expdb
-partition, writes and reads back FASTBOOT_PLEASE, syncs, then force-reboots.
-EOF
-}
-
-[[ ${1:-} == -h || ${1:-} == --help ]] && { usage; exit 0; }
-[[ $# -le 1 ]] || { usage >&2; exit 2; }
-timeout=${1:-60}
-serial=${ADB_SERIAL:-}
-[[ -n "$serial" ]] || { echo "ERROR: ADB_SERIAL must be supplied" >&2; exit 2; }
-adb_bin=${ADB_BIN:-adb}
-fastboot_bin=${FASTBOOT_BIN:-fastboot}
-[[ "$timeout" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: timeout must be a positive integer" >&2; exit 2; }
-command -v "$adb_bin" >/dev/null || { echo "ERROR: adb not found: $adb_bin" >&2; exit 1; }
-command -v "$fastboot_bin" >/dev/null || { echo "ERROR: fastboot not found: $fastboot_bin" >&2; exit 1; }
-
-state=$("$adb_bin" -s "$serial" get-state 2>/dev/null || true)
-[[ "$state" == device ]] || { echo "ERROR: ADB device $serial is not ready (state=${state:-none})" >&2; exit 1; }
-
-work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
-printf 'fastboot\n' > "$work/reboot.request"
-"$adb_bin" -s "$serial" push "$work/reboot.request" /tmp/reboot.request.new >/dev/null
-"$adb_bin" -s "$serial" shell 'mv /tmp/reboot.request.new /tmp/reboot.request'
-
-deadline=$((SECONDS + timeout))
-while ((SECONDS < deadline)); do
-  if "$fastboot_bin" -s "$serial" devices 2>/dev/null | awk '$2 == "fastboot" {found=1} END {exit !found}'; then
-    "$fastboot_bin" -s "$serial" devices -l
-    exit 0
-  fi
-  sleep 1
-done
-
-echo "ERROR: fastboot did not appear within ${timeout}s" >&2
-printf '%s\n' "Current ADB state:" >&2
-"$adb_bin" -s "$serial" devices -l >&2 || true
-exit 124
+"$ADB_BIN" -s "$serial" shell 'printf fastboot > /tmp/reboot.request'
+echo "Requested restart to fastboot on $serial; wait for: fastboot devices"

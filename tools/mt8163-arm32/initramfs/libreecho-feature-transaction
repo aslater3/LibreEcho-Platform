@@ -1,0 +1,21 @@
+#!/bin/busybox sh
+# Compatibility command name for the signed whole-generation engine.
+BB=/bin/busybox
+ROOT=${ROOT:-/data/libreecho/update}
+fail() { printf 'ERROR:%s\n' "$1" >&2; exit 1; }
+check_manifest() {
+    case "$($BB sed -n 's/^format=//p' "$1" 2>/dev/null)" in
+        libreecho-ota-v1|libreecho-ota-v2) fail legacy_manifest_unsupported;;
+    esac
+    "${TARGET_MANIFEST:-/usr/local/sbin/libreecho-target-manifest}" check "$1" "${2:-$1.sig}"
+}
+# V3 state never enters a per-file transaction implementation.
+case "${1:-}" in
+    preflight) check_manifest "$2" "${3:-$2.sig}";;
+    prepare-boot|recover-installed|abort-before-activation|rollback-evidence)
+        fail legacy_manifest_unsupported;;
+    activate|activate-mounts|activate-committed|restore-boot-store|commit|commit-after-confirm|rollback|fallback|gc|https-client|provenance|status|verify-running)
+        export ROOT
+        exec /bin/busybox sh "${GENERATION_TRANSACTION:-/usr/local/sbin/libreecho-generation-transaction}" "$@";;
+    *) fail usage;;
+esac

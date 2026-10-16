@@ -1,0 +1,244 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          libreecho-waked
+# Required-Start:    $remote_fs libreecho-micd
+# Required-Stop:     $remote_fs libreecho-micd
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+### END INIT INFO
+
+[ -r /etc/default/libreecho-waked ] && . /etc/default/libreecho-waked
+
+PAYLOAD=${PAYLOAD:-/data/libreecho/features/wakeword/payload.squashfs}
+RUNTIME_ROOT=${RUNTIME_ROOT:-/run/libreecho/features/wakeword/root}
+DAEMON=${DAEMON:-$RUNTIME_ROOT/usr/local/sbin/libreecho-waked}
+MODEL_ROOT=${MODEL_ROOT:-$RUNTIME_ROOT/usr/local/share/libreecho/openwakeword}
+PIDFILE=${PIDFILE:-/var/run/libreecho-waked.pid}
+LOGFILE=${LOGFILE:-/var/log/libreecho-waked.log}
+SOCKET=${SOCKET:-/run/libreecho/wakeword.sock}
+MIC_SOCKET=${MIC_SOCKET:-/run/libreecho/mic.sock}
+REFERENCE_SOCKET=${REFERENCE_SOCKET:-/run/libreecho-audio/aec-reference.sock}
+VAD_FLOOR_FILE=${VAD_FLOOR_FILE:-/data/libreecho/config/vad-floor-rms}
+# Echo cancellation is on unless this file says 0. It exists because a single
+# playback has been observed to stop the wake word detecting until reboot,
+# and the AEC reference is the prime suspect: before anything is spoken the
+# canceller is inert, afterwards it adapts. Being able to turn it off without
+# reflashing is what makes that testable on hardware.
+AEC_FILE=${AEC_FILE:-/data/libreecho/config/aec-reference}
+# Write a number of seconds here to have waked dump exactly the audio it
+# processes to /data/libreecho/config/wake-dump.raw. It is the only way to see
+# what the detector receives, the microphone and capture-mux having been proven
+# good independently.
+#
+# Two hard-won constraints. waked EXITS when the dump finishes, taking the wake
+# word with it until the next boot, so this is consumed one-shot below: the
+# request is cleared as it is read and a plain reboot always restores a working
+# device. And waked rejects anything from 60 seconds up, so the ceiling here is
+# deliberately far below that -- a dump is a diagnostic, and a long one is only
+# a longer outage.
+DUMP_FILE=${DUMP_FILE:-/data/libreecho/config/wake-dump-seconds}
+DUMP_MAX_SECONDS=${DUMP_MAX_SECONDS:-20}
+VAD_FLOOR_DEFAULT=16
+# Must not exceed what the waked binary accepts, or it exits at startup and
+# the device comes back with no wake word. That binary ships inside the wake
+# feature squashfs rather than the ramdisk, so an OTA cannot raise its limit:
+# keep this at 1024 until that payload is rebuilt, then it can go to
+# LE_VOICE_VAD_MAX_FLOOR_RMS (16384) in src/adapter/voice_dsp.h.
+VAD_FLOOR_MAX=1024
+VAD_FLOOR_RMS=${VAD_FLOOR_RMS:-$VAD_FLOOR_DEFAULT}
+
+mount_runtime() {
+    [ -f "$PAYLOAD" ] || {
+        echo "libreecho-waked: feature payload missing: $PAYLOAD" >&2
+        return 1
+    }
+    mkdir -p "$RUNTIME_ROOT"
+    if grep -q " $RUNTIME_ROOT " /proc/mounts 2>/dev/null; then
+        return 0
+    fi
+    mount -t squashfs -o loop,ro,nosuid,nodev,noatime "$PAYLOAD" "$RUNTIME_ROOT" || {
+        echo "libreecho-waked: feature payload mount failed" >&2
+        return 1
+    }
+}
+
+unmount_runtime() {
+    umount "$RUNTIME_ROOT" 2>/dev/null || true
+}
+
+# Every pid whose argv[0] is exactly $DAEMON. A pidfile is not proof of life:
+# it goes stale when the daemon is started from a shell that then exits (the
+# fallback branch of start_service() leaves the child in the caller's process
+# group), and it goes missing when /run is cleared. Matching on the executable
+# means stop and status still see the daemon in both cases, so restart cannot
+# silently leave a second copy running.
+running_pids() {
+    for entry in /proc/[0-9]*; do
+        candidate=${entry#/proc/}
+        [ "$candidate" = "$$" ] && continue
+        [ -r "$entry/cmdline" ] || continue
+        argv0=$(tr '\0' '\n' < "$entry/cmdline" 2>/dev/null | sed -n '1p')
+        [ "$argv0" = "$DAEMON" ] && printf '%s\n' "$candidate"
+    done
+}
+
+pidfile_pid() {
+    [ -s "$PIDFILE" ] || return 1
+    pid=$(sed -n '1p' "$PIDFILE")
+    case "$pid" in *[!0-9]*|'') return 1 ;; esac
+    kill -0 "$pid" 2>/dev/null || return 1
+    printf '%s\n' "$pid"
+}
+
+is_running() {
+    pidfile_pid >/dev/null && return 0
+    [ -n "$(running_pids)" ]
+}
+
+# Sends TERM, waits up to $2 seconds (default 5), then KILL.
+terminate() {
+    target=$1
+    limit=${2:-5}
+    kill "$target" 2>/dev/null || true
+    count=0
+    while kill -0 "$target" 2>/dev/null && [ "$count" -lt "$limit" ]; do
+        sleep 1
+        count=$((count + 1))
+    done
+    kill -KILL "$target" 2>/dev/null || true
+}
+
+wait_for_microphone() {
+    count=0
+    while [ ! -S "$MIC_SOCKET" ] && [ "$count" -lt 50 ]; do
+        sleep 0.1
+        count=$((count + 1))
+    done
+    [ -S "$MIC_SOCKET" ]
+}
+
+start_service() {
+    if is_running; then echo "libreecho-waked already running"; return 0; fi
+    mount_runtime || return 1
+    [ -x "$DAEMON" ] &&
+        [ -f "$MODEL_ROOT/melspectrogram.onnx" ] &&
+        [ -f "$MODEL_ROOT/embedding_model.onnx" ] &&
+        [ -f "$MODEL_ROOT/alexa_v0.1.onnx" ] || {
+        echo "libreecho-waked: incomplete wakeword runtime" >&2
+        unmount_runtime
+        return 1
+    }
+    wait_for_microphone || {
+        echo "libreecho-waked: microphone adapter did not become ready" >&2
+        unmount_runtime
+        return 1
+    }
+    if [ -r "$VAD_FLOOR_FILE" ]; then
+        VAD_FLOOR_RMS=$(sed -n '1p' "$VAD_FLOOR_FILE")
+    fi
+    # A bad floor must never cost the device its wake word. This used to
+    # return 1 on anything unparseable or outside the range, which stops the
+    # daemon and leaves the device silent to its wake word, explained only by
+    # a line in this log. The value is hand-provisioned in $VAD_FLOOR_FILE and
+    # nothing validates it on the way in, so treat a bad one as a bad setting
+    # rather than a reason to have no wake word: fall back on junk, clamp when
+    # out of range.
+    case "$VAD_FLOOR_RMS" in
+        *[!0-9]*|'')
+            echo "libreecho-waked: unreadable VAD floor '$VAD_FLOOR_RMS'; using $VAD_FLOOR_DEFAULT" >&2
+            VAD_FLOOR_RMS=$VAD_FLOOR_DEFAULT
+            ;;
+    esac
+    if [ "$VAD_FLOOR_RMS" -lt 1 ]; then
+        echo "libreecho-waked: VAD floor below 1; using 1" >&2
+        VAD_FLOOR_RMS=1
+    fi
+    if [ "$VAD_FLOOR_RMS" -gt "$VAD_FLOOR_MAX" ]; then
+        echo "libreecho-waked: VAD floor above $VAD_FLOOR_MAX; clamping" >&2
+        VAD_FLOOR_RMS=$VAD_FLOOR_MAX
+    fi
+    # Same fail-safe as the VAD floor: a bad value must not cost the device
+    # its wake word, so anything other than a literal 0 leaves AEC enabled.
+    AEC_REFERENCE_ARG="--reference-socket $REFERENCE_SOCKET"
+    if [ -r "$AEC_FILE" ] && [ "$(sed -n '1p' "$AEC_FILE")" = "0" ]; then
+        AEC_REFERENCE_ARG=""
+        echo "libreecho-waked: echo cancellation disabled by $AEC_FILE" >&2
+    fi
+    # Same fail-safe shape: only a plain positive integer turns dumping on.
+    DUMP_ARG=""
+    if [ -r "$DUMP_FILE" ]; then
+        DUMP_SECONDS=$(sed -n '1p' "$DUMP_FILE")
+        # One-shot: clear the request before acting on it, so a dump can never
+        # cost the wake word on more than the single boot that was asked for.
+        rm -f "$DUMP_FILE"
+        case "$DUMP_SECONDS" in
+            ""|*[!0-9]*) ;;
+            *) if [ "$DUMP_SECONDS" -gt 0 ]; then
+                   [ "$DUMP_SECONDS" -le "$DUMP_MAX_SECONDS" ] || DUMP_SECONDS=$DUMP_MAX_SECONDS
+                   DUMP_ARG="--dump-pcm /data/libreecho/config/wake-dump.raw --dump-seconds $DUMP_SECONDS"
+                   echo "libreecho-waked: dumping ${DUMP_SECONDS}s of processed audio; the wake word stops when it ends, until the next boot" >&2
+               fi ;;
+        esac
+    fi
+    ARGS=${ARGS:---foreground --socket $SOCKET --mic-socket $MIC_SOCKET $AEC_REFERENCE_ARG --model-dir $MODEL_ROOT --wake-threads 1 --vad-floor-rms $VAD_FLOOR_RMS $DUMP_ARG}
+    mkdir -p "$(dirname "$PIDFILE")" "$(dirname "$LOGFILE")" \
+        "$(dirname "$SOCKET")" "$(dirname "$REFERENCE_SOCKET")"
+    if command -v start-stop-daemon >/dev/null 2>&1; then
+        start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- $ARGS \
+            </dev/null >>"$LOGFILE" 2>&1
+    else
+        # setsid detaches the child from this shell's process group. Without it
+        # the daemon dies with the shell that started it -- which is why a
+        # restart issued over adb or ssh appeared to work and then evaporated.
+        if command -v setsid >/dev/null 2>&1; then
+            setsid "$DAEMON" $ARGS </dev/null >>"$LOGFILE" 2>&1 &
+        else
+            "$DAEMON" $ARGS </dev/null >>"$LOGFILE" 2>&1 &
+        fi
+        launched=$!
+        echo "$launched" >"$PIDFILE"
+        # setsid normally execs the daemon in-place, so the common case resolves
+        # immediately. If it forks, poll briefly for the real daemon instead of
+        # delaying every service start by a fixed second.
+        started=
+        count=0
+        while [ "$count" -lt 20 ]; do
+            if [ -r "/proc/$launched/cmdline" ]; then
+                argv0=$(tr '\0' '\n' < "/proc/$launched/cmdline" 2>/dev/null | sed -n '1p')
+                if [ "$argv0" = "$DAEMON" ]; then
+                    started=$launched
+                    break
+                fi
+            fi
+            started=$(running_pids | sort -n | sed -n '1p')
+            [ -n "$started" ] && break
+            sleep 0.05
+            count=$((count + 1))
+        done
+        [ -n "$started" ] && echo "$started" >"$PIDFILE"
+    fi
+}
+
+stop_service() {
+    if pidfile_pid >/dev/null && command -v start-stop-daemon >/dev/null 2>&1; then
+        start-stop-daemon -K -p "$PIDFILE" -R TERM/5/KILL/2
+    else
+        pid=$(pidfile_pid) && terminate "$pid" 5
+    fi
+    # Sweep anything the pidfile did not account for. Without this a lost or
+    # stale pidfile made stop a no-op that still reported success, and the
+    # following start added a second daemon instead of replacing the first.
+    for stray in $(running_pids); do
+        terminate "$stray" 5
+    done
+    rm -f "$PIDFILE" "$SOCKET" "$REFERENCE_SOCKET"
+    unmount_runtime
+}
+
+case "${1:-}" in
+    start) start_service ;;
+    stop) stop_service ;;
+    restart) stop_service; start_service ;;
+    status) if is_running; then echo "running"; else echo "stopped"; exit 1; fi ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

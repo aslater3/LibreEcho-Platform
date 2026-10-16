@@ -2,7 +2,20 @@
 # Signed A/B updater for the Amonet Biscuit layout.
 
 BB=/bin/busybox
-UPDATE_ROOT=/data/libreecho/update
+
+# Exact reviewed post-Amonet Biscuit userdata sizes, in 512-byte sectors.
+# Do not accept arbitrary larger partitions or change any other partition.
+userdata_size_supported()
+{
+    case "$1" in
+        2137088|2153472) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+DATA_ROOT=/data
+GENERATIONS=${GENERATIONS:-$DATA_ROOT/libreecho/generations}
+UPDATE_ROOT=$DATA_ROOT/libreecho/update
 INCOMING=$UPDATE_ROOT/incoming
 STAGING=$UPDATE_ROOT/staging
 STATE=$UPDATE_ROOT/state
@@ -23,8 +36,59 @@ BOOT_SECTORS=32768
 # Set once an install has begun writing progress to $STATE, so die() knows the
 # status file is mid-transaction and must not be left there.
 STATE_DIRTY=0
+ACTIVATION_STARTED=0
+ABORT_ATTEMPTED=0
 CURRENT_SERVICE_PROFILE=
-IDENTITY_SOURCE=
+FEATURE_TRANSACTION=/usr/local/sbin/libreecho-feature-transaction
+USERDATA_DEVICE=/dev/mmcblk0p16
+USERDATA_SYS=/sys/class/block/mmcblk0p16
+MOUNTS_FILE=/proc/mounts
+BOOT_DEVICE_ROOT=/dev
+BOOT_SYS_ROOT=/sys/class/block
+TRANSACTION_SLOT_FILE=$UPDATE_ROOT/transaction-slot
+TRANSACTION_BCB_FILE=$STAGING/bootctl.readback
+OTA_FORMAT=v3
+
+# Immutable image identity, not a caller environment or bootloader product.
+# Keep this bounded loader inline: no extra staged runtime file is required.
+load_image_target()
+{
+    local target_file=/etc/libreecho/target target_count
+    TARGET_ID=
+    TARGET_SLUG=
+    if [ ! -e "$target_file" ] && [ ! -L "$target_file" ]; then
+        TARGET_ID=radar_puffin
+        TARGET_SLUG=radar-puffin
+        printf '%s\n' 'target-file=missing fallback=radar_puffin' >&2
+        return 0
+    fi
+    [ -f "$target_file" ] && [ ! -L "$target_file" ] && [ -r "$target_file" ] || return 1
+    target_count=$($BB grep -c '^target_id=' "$target_file")
+    [ "$target_count" = 1 ] || return 1
+    TARGET_ID=$($BB sed -n 's/^target_id=//p' "$target_file")
+    case "$TARGET_ID" in
+        radar_puffin) TARGET_SLUG=radar-puffin ;;
+        biscuit) TARGET_SLUG=biscuit ;;
+        *) TARGET_ID=; return 1 ;;
+    esac
+}
+
+
+cleanup_refused_install_artifacts()
+{
+    # A pending target transaction owns its staged manifest and boot image as rollback evidence. Only discard transient working data
+    # when no durable transaction record exists, and only for the install
+    # command: inspect/status share die() and must never touch staging.
+    [ "${INSTALL_CLEANUP:-0}" = 1 ] || return 0
+    if [ -e "$PENDING" ]; then
+        return 0
+    fi
+    $BB rm -rf "$STAGING" 2>/dev/null || return 1
+    case "${package:-}" in
+        "$INCOMING"/*) $BB rm -f "$package" 2>/dev/null || return 1 ;;
+    esac
+    return 0
+}
 
 die()
 {
@@ -44,19 +108,26 @@ die()
             $BB mv "$STATE.tmp" "$STATE" 2>/dev/null || $BB rm -f "$STATE.tmp" 2>/dev/null
         $BB sync 2>/dev/null || true
     fi
+    # On an ordinary aborted install, release only this candidate's lifecycle
+    # pin. A pending target remains owned by the transaction instead.
+    if [ -n "${INSTALL_PIN:-}" ] && [ ! -e "$PENDING" ] && [ ! -L "$PENDING" ]; then
+        $BB rm -f "$INSTALL_PIN"
+        $BB sync
+    fi
+    cleanup_refused_install_artifacts || true
     exit 1
 }
 
 require_userdata()
 {
-    [ -b /dev/mmcblk0p16 ] &&
+    [ -b "$USERDATA_DEVICE" ] &&
         $BB grep -qx 'PARTNAME=userdata' \
-            /sys/class/block/mmcblk0p16/uevent 2>/dev/null &&
-        [ "$($BB cat /sys/class/block/mmcblk0p16/size 2>/dev/null)" = 2137088 ] &&
-        $BB grep -q ' /data ' /proc/mounts 2>/dev/null ||
+            "$USERDATA_SYS/uevent" 2>/dev/null &&
+        userdata_size_supported "$($BB cat "$USERDATA_SYS/size" 2>/dev/null)" &&
+        $BB grep -q " $DATA_ROOT " "$MOUNTS_FILE" 2>/dev/null ||
         die userdata_identity_or_mount_failed
     $BB mkdir -p "$INCOMING" "$UPDATE_ROOT" || die update_directory_failed
-    $BB chmod 0700 /data/libreecho "$UPDATE_ROOT" "$INCOMING" 2>/dev/null
+    $BB chmod 0700 "$DATA_ROOT/libreecho" "$UPDATE_ROOT" "$INCOMING" 2>/dev/null
 }
 
 channel_value()
@@ -90,19 +161,30 @@ target_device_for_slot()
     slot_name=$1
     case "$slot_name" in
         a)
-            target_device=/dev/mmcblk0p10
-            target_sys=/sys/class/block/mmcblk0p10
+            target_device=$BOOT_DEVICE_ROOT/mmcblk0p10
+            target_sys=$BOOT_SYS_ROOT/mmcblk0p10
             target_partname=boot_a_x
+            target_partname_pinned=boot_a
             ;;
         b)
-            target_device=/dev/mmcblk0p11
-            target_sys=/sys/class/block/mmcblk0p11
+            target_device=$BOOT_DEVICE_ROOT/mmcblk0p11
+            target_sys=$BOOT_SYS_ROOT/mmcblk0p11
             target_partname=boot_b_x
+            target_partname_pinned=boot_b
             ;;
         *) die boot_control_target ;;
     esac
+
+    # The slot store is the same reviewed 32768-sector partition at the same
+    # device node on both supported layouts; only its PARTNAME differs. The
+    # legacy Amonet layout redirects LK's boot_a/boot_b reads to these _x stores,
+    # while the pinned upstream chain names the stores boot_a/boot_b directly.
+    # Accepting either name for this node changes nothing else, and the exact
+    # sector check still rejects the 225280-sector Amonet wrapper partitions, so
+    # a boot image can never be written to a wrapper.
     [ -b "$target_device" ] &&
-        $BB grep -qx "PARTNAME=$target_partname" "$target_sys/uevent" 2>/dev/null &&
+        { $BB grep -qx "PARTNAME=$target_partname" "$target_sys/uevent" 2>/dev/null ||
+          $BB grep -qx "PARTNAME=$target_partname_pinned" "$target_sys/uevent" 2>/dev/null; } &&
         [ "$($BB cat "$target_sys/size" 2>/dev/null)" = "$BOOT_SECTORS" ] ||
         die boot_target_identity
 }
@@ -136,21 +218,6 @@ manifest_value()
     $BB sed -n "s/^${key}=//p" "$STAGING/manifest"
 }
 
-preserved_identity_value()
-{
-    key=$1
-    case "$IDENTITY_SOURCE" in
-        manifest)
-            manifest_value "$key"
-            ;;
-        pending)
-            $BB sed -n "s/^${key}=//p" "$PENDING"
-            ;;
-        *)
-            die preserve_identity_source
-            ;;
-    esac
-}
 
 current_service_profile()
 {
@@ -165,99 +232,47 @@ current_service_profile()
     esac
 }
 
+
+
+
+
+
+
+
+
+
 verify_manifest()
 {
-    required_keys='format manifest_version board soc architecture version boot_filename boot_size boot_sha256 feature_policy image_profile service_profile update_channel'
-    allowed_keys="$required_keys feature_airplay2_payload_sha256 feature_airplay2_payload_size feature_airplay2_manifest_sha256 feature_airplay2_daemon_sha256 feature_tts_payload_sha256 feature_tts_payload_size feature_tts_manifest_sha256 feature_tts_daemon_sha256 feature_wakeword_payload_sha256 feature_wakeword_payload_size feature_wakeword_manifest_sha256 feature_wakeword_daemon_sha256 feature_stt_payload_sha256 feature_stt_payload_size feature_stt_manifest_sha256 feature_stt_daemon_sha256 feature_assistant_payload_sha256 feature_assistant_payload_size feature_assistant_manifest_sha256 feature_assistant_daemon_sha256"
-    seen=
-    while IFS='=' read -r key value; do
-        [ -n "$key" ] && [ -n "$value" ] || die manifest_syntax
-        case " $allowed_keys " in
-            *" $key "*) ;;
-            *) die manifest_unknown_key ;;
-        esac
-        case " $seen " in
-            *" $key "*) die manifest_duplicate_key ;;
-        esac
-        seen="$seen $key"
-        case "$value" in
-            *[!A-Za-z0-9._+~:/-]*) die manifest_value_characters ;;
-        esac
-    done < "$STAGING/manifest"
-    for key in $required_keys; do
-        case " $seen " in
-            *" $key "*) ;;
-            *) die manifest_missing_key ;;
-        esac
-    done
+    case "$(manifest_value format)" in
+        libreecho-ota-v3)
+            "${TARGET_MANIFEST:-/usr/local/sbin/libreecho-target-manifest}" check "$STAGING/manifest" "$STAGING/manifest.sig" || die target_manifest_invalid
+            OTA_FORMAT=v3
+            version=$(manifest_value version)
+            SERVICE_PROFILE=$(manifest_value service_profile)
+            UPDATE_CHANNEL=$(manifest_value update_channel)
+            [ "$UPDATE_CHANNEL" = "$(channel_value)" ] || die update_channel_mismatch
+            boot_sha=$(manifest_value boot_sha256)
+            return 0;;
+        libreecho-ota-v1|libreecho-ota-v2) die legacy_manifest_unsupported;;
+    esac
+    die manifest_format
+}
 
-    [ "$(manifest_value format)" = libreecho-ota-v1 ] ||
-        die manifest_format
-    [ "$(manifest_value manifest_version)" = 1 ] ||
-        [ "$(manifest_value manifest_version)" = 2 ] ||
-        die manifest_version
-    [ "$(manifest_value board)" = radar_puffin ] || die manifest_board
-    [ "$(manifest_value soc)" = mt8163 ] || die manifest_soc
-    [ "$(manifest_value architecture)" = armv7 ] ||
-        die manifest_architecture
-    [ "$(manifest_value boot_filename)" = boot.img ] ||
-        die manifest_boot_filename
-    [ "$(manifest_value boot_size)" = "$BOOT_SIZE" ] ||
-        die manifest_boot_size
-    FEATURE_POLICY=$(manifest_value feature_policy)
-    case "$FEATURE_POLICY" in
-        preserve|redistributable|community-noncommercial|exclude) ;;
-        *) die manifest_feature_policy ;;
-    esac
-    if [ "$FEATURE_POLICY" = preserve ]; then
-        for feature in airplay2 tts wakeword stt assistant; do
-            for field in payload_sha256 payload_size manifest_sha256 daemon_sha256; do
-                value=$(manifest_value "feature_${feature}_${field}")
-                [ -n "$value" ] || die manifest_preserve_feature_identity_missing
-                case "$field:$value" in
-                    payload_sha256:[0-9a-f][0-9a-f]*|manifest_sha256:[0-9a-f][0-9a-f]*|daemon_sha256:[0-9a-f][0-9a-f]*)
-                        [ "${#value}" -eq 64 ] || die manifest_preserve_feature_identity_hash ;;
-                    payload_size:[0-9]*) ;;
-                    *) die manifest_preserve_feature_identity_value ;;
-                esac
-            done
-        done
-    fi
-    [ "$(manifest_value image_profile)" = ota ] ||
-        die manifest_image_profile
-    SERVICE_PROFILE=$(manifest_value service_profile)
-    case "$SERVICE_PROFILE" in
-        diagnostic|production) ;;
-        *) die manifest_service_profile ;;
-    esac
-    UPDATE_CHANNEL=$(manifest_value update_channel)
-    case "$UPDATE_CHANNEL" in
-        dev|stable) ;;
-        *) die manifest_update_channel ;;
-    esac
-    device_channel=$(channel_value)
-    [ "$device_channel" = dev ] || [ "$device_channel" = stable ] ||
-        die device_update_channel
-    [ "$UPDATE_CHANNEL" = "$device_channel" ] ||
-        die manifest_update_channel_mismatch
-    if [ "$FEATURE_POLICY" = exclude ] && [ "$SERVICE_PROFILE" != diagnostic ]; then
-        die manifest_excluded_features_require_diagnostic_profile
-    fi
-    version=$(manifest_value version)
-    case "$version" in
-        ''|*[!A-Za-z0-9._+~-]*) die manifest_version_value ;;
-    esac
-    boot_sha=$(manifest_value boot_sha256)
-    case "$boot_sha" in
-        ''|*[!0-9a-f]*) die manifest_boot_hash ;;
-    esac
-    [ "${#boot_sha}" -eq 64 ] || die manifest_boot_hash
+transaction_pending()
+{
+    [ -e "$PENDING" ] || [ -L "$PENDING" ]
+
 }
 
 extract_and_verify()
 {
     package=$1
     [ -f "$package" ] && [ ! -L "$package" ] || die package_not_regular
+    # The target confirmation path authenticates the signed generation and
+    # boot image. Re-extracting here would delete and replace
+    # that evidence -- even from an unrelated `inspect` -- and force a rollback,
+    # so refuse to touch $STAGING while a transaction is still pending.
+    transaction_pending && die transaction_pending
     [ "$($BB stat -c %s "$package" 2>/dev/null)" -le 33554432 ] ||
         die package_too_large
     members=$($BB tar -tf "$package" 2>/dev/null) || die package_tar_invalid
@@ -265,7 +280,9 @@ extract_and_verify()
 manifest.sig
 boot.img" ] || die package_member_contract
 
-    $BB rm -rf "$STAGING"
+    $BB rm -f "$STAGING/manifest" "$STAGING/manifest.sig" "$STAGING/boot.img" \
+        "$STAGING/boot-write.log" "$STAGING/bootctl.status" "$STAGING/bootctl.activate" \
+        "$TRANSACTION_BCB_FILE" 2>/dev/null
     $BB mkdir -p "$STAGING" || die staging_create_failed
     $BB tar -xf "$package" -C "$STAGING" manifest manifest.sig boot.img \
         2>/dev/null || die package_extract_failed
@@ -294,6 +311,7 @@ boot.img" ] || die package_member_contract
     [ "$actual" = "$boot_sha" ] || die boot_package_hash
 }
 
+
 bootctl_status()
 {
     "$BOOTCTL" status > "$STAGING/bootctl.status" ||
@@ -309,6 +327,46 @@ bootctl_status()
     [ "$selected_success" = 1 ] || die current_slot_not_confirmed
     target=$inactive
     target_device_for_slot "$target"
+    write_device=$target_device
+    backup_device=
+    store_mode=$($BB sed -n 's/^boot_store_mode=//p' "$STAGING/bootctl.status")
+    case "$store_mode" in
+        ''|slotted) ;;
+        fixed-a)
+            # Issue #231: the pinned chain's LK always loads boot_a; the BCB
+            # selects only the reported suffix and the tries accounting. The
+            # candidate must therefore replace boot_a, and the running image is
+            # kept in boot_b as the copy the boot path restores after a rollback.
+            target_device_for_slot b
+            backup_device=$target_device
+            target_device_for_slot a
+            write_device=$target_device
+            ;;
+        *) die boot_store_mode ;;
+    esac
+}
+
+# Preserve the running image before a fixed-a store is overwritten. It must be
+# the committed generation's signed image (the boot path converges boot_a onto
+# it), so an unrecognised image is never promoted to the recovery copy.
+backup_running_boot()
+{
+    [ -n "$backup_device" ] || return 0
+    running_sha=$($BB dd if="$write_device" bs=4096 count=4096 2>/dev/null |
+        $BB sha256sum | $BB awk '{print $1}')
+    if [ -r "$UPDATE_ROOT/current" ]; then
+        committed=$($BB cat "$UPDATE_ROOT/current")
+        case "$committed" in ''|.|..|*[!A-Za-z0-9._+~:-]*) die boot_store_committed_pointer;; esac
+        committed_sha=$($BB sed -n 's/^boot_sha256=//p' \
+            "$GENERATIONS/$committed/target.manifest" 2>/dev/null | $BB head -n 1)
+        [ -n "$committed_sha" ] && [ "$running_sha" = "$committed_sha" ] ||
+            die boot_store_not_committed
+    fi
+    $BB dd if="$write_device" of="$backup_device" bs=4096 count=4096 \
+        conv=fsync 2>"$STAGING/boot-backup.log" || die boot_backup_write
+    backup_sha=$($BB dd if="$backup_device" bs=4096 count=4096 2>/dev/null |
+        $BB sha256sum | $BB awk '{print $1}')
+    [ "$backup_sha" = "$running_sha" ] || die boot_backup_hash
 }
 
 feature_file_sha256()
@@ -325,8 +383,37 @@ feature_file_sha256()
     printf '%s\n' "$digest"
 }
 
+transaction_status()
+{
+    if [ -r "$UPDATE_ROOT/features-status" ] && [ ! -L "$UPDATE_ROOT/features-status" ]; then
+        $BB grep -E '^features_(state|error)=[A-Za-z0-9_:-]*$' "$UPDATE_ROOT/features-status"
+    fi
+    if [ -r "$UPDATE_ROOT/config-status" ] && [ ! -L "$UPDATE_ROOT/config-status" ]; then
+        $BB grep -E '^config_(schema|error)=[A-Za-z0-9_:-]*$' "$UPDATE_ROOT/config-status"
+    fi
+    transaction_state=none
+    [ -r "$PENDING" ] && transaction_state=pending
+    # The rolled-back marker is retained rollback history, not live state, so it
+    # must not mask a pending or committing transaction recorded above.
+    [ "$transaction_state" = none ] && [ -r "$UPDATE_ROOT/rolled-back" ] &&
+        transaction_state=rollback
+    echo "ota_transaction_state=$transaction_state"
+    [ "$transaction_state" = pending ] && echo ota_transaction_pending=1
+    [ "$transaction_state" = rollback ] && echo ota_transaction_rollback=1
+
+}
+
 feature_status()
 {
+    [ -f "$UPDATE_ROOT/current" ] && [ ! -L "$UPDATE_ROOT/current" ] || return 1
+    current=$($BB cat "$UPDATE_ROOT/current")
+    case "$current" in ''|.|..|*[!A-Za-z0-9._+~:-]*) return 1;; esac
+    [ "${#current}" -le 96 ] || return 1
+    FEATURE_ROOT=$GENERATIONS/$current/features
+    for path in "$GENERATIONS" "$GENERATIONS/$current" "$FEATURE_ROOT"; do
+        [ ! -L "$path" ] || return 1
+    done
+    printf 'generation=%s\n' "$current"
     for feature in airplay2 tts wakeword stt assistant; do
         case "$feature" in
             airplay2) daemon=libreecho-audio-engine ;;
@@ -335,7 +422,7 @@ feature_status()
             stt) daemon=libreecho-sttd ;;
             assistant) daemon=libreecho-agentd ;;
         esac
-        feature_root=/data/libreecho/features/$feature
+        feature_root=$FEATURE_ROOT/$feature
         payload=$feature_root/payload.squashfs
         manifest=$feature_root/manifest.json
         payload_sha=$(feature_file_sha256 "$payload")
@@ -367,110 +454,12 @@ feature_status()
     done
 }
 
-feature_daemon_required()
-{
-    feature=$1
-    [ "$CURRENT_SERVICE_PROFILE" != diagnostic ] || return 1
-    case "$feature" in
-        airplay2|wakeword) return 0 ;;
-        tts|stt|assistant)
-            integrations=0
-            config=/data/libreecho/config/web-config.json
-            if [ -r "$config" ]; then
-                integrations=$($BB sed -n \
-                    's/.*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
-                    "$config" 2>/dev/null | $BB head -n 1)
-                case "$integrations" in
-                    ''|*[!0-9]*) integrations=0 ;;
-                esac
-            fi
-            [ $((integrations & 1)) -eq 0 ]
-            ;;
-        *) return 1 ;;
-    esac
-}
 
-write_preserved_feature_identity()
-{
-    for feature in airplay2 tts wakeword stt assistant; do
-        for field in payload_sha256 payload_size manifest_sha256 daemon_sha256; do
-            value=$(manifest_value "feature_${feature}_${field}")
-            [ -n "$value" ] || die pending_feature_identity_missing
-            printf '%s\n' "feature_${feature}_${field}=$value"
-        done
-    done
-}
 
-verify_preserved_feature_identity()
-{
-    IDENTITY_SOURCE=$1
-    [ "$IDENTITY_SOURCE" = manifest ] || [ "$IDENTITY_SOURCE" = pending ] ||
-        die preserve_identity_source
-    current_service_profile
-    for feature in airplay2 tts wakeword stt assistant; do
-        case "$feature" in
-            airplay2) daemon=libreecho-audio-engine ;;
-            tts) daemon=libreecho-ttsd ;;
-            wakeword) daemon=libreecho-waked ;;
-            stt) daemon=libreecho-sttd ;;
-            assistant) daemon=libreecho-agentd ;;
-        esac
-        feature_root=/data/libreecho/features/$feature
-        payload=$feature_root/payload.squashfs
-        manifest=$feature_root/manifest.json
-        expected_payload=$(preserved_identity_value "feature_${feature}_payload_sha256")
-        expected_size=$(preserved_identity_value "feature_${feature}_payload_size")
-        expected_manifest=$(preserved_identity_value "feature_${feature}_manifest_sha256")
-        expected_daemon=$(preserved_identity_value "feature_${feature}_daemon_sha256")
-        actual_payload=$(feature_file_sha256 "$payload")
-        [ "$actual_payload" = "$expected_payload" ] ||
-            die preserve_feature_payload_mismatch
-        actual_size=$($BB stat -c %s "$payload" 2>/dev/null)
-        [ "$actual_size" = "$expected_size" ] ||
-            die preserve_feature_payload_size_mismatch
-        actual_manifest=$(feature_file_sha256 "$manifest")
-        [ "$actual_manifest" = "$expected_manifest" ] ||
-            die preserve_feature_manifest_mismatch
-        if ! feature_daemon_required "$feature"; then
-            continue
-        fi
-        pid=$($BB pidof "$daemon" 2>/dev/null | $BB awk '{print $1}')
-        case "$pid" in
-            ''|*[!0-9]*) die preserve_feature_daemon_not_running ;;
-        esac
-        running_daemon=$(feature_file_sha256 "/proc/$pid/exe" 1)
-        [ "$running_daemon" != unavailable ] || die preserve_feature_daemon_unavailable
-        [ "$running_daemon" = "$expected_daemon" ] ||
-            die preserve_feature_daemon_mismatch
-    done
-}
-
-clear_exact_development_marker()
-{
-    expdb=/dev/mmcblk0p7
-    expdb_sys=/sys/class/block/mmcblk0p7
-    [ -b "$expdb" ] &&
-        $BB grep -qx 'PARTNAME=expdb' "$expdb_sys/uevent" 2>/dev/null &&
-        [ "$($BB cat "$expdb_sys/size" 2>/dev/null)" = 20480 ] ||
-        die expdb_identity
-    marker=$($BB dd if="$expdb" bs=15 count=1 2>/dev/null)
-    [ "$marker" = FASTBOOT_PLEASE ] || return 0
-    $BB dd if="$expdb" of="$STAGING/expdb-sector.before" bs=512 count=1 \
-        2>/dev/null || die expdb_read
-    $BB cp "$STAGING/expdb-sector.before" "$STAGING/expdb-sector.after" ||
-        die expdb_copy
-    $BB dd if=/dev/zero of="$STAGING/expdb-sector.after" bs=15 count=1 \
-        conv=notrunc 2>/dev/null || die expdb_marker_clear_prepare
-    $BB dd if="$STAGING/expdb-sector.after" of="$expdb" bs=512 count=1 \
-        conv=fsync 2>/dev/null || die expdb_marker_clear_write
-    $BB dd if="$expdb" of="$STAGING/expdb-sector.readback" bs=512 count=1 \
-        2>/dev/null || die expdb_marker_clear_read
-    $BB cmp "$STAGING/expdb-sector.after" "$STAGING/expdb-sector.readback" ||
-        die expdb_marker_clear_readback
-}
 
 install_package()
 {
+    INSTALL_PIN=
     package=$1
     require_userdata
     lock_take
@@ -478,42 +467,71 @@ install_package()
     STATE_DIRTY=1
     state_write verifying 5 package
     extract_and_verify "$package"
+    if [ "$OTA_FORMAT" = v3 ]; then
+        tx=$(manifest_value transaction_id)
+        generation="${GENERATIONS:-/data/libreecho/generations}/$tx"
+        [ -f "$generation/target.manifest" ] && [ ! -L "$generation/target.manifest" ] || die generation_manifest_mismatch
+        [ "$(sha256sum "$generation/target.manifest" | $BB awk '{print $1}')" = "$(sha256sum "$STAGING/manifest" | $BB awk '{print $1}')" ] || die generation_manifest_mismatch
+        # The install lock and authenticated candidate identity transfer ownership
+        # before fallible tree verification and boot-control probing. Unverified
+        # callers and colliding transaction identities own no pin.
+        INSTALL_PIN=$GENERATIONS/$tx.pin
+        "${GENERATION_TOOL:-/usr/local/sbin/libreecho-generation}" verify "$generation" || die generation_invalid
+    fi
     state_write verified 20 "$version"
     bootctl_status
-    if [ "$FEATURE_POLICY" = preserve ]; then
-        verify_preserved_feature_identity manifest
-    fi
 
     state_write writing 30 "$target"
-    $BB dd if="$STAGING/boot.img" of="$target_device" bs=4096 \
+    backup_running_boot
+    $BB dd if="$STAGING/boot.img" of="$write_device" bs=4096 \
         conv=fsync 2>"$STAGING/boot-write.log" || die boot_write
     state_write verifying-write 75 "$target"
-    written=$($BB dd if="$target_device" bs=4096 count=4096 2>/dev/null |
+    written=$($BB dd if="$write_device" bs=4096 count=4096 2>/dev/null |
         $BB sha256sum | $BB awk '{print $1}')
     [ "$written" = "$boot_sha" ] || die boot_write_hash
 
-    {
-        echo schema=1
-        echo "version=$version"
-        echo "slot=$target"
-        echo "boot_sha256=$boot_sha"
-        echo "update_channel=$UPDATE_CHANNEL"
-        echo "feature_policy=$FEATURE_POLICY"
-        if [ "$FEATURE_POLICY" = preserve ]; then
-            write_preserved_feature_identity
-        fi
-    } > "$PENDING.tmp" || die pending_write
-    $BB mv "$PENDING.tmp" "$PENDING" || die pending_commit
-    $BB sync
+    if [ "$OTA_FORMAT" = v3 ]; then
+        {
+            echo schema=3
+            echo "slot=$target"
+            echo "transaction_id=$tx"
+            echo "manifest_sha256=$(sha256sum "$STAGING/manifest" | $BB awk '{print $1}')"
+        } > "$PENDING.tmp" || die pending_write
+        $BB chmod 0600 "$PENDING.tmp" || die pending_mode
+        $BB sync
+        $BB mv "$PENDING.tmp" "$PENDING" || die pending_commit
+        $BB sync
+        $BB rm -f "$GENERATIONS/$tx.pin" || die generation_unpin
+        $BB sync
 
-    # Old development images leave this marker armed. Clear only its exact
-    # prefix before the BCB commit; OTA-profile kernels do not recreate it.
-    clear_exact_development_marker
+    fi
+
     state_write activating 90 "$target"
+    ACTIVATION_STARTED=1
     "$BOOTCTL" activate "$target" > "$STAGING/bootctl.activate" ||
         die boot_control_activate
     state_write reboot-pending 100 "$target"
     echo "UPDATE_READY slot=$target version=$version"
+}
+
+# The installer's check record ends at `reboot-pending`, which the web UI shows
+# as "Ready to restart".  Once the candidate is confirmed that is no longer
+# true: the device is running the release that check resolved.  Relabel only
+# that exact record, keeping its release identity, so the UI reports the
+# confirmed install as current instead of asking for a restart that already
+# happened.  Best effort: the slot is already confirmed, and the next check
+# rewrites the record whole anyway.
+publish_confirmed_check_status()
+{
+    check=$UPDATE_ROOT/check-status
+    [ "$($BB sed -n 's/^status=//p' "$check" 2>/dev/null)" = reboot-pending ] || return 0
+    if $BB sed 's/^status=reboot-pending$/status=up-to-date/' "$check" > "$check.confirm.tmp" &&
+       $BB mv "$check.confirm.tmp" "$check"; then
+        $BB sync
+        return 0
+    fi
+    $BB rm -f "$check.confirm.tmp"
+    return 0
 }
 
 confirm_pending()
@@ -521,48 +539,19 @@ confirm_pending()
     require_userdata
     lock_take
     [ -r "$PENDING" ] || die no_pending_update
-    slot=$($BB sed -n 's/^slot=//p' "$PENDING")
-    version=$($BB sed -n 's/^version=//p' "$PENDING")
-    expected=$($BB sed -n 's/^boot_sha256=//p' "$PENDING")
-    feature_policy=$($BB sed -n 's/^feature_policy=//p' "$PENDING")
-    case "$feature_policy" in
-        preserve|redistributable|community-noncommercial|exclude) ;;
-        *) die pending_feature_policy ;;
-    esac
-    update_channel=$($BB sed -n 's/^update_channel=//p' "$PENDING")
-    if [ "$update_channel" != dev ] && [ "$update_channel" != stable ]; then
-        update_channel=$($BB cat "$PACKAGED_CHANNEL_FILE" 2>/dev/null)
-        [ "$update_channel" = dev ] || [ "$update_channel" = stable ] ||
-            update_channel=$(channel_value)
-        [ "$update_channel" = dev ] || [ "$update_channel" = stable ] ||
-            die pending_update_channel
-        printf '%s\n' "update_channel=$update_channel" >> "$PENDING"
+    pending_schema=$($BB sed -n 's/^schema=//p' "$PENDING")
+    if [ "$pending_schema" = 3 ]; then
+        slot=$($BB sed -n 's/^slot=//p' "$PENDING")
+        target_device_for_slot "$slot"
+        ROOT="$UPDATE_ROOT" "$FEATURE_TRANSACTION" verify-running || die feature_target_not_ready
+        "$BOOTCTL" confirm "$slot" > "$UPDATE_ROOT/bootctl.confirm" || die boot_control_confirm
+        ROOT="$UPDATE_ROOT" "$FEATURE_TRANSACTION" commit || die generation_commit_pending
+        state_write installed 100 "$slot"
+        publish_confirmed_check_status
+        echo "UPDATE_CONFIRMED slot=$slot"
+        return 0
     fi
-    target_device_for_slot "$slot"
-    actual=$($BB dd if="$target_device" bs=4096 count=4096 2>/dev/null |
-        $BB sha256sum | $BB awk '{print $1}')
-    [ "$actual" = "$expected" ] || die pending_boot_hash
-    if [ "$feature_policy" = preserve ]; then
-        # Feature staging is independent of the boot write. Recheck the
-        # identities captured in the pending transaction before confirmation,
-        # so a changed payload cannot be confirmed with the new boot image.
-        verify_preserved_feature_identity pending
-    fi
-    selected_channel=$(channel_value)
-    case "$selected_channel" in
-        dev|stable)
-            {
-                $BB sed '/^channel=/d' "$PENDING"
-                printf '%s\n' "channel=$selected_channel"
-            } > "$PENDING.tmp" || die pending_channel_preserve
-            $BB mv "$PENDING.tmp" "$PENDING" || die pending_channel_preserve
-            ;;
-    esac
-    "$BOOTCTL" confirm "$slot" > "$UPDATE_ROOT/bootctl.confirm" ||
-        die boot_control_confirm
-    $BB mv "$PENDING" "$UPDATE_ROOT/installed"
-    state_write installed 100 "$version"
-    echo "UPDATE_CONFIRMED slot=$slot version=$version"
+    die legacy_manifest_unsupported
 }
 
 inspect_package()
@@ -585,13 +574,18 @@ case "${1:-}" in
         # reset during OTA triage.
         [ ! -r "$UPDATE_ROOT/restart-record" ] ||
             { echo restart_record=1; $BB cat "$UPDATE_ROOT/restart-record"; }
+        transaction_status
         feature_status
         ;;
     install)
         shift
         if [ "${1:-}" = "--allow-unsigned" ]; then ALLOW_UNSIGNED=1; shift; fi
-        [ "$#" -eq 1 ] || die usage
-        install_package "$1"
+        [ "$#" -ge 1 ] || die usage
+        package=$1; shift
+        [ "$ALLOW_UNSIGNED" = 0 ] || die unsigned_target_unsupported
+        [ "$#" = 0 ] || die usage
+        INSTALL_CLEANUP=1
+        install_package "$package"
         ;;
     inspect)
         [ "$#" -eq 2 ] || die usage
@@ -607,7 +601,7 @@ case "${1:-}" in
         # this subcommand and fall through to the usage/exit-2 case, which the
         # daemon reads as "unsupported" -- a safe default.
         [ "$#" -eq 1 ] || die usage
-        echo allow-unsigned
+        echo immutable-target-v3
         ;;
     *)
         echo "Usage: libreecho-update status | inspect PACKAGE.tar | install [--allow-unsigned] PACKAGE.tar | confirm | capabilities" >&2

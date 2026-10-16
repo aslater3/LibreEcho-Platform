@@ -2,7 +2,13 @@
 
 ## Platform mapping
 
-The Biscuit Amonet layout has two layers of boot storage:
+Two boot layouts are supported. A unit matches exactly one of them, and a slot's
+boot store is the same device node at the same reviewed size in both, so nothing
+outside partition identity differs between them.
+
+### Legacy Amonet layout
+
+Two layers of boot storage:
 
 | BCB slot | Amonet entry/wrapper | Redirected OS image |
 | --- | --- | --- |
@@ -15,6 +21,18 @@ fastboot `flash boot_a`/`flash boot_b` commands to `_x`. Linux does not pass
 through that fastboot hook, so the on-device updater must write `_x` directly.
 The large `boot_a` and `boot_b` partitions contain the Amonet header and tail
 payload and are read-only invariants for OTA.
+
+### Pinned upstream chain layout
+
+No redirect and no wrapper partitions: `boot_a` (`/dev/mmcblk0p10`, 32768
+sectors) and `boot_b` (`/dev/mmcblk0p11`, 32768 sectors) are the stores LK reads,
+and `/dev/mmcblk0p17` and `/dev/mmcblk0p18` do not exist. The updater writes the
+inactive store directly, exactly as it writes `_x` on the Amonet layout.
+
+`libreecho-bootctl` validates the Amonet contract set first and unchanged, then
+the pinned set, and reports which one matched as `boot_layout=`. Probing the
+layout a unit does not use stays quiet, and a unit matching neither fails closed
+with the Amonet contract diagnostics.
 
 The Amazon BCB is 7 bytes at offset `0x360` in `misc`
 (`/dev/mmcblk0p8`, 1025 sectors):
@@ -36,7 +54,8 @@ preloader falls back to the successful priority-14 slot.
 
 An ordinary OTA transaction may write only:
 
-1. the inactive redirected image store, `boot_a_x` or `boot_b_x`;
+1. the inactive image store — `boot_a_x` or `boot_b_x` on the Amonet layout, or
+   `boot_a`/`boot_b` on the pinned layout;
 2. the single 512-byte `misc` sector containing the BCB; and
 3. `/data/libreecho/update`, which holds downloaded packages and transaction
    state on the existing `userdata` filesystem.
@@ -47,12 +66,180 @@ the eMMC boot areas. User configuration remains under
 `/data/libreecho/config`; IDME, calibration, MAC addresses, and identity remain
 in `persist` and the eMMC boot areas.
 
-There is one bounded migration exception for an installation launched from an
-old development image. If, and only if, `expdb` has its exact expected
-partition identity and begins with `FASTBOOT_PLEASE`, the installer preserves
-the first sector, clears those 15 marker bytes, syncs, and verifies the complete
-sector. No other `expdb` content is changed. OTA-profile images do not write
-the marker again.
+The installer never writes or erases `expdb`. Older development images may have
+left a legacy marker there, but this release does not attempt to clear it because
+amonet v2.0.0 uses the partition for the LK-stage kaeru payload.
+
+## Repeated v2 fallback history
+
+After the existing signed-intent, confirmed fallback-slot, prior installation,
+and untouched-feature gates pass, v2 recovery preserves the previous
+`update/rolled-back` bytes as `update/rolled-back-history.<sha256>` before
+atomically publishing the current pending record as `rolled-back`. These flat
+regular files survive older slots' userdata cleanup without a new directory
+allowlist. History is opaque diagnostic evidence, not signed authority and not
+an input to cleanup authorization; historical v1 and v2 records need no schema
+conversion.
+
+The archive uses an atomic no-clobber hard link followed by sync, then the
+existing atomic latest-record copy. Retries after either publication boundary
+reuse matching bytes without losing older evidence. Archive names bind complete
+record hashes, not transaction IDs. Symlinks, nonregular files, hash mismatches,
+and hard-linked temporary output are rejected before transaction cleanup.
+
+Retention is bounded to 16 archived records, at most 8192 bytes per record.
+A full archive refuses a new distinct historical record with
+`fallback-history-full` and retains pending/journal/staging. There is no automatic
+history pruning: export and any removal require a separate operator decision.
+`rolled-back` remains the latest record consumed by existing status readers.
+
+## Automatic finalization of a confirmed rollback
+
+When the bootloader has already returned to the previously confirmed slot, the
+boot worker finalizes the failed transaction by itself: it runs the
+version-matched recovery implementation from the running (previously confirmed)
+slot, which retires only the matching `pending`/`feature-commit`/staging records
+and preserves the bounded `rolled-back` history described above. No operator
+action and no ADB session are required before the device can accept the next
+candidate.
+
+The worker runs on every OTA boot, whatever the service profile is, because this
+finalization is not candidate health: `exclude:diagnostic` is a supported OTA
+combination, and a boot that skipped the finalization would leave
+`pending`/`feature-commit`/staging live and the update flow's durable journal
+would then reject every later installation. Candidate confirmation -- the health
+probes, the `confirm` calls and the restart -- stays production-only, gated
+inside the worker (`ota-health-confirmation-skipped-non-production-profile`),
+and the exclusion policy skips exactly that same half
+(`ota-health-feature-validation-skipped-by-exclusion-policy`). A diagnostic slot
+is therefore still left pending and unconfirmed for the operator.
+
+Finalization is fail-closed and asserted on the filesystem, not on the helper's
+exit status alone. The worker claims the rollback only when `pending`,
+`feature-commit` and staging are gone and `rolled-back` exists; if any of those
+post-conditions does not hold it logs
+`ota-v2-fallback-preserved-for-recovery` and leaves every record, keeping the
+identity, signature, slot, hash, file-type, and generation evidence intact for
+operator recovery. A new download cannot overwrite staging while the
+transaction is still live.
+
+Only after those post-conditions hold does the worker publish the terminal
+`state` record (`state=rolled-back`, `progress=100`) and refresh a check record
+that the failed candidate left at `reboot-pending` to
+`update-held-after-rollback`. The check record is rewritten only when its
+`latest_version` equals the version recorded in `rolled-back`, so a record
+belonging to a different candidate is never relabelled. Publication is atomic
+and idempotent across repeated boots and interruptions, and it leaves
+configuration, installed feature authority, active payloads, and boot
+partitions untouched.
+
+The `rolled-back` history record is correlation and history, not cleanup
+authorization; the record is unsigned, lives in userdata, and any writer can
+replace it. The gate that does authorize a resumed removal is the packaged
+helper's read-only `rollback-evidence` proof -- the signed staged manifest, the
+durable prepared journal, the BCB the bootloader fell back from, and the
+untouched feature state -- which must name the same transaction and slot this
+boot decided with. The record is still shape-checked first: the recovery helper
+refuses to read one that is not a bounded regular non-symlink, and the boot
+worker applies the same test -- a regular file, not a symlink, at most 8192
+bytes -- before it reads a slot or a transaction id out of that record, and
+again once it holds the install lock. A record that fails the shape test is
+refused as `ota-rollback-resume-history-unsafe` (or as
+`ota-rollback-resume-evidence-invalid` when the record is absent), evidence
+that does not name this rollback is refused as
+`ota-rollback-resume-rollback-evidence-unproven` or
+`ota-rollback-resume-rollback-evidence-mismatch`, and nothing is read through a
+refused record, removed, or published; a symlink pointing at a surviving live
+record is never read for cleanup.
+
+The helper retires `pending`/`feature-commit` before it removes its staging
+tree, and it exits immediately once the live transaction is gone, so an
+interruption between those two steps leaves a cleanup that only the boot worker
+can finish. The worker therefore completes it on the next boot, and publishes
+the terminal records only afterwards: the removal is validated the way the
+helper validates it, so a staging tree that is a symlink, is not a directory,
+contains a symlink, or cannot be removed is refused with
+`ota-rollback-resume-staging-unsafe` (or
+`ota-rollback-resume-staging-cleanup-failed`) and left for operator recovery
+with the failed candidate's records still in place. A refused or interrupted
+attempt is retried on every subsequent boot and logs
+`ota-rollback-resume-staging-cleaned` before the publication marker
+`ota-rollback-terminal-publication-resumed`.
+
+Both resumed removals act inside the update root the update flow stages into, so
+they run under that flow's own locks, in the order it takes them: the boot-local
+fetch lock the fetcher holds while it downloads feature assets straight into this
+staging tree, then the persistent install lock. The fetcher releases the install
+lock before that download and re-takes it for the install, so the fetch lock is
+what protects a tree being written, and a fetch or installation in flight owns
+the tree until it finishes: the boot logs `ota-rollback-resume-fetch-locked` or
+`ota-rollback-resume-install-locked` and leaves the records unpublished for the
+next boot to retry. Their inputs are revalidated once both locks are held: a
+history record that stopped being a bounded regular non-symlink, or a live
+record that appeared while this boot was deciding, is refused there as well
+(`ota-rollback-resume-live-record-foreign` for a record naming another
+transaction), so a tree staged for a newer candidate is never removed in the
+rollback's name.
+
+The fallback branch takes the same pair of locks before it touches the update
+root, and holds them through the whole helper sequence: the bootctl readback it
+writes into `staging`, `fallback` itself, the post-condition that validates it,
+and the terminal publication that follows. The helper retires the live pair and
+then removes the staged tree, so running it unlocked would let a download that
+starts the moment the live records disappear have its tree deleted, or leave a
+newly prepared transaction without its staged artifacts. A writer that already
+holds either lock owns the update root until it finishes: the boot logs
+`ota-rollback-resume-fetch-locked` or `ota-rollback-resume-install-locked`,
+leaves every record for the next boot, and releases nothing it did not take.
+
+Because the install lock lives in persistent `/data` and the flow's protocol has
+no answer for a holder that never released it, every lock this worker takes is
+tagged with the boot it was taken in (`owner=rollback-resume`, `boot_id=...`) and
+is released on every path. A lock this worker left behind by a power loss is
+therefore recognised on the next boot and reclaimed with
+`ota-rollback-resume-lock-recovered`, instead of blocking this worker and both
+update tools forever; an untagged lock (an installation) or one taken by the
+current boot is never reclaimed, and a lock that cannot be tagged is given back
+rather than held (`ota-rollback-resume-lock-untagged`).
+
+The retirement of the live records is the helper's other interruptible step: it
+removes the pending record and the feature commit with a single `rm -f` and
+exits as soon as either is gone, while `fallback` and
+`abort-before-activation` both require the pair, so a one-sided retirement has
+no other way out — and for as long as the durable journal survives, the update
+flow refuses to stage anything else. The worker therefore retires a surviving
+record as well, but only when it carries the `transaction_id` recorded in
+`rolled-back` and its other half is already gone (`ota-rollback-resume-live-record-foreign`
+otherwise, and `-unsafe` for a record that is not a regular file); a complete
+pair stays a live transaction for its own rollback branch. A schema-2 `pending`
+record without its durable journal was never prepared or activated, so it is
+preserved for the update flow that rebuilds it instead of being retired as a
+rollback whose staged tree still holds the candidate.
+
+A schema-1 (v1 updater) rollback has neither of those things to resume: the boot
+worker retires that transaction by moving the `pending` record itself, so the
+record an interrupted finalization leaves behind carries no `transaction_id` and
+has no durable v2 journal beside it. The worker publishes for it as well --
+otherwise a check record the failed candidate left at `reboot-pending` would stay
+frozen on every later boot, because the rollback branch can no longer be entered
+once the pending record has been moved -- and it runs neither v2 cleanup for that
+record, matching it on its `schema=1` contents and on the absence of `pending`
+and `feature-commit`. A surviving live record logs
+`ota-rollback-resume-live-record-present:<record>` and keeps its own recovery
+path, and the check record is rewritten only when its `latest_version` equals the
+version in `rolled-back`, exactly as for a schema-2 rollback.
+
+Which progress record the failed candidate left is not part of that evidence: a
+candidate that crashes -- or loses power -- on its boots exhausts its attempts
+before the worker reaches its own restart record, so the survivor can be the
+installer's `reboot-pending` or the `boot-validating` record the worker writes
+before its health checks. Both are the failed candidate's own records, and the
+finalized history record is what correlates them with the retired transaction, so
+the resume publishes from them as well. The slot that record names is checked
+against the running one first, because a rollback leaves the previously confirmed
+slot running -- a history record naming the slot this boot runs is retained
+history (or a confirmation the device already finished) and is refused with
+`ota-rollback-resume-history-slot-still-selected` instead of being published.
 
 ## Signed bundle v1
 
@@ -111,12 +298,74 @@ The expected identities are also copied into the persistent `pending`
 transaction at `UPDATE_READY`; confirmation rereads those values and repeats
 the checks immediately before `bootctl confirm`, so a feature staging operation
 between reboot boundaries cannot silently produce a hybrid. A mismatch leaves
-the slot unconfirmed and therefore rollback-eligible. This does not refresh
+A mismatch leaves the slot unconfirmed and therefore rollback-eligible. This does not refresh
 payloads or models; it prevents a candidate from being installed or confirmed
 when preserve would leave a different runtime behind.
 
-Manual browser upload streams the tar to `/data/libreecho/update/incoming` and
-invokes the target installer. OTA-profile images also check the stable public
+### v2 pre-confirm runtime acceptance
+
+Before `libreecho-update confirm` calls `libreecho-bootctl confirm`, the
+Platform transaction verifier requires all of the following from the running
+system, not from signed URL or manifest metadata alone:
+
+- `/proc/cmdline` slot suffix, the selected BCB slot, and the pending/journal
+  slot agree; the target may still have `slot_<target>_success=0`;
+- the running slot's complete 16 MiB redirected boot image hashes to the
+  signature-bound pending, journal, and staged manifest `boot_sha256`;
+- staged payload and feature-manifest files, canonical base payload/manifest
+  files, their sizes, and the signed manifest's daemon path/hash identities
+  match the durable transaction;
+- `replace` mounts the staged payload, while `runtime` mounts the canonical
+  base, staged capsule, and exact daemon bind target from `/proc/self/mountinfo`;
+- the selected service/profile/feature-policy graph supplies each required
+  feature's pidfile, live `/proc/<pid>/exe` hash, Unix socket, and
+  `/proc/net/unix` registration. Excluded wakeword is not required; and
+- every failed probe returns before BCB confirmation, leaving canonical feature
+  files untouched and the slot unconfirmed.
+
+`libreecho-update status` preserves the existing effective fields
+`feature_<id>_payload_sha256`, `feature_<id>_payload_size`,
+`feature_<id>_manifest_sha256`, `feature_<id>_running_daemon_sha256`, and
+`feature_<id>_effective`. During a v2 transaction it additionally emits
+`ota_transaction_state=pending|commit|rollback|none`, the corresponding
+`ota_transaction_<state>=1` marker, and (while the commit journal remains)
+`feature_<id>_candidate_payload_sha256`,
+`feature_<id>_candidate_manifest_sha256`, and
+`feature_<id>_candidate_daemon_sha256`.
+
+The UI/API currently has no fields for the pre-confirm evidence itself. The
+missing fields are: `candidate_boot_sha256`, `candidate_manifest_sha256`,
+`candidate_manifest_sig_sha256`, `candidate_mount_state`,
+`candidate_service_probe_state`, `candidate_probe_failure`, and per-feature
+`candidate_payload_sha256`, `candidate_manifest_sha256`,
+`candidate_daemon_sha256`, `candidate_mount_source`, `candidate_socket`, and
+`candidate_exe_sha256`. This Platform slice does not change Product/UI.
+
+The Platform v2 transaction gate uses target filesystem accounting rather than a
+logical byte sum. It reads the filesystem block size and each existing file's
+allocated blocks with the target `stat` implementation, and reads available
+blocks from `df -Pk`; every future file and policy value is rounded up to that
+filesystem block size. The download phase accounts for the control tar,
+extracted control members, existing final/partial downloads, and the configured
+metadata/evidence/journal/rename policy. The pre-write phase additionally
+reserves a rounded destination copy for every changed payload/manifest and a
+copy of each existing rollback file. A staged source is counted as already
+allocated and is never charged again. No cleanup operation is used to satisfy
+the gate, and a failed gate precedes boot or BCB writes.
+
+The conservative build policy is configurable through
+`LIBREECHO_TRANSACTION_RESERVE_BYTES` (default 262144),
+`LIBREECHO_TRANSACTION_METADATA_BYTES` (32768),
+`LIBREECHO_TRANSACTION_RETAINED_EVIDENCE_BYTES` (65536),
+`LIBREECHO_TRANSACTION_JOURNAL_BYTES` (32768), and
+`LIBREECHO_TRANSACTION_RENAME_BYTES` (16384). The transaction emits
+`phase`, `filesystem_block_bytes`, `required_blocks`, `required_bytes`,
+`available_bytes`, `reserve_bytes`, and `already_allocated_bytes` on stdout and
+in `/data/libreecho/update/free-space`. These defaults are conservative policy
+values, not MT8163 measurements; target-mounted validation must replace or
+confirm them before production release qualification.
+
+Manual browser upload streams the tar to `/data/libreecho/update/incoming` and invokes the target installer. OTA-profile images also check the stable public
 GitHub Release asset in `aslater3/LibreEcho`, configured in
 `/etc/libreecho/ota-source.conf`. The
 fetcher mounts the root-owned assistant feature payload read-only, verifies it
@@ -163,11 +412,51 @@ repository variable `ENABLE_SELF_HOSTED_OTA` is exactly `true`. Until a
 dedicated runner is provisioned, Kernel and UI branch checks run independently
 in their respective private repositories and main merges do not queue a build.
 
+## Update check record
+
+A completed check persists its result in `/data/libreecho/update/check-status`
+as a `schema=1`, line-based record: `source`, `channel`, `status`,
+`source_reachable`, `latest_version`, `last_check_epoch`, `last_success_epoch`,
+`error`, `error_exit`, `error_detail`, `http_status`, `resolved_release_tag`,
+and `ota_sha256`. Every check rewrites the record as a whole, so a key always
+describes the current check and is never inherited from an earlier one.
+
+`resolved_release_tag` and `ota_sha256` name the candidate the check resolved:
+the immutable GitHub release tag the dev release pointer resolved to (for
+example `radar-puffin-build-<sha7>-<source-set>-<artifact-set>`) and the OTA
+package SHA-256 the device verifies its download against. Both are sanitised and
+bounded like every other record value and then format checked against the dev
+pointer grammar; a malformed, oversized, or unexpected value is recorded as
+empty rather than as an identity the device never resolved. They stay empty for
+a `stable` candidate, which has no immutable tag of its own, and for
+`checking`, `downloading`, `not-checked`, and every failed check, so a status
+that reports an update can never display a tag left behind by an earlier check.
+A stable check also stays empty when `DEV_RELEASE_TAG`/`DEV_OTA_SHA256` are
+inherited from the process environment: `resolve_dev_release` clears both before
+its channel gate, and the identity is only recorded from a `dev` resolution, so
+an exported value is never persisted as an identity the device resolved.
+The two keys are additive to `schema=1`: a reader that does not know them
+ignores them, and a record written by an earlier image simply does not contain
+them.
+
+Exposing these two values through `GET /api/v1/system/update` and the system
+page is the LibreEcho-UI half of the same contract (LibreEcho-Platform#165) and
+is not part of this repository.
+
 ## Development marker
 
-The current development image writes `FASTBOOT_PLEASE` to `expdb` and resets
-the BCB to seven tries on every boot. Both behaviors defeat OTA selection and
-rollback. They remain available only in an explicit development build profile.
-A release/OTA image does not write `expdb` automatically and does not reset the
-BCB. An explicit operator request to reboot to fastboot may still write the
-marker after validating the `expdb` identity.
+Development and OTA images never write or erase `expdb`. On amonet v2.0.0,
+`expdb` contains the LK-stage kaeru payload, so `FASTBOOT_PLEASE` is not a
+valid marker there. The development kernel may still reset the Amazon BCB retry
+counters in `misc` at offset `0x360`; the separate expdb fastboot escape and
+its updater cleanup path are disabled.
+
+Restart to fastboot uses Kaeru's own one-shot command instead: writing
+`fastboot` to `/tmp/reboot.request` makes init run
+`libreecho-bootctl reboot-bootloader`, which proves the Kaeru payload header in
+`expdb` read-only, then writes `bootonce-bootloader` into the 32-byte
+bootloader_message command at `misc` offset 0 (never the BCB at `0x360`) and
+reads it back. Kaeru enters fastboot and clears the command, so `fastboot
+reboot` returns to LibreEcho. The request is refused, with nothing written, on
+the legacy layout, without a proven payload, or when misc already holds a
+different command.

@@ -3,6 +3,17 @@
 # this metadata file before invoking it through adb-run-root.sh.
 
 BB=/bin/busybox
+
+# Exact reviewed post-Amonet Biscuit userdata sizes, in 512-byte sectors.
+# Do not accept arbitrary larger partitions or change any other partition.
+userdata_size_supported()
+{
+    case "$1" in
+        2137088|2153472) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 CONFIG=/tmp/libreecho-feature-stage.conf
 [ -r "$CONFIG" ] || { echo FEATURE_STAGE_CONFIG_MISSING; exit 1; }
 
@@ -77,11 +88,26 @@ airplay_explicitly_disabled()
     [ $((integrations & 16)) -eq 0 ]
 }
 
+home_assistant_enabled()
+{
+    config=/data/libreecho/config/web-config.json
+    [ -r "$config" ] || return 1
+    integrations=$($BB sed -n \
+        's/.*"integrations"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "$config" 2>/dev/null | $BB sed -n '1p')
+    case "$integrations" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ $((integrations & 1)) -ne 0 ]
+}
+
 start_feature_service_if_enabled()
 {
+    # airplayd also owns the shared local playback engine.  The integration bit
+    # disables the AirPlay protocol inside the controller; it must not prevent
+    # the controller/runtime from being restored after payload staging.
     if [ "$FEATURE_ID" = airplay2 ] && airplay_explicitly_disabled; then
-        echo FEATURE_STAGE_AIRPLAY_DISABLED
-        return 0
+        echo FEATURE_STAGE_AIRPLAY_PROTOCOL_DISABLED
     fi
     start_feature_service
 }
@@ -112,7 +138,7 @@ if ! $BB grep -q ' /data ' /proc/mounts 2>/dev/null; then
     DEVICE=/dev/mmcblk0p16
     SYS=/sys/class/block/mmcblk0p16
     [ -b "$DEVICE" ] && $BB grep -qx 'PARTNAME=userdata' "$SYS/uevent" 2>/dev/null &&
-        [ "$($BB cat "$SYS/size" 2>/dev/null)" = 2137088 ] || {
+        userdata_size_supported "$($BB cat "$SYS/size" 2>/dev/null)" || {
         echo FEATURE_STAGE_USERDATA_IDENTITY_FAILED
         exit 1
     }

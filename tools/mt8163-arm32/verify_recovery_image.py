@@ -4,23 +4,28 @@
 from __future__ import annotations
 
 import argparse
-import gzip
 import hashlib
 import json
+import lzma
 import re
 import stat
 import struct
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import cast
+from typing import Any, cast
 
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 from generate_boot_envelope import generate as generate_boot_envelope
+from libreecho_platform_targets import add_target_arguments, validate_target_arguments, identity_bytes, get_target, audio_profile_bytes
 
 
 ANDROID_MAGIC = b"ANDROID!"
+RAMDISK_COMPRESSION = "xz-crc32-lzma2-8m"
+RAMDISK_XZ_MAX_DICT_SIZE = 8 << 20
+XZ_MAGIC = b"\xfd7zXZ\x00"
+XZ_CHECK_CRC32 = b"\x00\x01"
 MKIMG_MAGIC = bytes.fromhex("88168858")
 FDT_MAGIC = bytes.fromhex("d00dfeed")
 PAGE = 0x800
@@ -38,7 +43,7 @@ ZIMAGE_MAGIC = 0x016F2818
 ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
 CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
-CONNECTIVITY_IMPORTER_SHA256 = "7601145a15750abce6a4c21d20326ecbdc1e4dc36e5670c0ca3cc9d1bf1f1326"
+CONNECTIVITY_IMPORTER_SHA256 = "58b907e1a7840fb9135f9b16e3f95b33424255e5d3d4ecb594c5a74b3de3f907"
 CONNECTIVITY_STOCK_SYSTEM_SHA256 = "56540b3a9ac4437901a5510d9fb5e09b1a8d0cc229548f0b08bb5c22d78684fe"
 CONNECTIVITY_EVIDENCE_MANIFEST_SHA256 = "d1eedd04efe0dbc78853f2b0f9357c092b4ca66242648908c0369956538441eb"
 WPA_SUPPLICANT_VERSION = "2.10"
@@ -53,7 +58,7 @@ WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-INIT_SHA256 = "fdf851a563b291ab0440b196e46a06905c2beaa1494dadd4f4a0b8eb95042e5a"
+INIT_SHA256 = "de813146c808eb3cab93977e0ec7e84108c3f60005e28021a873fe3ea20337a4"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -61,72 +66,137 @@ OVERLAY_FILES = {
     "init.rc": 0o644,
     "init.recovery.mt8163.rc": 0o644,
     "libreecho-init": 0o755,
+    "libreecho-recovery-ap-probe": 0o755,
+    "libreecho-recovery-ap-ready": 0o755,
+    "libreecho-recovery-net-up": 0o755,
+    "libreecho-recovery-net-down": 0o755,
+    "libreecho-mdnsd": 0o755,
     "libreecho-reconcile-features": 0o755,
     "libreecho-data-cleanup": 0o755,
     "libreecho-vendor-import": 0o755,
     "vendor-assets/mt8163-v181-stock-v1.tsv": 0o644,
+    "vendor-assets/mt8163-v181-stock-v2.tsv": 0o644,
+    "vendor-assets/mt8163-v181-stock-v3.tsv": 0o644,
     "libreecho-update": 0o755,
     "libreecho-update-fetch": 0o755,
+    "libreecho-ping": 0o755,
+    "libreecho-feature-transaction": 0o755,
+    "libreecho-target-manifest": 0o755,
+    "libreecho-generation": 0o755,
+    "libreecho-config-migrate": 0o755,
+    "libreecho-generation-transaction": 0o755,
     "ota-source.conf": 0o644,
     "regulatory.db": 0o644,
     "regulatory.db.p7s": 0o644,
 }
 OVERLAY_TARGETS = {
     "profile": "etc/profile",
+    "libreecho-mdnsd": "etc/init.d/libreecho-mdnsd.init",
+    "libreecho-recovery-ap-probe": "usr/local/sbin/libreecho-recovery-ap-probe",
+    "libreecho-recovery-ap-ready": "usr/local/sbin/libreecho-recovery-ap-ready",
+    "libreecho-recovery-net-up": "usr/local/sbin/libreecho-recovery-net-up",
+    "libreecho-recovery-net-down": "usr/local/sbin/libreecho-recovery-net-down",
     "libreecho-reconcile-features": "usr/local/sbin/libreecho-reconcile-features",
     "libreecho-data-cleanup": "usr/local/sbin/libreecho-data-cleanup",
     "libreecho-vendor-import": "usr/local/sbin/libreecho-vendor-import",
     "vendor-assets/mt8163-v181-stock-v1.tsv": (
         "etc/libreecho/vendor-assets/mt8163-v181-stock-v1.tsv"
     ),
+    "vendor-assets/mt8163-v181-stock-v2.tsv": (
+        "etc/libreecho/vendor-assets/mt8163-v181-stock-v2.tsv"
+    ),
+    "vendor-assets/mt8163-v181-stock-v3.tsv": (
+        "etc/libreecho/vendor-assets/mt8163-v181-stock-v3.tsv"
+    ),
     "libreecho-update": "usr/local/sbin/libreecho-update",
     "libreecho-update-fetch": "usr/local/sbin/libreecho-update-fetch",
+    "libreecho-ping": "usr/local/sbin/libreecho-ping",
+    "libreecho-feature-transaction": "usr/local/sbin/libreecho-feature-transaction",
+    "libreecho-target-manifest": "usr/local/sbin/libreecho-target-manifest",
+    "libreecho-generation": "usr/local/sbin/libreecho-generation",
+    "libreecho-config-migrate": "usr/local/sbin/libreecho-config-migrate",
+    "libreecho-generation-transaction": "usr/local/sbin/libreecho-generation-transaction",
     "ota-source.conf": "etc/libreecho/ota-source.conf",
     "regulatory.db": "lib/firmware/regulatory.db",
     "regulatory.db.p7s": "lib/firmware/regulatory.db.p7s",
 }
-SSH_PASSWORD_HASH_RE = re.compile(
-    rb"\$(?:1|5|6|2[abxy]?|y|gy)\$[^$:\r\n]{1,64}\$[^:\r\n]{1,512}\Z"
-)
+# Pinned recovery access-point bundle (issue #96).  The shell probes and the
+# interface helpers ship via the overlay; hostapd/dnsmasq/iw and the compiled
+# evdev button detector ship as hash-pinned components staged by
+# build_recovery_image.py --recovery-ap-binaries/--recovery-ap-metadata.
+RECOVERY_AP_COMPONENTS = {
+    "hostapd": "usr/local/sbin/hostapd",
+    "dnsmasq": "usr/local/sbin/dnsmasq",
+    "iw": "usr/local/sbin/iw",
+    "libreecho-recovery-button": "usr/local/sbin/libreecho-recovery-button",
+}
+RECOVERY_AP_OVERLAY = {
+    "ap_probe": "usr/local/sbin/libreecho-recovery-ap-probe",
+    "ready_probe": "usr/local/sbin/libreecho-recovery-ap-ready",
+    "net_up": "usr/local/sbin/libreecho-recovery-net-up",
+    "net_down": "usr/local/sbin/libreecho-recovery-net-down",
+}
+RECOVERY_AP_MARKER = "/run/libreecho/recovery-mode"
+RECOVERY_AP_METADATA = "etc/libreecho/recovery-ap-binaries.json"
+RECOVERY_AP_METADATA_SCHEMA = "libreecho-recovery-ap-binaries/v1"
+# The checked-in pin document the on-image metadata must agree with.  The
+# metadata is a self-declared JSON document, so the verifier refuses any
+# component whose name/version/source URL/source SHA-256/licence does not match
+# this file; a hand-written document cannot pass off an unlisted component.
+RECOVERY_AP_LOCK_PATH = Path(__file__).resolve().parent / "recovery-ap" / "SOURCE.lock"
+RECOVERY_AP_LICENSE_ROOT = "usr/local/share/licenses/libreecho-core"
 SSH_MEMBER_NAMES = {
-    "sbin/dropbear", "sbin/dropbearkey", "etc/passwd", "etc/group",
-    "etc/shells", "etc/shadow", "root", "etc/dropbear",
+    "sbin/dropbear", "sbin/dropbearkey", "usr/bin/scp", "etc/passwd", "etc/group",
+    "etc/shells", "etc/init.d/libreecho-ssh.init",
 }
 UI_BINARY_NAMES = {
     "usr/local/sbin/libreecho-web",
     "usr/local/sbin/libreecho-logd",
     "usr/local/sbin/libreecho-networkd",
     "usr/local/sbin/libreecho-timed",
+    "usr/local/sbin/libreecho-timerd",
+    "usr/local/sbin/libreecho-watchdogd",
     "usr/local/sbin/libreecho-audiod",
     "usr/local/sbin/libreecho-micd",
     "usr/local/sbin/libreecho-ledd",
+    "usr/local/sbin/libreecho-buttond",
+    "usr/local/sbin/libreecho-radiod",
     "usr/local/sbin/libreecho-btd",
     "usr/local/sbin/libreecho-airplayd",
-    "usr/local/sbin/libreecho-wyomingd",
+    "usr/local/sbin/libreecho-esphomed",
     "usr/local/sbin/libreecho-sttd-wyoming",
     "usr/local/sbin/libreecho-ttsd-wyoming",
+    "usr/local/sbin/libreecho-mdnsd",
 }
 UI_INIT_NAMES = {
     "etc/init.d/libreecho-web.init",
     "etc/init.d/libreecho-logd.init",
     "etc/init.d/libreecho-networkd.init",
     "etc/init.d/libreecho-timed.init",
+    "etc/init.d/libreecho-timerd.init",
+    "etc/init.d/libreecho-watchdogd.init",
     "etc/init.d/libreecho-audiod.init",
     "etc/init.d/libreecho-micd.init",
     "etc/init.d/libreecho-ledd.init",
+    "etc/init.d/libreecho-buttond.init",
+    "etc/init.d/libreecho-radiod.init",
     "etc/init.d/libreecho-btd.init",
     "etc/init.d/libreecho-airplayd.init",
     "etc/init.d/libreecho-ttsd.init",
     "etc/init.d/libreecho-waked.init",
     "etc/init.d/libreecho-sttd.init",
     "etc/init.d/libreecho-agentd.init",
-    "etc/init.d/libreecho-wyomingd.init",
+    "etc/init.d/libreecho-esphomed.init",
 }
 UI_FIXED_NAMES = UI_BINARY_NAMES | UI_INIT_NAMES | {
     "etc/libreecho/web-config.json",
     "etc/libreecho/airplay2.conf",
     "etc/libreecho/ntp.conf",
+    "etc/libreecho/avahi-services/esphome.service",
     "usr/local/share/libreecho/ui-manifest.txt",
+    "usr/local/share/libreecho/sounds/action-1.raw",
+    "usr/local/share/libreecho/sounds/action-2.raw",
+    "usr/local/share/libreecho/sounds/action-3.raw",
 }
 UI_OPTIONAL_NAMES = {"etc/libreecho/users"}
 AIRPLAY_BINARY_NAMES = {
@@ -135,6 +205,13 @@ AIRPLAY_BINARY_NAMES = {
     "usr/local/sbin/libreecho-airplay-audio",
     "usr/local/sbin/libreecho-audio-engine",
 }
+MDNS_CONTRACT_SCHEMA = "libreecho-mdns-runtime-contract/v1"
+MDNS_RUNTIME_SCHEMA = "libreecho-mdns-runtime/v1"
+MDNS_MARKER_SCHEMA = "libreecho-mdns-runtime-marker/v1"
+MDNS_RUNTIME_PREFIX = "usr/local/lib/libreecho-mdns/root/"
+MDNS_MARKER = "etc/libreecho/mdns-runtime.json"
+MDNS_INIT = "etc/init.d/libreecho-mdnsd.init"
+MDNS_CONTRACT_CATEGORIES = ("executables", "libraries", "config", "accounts", "licenses")
 
 CONNECTIVITY_ASSET_REQUIREMENTS: dict[str, dict[str, str | int]] = {
     "ROMv2_lm_patch_1_0_hdr.bin": {
@@ -256,6 +333,26 @@ class Entry:
     gid: int
     mtime: int
     data: bytes
+
+
+def decompress_ramdisk(ramdisk: bytes) -> bytes:
+    """Accept only a single-stream CRC32 xz the target kernel can unpack.
+
+    The Linux xz_dec used for initramfs rejects CRC64/SHA-256 checks, so an
+    archive Python can read may still fail at boot; enforce the subset here.
+    """
+    if ramdisk[:6] != XZ_MAGIC:
+        fail("ramdisk is not an xz stream")
+    if ramdisk[6:8] != XZ_CHECK_CRC32:
+        fail("ramdisk xz integrity check must be CRC32 for the kernel decoder")
+    decoder = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=RAMDISK_XZ_MAX_DICT_SIZE * 2)
+    try:
+        cpio = decoder.decompress(ramdisk)
+    except lzma.LZMAError as exc:
+        fail(f"ramdisk xz is invalid: {exc}")
+    if not decoder.eof or decoder.unused_data:
+        fail("ramdisk xz stream is truncated or has trailing data")
+    return cpio
 
 
 def parse_newc(data: bytes) -> dict[str, Entry]:
@@ -486,7 +583,8 @@ def validate_no_connectivity_autostart(entries: dict[str, Entry]) -> None:
 
 def validate_ssh(entries: dict[str, Entry], manifest: dict[str, object],
                  expected_dropbear_sha256: str | None,
-                 expected_dropbearkey_sha256: str | None) -> bool:
+                 expected_dropbearkey_sha256: str | None,
+                 expected_scp_sha256: str | None) -> bool:
     raw_ssh = manifest.get("ssh")
     if raw_ssh is None:
         ssh: dict[str, object] = {"enabled": False}
@@ -495,17 +593,8 @@ def validate_ssh(entries: dict[str, Entry], manifest: dict[str, object],
     else:
         ssh = cast(dict[str, object], raw_ssh)
 
-    expected_enabled = (
-        expected_dropbear_sha256 is not None or
-        expected_dropbearkey_sha256 is not None
-    )
-    if bool(ssh.get("enabled")) != expected_enabled:
-        fail(
-            "SSH bundle expectation mismatch: "
-            f"expected={'enabled' if expected_enabled else 'disabled'} "
-            f"actual={'enabled' if ssh.get('enabled') else 'disabled'}"
-        )
-
+    if "etc/shadow" in entries:
+        fail("SSH image contains forbidden /etc/shadow credential material")
     forbidden_ssh_names = sorted(
         name for name in entries
         if name.endswith("/authorized_keys") or name == "authorized_keys"
@@ -514,21 +603,42 @@ def validate_ssh(entries: dict[str, Entry], manifest: dict[str, object],
     if forbidden_ssh_names:
         fail(f"SSH image contains forbidden key material: {forbidden_ssh_names}")
 
+    expected_enabled = (
+        expected_dropbear_sha256 is not None or
+        expected_dropbearkey_sha256 is not None or
+        expected_scp_sha256 is not None
+    )
+    if bool(ssh.get("enabled")) != expected_enabled:
+        fail(
+            "SSH bundle expectation mismatch: "
+            f"expected={'enabled' if expected_enabled else 'disabled'} "
+            f"actual={'enabled' if ssh.get('enabled') else 'disabled'}"
+        )
+
     if not expected_enabled:
         unexpected = sorted(name for name in SSH_MEMBER_NAMES if name in entries)
         if unexpected:
             fail(f"SSH bundle is disabled but members are present: {unexpected}")
+        if any(name.startswith("etc/dropbear/") for name in entries):
+            fail("SSH image contains persistent host-key material")
         return False
 
-    if expected_dropbear_sha256 is None or expected_dropbearkey_sha256 is None:
+    if (expected_dropbear_sha256 is None or
+            expected_dropbearkey_sha256 is None or
+            expected_scp_sha256 is None):
         fail("SSH binary identities are incomplete")
+    assert expected_dropbear_sha256 is not None
+    assert expected_dropbearkey_sha256 is not None
+    assert expected_scp_sha256 is not None
     expected_policy = {
         "enabled": True,
-        "activation": "manual-only",
-        "autostart": False,
-        "authentication": "password-only",
+        "activation": "deferred-after-webui-bootstrap",
+        "autostart": True,
+        "authentication": "webui-users-sha256",
+        "account_source": "/data/libreecho/config/users",
+        "privilege_policy": "non-root-ephemeral-users",
         "public_key_auth": False,
-        "root_login": True,
+        "root_login": False,
         "host_keys": "generated-ephemerally-under-/tmp/dropbear",
     }
     for key, value in expected_policy.items():
@@ -538,7 +648,7 @@ def validate_ssh(entries: dict[str, Entry], manifest: dict[str, object],
     if not isinstance(raw_files, dict):
         fail("SSH file manifest is missing")
     files = cast(dict[str, object], raw_files)
-    if set(files) != SSH_MEMBER_NAMES - {"root", "etc/dropbear"}:
+    if set(files) != SSH_MEMBER_NAMES:
         fail("SSH file manifest members changed")
 
     def static_binary_record(name: str, expected_hash: str) -> None:
@@ -573,10 +683,11 @@ def validate_ssh(entries: dict[str, Entry], manifest: dict[str, object],
 
     static_binary_record("sbin/dropbear", expected_dropbear_sha256)
     static_binary_record("sbin/dropbearkey", expected_dropbearkey_sha256)
+    static_binary_record("usr/bin/scp", expected_scp_sha256)
 
     expected_accounts = {
         "etc/passwd": b"root:x:0:0:root:/root:/bin/sh\n",
-        "etc/group": b"root:x:0:\n",
+        "etc/group": b"root:x:0:\nlibreecho-ssh:x:1000:\n",
         "etc/shells": b"/bin/sh\n",
     }
     for name, data in expected_accounts.items():
@@ -592,28 +703,29 @@ def validate_ssh(entries: dict[str, Entry], manifest: dict[str, object],
         if member.data != data:
             fail(f"SSH account content changed: {name}")
 
-    shadow = entries.get("etc/shadow")
-    if shadow is None or not stat.S_ISREG(shadow.mode) or stat.S_IMODE(shadow.mode) != 0o600:
-        fail("SSH /etc/shadow is missing or has unsafe permissions")
-    shadow_fields = shadow.data.rstrip(b"\n").split(b":")
-    if len(shadow_fields) != 9 or shadow_fields[0] != b"root":
-        fail("SSH /etc/shadow root record is malformed")
-    if not SSH_PASSWORD_HASH_RE.fullmatch(shadow_fields[1]):
-        fail("SSH /etc/shadow does not contain a supported salted root hash")
-    if shadow.data.count(b"\n") != 1 or shadow.data.endswith(b"\n\n"):
-        fail("SSH /etc/shadow must contain exactly one normalized record")
-    if files.get("etc/shadow") != {
-        "path": "/etc/shadow",
-        "size": len(shadow.data),
-        "mode": "0600",
-        "secret_content_not_recorded": True,
+    supervisor = entries.get("etc/init.d/libreecho-ssh.init")
+    raw_supervisor = files.get("etc/init.d/libreecho-ssh.init")
+    if (supervisor is None or not stat.S_ISREG(supervisor.mode) or
+            stat.S_IMODE(supervisor.mode) != 0o755 or
+            not isinstance(raw_supervisor, dict)):
+        fail("SSH supervisor is missing or has unsafe permissions")
+    assert supervisor is not None
+    assert isinstance(raw_supervisor, dict)
+    supervisor_record = cast(dict[str, object], raw_supervisor)
+    supervisor_path = supervisor_record.get("path")
+    if not isinstance(supervisor_path, str) or not Path(supervisor_path).is_absolute():
+        fail("SSH supervisor manifest path is not absolute")
+    if supervisor_record != {
+        "path": supervisor_path,
+        "sha256": sha256(supervisor.data),
+        "size": len(supervisor.data),
+        "mode": "0755",
     }:
-        fail("SSH shadow manifest record is unsafe or changed")
-
-    for name, mode in (("root", 0o755), ("etc/dropbear", 0o700)):
-        entry = entries.get(name)
-        if entry is None or not stat.S_ISDIR(entry.mode) or stat.S_IMODE(entry.mode) != mode:
-            fail(f"SSH runtime directory contract changed: {name}")
+        fail("SSH supervisor manifest record mismatch")
+    if (b"/etc/shadow" in supervisor.data or
+            b"ssh-root-password-hash" in supervisor.data or
+            b"authorized_keys" in supervisor.data):
+        fail("SSH supervisor contains forbidden credential or key material")
     if any(name.startswith("etc/dropbear/") for name in entries):
         fail("SSH image contains persistent host-key material")
     return True
@@ -721,6 +833,15 @@ def validate_ui(entries: dict[str, Entry], manifest: dict[str, object],
                 expected_manifest_sha256: str | None,
                 expected_commit: str | None,
                 expected_diff_sha256: str | None) -> bool:
+    for name, entry in entries.items():
+        if ((name.endswith(".service") and b"_wyoming._tcp" in entry.data) or
+                name.startswith("usr/local/sbin/libreecho-wyomingd") or
+                name.startswith("etc/init.d/libreecho-wyomingd") or
+                name.endswith("/wyoming.service") or
+                name.startswith("etc/libreecho/esphome-") or
+                (name.startswith("usr/local/sbin/libreecho-esphomed") and
+                 name != "usr/local/sbin/libreecho-esphomed")):
+            fail(f"forbidden obsolete satellite or private ESPHome file: {name}")
     raw_ui = manifest.get("ui", {"enabled": False})
     if not isinstance(raw_ui, dict) or not isinstance(raw_ui.get("enabled"), bool):
         fail("UI manifest record is malformed")
@@ -765,6 +886,9 @@ def validate_ui(entries: dict[str, Entry], manifest: dict[str, object],
     if not isinstance(raw_files, dict):
         fail("UI file manifest record is missing")
     files = cast(dict[str, object], raw_files)
+    if any(name not in UI_FIXED_NAMES | UI_OPTIONAL_NAMES and
+           not name.startswith("usr/local/share/libreecho/web/") for name in files):
+        fail("UI file set has unexpected members")
     if set(files) != actual_ui_files or not UI_FIXED_NAMES.issubset(files):
         fail("UI file set changed")
     if not any(name.startswith("usr/local/share/libreecho/web/") for name in files):
@@ -792,6 +916,8 @@ def validate_ui(entries: dict[str, Entry], manifest: dict[str, object],
             fail(f"UI file size changed: {name}")
         if name == "etc/libreecho/users" and not member.data.strip():
             fail("UI users file is empty")
+        if name.startswith("usr/local/share/libreecho/sounds/") and not member.data:
+            fail(f"UI action sound is empty: {name}")
         if name in UI_BINARY_NAMES:
             if name in {
                     "usr/local/sbin/libreecho-sttd-wyoming",
@@ -805,6 +931,110 @@ def validate_ui(entries: dict[str, Entry], manifest: dict[str, object],
             if elf_info(member.data) != expected_elf:
                 fail(f"UI binary ARM32 ABI contract changed: {name}")
 
+    return True
+
+
+def mdns_contract() -> dict[str, Any]:
+    """Read the checked-in shared mDNS runtime contract."""
+    path = Path(__file__).resolve().parent / "mdns" / "runtime-contract.json"
+    try:
+        document = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"ERROR: mDNS runtime contract is unreadable: {path}") from exc
+    if not isinstance(document, dict) or document.get("schema") != MDNS_CONTRACT_SCHEMA:
+        raise SystemExit("ERROR: mDNS runtime contract schema changed")
+    return document
+
+
+def validate_mdns(entries: dict[str, Entry], manifest: dict[str, object],
+                  expected_mdns_runtime_manifest_sha256: str | None,
+                  expected_service_profile: str) -> bool:
+    """Fail closed on a missing loader, library, executable, config or license."""
+    raw_mdns = manifest.get("mdns", {"enabled": False})
+    if not isinstance(raw_mdns, dict) or not isinstance(raw_mdns.get("enabled"), bool):
+        fail("mDNS manifest record is malformed")
+    mdns = cast(dict[str, object], raw_mdns)
+    contract = mdns_contract()
+    present = sorted(name for name in entries if name.startswith(MDNS_RUNTIME_PREFIX))
+    if not mdns.get("enabled"):
+        if present or MDNS_MARKER in entries:
+            fail("mDNS runtime is disabled but members are present")
+        if expected_service_profile == "production":
+            fail("production image is missing the shared discovery runtime")
+        return False
+    if (expected_mdns_runtime_manifest_sha256 is not None and
+            mdns.get("manifest_sha256") != expected_mdns_runtime_manifest_sha256):
+        fail("mDNS runtime manifest identity mismatch")
+    for key in ("airplay_payload_dependency", "feature_payload_dependency"):
+        if mdns.get(key) is not False:
+            fail(f"mDNS runtime must not depend on another payload: {key}")
+    if mdns.get("single_responder") is not True:
+        fail("mDNS runtime must declare single-responder ownership")
+    if mdns.get("contract") != contract["schema"]:
+        fail("mDNS runtime contract identity mismatch")
+    if mdns.get("runtime_dirs") != contract["runtime_dirs"]:
+        fail("mDNS runtime directory contract mismatch")
+    raw_files = mdns.get("files")
+    if not isinstance(raw_files, dict) or not raw_files:
+        fail("mDNS runtime inventory is missing")
+    records = cast(dict[str, object], raw_files)
+    required = {contract["loader"]}
+    for category in MDNS_CONTRACT_CATEGORIES:
+        required |= set(contract[category])
+    missing = sorted(required - set(records))
+    if missing:
+        fail(f"mDNS runtime contract input missing: {missing[0]}")
+    for relative in sorted(records):
+        raw_record = records[relative]
+        if not isinstance(raw_record, dict):
+            fail(f"mDNS runtime record is malformed: {relative}")
+        record = cast(dict[str, object], raw_record)
+        digest = record.get("sha256")
+        size = record.get("size")
+        mode = record.get("mode")
+        if (not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest) or
+                not isinstance(size, int) or mode not in ("0644", "0755")):
+            fail(f"mDNS runtime record is invalid: {relative}")
+        member = require_member(
+            entries, MDNS_RUNTIME_PREFIX + relative, digest,
+            0o755 if mode == "0755" else 0o644,
+        )
+        if len(member.data) != size:
+            fail(f"mDNS runtime member size changed: {relative}")
+        info = elf_info(member.data)
+        if relative == contract["loader"]:
+            if info is None or info[:3] != (1, 40, 0x05000400) or info[3] is not None:
+                fail("mDNS runtime loader ELF contract changed")
+            continue
+        if info is None:
+            continue
+        if info[:3] != (1, 40, 0x05000400):
+            fail(f"mDNS runtime member is not ARM32 hard-float: {relative}")
+        if relative in contract["executables"] and (
+                info[3] != contract["abi"]["interpreter"] or not info[5]):
+            fail(f"mDNS runtime executable ELF contract changed: {relative}")
+
+    raw_marker = entries.get(MDNS_MARKER)
+    if raw_marker is None or not stat.S_ISREG(raw_marker.mode):
+        fail("mDNS runtime marker is missing")
+    if sha256(raw_marker.data) != mdns.get("marker_sha256"):
+        fail("mDNS runtime marker hash mismatch")
+    try:
+        marker = json.loads(raw_marker.data)
+    except json.JSONDecodeError:
+        fail("mDNS runtime marker is not JSON")
+    if (not isinstance(marker, dict) or marker.get("schema") != MDNS_MARKER_SCHEMA or
+            marker.get("contract") != contract["schema"] or
+            marker.get("readiness") != "presence-is-not-readiness" or
+            marker.get("manifest_sha256") != mdns.get("manifest_sha256") or
+            marker.get("runtime_dirs") != mdns.get("runtime_dirs") or
+            marker.get("init") != "/" + MDNS_INIT or
+            mdns.get("init") != "/" + MDNS_INIT):
+        fail("mDNS runtime marker contract mismatch")
+    init_entry = entries.get(MDNS_INIT)
+    if (init_entry is None or not stat.S_ISREG(init_entry.mode) or
+            stat.S_IMODE(init_entry.mode) != 0o755):
+        fail("mDNS init entry is missing from the image")
     return True
 
 
@@ -974,6 +1204,94 @@ def validate_connectivity(entries: dict[str, Entry], manifest: dict[str, object]
     return True
 
 
+BOOT_HTTPS_CA_SHA256 = "c0c940a0e30d859783f7f130868d8082e79936ff0b41a0b1098ac7f98909263b"
+
+
+def validate_boot_https_transport(entries: dict[str, Entry], manifest: dict[str, object],
+                                 expected_payload_sha256: str | None) -> None:
+    # Independently enforce paths, ABI, mode, CA pin and closure; not presence-only.
+    sources = {
+        "usr/bin/curl": "usr/local/libexec/libreecho-curl",
+        "etc/ssl/certs/ca-certificates.crt": "usr/local/share/libreecho/cacert.pem",
+        "usr/local/share/licenses/curl/COPYING": "usr/local/share/licenses/curl/COPYING",
+        "usr/local/share/licenses/ca-certificates/copyright": "usr/local/share/licenses/ca-certificates/copyright",
+    }
+    for name in ("THIRD_PARTY_NOTICES.txt", "OpenSSL-copyright", "glibc-copyright",
+                 "gcc-runtime-copyright", "LGPL-2.1.txt", "GPL-3.0.txt"):
+        path = "usr/local/share/licenses/libreecho-assistant/" + name
+        sources[path] = path
+    record = manifest.get("boot_https_transport")
+    if (not isinstance(record, dict) or
+            record.get("schema") != "libreecho-boot-https-transport/v1" or
+            record.get("payload_dependency") is not False or
+            record.get("userdata_dependency") is not False or
+            record.get("client") != "/usr/bin/curl" or
+            record.get("ca") != "/etc/ssl/certs/ca-certificates.crt" or
+            record.get("curl_source_sha256") != "aa1b66a70eace83dc624508745646c08ae561de512ab403adffb93ac87fc72e6"):
+        fail("mandatory boot HTTPS transport manifest is missing or invalid")
+    assert isinstance(record, dict)
+    if (expected_payload_sha256 is None or
+            not re.fullmatch(r"[0-9a-f]{64}", expected_payload_sha256) or
+            record.get("source_payload_sha256") != expected_payload_sha256 or
+            not re.fullmatch(r"[0-9a-f]{64}", str(record.get("source_manifest_sha256", "")))):
+        fail("boot HTTPS transport source identity is not trusted")
+    if record.get("capabilities") != {
+            "curl": "8.21.0", "tls": "OpenSSL/3.0.13", "protocols": ["http", "https"]}:
+        fail("boot HTTPS client capability record is missing or invalid")
+    files = record.get("files")
+    if not isinstance(files, dict) or set(files) != set(sources):
+        fail("boot HTTPS transport closure is incomplete")
+    assert isinstance(files, dict)
+    for name, source in sources.items():
+        item = files[name]
+        mode = 0o755 if name == "usr/bin/curl" else 0o644
+        if (not isinstance(item, dict) or
+                set(item) != {"source_member", "sha256", "size", "mode"} or
+                item.get("source_member") != source or item.get("mode") != f"{mode:04o}" or
+                type(item.get("size")) is not int or item["size"] <= 0 or
+                not re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256", "")))):
+            fail(f"boot HTTPS transport record is invalid: {name}")
+        assert isinstance(item, dict)
+        member = require_member(entries, name, item["sha256"], mode)
+        if len(member.data) != item["size"]:
+            fail(f"boot HTTPS transport member size mismatch: {name}")
+        if name == "usr/bin/curl" and elf_info(member.data) != (1, 40, 0x05000400, None, (), False):
+            fail("boot HTTPS curl is not static ARM32 hard-float")
+        if name.startswith("etc/ssl/") and sha256(member.data) != BOOT_HTTPS_CA_SHA256:
+            fail("boot HTTPS CA identity changed")
+    assistant = manifest.get("assistant", {})
+    if isinstance(assistant, dict) and assistant.get("enabled"):
+        payload = assistant.get("payload", {})
+        if isinstance(payload, dict) and payload.get("sha256") == expected_payload_sha256:
+            for name, source in sources.items():
+                originals = payload.get("files")
+                if not isinstance(originals, dict) or not isinstance(originals.get(source), dict):
+                    fail(f"boot HTTPS source member is missing: {source}")
+                assert isinstance(originals, dict)
+                original = originals[source]
+                if any(original.get(key) != files[name][key] for key in ("sha256", "size", "mode")):
+                    fail(f"boot HTTPS transport differs from verified assistant input: {name}")
+
+
+def validate_target_identity(entries: dict[str, Entry], manifest: dict[str, object],
+                             target: str, digest: str | None = None) -> None:
+    get_target(target)
+    if manifest.get("board") != target or manifest.get("ota", {}).get("board") != target:
+        fail("image target manifest mismatch")
+    recorded_digest = manifest.get("target_descriptor_sha256")
+    if digest is not None and recorded_digest != digest:
+        fail("image target descriptor digest mismatch")
+    # Validate a descriptor supplied by Product as a canonical digest even when
+    # the caller did not request one; it must agree bytewise with the image.
+    require_member(entries, "etc/libreecho/target",
+                   sha256(identity_bytes(target, recorded_digest)), 0o644)
+    # The speaker policy must be exactly the table rendering for this target.
+    profile_hash = sha256(audio_profile_bytes(target))
+    require_member(entries, "etc/libreecho/audio-profile", profile_hash, 0o644)
+    if manifest.get("audio_profile", {}).get("sha256") != profile_hash:
+        fail("image audio profile manifest mismatch")
+
+
 def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                        schema_version: int,
                        expected_image_profile: str,
@@ -993,6 +1311,7 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                        expected_iwconfig_sha256: str | None,
                        expected_dropbear_sha256: str | None,
                        expected_dropbearkey_sha256: str | None,
+                       expected_scp_sha256: str | None,
                        expected_ui_manifest_sha256: str | None,
                        expected_ui_commit: str | None,
                        expected_ui_diff_sha256: str | None,
@@ -1010,17 +1329,22 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
                        expected_shairport_sync_sha256: str | None,
                        expected_avahi_daemon_sha256: str | None,
                        expected_dbus_daemon_sha256: str | None,
-                       expected_wpa_supplicant_sha256: str | None = None) -> bool:
-    if ramdisk[:4] != b"\x1f\x8b\x08\x00":
-        fail("ramdisk gzip header is not deterministic")
-    try:
-        cpio = gzip.decompress(ramdisk)
-    except gzip.BadGzipFile as exc:
-        fail(f"ramdisk gzip is invalid: {exc}")
+                       expected_wpa_supplicant_sha256: str | None = None,
+                       expected_mdns_runtime_manifest_sha256: str | None = None,
+                       expected_target: str | None = None,
+                       target_descriptor_sha256: str | None = None,
+                       expected_boot_https_payload_sha256: str | None = None) -> bool:
+    cpio = decompress_ramdisk(ramdisk)
     entries = parse_newc(cpio)
     validate_archive_tree(entries)
     validate_symlinks(entries)
+    validate_boot_https_transport(
+        entries, manifest, expected_boot_https_payload_sha256 or expected_assistant_payload_sha256,
+    )
     validate_no_connectivity_autostart(entries)
+    if expected_target is not None:
+        validate_target_identity(entries, manifest, expected_target, target_descriptor_sha256)
+    target = expected_target or "radar_puffin"
     if manifest.get("image_profile") != expected_image_profile:
         fail("image profile manifest mismatch")
     if manifest.get("service_profile") != expected_service_profile:
@@ -1047,7 +1371,7 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     )
     require_member(
         entries, "etc/libreecho/first-install-confirm",
-        sha256(b"schema=1\nmode=first-install\nboard=radar_puffin\n"), 0o644,
+        sha256(f"schema=1\nmode=first-install\nboard={target}\n".encode()), 0o644,
     )
     ota = manifest.get("ota")
     if not isinstance(ota, dict) or ota.get("format") != "libreecho-ota-v1":
@@ -1632,20 +1956,52 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         "size": len(adbd.data),
         "mode": "0750",
         "source": adbd_record.get("source") if isinstance(adbd_record, dict) else None,
+        "transport_policy": adbd_record.get("transport_policy")
+        if isinstance(adbd_record, dict) else None,
     }:
         fail("adbd manifest record mismatch")
     source_record = adbd_record["source"]
+    expected_transport = (
+        ("usb-functionfs-and-tcp", True, 5555) if expected_update_channel == "dev"
+        else ("usb-functionfs-only", False, 0)
+    )
     if (
         not isinstance(source_record, dict)
         or source_record.get("source_license") != "Apache-2.0"
-        or source_record.get("transport") != "usb-functionfs-only"
-        or source_record.get("tcp_listener") is not False
+        or source_record.get("transport") != expected_transport[0]
+        or source_record.get("tcp_listener") is not expected_transport[1]
+        or type(source_record.get("tcp_port")) is not int
+        or source_record["tcp_port"] != expected_transport[2]
         or not isinstance(source_record.get("kernel_headers"), str)
         or not source_record.get("kernel_headers")
         or not re.fullmatch(r"[0-9a-f]{40}", str(source_record.get("source_commit", "")))
         or not re.fullmatch(r"[0-9a-f]{64}", str(source_record.get("patch_sha256", "")))
     ):
         fail("adbd source provenance or transport policy is invalid")
+    # The image must carry the transport policy init reports, and it must agree
+    # with the validated source record: a build that is USB-only must not be
+    # reported as TCP-capable, and the staged file must bind to this binary.
+    policy_record = adbd_record["transport_policy"]
+    expected_policy = (
+        f"schema=1\n"
+        f"transport={source_record['transport']}\n"
+        f"tcp_listener={'true' if source_record['tcp_listener'] else 'false'}\n"
+        f"tcp_port={source_record['tcp_port']}\n"
+        f"binary_sha256={expected_adbd_sha256}\n"
+    ).encode()
+    if not isinstance(policy_record, dict) or policy_record != {
+        "path": "/etc/libreecho/adb-transport",
+        "transport": source_record["transport"],
+        "tcp_listener": source_record["tcp_listener"],
+        "tcp_port": source_record["tcp_port"],
+        "binary_sha256": expected_adbd_sha256,
+    }:
+        fail("adbd transport policy record mismatch")
+    policy_member = require_member(
+        entries, "etc/libreecho/adb-transport", sha256(expected_policy), 0o644
+    )
+    if policy_member.data != expected_policy:
+        fail("staged adbd transport policy does not match the validated source")
     if "stock_userspace" in manifest:
         fail("stock userspace manifest entry is forbidden")
     busybox = require_member(entries, "bin/busybox", expected_busybox_sha256, 0o755)
@@ -1668,9 +2024,9 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         "sbin/watchdogd": b"../init",
         "system/bin/sh": b"../../bin/busybox",
     }
-    for name, target in symlinks.items():
+    for name, link_target in symlinks.items():
         entry = entries.get(name)
-        if entry is None or not stat.S_ISLNK(entry.mode) or entry.data != target:
+        if entry is None or not stat.S_ISLNK(entry.mode) or entry.data != link_target:
             fail(f"symlink contract mismatch for {name}")
 
     required_applets = (
@@ -1696,6 +2052,8 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
     verified_overlay: dict[str, Entry] = {}
     for name, mode in OVERLAY_FILES.items():
         expected = read(overlay_dir / name)
+        if name == "default.prop" and target != "radar_puffin":
+            expected = expected.replace(b"=radar_puffin\n", b"=" + target.encode("ascii") + b"\n")
         if name == "ota-source.conf":
             source_text = expected.decode()
             source_text = re.sub(
@@ -1729,8 +2087,8 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         if record != {"sha256": sha256(expected), "size": len(expected), "mode": "0644"}:
             fail(f"core license overlay manifest mismatch for {name}")
 
-    control = verified_overlay["libreecho-init"]
-    if init.data != control.data:
+    control = init
+    if init.data != read(overlay_dir / "libreecho-init"):
         fail("runtime /init is not byte-identical to audited libreecho-init")
     init_record = overlay_manifest.get("init", {})
     if init_record != {
@@ -1747,19 +2105,59 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         b"$ETC_ROOT/libreecho/feature-policy",
         b"integrations & 1",
         b"integrations & 16",
-        b"$DATA_ROOT/libreecho/features/$feature/payload.squashfs",
+        b'feature_runtime_mounted "$RUN_ROOT/libreecho/features/$feature/root"',
+        b"FEATURE_RECONCILE_MOUNTINFO:-/proc/self/mountinfo",
         b"\"$script\" start",
         b"feature-services-reconcile-failed",
+        b"shared_discovery_active",
+        b"LIBREECHO_SHARED_DISCOVERY=1",
+        b"feature-reconcile-shared-discovery-owner:airplayd",
     ):
         if marker not in reconcile.data:
             fail(f"feature reconciliation helper lacks {marker!r}")
+    # V3 payloads exist only as authenticated generation mounts; a legacy v2
+    # tree on /data must never satisfy the reconciler's payload gate.
+    if b"libreecho/features/$feature/payload.squashfs" in reconcile.data:
+        fail("feature reconciliation helper is gated on the legacy v2 payload tree")
+    mdns_entry = verified_overlay["libreecho-mdnsd"]
     for marker in (
-        b"FASTBOOT_PLEASE", b"/tmp/runme", b"functionfs", b"/dev/stpwmt", b"/dev/stpbt",
-        b"PARTNAME=expdb", b"/sys/class/block/mmcblk0p7", b"20480", b"bs=15 count=1",
-        b"stat -c '%t:%T'",
+        b"MDNS_RUNTIME_ROOT:-/usr/local/lib/libreecho-mdns/root",
+        b"mdns-shared-runtime-unavailable",
+        b"mdns-competing-responder-refused",
+        b"mdns-competing-responder:",
+        b"mdns-orphan-reconcile:",
+        b"$RUNTIME_ROOT/run",
+        b"$RUNTIME_ROOT/var/lib/dbus",
+        b"$BB chroot",
+        b"ld-linux-armhf.so.3",
+        b"avahi-daemon",
+        b"dbus-daemon",
+    ):
+        if marker not in mdns_entry.data:
+            fail(f"shared mDNS init entry lacks {marker!r}")
+    for marker in (b"/data/libreecho/features/", b"payload.squashfs"):
+        if marker in mdns_entry.data:
+            fail("shared mDNS init entry is gated on a feature payload mount")
+    if b"avahi-daemon" in control.data and b"system_bus_socket" not in control.data:
+        fail("libreecho-init does not start the shared discovery runtime")
+    validate_mdns(
+        entries, manifest, expected_mdns_runtime_manifest_sha256,
+        expected_service_profile,
+    )
+    for marker in (
+        b"/run/libreecho-control/runme", b"functionfs", b"/dev/stpwmt", b"/dev/stpbt",
+        b"for role_sx in /sys/class/usb_role/*/role; do",
+        b'printf device > "$role_sx"', b"usb-role-pinned-device:",
+        b"usb-role-pin-failed:",
     ):
         if marker not in control.data:
             fail(f"libreecho-init lacks {marker!r}")
+    for forbidden in (
+        b"FASTBOOT_PLEASE", b"PARTNAME=expdb", b"/sys/class/block/mmcblk0p7",
+        b"printf FASTBOOT_PLEASE", b"expdb-sector",
+    ):
+        if forbidden in control.data:
+            fail(f"libreecho-init contains forbidden expdb marker path {forbidden!r}")
     adbd_launches = tuple(
         line.strip() for line in control.data.splitlines()
         if line.lstrip().startswith(b"/sbin/adbd ")
@@ -1817,8 +2215,245 @@ def validate_initramfs(ramdisk: bytes, manifest: dict[str, object],
         info = elf_info(entry.data)
         if info is not None and info[:2] != (1, 40):
             fail(f"non-ARM32 ELF member {name}: {info[:2]}")
-    validate_ssh(entries, manifest, expected_dropbear_sha256, expected_dropbearkey_sha256)
-    return validate_connectivity(entries, manifest, schema_version)
+    validate_ssh(entries, manifest, expected_dropbear_sha256,
+                 expected_dropbearkey_sha256, expected_scp_sha256)
+    connectivity_ok = validate_connectivity(entries, manifest, schema_version)
+    validate_recovery_ap(entries, manifest)
+    return connectivity_ok
+
+
+def load_recovery_ap_lock() -> dict[str, Any]:
+    """Read and structurally validate the checked-in recovery-AP SOURCE.lock."""
+    path = RECOVERY_AP_LOCK_PATH
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit(f"ERROR: recovery-AP SOURCE.lock is unavailable: {path}")
+    try:
+        lock = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"ERROR: recovery-AP SOURCE.lock is not valid JSON: {exc}") from exc
+    if not isinstance(lock, dict):
+        raise SystemExit("ERROR: recovery-AP SOURCE.lock is not a JSON object")
+    components = lock.get("components")
+    first_party = lock.get("first_party")
+    if not isinstance(components, dict) or not isinstance(first_party, dict):
+        raise SystemExit("ERROR: recovery-AP SOURCE.lock lacks component records")
+    if set(components) | set(first_party) != set(RECOVERY_AP_COMPONENTS):
+        raise SystemExit("ERROR: recovery-AP SOURCE.lock does not describe the pinned set")
+    return lock
+
+
+def validate_recovery_ap_source_lock(provenance: dict[str, Any],
+                                     source_offer: object) -> None:
+    """Bind the on-image metadata provenance to the checked-in SOURCE.lock.
+
+    The metadata is a self-declared document staged by whichever build produced
+    it, so it is only trustworthy when every component's name, version, https
+    source URL, source SHA-256, licence and on-image licence copies match the
+    repository's ``recovery-ap/SOURCE.lock``.  A metadata document written for an
+    arbitrary binary is refused.
+    """
+    lock = load_recovery_ap_lock()
+    components = lock["components"]
+    first_party = lock["first_party"]
+    on_image = lock.get("on_image")
+    on_image_licenses = on_image.get("licenses") if isinstance(on_image, dict) else None
+    if not isinstance(on_image_licenses, dict):
+        on_image_licenses = {}
+
+    for name, record in components.items():
+        entry = provenance.get(name)
+        if not isinstance(entry, dict):
+            raise SystemExit(f"ERROR: recovery-AP metadata provenance is missing for {name}")
+        for field in ("version", "license", "source_url", "source_sha256",
+                      "source_license", "artifact"):
+            if entry.get(field) != record.get(field):
+                raise SystemExit(
+                    f"ERROR: recovery-AP metadata {field} does not match SOURCE.lock: {name}"
+                )
+        if record.get("source_license_secondary") and (
+                entry.get("source_license_secondary") != record["source_license_secondary"]):
+            raise SystemExit(
+                f"ERROR: recovery-AP metadata secondary licence does not match SOURCE.lock: {name}"
+            )
+        if entry.get("image_path") != RECOVERY_AP_COMPONENTS[name]:
+            raise SystemExit(
+                f"ERROR: recovery-AP metadata image path does not match the pinned target: {name}"
+            )
+        if list(entry.get("image_license", [])) != list(on_image_licenses.get(name, [])):
+            raise SystemExit(
+                f"ERROR: recovery-AP metadata on-image licences do not match SOURCE.lock: {name}"
+            )
+
+    for name, record in first_party.items():
+        entry = provenance.get(name)
+        if not isinstance(entry, dict):
+            raise SystemExit(f"ERROR: recovery-AP metadata provenance is missing for {name}")
+        for field in ("license", "source_url", "source_path", "artifact"):
+            if entry.get(field) != record.get(field):
+                raise SystemExit(
+                    f"ERROR: recovery-AP metadata {field} does not match SOURCE.lock: {name}"
+                )
+        if entry.get("image_path") != RECOVERY_AP_COMPONENTS[name]:
+            raise SystemExit(
+                f"ERROR: recovery-AP metadata image path does not match the pinned target: {name}"
+            )
+
+    lock_offer = lock.get("source_offer")
+    if not isinstance(lock_offer, dict) or not isinstance(source_offer, dict):
+        raise SystemExit("ERROR: recovery-AP metadata has no source offer to bind to SOURCE.lock")
+    if sorted(source_offer.get("components", [])) != sorted(lock_offer.get("components", [])):
+        raise SystemExit("ERROR: recovery-AP source-offer components do not match SOURCE.lock")
+    if (str(source_offer.get("statement", "")).strip() !=
+            str(lock_offer.get("statement", "")).strip()):
+        raise SystemExit("ERROR: recovery-AP source-offer statement does not match SOURCE.lock")
+    if (str(source_offer.get("description", "")).strip() !=
+            str(lock_offer.get("description", "")).strip()):
+        raise SystemExit("ERROR: recovery-AP source-offer description does not match SOURCE.lock")
+
+
+def validate_recovery_ap(entries: dict[str, Entry], manifest: dict[str, object]) -> None:
+    """Verify the pinned recovery-AP bundle and its interface helpers.
+
+    When the bundle is disabled no component binary may be present.  When it is
+    enabled every compiled component (hostapd, dnsmasq, iw and the compiled
+    evdev button detector) must be present as a static ARM32 ELF whose bytes
+    match the hash the manifest recorded and the staged metadata file, and the
+    overlay probes/interface helpers must ship at their pinned paths.  The
+    button detector is pinned here, not accepted as "a shell file exists".
+    """
+    record = manifest.get("recovery_ap", {"enabled": False})
+    if not isinstance(record, dict) or not isinstance(record.get("enabled"), bool):
+        fail("recovery-AP manifest record is malformed")
+    assert isinstance(record, dict)
+
+    if not record["enabled"]:
+        present = sorted(
+            path for path in RECOVERY_AP_COMPONENTS.values() if path in entries
+        )
+        if present or RECOVERY_AP_METADATA in entries:
+            fail(f"recovery-AP bundle is disabled but members are present: {present}")
+        return
+
+    for key, relative in RECOVERY_AP_OVERLAY.items():
+        if record.get(key) != f"/{relative}":
+            fail(f"recovery-AP manifest {key} path mismatch")
+        if relative not in entries:
+            fail(f"recovery-AP interface helper missing: {relative}")
+        entry = entries[relative]
+        if not stat.S_ISREG(entry.mode) or stat.S_IMODE(entry.mode) != 0o755:
+            fail(f"recovery-AP interface helper mode mismatch: {relative}")
+    if record.get("marker") != RECOVERY_AP_MARKER:
+        fail("recovery-AP marker path mismatch")
+    if record.get("button_detector") != (
+        "/" + RECOVERY_AP_COMPONENTS["libreecho-recovery-button"]
+    ):
+        fail("recovery-AP button detector path mismatch")
+
+    components = record.get("components")
+    if not isinstance(components, dict) or set(components) != set(RECOVERY_AP_COMPONENTS):
+        fail("recovery-AP component inventory does not match the pinned set")
+    assert isinstance(components, dict)
+    for name, relative in RECOVERY_AP_COMPONENTS.items():
+        spec = components[name]
+        if (not isinstance(spec, dict) or spec.get("path") != f"/{relative}" or
+                spec.get("mode") != "0755"):
+            fail(f"recovery-AP component path/mode mismatch: {name}")
+        if relative not in entries:
+            fail(f"recovery-AP component missing from initramfs: {relative}")
+        entry = entries[relative]
+        if not stat.S_ISREG(entry.mode) or stat.S_IMODE(entry.mode) != 0o755:
+            fail(f"recovery-AP component mode mismatch: {name}")
+        if sha256(entry.data) != spec.get("sha256") or len(entry.data) != spec.get("size"):
+            fail(f"recovery-AP component identity mismatch: {name}")
+        info = elf_info(entry.data)
+        if info is None:
+            fail(f"recovery-AP component is not an ELF: {name}")
+        assert info is not None
+        if info[0] != 1 or info[1] != 40:
+            fail(f"recovery-AP component is not ARM32 ELF: {name}")
+        if info[2] != 0x05000400 or info[3] is not None or info[4] != () or info[5]:
+            fail(f"recovery-AP component is not a static EABI5 binary: {name}")
+
+    metadata_entry = entries.get(RECOVERY_AP_METADATA)
+    if metadata_entry is None:
+        fail("recovery-AP staged metadata is missing")
+    assert metadata_entry is not None
+    metadata_record = record.get("metadata")
+    if (not isinstance(metadata_record, dict) or
+            metadata_record.get("path") != f"/{RECOVERY_AP_METADATA}" or
+            metadata_record.get("sha256") != sha256(metadata_entry.data) or
+            metadata_record.get("size") != len(metadata_entry.data) or
+            metadata_record.get("mode") != "0644"):
+        fail("recovery-AP metadata manifest record mismatch")
+    metadata: object = None
+    try:
+        metadata = json.loads(metadata_entry.data.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        fail("recovery-AP metadata is not valid JSON")
+    binaries = metadata.get("binaries") if isinstance(metadata, dict) else None
+    if not isinstance(binaries, dict) or set(binaries) != set(RECOVERY_AP_COMPONENTS):
+        fail("recovery-AP metadata binaries do not match the pinned set")
+    assert isinstance(binaries, dict)
+    for name in RECOVERY_AP_COMPONENTS:
+        record_hash = binaries[name].get("sha256") if isinstance(binaries[name], dict) else None
+        if record_hash != sha256(entries[RECOVERY_AP_COMPONENTS[name]].data):
+            fail(f"recovery-AP metadata hash mismatch: {name}")
+
+    # The staged metadata is the on-image attribution: it must carry the licence,
+    # source, and corresponding-source offer for every redistributed binary, not
+    # just their hashes.  A disabled bundle carries neither, so this runs only
+    # for an enabled one.
+    if not isinstance(metadata, dict) or metadata.get("schema") != RECOVERY_AP_METADATA_SCHEMA:
+        fail("recovery-AP metadata schema is not the pinned contract")
+    assert isinstance(metadata, dict)
+    provenance = metadata.get("components")
+    if not isinstance(provenance, dict) or set(provenance) != set(RECOVERY_AP_COMPONENTS):
+        fail("recovery-AP metadata carries no provenance for the pinned set")
+    assert isinstance(provenance, dict)
+    offer = metadata.get("source_offer")
+    if not isinstance(offer, dict) or not str(offer.get("statement", "")).strip():
+        fail("recovery-AP metadata carries no corresponding-source statement")
+    assert isinstance(offer, dict)
+    offer_components = offer.get("components")
+    offered = set(offer_components) if isinstance(offer_components, list) else set()
+    for name, relative in RECOVERY_AP_COMPONENTS.items():
+        record = provenance[name]
+        if not isinstance(record, dict):
+            fail(f"recovery-AP metadata provenance is malformed: {name}")
+        assert isinstance(record, dict)
+        licence = record.get("license")
+        source_url = record.get("source_url")
+        if not isinstance(licence, str) or not licence.strip():
+            fail(f"recovery-AP metadata provenance declares no licence: {name}")
+        assert isinstance(licence, str)
+        if not isinstance(source_url, str) or not source_url.startswith("https://"):
+            fail(f"recovery-AP metadata provenance has no https source URL: {name}")
+        if record.get("image_path") != relative:
+            fail(f"recovery-AP metadata provenance image path mismatch: {name}")
+        source_path = record.get("source_path")
+        if not (isinstance(source_path, str) and source_path):
+            source_sha = record.get("source_sha256")
+            if not isinstance(source_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", source_sha):
+                fail(f"recovery-AP metadata provenance has no pinned source SHA-256: {name}")
+            if not isinstance(record.get("source_license"), str) or not record["source_license"]:
+                fail(f"recovery-AP metadata provenance names no licence file: {name}")
+            image_license = record.get("image_license")
+            if not isinstance(image_license, list) or not image_license:
+                fail(f"recovery-AP metadata provenance names no on-image licence copy: {name}")
+            assert isinstance(image_license, list)
+            for licence_name in image_license:
+                if not isinstance(licence_name, str) or not licence_name:
+                    fail(f"recovery-AP metadata provenance has a malformed licence name: {name}")
+                staged = f"{RECOVERY_AP_LICENSE_ROOT}/{licence_name}"
+                if staged not in entries:
+                    fail(f"recovery-AP on-image licence copy is missing: {staged}")
+            if "GPL" in licence and name not in offered:
+                fail(f"recovery-AP GPL component has no corresponding-source offer: {name}")
+
+    # The attribution above is self-declared by the staged document; bind it to
+    # the repository's checked-in pins so an image cannot claim a component the
+    # SOURCE.lock does not list, or altered version/URL/source-hash/licence.
+    validate_recovery_ap_source_lock(provenance, offer)
 
 
 def system_map_physical_end(path: Path) -> int:
@@ -1859,6 +2494,9 @@ def main() -> None:
                         help="require this static ARM32 wireless-tools iwconfig utility")
     parser.add_argument("--expected-wpa-supplicant-sha256",
                         help="require this exact static ARM32 wpa_supplicant")
+    parser.add_argument("--expected-mdns-runtime-manifest-sha256",
+                        help="require this shared mDNS runtime manifest hash when "
+                             "the boot-contained discovery runtime is staged")
     parser.add_argument("--expected-image-profile", choices=("development", "ota"), required=True)
     parser.add_argument("--expected-service-profile", choices=("diagnostic", "production"),
                         required=True)
@@ -1878,6 +2516,8 @@ def main() -> None:
                         help="require this static ARM32 Dropbear server in the initramfs")
     parser.add_argument("--expected-dropbearkey-sha256",
                         help="require this static ARM32 Dropbear host-key utility in the initramfs")
+    parser.add_argument("--expected-scp-sha256",
+                        help="require the static ARM32 scp server-side executable in the initramfs")
     parser.add_argument("--expected-ui-manifest-sha256",
                         help="require this pinned LibreEcho-UI file manifest")
     parser.add_argument("--expected-ui-commit",
@@ -1908,6 +2548,8 @@ def main() -> None:
                         help="require this external English STT SquashFS payload")
     parser.add_argument("--expected-stt-payload-size", type=int,
                         help="require this external English STT payload size")
+    parser.add_argument("--expected-boot-https-payload-sha256",
+                        help="trusted boot transport input hash (defaults to assistant payload hash)")
     parser.add_argument("--expected-assistant-payload-sha256",
                         help="require this external streamed assistant SquashFS payload")
     parser.add_argument("--expected-assistant-payload-size", type=int,
@@ -1919,7 +2561,9 @@ def main() -> None:
         default="none",
         help="require the initramfs to contain exactly this opt-in connectivity bundle",
     )
+    add_target_arguments(parser)
     args = parser.parse_args()
+    validate_target_arguments(parser, args)
 
     envelope, zimage, system_map, ramdisk, boot = map(
         read, (args.boot_envelope, args.zimage, args.system_map, args.ramdisk, args.boot_image)
@@ -1936,8 +2580,10 @@ def main() -> None:
         fail("System.map hash mismatch")
     if manifest["inputs"].get("system_map", {}).get("sha256") != args.expected_system_map_sha256:
         fail("manifest System.map identity mismatch")
-    if sha256(ramdisk) != manifest["initramfs"]["gzip_sha256"]:
+    if sha256(ramdisk) != manifest["initramfs"]["ramdisk_sha256"]:
         fail("ramdisk hash differs from manifest")
+    if manifest["initramfs"].get("compression") != RAMDISK_COMPRESSION:
+        fail("ramdisk compression differs from the kernel-supported xz contract")
     if sha256(boot) != args.expected_boot_sha256 or manifest["output"]["sha256"] != args.expected_boot_sha256:
         fail("boot-image hash mismatch")
     if manifest.get("status") != "PREPARED_NOT_FLASHED":
@@ -2032,6 +2678,7 @@ def main() -> None:
         args.expected_tinymix_sha256,
         args.expected_iwconfig_sha256,
         args.expected_dropbear_sha256, args.expected_dropbearkey_sha256,
+        args.expected_scp_sha256,
         args.expected_ui_manifest_sha256, args.expected_ui_commit,
         args.expected_ui_diff_sha256,
         args.expected_airplay_payload_sha256, args.expected_airplay_payload_size,
@@ -2044,6 +2691,10 @@ def main() -> None:
         args.expected_nqptp_sha256, args.expected_shairport_sync_sha256,
         args.expected_avahi_daemon_sha256, args.expected_dbus_daemon_sha256,
         args.expected_wpa_supplicant_sha256,
+        args.expected_mdns_runtime_manifest_sha256,
+        expected_target=args.target,
+        target_descriptor_sha256=args.target_descriptor_sha256,
+        expected_boot_https_payload_sha256=args.expected_boot_https_payload_sha256,
     )
     expected_connectivity = args.expected_connectivity_bundle != "none"
     if connectivity_enabled != expected_connectivity:
@@ -2056,6 +2707,10 @@ def main() -> None:
     network_activation = (
         network_record.get("activation", "passive")
         if isinstance(network_record, dict) else "passive"
+    )
+    mdns_record = manifest.get("mdns", {})
+    mdns_enabled = bool(
+        isinstance(mdns_record, dict) and mdns_record.get("enabled") is True
     )
     print(
         "arm32_recovery_image_contract=PASS android_v0=yes mtk_wrapper=yes "
@@ -2071,7 +2726,8 @@ def main() -> None:
         f"wakeword={'yes' if args.expected_wakeword_payload_sha256 else 'no'} "
         f"stt={'yes' if args.expected_stt_payload_sha256 else 'no'} "
         f"assistant={'yes' if args.expected_assistant_payload_sha256 else 'no'} "
-        f"network_activation={network_activation} status=PREPARED_NOT_FLASHED"
+        f"network_activation={network_activation} "
+        f"mdns={'yes' if mdns_enabled else 'no'} status=PREPARED_NOT_FLASHED"
     )
 
 

@@ -1,0 +1,380 @@
+#!/bin/busybox sh
+# shellcheck shell=dash
+#
+# Recovery access-point interface bring-up (issue #96, Platform side).
+#
+# Contract consumed by networkd (see evidence/recovery-handoff.md):
+#   libreecho-recovery-net-up --interface <iface> --address <portal-addr>/<prefix>
+# Exit 0 means: the radio has been released from client-supplied STA management,
+# the portal IPv4 is assigned to <iface>, and the link is up, so hostapd and
+# dnsmasq can bind.  networkd runs this BEFORE it spawns either child and BEFORE
+# any DHCP/DNS lease is claimed; a non-zero exit fails the whole recovery start
+# closed.
+#
+# Properties the single-radio handover depends on:
+#   - idempotent: re-running with the same interface/address is a no-op success;
+#   - re-entrant: it may run again after a net-down without corrupting state;
+#   - rollback: if the link cannot come up or the address cannot be assigned
+#     after the client service was stopped, the client service is restored and
+#     the call fails; if that restore itself fails the ownership record is kept
+#     so a later net-down retries it instead of losing the debt;
+#   - no generic process killing: the client supplicant is stopped through its
+#     own service (pidfile-driven), never with pkill/killall;
+#   - no driver backdoor: it never touches /dev/wmtWifi, never reboots, and
+#     never writes a persistent filesystem (only the boot tmpfs state file).
+#
+# The portal address it assigns is the ONLY address it ever owns: it records it
+# in a tmpfs state file so the matching net-down removes exactly that address.
+
+set -u
+
+BB=${BB:-/bin/busybox}
+STATE_DIR=${RECOVERY_NET_STATE_DIR:-/run/libreecho}
+WPA_SERVICE=${RECOVERY_AP_WPA_SERVICE:-/sbin/libreecho-wifi}
+DEFAULT_ADDRESS=192.168.4.1/24
+# The client service records its supplicant and DHCP processes in
+# /tmp/<name>.<iface>.pid, named for the interface it manages (WIFI_IFACE,
+# default wlan0 -- see libreecho-wifi).  net-up stops it with the same
+# environment, so those are the files that name the processes the handover must
+# wait on before it may report the radio released.  CLIENT_PID_DIR and the wait
+# bounds are overridable so the contract can be exercised without /tmp.
+CLIENT_IFACE=${WIFI_IFACE:-wlan0}
+CLIENT_PID_DIR=${RECOVERY_AP_CLIENT_PID_DIR:-/tmp}
+STOP_WAIT_TIMEOUT=${RECOVERY_AP_STOP_TIMEOUT:-3}
+STOP_WAIT_POLL=${RECOVERY_AP_STOP_POLL:-1}
+
+IFACE=
+ADDRESS=
+
+usage() {
+    printf '%s\n' \
+        'usage: libreecho-recovery-net-up --interface IFACE [--address ADDR/PREFIX]' \
+        '                                    [--state-dir DIR]' >&2
+}
+
+die() { printf 'libreecho-recovery-net-up: %s\n' "$1" >&2; exit 2; }
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --interface) [ "$#" -ge 2 ] || die 'missing --interface value'; IFACE=$2; shift 2 ;;
+        --address) [ "$#" -ge 2 ] || die 'missing --address value'; ADDRESS=$2; shift 2 ;;
+        --state-dir) [ "$#" -ge 2 ] || die 'missing --state-dir value'; STATE_DIR=$2; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage; exit 2 ;;
+    esac
+done
+[ -n "$IFACE" ] || { usage; exit 2; }
+[ -n "$ADDRESS" ] || ADDRESS=$DEFAULT_ADDRESS
+
+# An interface name must be a plain link name; anything else is a caller error
+# and must never reach the shell's argument parsing as a path or option.
+case "$IFACE" in
+    *[!A-Za-z0-9._-]*|'') die "unsafe interface name: $IFACE" ;;
+    -*) die "unsafe interface name: $IFACE" ;;
+esac
+case "$ADDRESS" in
+    [0-9]*.[0-9]*.[0-9]*.[0-9]*/[0-9]*) ;;
+    *) die "unsafe portal address: $ADDRESS" ;;
+esac
+# The state file is a boot-scoped tmpfs handoff; refuse a persistent location
+# exactly like the button detector refuses a non-tmpfs marker.
+case "$STATE_DIR" in
+    */run/*) ;;
+    *) die "refusing non-tmpfs state directory: $STATE_DIR" ;;
+esac
+
+STATE_FILE=$STATE_DIR/recovery-net.state
+# The boot path records the client profile it selected in a boot-scoped file so
+# the handover can restart the client service with the same profile after the
+# portal is torn down (otherwise the helper's restart falls back to the packaged
+# /etc/wifi config).
+PROFILE_FILE=$STATE_DIR/wifi-client.conf
+# ...and the recorded path is only ever accepted from the two locations the boot
+# path writes: the persistent /data config or the packaged /etc/wifi file.
+PROFILE_ROOTS=${RECOVERY_AP_PROFILE_ROOTS:-/data/libreecho/config:/etc/wifi}
+
+resolve_ip() {
+    if [ -n "${RECOVERY_AP_IP:-}" ]; then
+        printf '%s\n' "$RECOVERY_AP_IP"
+    elif [ -x /bin/ip ]; then
+        printf '%s\n' /bin/ip
+    elif [ -x /sbin/ip ]; then
+        printf '%s\n' /sbin/ip
+    else
+        printf '%s\n' ip
+    fi
+}
+IP_BIN=$(resolve_ip)
+
+address_present() {
+    "$IP_BIN" addr show dev "$IFACE" 2>/dev/null | grep -q "inet $ADDRESS"
+}
+
+mkdir -p "$STATE_DIR" 2>/dev/null || die "cannot create state directory: $STATE_DIR"
+chmod 0700 "$STATE_DIR" 2>/dev/null
+
+read_state_field() {
+    # $1 field name; prints value or empty.  Only reads the file net-up wrote.
+    [ -f "$STATE_FILE" ] || return 0
+    sed -n "s/^$1=//p" "$STATE_FILE" | head -n 1
+}
+
+write_state() {
+    # $1 stopped-client flag; $2 validated client profile path (may be empty)
+    tmp=$STATE_FILE.tmp.$$
+    {
+        printf 'iface=%s\n' "$IFACE"
+        printf 'address=%s\n' "$ADDRESS"
+        printf 'stopped=%s\n' "$1"
+        printf 'wpa_service=%s\n' "$WPA_SERVICE"
+        printf 'wifi_conf=%s\n' "$2"
+    } >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    chmod 0600 "$tmp" 2>/dev/null
+    [ "$(id -u 2>/dev/null)" = 0 ] && chown 0:0 "$tmp" 2>/dev/null
+    mv -f "$tmp" "$STATE_FILE" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    return 0
+}
+
+resolve_wifi_conf() {
+    # $1 candidate path (may be empty).  Prints the validated path, or nothing
+    # when none was recorded.  An invalid recorded path is a hard error (non-zero
+    # return) rather than a silent fallback: restarting the client with the wrong
+    # profile would look like a successful restore.  It returns a status instead
+    # of calling die() because it is always invoked in a command substitution,
+    # where an exit would only terminate the subshell.
+    conf=${1:-}
+    [ -n "$conf" ] || return 0
+    case "$conf" in
+        /*) ;;
+        *) printf '%s: non-absolute client profile path: %s\n' "$0" "$conf" >&2; return 2 ;;
+    esac
+    case "$conf" in
+        *..*) printf '%s: unsafe client profile path: %s\n' "$0" "$conf" >&2; return 2 ;;
+    esac
+    if [ ! -f "$conf" ] || [ -L "$conf" ]; then
+        printf '%s: client profile is not a regular file: %s\n' "$0" "$conf" >&2
+        return 2
+    fi
+    found=0
+    saved_ifs=$IFS
+    IFS=:
+    for root in $PROFILE_ROOTS; do
+        case "$conf" in
+            "$root"/*) found=1; break ;;
+        esac
+    done
+    IFS=$saved_ifs
+    if [ "$found" != 1 ]; then
+        printf '%s: client profile outside expected location: %s\n' "$0" "$conf" >&2
+        return 2
+    fi
+    printf '%s\n' "$conf"
+}
+
+# A stable identity for a captured client process, or nothing when it is gone.
+# The kernel start time (the 20th field after the parenthesised comm in
+# /proc/<pid>/stat) distinguishes the recorded process from an unrelated one
+# that later reused the PID.
+client_process_identity() {
+    pid=$1
+    [ -r "/proc/$pid/stat" ] || return 1
+    stat=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+    # Strip up to and including the comm, which may itself contain spaces or
+    # parentheses, then read the whitespace-separated numeric fields.
+    rest=${stat##*) }
+    # shellcheck disable=SC2086
+    set -- $rest
+    [ "$#" -ge 20 ] || return 1
+    # A zombie has already exited and released the radio even though its parent
+    # has not reaped it yet; it is not a lingering client.
+    [ "$1" != Z ] || return 1
+    shift 19
+    printf '%s\n' "$1"
+}
+
+# "pid identity" records for the client processes the service's pidfiles name,
+# read BEFORE the stop (the service unlinks the pidfiles).
+capture_client_pids() {
+    for name in wpa_supplicant udhcpc; do
+        pidfile=$CLIENT_PID_DIR/$name.$CLIENT_IFACE.pid
+        [ -r "$pidfile" ] || continue
+        pid=$(cat "$pidfile" 2>/dev/null)
+        case "$pid" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        identity=$(client_process_identity "$pid") || continue
+        [ -n "$identity" ] || continue
+        printf '%s %s\n' "$pid" "$identity"
+    done
+}
+
+# Bounded wait for the captured client processes to exit.  Returns non-zero if
+# any is still alive once the timeout is spent; a process whose identity
+# changed is treated as gone (the PID was recycled).
+wait_for_client_exit() {
+    records=${1:-}
+    [ -n "$records" ] || return 0
+    remaining=$STOP_WAIT_TIMEOUT
+    while :; do
+        lingering=0
+        while IFS=' ' read -r pid identity; do
+            [ -n "$pid" ] || continue
+            current=$(client_process_identity "$pid") || continue
+            [ -n "$current" ] || continue
+            [ "$current" = "$identity" ] && lingering=1
+        done <<EOF
+$records
+EOF
+        [ "$lingering" -eq 0 ] && return 0
+        [ "$remaining" -le 0 ] && return 1
+        sleep "$STOP_WAIT_POLL"
+        remaining=$((remaining - STOP_WAIT_POLL))
+    done
+}
+
+stop_client_service() {
+    [ -x "$WPA_SERVICE" ] || return 1
+    "$WPA_SERVICE" stop >/dev/null 2>&1 || return 1
+    return 0
+}
+
+restore_client_service() {
+    # $1 service; $2 validated profile path (optional).  When a profile was
+    # recorded the service is restarted with WIFI_CONF so it re-selects the same
+    # config the boot path chose.
+    [ -x "$1" ] || return 0
+    if [ -n "${2:-}" ]; then
+        WIFI_CONF="$2" "$1" start >/dev/null 2>&1
+    else
+        "$1" start >/dev/null 2>&1
+    fi
+    return $?
+}
+
+# Idempotent fast path: already configured for this exact interface/address.
+if [ "$(read_state_field iface)" = "$IFACE" ] &&
+        [ "$(read_state_field address)" = "$ADDRESS" ] && address_present; then
+    printf 'net-up: already-configured %s %s\n' "$IFACE" "$ADDRESS"
+    exit 0
+fi
+
+# 1. Resolve and validate the client profile the boot path selected BEFORE the
+#    radio is touched.  A recorded profile that is missing, a symlink, or
+#    outside the allowed roots is a hard error, and it must fail closed without
+#    stopping the client service: on a first run there is no ownership record
+#    yet, so a stop here could never be restored by a later net-down.
+#
+#    resolve_wifi_conf validates it and fails closed on a recorded-but-unusable
+#    path.  A re-run over an existing ownership record keeps the value that
+#    record already holds when no fresh record is present.
+recorded_wifi_conf=
+if [ -f "$PROFILE_FILE" ] && [ ! -L "$PROFILE_FILE" ]; then
+    recorded_wifi_conf=$(sed -n '1p' "$PROFILE_FILE" 2>/dev/null)
+fi
+if ! wifi_conf=$(resolve_wifi_conf "$recorded_wifi_conf"); then
+    exit 2
+fi
+if [ -z "$wifi_conf" ]; then
+    if ! wifi_conf=$(resolve_wifi_conf "$(read_state_field wifi_conf)"); then
+        exit 2
+    fi
+fi
+
+# Ownership is a property of the portal, not of this invocation: if a
+# previous net-up already released the plane for this same interface/address
+# and recorded it, a re-run must keep that record even though the service is
+# already stopped and its stop call now fails.  Otherwise the re-run would
+# overwrite stopped=1 with stopped=0 and a later net-down would skip the
+# restoration the previous call still owes.
+prior_stopped=0
+if [ "$(read_state_field iface)" = "$IFACE" ] &&
+        [ "$(read_state_field address)" = "$ADDRESS" ] &&
+        [ "$(read_state_field stopped)" = 1 ]; then
+    prior_stopped=1
+fi
+
+# 2. Release client-supplied STA management.  The client supplicant and its
+#    DHCP client are stopped through their owning service (pidfile-scoped);
+#    there is deliberately no pattern-based process kill here.  Their PIDs are
+#    captured first: `stop` only signals and unlinks the pidfiles, so a client
+#    that has not actually exited must not be mistaken for a released radio.
+client_pids=$(capture_client_pids)
+
+stopped=0
+if stop_client_service; then
+    stopped=1
+elif [ "$prior_stopped" = 1 ]; then
+    # A previous net-up already released the plane for this interface/address
+    # and recorded it; the service is already stopped, so its stop call failing
+    # now is expected and the recorded ownership (and the restore it still
+    # owes) is preserved.
+    stopped=1
+elif [ -x "$WPA_SERVICE" ] || [ -n "$client_pids" ]; then
+    # The stop did not succeed on a first handover and a client service exists
+    # (or a client process was captured): the radio may still be owned by the
+    # client plane, so fail closed exactly like the lingering-process path
+    # below.  Restore the client and claim no ownership, rather than bringing
+    # up the portal and letting a still-running supplicant fight hostapd.  The
+    # only case allowed to proceed without stopping is genuinely nothing to
+    # stop: no helper and no captured client process.
+    if ! restore_client_service "$WPA_SERVICE" "$wifi_conf"; then
+        die "client service did not stop and cannot restore $WPA_SERVICE"
+    fi
+    rm -f "$STATE_FILE"
+    die "client service did not stop"
+fi
+
+# The service reported the client released, but a captured supplicant/DHCP
+# client is still alive after the bounded wait: the radio is still owned by the
+# client plane, so fail closed instead of letting networkd start hostapd on it.
+# The client plane is restored, and if that restore fails the ownership record
+# is retained, exactly like the link-up rollback below.
+if [ "$stopped" = 1 ] && ! wait_for_client_exit "$client_pids"; then
+    write_state 1 "$wifi_conf" || die "cannot record ownership state: $STATE_FILE"
+    if ! restore_client_service "$WPA_SERVICE" "$wifi_conf"; then
+        die "client processes did not exit after stop and cannot restore client service $WPA_SERVICE"
+    fi
+    rm -f "$STATE_FILE"
+    die "client processes did not exit after stop"
+fi
+
+# Record ownership before mutating the link so a later net-down (or a rollback
+# below) can restore exactly what this call changed -- including the client
+# profile the restore must use.
+write_state "$stopped" "$wifi_conf" || die "cannot record ownership state: $STATE_FILE"
+
+# 3. Bring the link up.
+if ! "$IP_BIN" link set dev "$IFACE" up >/dev/null 2>&1; then
+    # Roll back.  If the client service cannot be restored, the ownership
+    # record is deliberately left in place: a later net-down then retries the
+    # restore instead of taking the nothing-owned no-op path and leaving the
+    # client plane down for good.
+    if [ "$stopped" = 1 ]; then
+        if ! restore_client_service "$WPA_SERVICE" "$wifi_conf"; then
+            die "cannot bring up $IFACE and cannot restore client service $WPA_SERVICE"
+        fi
+    fi
+    rm -f "$STATE_FILE"
+    die "cannot bring up $IFACE"
+fi
+
+# 4. Assign the portal address (idempotent: only if not already present).
+if ! address_present; then
+    if ! "$IP_BIN" addr add "$ADDRESS" dev "$IFACE" >/dev/null 2>&1; then
+        # Roll back: no owned address is left behind, and the client service we
+        # stopped is restored.  A failed restore keeps the ownership record so
+        # the debt survives for a later net-down to retry, exactly like the
+        # link-up rollback above.
+        "$IP_BIN" addr del "$ADDRESS" dev "$IFACE" >/dev/null 2>&1
+        if [ "$stopped" = 1 ]; then
+            if ! restore_client_service "$WPA_SERVICE" "$wifi_conf"; then
+                die "cannot assign $ADDRESS to $IFACE and cannot restore client service $WPA_SERVICE"
+            fi
+        fi
+        rm -f "$STATE_FILE"
+        die "cannot assign $ADDRESS to $IFACE"
+    fi
+fi
+
+printf 'net-up: %s %s\n' "$IFACE" "$ADDRESS"
+exit 0

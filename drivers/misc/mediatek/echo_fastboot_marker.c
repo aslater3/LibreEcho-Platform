@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * echo_fastboot_marker.c - Write FASTBOOT_PLEASE to expdb and reset BCB.
+ * echo_fastboot_marker.c - Reset the development BCB retry counters.
  *
- * Spawns a thread at postcore_initcall that:
- *   1. Polls for /dev/mmcblk0p7 (expdb) and writes FASTBOOT_PLEASE
- *   2. Polls for /dev/mmcblk0p8 (misc) and resets the BCB try counter
- *      to 7 tries per slot, preventing the bootloader from exhausting
- *      its retry budget during rapid iteration.
+ * Spawns a thread at postcore_initcall that polls for /dev/mmcblk0p8 (misc)
+ * and resets the BCB try counter to 7 tries per slot, preventing the
+ * bootloader from exhausting its retry budget during rapid iteration.
  *
- * Both writes happen from a single kernel thread so they complete even
- * if a later initcall panics before userspace starts.
+ * This driver deliberately never writes or erases expdb. On amonet v2.0.0,
+ * expdb contains the LK-stage kaeru payload and is not a marker partition.
  *
  * BCB layout (misc partition, sector 1, offset 0x160, 7 bytes):
  *   zero=0  magic='ABB'  version=1
@@ -24,9 +22,7 @@
 #include <linux/string.h>
 #include <linux/uaccess.h>
 
-#define EXPDB_PATH	"/dev/mmcblk0p7"
 #define MISC_PATH	"/dev/mmcblk0p8"
-#define MARKER		"FASTBOOT_PLEASE"
 #define POLL_MS		100
 #define WRITE_RETRIES	5
 #define VERIFY_MAX	32
@@ -105,13 +101,7 @@ static int marker_thread(void *unused)
 {
 	int elapsed;
 
-	/* 1. Write FASTBOOT_PLEASE to expdb */
-	elapsed = write_file(EXPDB_PATH, MARKER, strlen(MARKER), 0);
-	if (elapsed >= 0)
-		pr_info("echo-marker: %s written to %s after %d ms\n",
-			MARKER, EXPDB_PATH, elapsed);
-
-	/* 2. Reset BCB try counter in misc */
+	/* Reset the BCB try counter in misc; expdb is never touched. */
 	elapsed = write_file(MISC_PATH, bcb_reset, BCB_SIZE, BCB_OFFSET);
 	if (elapsed >= 0)
 		pr_info("echo-marker: BCB reset (7 tries/slot) in %s after %d ms\n",

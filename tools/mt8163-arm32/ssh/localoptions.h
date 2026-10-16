@@ -1,4 +1,4 @@
-/* LibreEcho ARM32 Dropbear server-only, password-auth build. */
+/* LibreEcho ARM32 Dropbear server-only, WebUI-backed password-auth build. */
 #ifndef LIBREECHO_DROPBEAR_LOCALOPTIONS_H
 #define LIBREECHO_DROPBEAR_LOCALOPTIONS_H
 

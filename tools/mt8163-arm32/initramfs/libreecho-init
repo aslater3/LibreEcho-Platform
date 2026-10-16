@@ -3,6 +3,17 @@
 # v97-compatible ARM32 recovery control plane.
 
 BB=/bin/busybox
+
+# Exact reviewed post-Amonet Biscuit userdata sizes, in 512-byte sectors.
+# Do not accept arbitrary larger partitions or change any other partition.
+userdata_size_supported()
+{
+    case "$1" in
+        2137088|2153472) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 PATH=/bin:/sbin:/system/bin
 export PATH
 umask 022
@@ -31,13 +42,24 @@ FEATURE_POLICY_VALUE=$($BB cat /etc/libreecho/feature-policy 2>/dev/null)
 FEATURE_POLICY=exclude
 FIRST_INSTALL_MARKER=/etc/libreecho/first-install-confirm
 STARTUP_READY=${STARTUP_READY:-/run/libreecho/startup-ready}
+# Boot-control diagnostics.  A device that stops booting can report nothing
+# about itself, so the retry countdown the preloader enforces is recorded on the
+# persistent filesystem while the device still boots.  These records live on
+# userdata and do not survive a reinstall that formats it: collect the
+# diagnostic bundle before reinstalling.
+BOOT_HEALTH=/data/libreecho/update/boot-health
+BOOT_COUNT=/data/libreecho/update/boot-count
+BOOT_HISTORY=/data/libreecho/update/boot-history
+BOOT_HISTORY_MAX=8
+MDNS_RUNTIME_ROOT=${MDNS_RUNTIME_ROOT:-/usr/local/lib/libreecho-mdns/root}
 case "$FEATURE_POLICY_VALUE" in
     preserve|redistributable|community-noncommercial|exclude)
         FEATURE_POLICY=$FEATURE_POLICY_VALUE
         ;;
 esac
 
-$BB mkdir -p /dev/pts /dev/usb-ffs/adb /dev/socket /proc /sys /tmp
+$BB mkdir -p /dev/pts /dev/usb-ffs/adb /dev/socket /proc /sys /tmp /run/libreecho-control
+$BB chmod 0700 /run/libreecho-control
 $BB chmod 0777 /tmp
 
 # Create /dev/null before the first stderr redirection.  If it is absent, a
@@ -80,6 +102,415 @@ log()
 	# the old /dev/kmsg writer does not default to INFO.
 	printf '<6>%s\n' "$msg" > /dev/kmsg 2>/dev/null
 	printf '%s\n' "$msg" > /dev/console 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Boot-control diagnostics.
+#
+# The preloader selects the highest-priority slot that is successful or still
+# has tries, and refuses a slot whose tries reach zero while success is 0.  Only
+# `libreecho-bootctl confirm` clears that countdown, so every boot records the
+# state the countdown was in and why confirmation did or did not happen.  These
+# records are the only boot-slot evidence left once a device stops booting.
+#
+# Globals consumed by bh_write(): bh_state, bh_mode_value, bh_running,
+# bh_selected, bh_pending, bh_boot_count, bh_attempt, bh_passed, bh_last_check,
+# bh_strict.
+bh_status=
+bh_state=booting
+bh_mode_value=none
+bh_running=-
+bh_selected=-
+bh_pending=-
+bh_boot_count=0
+bh_attempt=0
+bh_passed=0
+bh_last_check=none
+bh_strict=0
+
+bh_bootctl()
+{
+	bh_status=$(/usr/local/sbin/libreecho-bootctl status 2>/dev/null)
+}
+
+bh_value()
+{
+	bh_field=$(printf '%s\n' "$bh_status" | $BB sed -n "s/^$1=//p" |
+		$BB head -n 1)
+	if [ -z "$bh_field" ]; then
+		printf '%s\n' -
+	else
+		printf '%s\n' "$bh_field"
+	fi
+}
+
+bh_classify_mode()
+{
+	if [ -r /data/libreecho/update/pending ]; then
+		printf '%s\n' ota
+	elif [ -r "$FIRST_INSTALL_MARKER" ]; then
+		printf '%s\n' first-boot
+	else
+		printf '%s\n' none
+	fi
+}
+
+bh_running_slot()
+{
+	bh_slot=$($BB sed -n \
+		's/.*androidboot.slot_suffix=_\([ab]\).*/\1/p' /proc/cmdline)
+	if [ -z "$bh_slot" ]; then
+		printf '%s\n' -
+	else
+		printf '%s\n' "$bh_slot"
+	fi
+}
+
+bh_pending_slot()
+{
+	bh_rec=$($BB sed -n 's/^slot=//p' /data/libreecho/update/pending 2>/dev/null |
+		$BB head -n 1)
+	if [ -z "$bh_rec" ]; then
+		printf '%s\n' -
+	else
+		printf '%s\n' "$bh_rec"
+	fi
+}
+
+bh_bump_count()
+{
+	bh_seen=$($BB sed -n '1p' "$BOOT_COUNT" 2>/dev/null)
+	case "$bh_seen" in
+		''|*[!0-9]*) bh_seen=0 ;;
+	esac
+	bh_seen=$((bh_seen + 1))
+	if printf '%s\n' "$bh_seen" > "$BOOT_COUNT.tmp" 2>/dev/null; then
+		$BB sync
+		if $BB mv "$BOOT_COUNT.tmp" "$BOOT_COUNT" 2>/dev/null; then
+			printf '%s\n' "$bh_seen"
+			return 0
+		fi
+		$BB rm -f "$BOOT_COUNT.tmp"
+	fi
+	printf '%s\n' 0
+}
+
+# One bounded line per boot.  The verdict the previous boot recorded is carried
+# into the new line before this boot overwrites boot-health, so a device that has
+# already stopped booting still shows how the countdown reached zero.
+bh_history()
+{
+	bh_prev=$($BB sed -n 's/^state=//p' "$BOOT_HEALTH" 2>/dev/null | $BB head -n 1)
+	bh_prev_check=$($BB sed -n 's/^last_check=//p' "$BOOT_HEALTH" 2>/dev/null |
+		$BB head -n 1)
+	bh_prev_slot=$($BB sed -n 's/^selected_slot=//p' "$BOOT_HEALTH" 2>/dev/null |
+		$BB head -n 1)
+	[ -n "$bh_prev" ] || bh_prev=none
+	[ -n "$bh_prev_check" ] || bh_prev_check=none
+	[ -n "$bh_prev_slot" ] || bh_prev_slot=-
+	bh_bootctl
+	bh_line="epoch=$(date -u +%s 2>/dev/null) boot=$bh_boot_count"
+	bh_line="$bh_line mode=$bh_mode_value running=$bh_running"
+	bh_line="$bh_line selected=$bh_selected pending=$bh_pending"
+	bh_line="$bh_line a=$(bh_value slot_a_priority)/$(bh_value slot_a_tries)/$(bh_value slot_a_success)"
+	bh_line="$bh_line b=$(bh_value slot_b_priority)/$(bh_value slot_b_tries)/$(bh_value slot_b_success)"
+	bh_line="$bh_line prev=$bh_prev:$bh_prev_check prev_slot=$bh_prev_slot"
+	bh_tmp=$BOOT_HISTORY.tmp
+	if [ -s "$BOOT_HISTORY" ]; then
+		$BB tail -n $((BOOT_HISTORY_MAX - 1)) "$BOOT_HISTORY" > "$bh_tmp" \
+			2>/dev/null || : > "$bh_tmp"
+	else
+		: > "$bh_tmp"
+	fi
+	printf '%s\n' "$bh_line" >> "$bh_tmp" 2>/dev/null &&
+		$BB mv "$bh_tmp" "$BOOT_HISTORY" 2>/dev/null
+	$BB rm -f "$bh_tmp"
+}
+
+# Atomic record of the current boot's slot state and confirmation verdict.
+bh_write()
+{
+	bh_bootctl
+	bh_tmp=$BOOT_HEALTH.tmp
+	{
+		printf 'schema=1\n'
+		printf 'state=%s\n' "$bh_state"
+		printf 'mode=%s\n' "$bh_mode_value"
+		printf 'running_slot=%s\n' "$bh_running"
+		printf 'selected_slot=%s\n' "$bh_selected"
+		printf 'pending_slot=%s\n' "$bh_pending"
+		printf 'slot_a_priority=%s\n' "$(bh_value slot_a_priority)"
+		printf 'slot_a_tries=%s\n' "$(bh_value slot_a_tries)"
+		printf 'slot_a_success=%s\n' "$(bh_value slot_a_success)"
+		printf 'slot_b_priority=%s\n' "$(bh_value slot_b_priority)"
+		printf 'slot_b_tries=%s\n' "$(bh_value slot_b_tries)"
+		printf 'slot_b_success=%s\n' "$(bh_value slot_b_success)"
+		printf 'boot_count=%s\n' "$bh_boot_count"
+		printf 'attempt=%s\n' "$bh_attempt"
+		printf 'passed=%s\n' "$bh_passed"
+		printf 'last_check=%s\n' "$bh_last_check"
+		printf 'strict_graph=%s\n' "$bh_strict"
+		printf 'epoch=%s\n' "$(date -u +%s 2>/dev/null)"
+	} > "$bh_tmp" 2>/dev/null || {
+		$BB rm -f "$bh_tmp"
+		return 1
+	}
+	$BB sync
+	if $BB mv "$bh_tmp" "$BOOT_HEALTH" 2>/dev/null; then
+		return 0
+	fi
+	$BB rm -f "$bh_tmp"
+	return 1
+}
+
+# Record why this boot did not attempt a confirmation.  Answering that question
+# after the fact is the whole point of the record: "no confirmation happened" and
+# "the health gate failed" have different fixes.
+bh_skipped()
+{
+	bh_state=skipped
+	bh_last_check=$1
+	bh_write
+}
+
+# Immutable image identity, not a caller environment or bootloader product.
+# Keep this bounded loader inline: no extra staged runtime file is required.
+load_image_target()
+{
+    local target_file=/etc/libreecho/target target_count
+    TARGET_ID=
+    TARGET_SLUG=
+    if [ ! -e "$target_file" ] && [ ! -L "$target_file" ]; then
+        TARGET_ID=radar_puffin
+        TARGET_SLUG=radar-puffin
+        log 'target-file=missing fallback=radar_puffin'
+        return 0
+    fi
+    [ -f "$target_file" ] && [ ! -L "$target_file" ] && [ -r "$target_file" ] || return 1
+    target_count=$($BB grep -c '^target_id=' "$target_file")
+    [ "$target_count" = 1 ] || return 1
+    TARGET_ID=$($BB sed -n 's/^target_id=//p' "$target_file")
+    case "$TARGET_ID" in
+        radar_puffin) TARGET_SLUG=radar-puffin ;;
+        biscuit) TARGET_SLUG=biscuit ;;
+        *) TARGET_ID=; return 1 ;;
+    esac
+}
+
+first_install_marker_matches()
+{
+    load_image_target || return 1
+    [ -r "$FIRST_INSTALL_MARKER" ] &&
+        [ "$($BB sed -n 's/^schema=//p' "$FIRST_INSTALL_MARKER")" = 1 ] &&
+        [ "$($BB sed -n 's/^mode=//p' "$FIRST_INSTALL_MARKER")" = first-install ] &&
+        [ "$($BB sed -n 's/^board=//p' "$FIRST_INSTALL_MARKER")" = "$TARGET_ID" ]
+}
+
+# pmsg is the only userspace pstore input that survives a forced reboot. Keep
+# the record deliberately tiny and token-only: arbitrary logs can contain
+# credentials, URLs or board identity and must never be mirrored wholesale.
+pmsg_marker()
+{
+    marker=${1:-}
+    [ -c /dev/pmsg0 ] || return 0
+    case "$marker" in
+        ''|*[!A-Za-z0-9._:/=-]*) return 0 ;;
+    esac
+    [ "${#marker}" -le 160 ] || return 0
+    printf 'libreecho-init:%s\n' "$marker" > /dev/pmsg0 2>/dev/null || true
+}
+
+# A candidate slot that fails its health confirmation is rebooted by this
+# worker, which destroys /tmp and with it $INIT_LOG -- the only place the
+# underlying reason is written.  Keep a bounded, scrubbed copy on the
+# persistent userdata filesystem so a rollback stays diagnosable after the
+# reboot.  The record is deliberately never mirrored to pmsg: it carries more
+# than a token, and pmsg stays token-only.
+sanitize_failure_text()
+{
+    $BB sed \
+        -e 's#http://[^ ]*#URL#g' \
+        -e 's#https://[^ ]*#URL#g' \
+        -e 's#ssid:[^ ]*#ssid:SSID#g' \
+        -e 's#ssid=[^ ]*#ssid=SSID#g' \
+        -e 's#serialno=[^ ]*#serialno=SERIAL#g' \
+        -e 's#[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]#MAC#g'
+}
+
+# Never fails the caller: recording evidence must not change the boot outcome.
+# Prints the record basename on success, nothing otherwise.
+persist_failure_log()
+{
+    : "${FAILURE_LOG_DIR:=/data/libreecho/update}"
+    : "${FAILURE_LOG_MAX_BYTES:=8192}"
+    : "${FAILURE_LOG_KEEP:=3}"
+    : "${INIT_LOG:=/tmp/init.log}"
+    reason=${1:-unknown}
+    detail=${2:-}
+    airplay_start_log=${3:-/tmp/libreecho-airplayd.reconcile.log}
+    case "$reason" in
+        ''|*[!A-Za-z0-9._-]*) reason=invalid-reason ;;
+    esac
+    [ -d "$FAILURE_LOG_DIR" ] || return 0
+    epoch=$($BB date -u +%s 2>/dev/null)
+    case "$epoch" in ''|*[!0-9]*) epoch=0 ;; esac
+    # Slot identity at the moment of failure.  The bare `status` form is the
+    # only one that reads the boot-control block: `status <slot>` echoes its
+    # argument under the same field name, so a difference between what the BCB
+    # selects next and the slot actually running is visible only here.
+    bootctl=${LIBREECHO_BOOTCTL_TOOL:-/usr/local/sbin/libreecho-bootctl}
+    cmdline=${LIBREECHO_CMDLINE_FILE:-/proc/cmdline}
+    running_slot=$($BB sed -n 's/.*androidboot.slot_suffix=_\([ab]\).*/\1/p' \
+        "$cmdline" 2>/dev/null | $BB head -n 1)
+    pending_slot=$($BB sed -n 's/^slot=//p' "$FAILURE_LOG_DIR/pending" 2>/dev/null |
+        $BB head -n 1)
+    # The transaction tool's journal is $ROOT/feature-commit, not a file named
+    # "journal"; fall back to the pending record, which carries the same field
+    # while the candidate is still pending.
+    transaction_id=$($BB sed -n 's/^transaction_id=//p' \
+        "$FAILURE_LOG_DIR/feature-commit" 2>/dev/null | $BB head -n 1)
+    [ -n "$transaction_id" ] || transaction_id=$($BB sed -n \
+        's/^transaction_id=//p' "$FAILURE_LOG_DIR/pending" 2>/dev/null | $BB head -n 1)
+    name=failure-$epoch-$$.log
+    target=$FAILURE_LOG_DIR/$name
+    tmp=$FAILURE_LOG_DIR/.$name.tmp
+    # Cap the free-form detail well below the record budget, so the identity
+    # and readback that make the snapshot useful survive truncation.
+    detail_limit=$((FAILURE_LOG_MAX_BYTES / 4))
+    {
+        echo schema=1
+        echo "reason=$reason"
+        echo "slot_suffix=$running_slot"
+        echo "uptime_seconds=$($BB cut -d' ' -f1 /proc/uptime 2>/dev/null)"
+        echo "epoch=$epoch"
+        echo "running_slot=$running_slot"
+        echo "pending_slot=${pending_slot:-none}"
+        echo "transaction_id=${transaction_id:-none}"
+        echo "--- bcb-readback (bare status: next-boot eligibility, not the running slot)"
+        if [ -x "$bootctl" ]; then
+            "$bootctl" status 2>/dev/null | $BB head -n 20
+        else
+            echo bcb-readback-unavailable
+        fi
+        echo "--- detail"
+        printf '%s\n' "$detail" | sanitize_failure_text | $BB head -c "$detail_limit"
+        echo
+        if $BB grep -q 'feature-reconcile-service-start-failed:airplayd' "$INIT_LOG" 2>/dev/null &&
+                [ -r "$airplay_start_log" ]; then
+            echo "--- airplayd-reconcile-log"
+            # This is the wrapper's bounded start output, not the daemon's
+            # unrestricted service log. Redact user-selected names and the
+            # common network/device identifiers before persisting it.
+            $BB tail -c 1024 "$airplay_start_log" 2>/dev/null | sanitize_failure_text | \
+                $BB sed 's/AirPlay service name is "[^"]*"/AirPlay service name is "REDACTED"/g'
+        fi
+        echo "--- init.log"
+        $BB tail -n 120 "$INIT_LOG" 2>/dev/null | sanitize_failure_text
+    } > "$tmp" 2>/dev/null || { $BB rm -f "$tmp"; return 0; }
+    if $BB head -c "$FAILURE_LOG_MAX_BYTES" "$tmp" > "$tmp.cut" 2>/dev/null; then
+        $BB mv "$tmp.cut" "$tmp" 2>/dev/null || $BB rm -f "$tmp.cut"
+    fi
+    $BB chmod 0600 "$tmp" 2>/dev/null || true
+    $BB mv "$tmp" "$target" 2>/dev/null || { $BB rm -f "$tmp"; return 0; }
+    $BB sync 2>/dev/null || true
+    $BB ls -1dt "$FAILURE_LOG_DIR"/failure-*.log 2>/dev/null |
+        $BB tail -n "+$((FAILURE_LOG_KEEP + 1))" |
+        while read -r stale; do $BB rm -f "$stale" 2>/dev/null || true; done
+    printf '%s\n' "$name"
+    return 0
+}
+
+# The confirmer's output in /tmp is lost on the failure reboot. Persist only
+# known updater error codes, never unrestricted stderr (which can contain
+# signed URLs, configuration, or device identity).
+ota_confirm_error_token()
+{
+    confirm_token=$($BB grep -xE \
+        'ERROR:(update_busy|update_directory_failed|no_pending_update|boot_control_target|boot_target_identity|pending_boot_hash|boot_control_running_readback|feature_runtime_not_ready|boot_control_confirm|boot_control_readback|boot_control_readback_ambiguous|feature_commit_pending|state_write_failed|state_commit_failed|userdata_identity_or_mount_failed|pending_feature_policy|pending_update_channel|packaged_update_channel|pending_channel_preserve|current_service_profile_unavailable|preserve_identity_source|preserve_feature_(payload(_size)?_mismatch|manifest_mismatch|daemon_(not_running|unavailable|mismatch)))' \
+        "$1" 2>/dev/null | $BB head -n 1)
+    printf '%s\n' "${confirm_token:-ERROR:confirm-failed-no-detail}"
+}
+
+# The kernel already carries ramoops/pstore and pmsg support, but this reduced
+# userspace previously mounted neither pstore nor the dynamically allocated
+# pmsg character device. Materialise both without assuming a fixed major.
+setup_pstore()
+{
+    pstore_dir=/sys/fs/pstore
+    $BB mkdir -p "$pstore_dir"
+    if ! $BB grep -q " $pstore_dir " /proc/mounts 2>/dev/null; then
+        $BB mount -t pstore pstore "$pstore_dir" 2>/tmp/pstore-mount.log || return 1
+    fi
+    log pstore-mounted
+
+    i=0
+    while [ "$i" -lt 10 ] && [ ! -r /sys/class/pmsg/pmsg0/dev ]; do
+        $BB sleep 1
+        i=$((i + 1))
+    done
+    if [ -r /sys/class/pmsg/pmsg0/dev ]; then
+        devno=$($BB cat /sys/class/pmsg/pmsg0/dev 2>/dev/null)
+        case "$devno" in
+            ''|*[!0-9:]*|*:*:*) ;;
+            *)
+                major=${devno%:*}
+                minor=${devno#*:}
+                if [ ! -c /dev/pmsg0 ]; then
+                    $BB rm -f /dev/pmsg0
+                    $BB mknod /dev/pmsg0 c "$major" "$minor" 2>/dev/null || true
+                fi
+                if [ -c /dev/pmsg0 ]; then
+                    $BB chmod 0600 /dev/pmsg0 2>/dev/null
+                    log pmsg-ready
+                    pmsg_marker pstore-ready
+                else
+                    log pmsg-node-failed
+                fi
+                ;;
+        esac
+    else
+        log pmsg-sysfs-unavailable
+    fi
+    return 0
+}
+if ! setup_pstore; then
+    log pstore-mount-failed
+fi
+
+# Production LAN exposure requires a valid WebUI account database even when
+# the optional SSH bundle is absent. Keep this validator aligned with the SSH
+# supervisor's fail-closed account contract.
+web_users_file_ready()
+{
+	users_file=/data/libreecho/config/users
+	[ -f "$users_file" ] && [ ! -L "$users_file" ] || return 1
+	[ "$($BB stat -c %u "$users_file" 2>/dev/null)" = 0 ] || return 1
+	[ "$($BB stat -c %a "$users_file" 2>/dev/null)" = 600 ] || return 1
+	$BB awk -F: '
+		function ishex(value,    rest, removed) {
+			rest = value
+			removed = gsub(/[0-9A-Fa-f]/, "", rest)
+			return removed == length(value)
+		}
+		BEGIN { good = 1; count = 0 }
+		{
+			if (length($0) > 255) { good = 0; next }
+			if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/) next
+			name = tolower($1)
+			if (NF != 4 || length($1) < 1 || length($1) > 31 ||
+				name == "root" || name == "." || name == ".." ||
+				$1 !~ /^[A-Za-z0-9._-]+$/ ||
+				$2 != "sha256" || length($3) < 16 || length($3) > 64 ||
+				!ishex($3) || length($4) != 64 || !ishex($4)) {
+				good = 0
+				next
+			}
+			if (name in seen) good = 0
+			seen[name] = 1
+			count++
+		}
+		END { exit (good && count > 0 && count <= 8) ? 0 : 1 }
+	' "$users_file"
 }
 
 if [ "$SERVICE_PROFILE_INVALID" -eq 1 ]; then
@@ -152,6 +583,7 @@ create_input_nodes()
 }
 
 log init-started
+pmsg_marker init-started
 
 # Give every device a stable, human-readable network identity before Wi-Fi,
 # DHCP, mDNS, and the control-plane daemons start. A user-selected hostname on
@@ -249,13 +681,227 @@ input_node_worker()
 input_node_worker &
 log input-node-worker-started
 
-# The GPT used by Biscuit exposes expdb as Linux partition 7.  Wait for the
-# kernel's block identity, then create direct aliases from sysfs rather than
-# assuming MMC minor numbers.
-EXPDB=/dev/mmcblk0p7
-EXPDB_SYS=/sys/class/block/mmcblk0p7
+# Linux 6.1 has no Android android_usb class.  Compose an ADB-only gadget with
+# ConfigFS and FunctionFS, and bind the UDC only after adbd publishes endpoints.
+ADBD_TRANSPORT_FILE=/etc/libreecho/adb-transport
+adbd_dev_tcp_policy()
+{
+    [ -r /etc/libreecho/update-channel ] &&
+        [ "$($BB cat /etc/libreecho/update-channel 2>/dev/null)" = dev ] &&
+        [ -r "$ADBD_TRANSPORT_FILE" ] &&
+        $BB grep -qxF 'schema=1' "$ADBD_TRANSPORT_FILE" &&
+        $BB grep -qxF 'transport=usb-functionfs-and-tcp' "$ADBD_TRANSPORT_FILE" &&
+        $BB grep -qxF 'tcp_listener=true' "$ADBD_TRANSPORT_FILE" &&
+        $BB grep -qxF 'tcp_port=5555' "$ADBD_TRANSPORT_FILE"
+}
+adbd_tcp_configured=0
+if [ -r "$ADBD_TRANSPORT_FILE" ]; then
+    log adb-transport-policy-read
+    adbd_dev_tcp_policy && adbd_tcp_configured=1
+else
+    log adb-transport-policy-absent
+fi
+start_adbd()
+{
+    export ADB_TRACE=all
+    /sbin/adbd --device_banner=device </dev/null >/tmp/adbd.log 2>&1 &
+    adbd_pid=$!
+    log "adbd-started:$adbd_pid"
+}
+G=/sys/kernel/config/usb_gadget/libreecho
+ffs_ready=0
+$BB mkdir -p /sys/kernel/config
+if ! $BB grep -q ' /sys/kernel/config ' /proc/mounts 2>/dev/null; then
+    if $BB mount -t configfs configfs /sys/kernel/config 2>/tmp/configfs.log; then
+        log configfs-mounted
+    else
+        log configfs-mount-failed
+    fi
+else
+    log configfs-already-mounted
+fi
+
+if $BB grep -q ' /sys/kernel/config ' /proc/mounts 2>/dev/null; then
+    $BB mkdir -p "$G" "$G/strings/0x409" \
+        "$G/configs/c.1/strings/0x409" "$G/functions/ffs.adb"
+    echo 0x18d1 > "$G/idVendor"
+    echo 0xd001 > "$G/idProduct"
+    echo 0x0200 > "$G/bcdUSB"
+    serial=$($BB sed -n 's/.*androidboot.serialno=\([^ ]*\).*/\1/p' /proc/cmdline)
+    echo "${serial:-libreecho}" > "$G/strings/0x409/serialnumber"
+    echo LibreEcho > "$G/strings/0x409/manufacturer"
+    echo MT8163-ARM32-ADB > "$G/strings/0x409/product"
+    echo adb > "$G/configs/c.1/strings/0x409/configuration"
+    echo 120 > "$G/configs/c.1/MaxPower"
+    [ -e "$G/configs/c.1/ffs.adb" ] || \
+        $BB ln -s "$G/functions/ffs.adb" "$G/configs/c.1/ffs.adb"
+    log configfs-adb-composition-created
+
+    if $BB mount -t functionfs -o uid=2000,gid=2000 adb /dev/usb-ffs/adb 2>/tmp/functionfs.log; then
+        log functionfs-mounted
+        # Linux 6.1 is built with DAC as its security model and has no SELinux
+        # filesystem.  Passing Android's root_seclabel makes this static adbd
+        # exit before opening FunctionFS, so retain only its device banner.
+        # HW18 enables adbd's own bounded trace so UART can distinguish a
+        # missing transport thread from a FunctionFS endpoint failure.
+        start_adbd
+
+        i=0
+        while [ "$i" -lt 15 ]; do
+            if [ -e /dev/usb-ffs/adb/ep1 ] && [ -e /dev/usb-ffs/adb/ep2 ]; then
+                ffs_ready=1
+                break
+            fi
+            if ! $BB kill -0 "$adbd_pid" 2>/dev/null; then
+                wait "$adbd_pid" 2>/dev/null
+                log "adbd-exit-status:$?"
+                log adbd-exited-early
+                break
+            fi
+            $BB sleep 1
+            i=$((i + 1))
+        done
+
+        if [ "$ffs_ready" -eq 1 ]; then
+            log functionfs-ready
+            udc=
+            for candidate in /sys/class/udc/*; do
+                [ -e "$candidate" ] || continue
+                udc=${candidate##*/}
+                break
+            done
+            if [ -n "$udc" ] && echo "$udc" > "$G/UDC" 2>/tmp/configfs-udc-bind.err; then
+                log "configfs-udc-bound:$udc"
+                # The port is dr_mode="otg" so the role can be switched at
+                # runtime, which the storage toggle needs.  The cost is that the
+                # boot role is otherwise decided by ID/VBUS detection, and that
+                # proved unreliable -- ADB came up on some boots and not others,
+                # which is unacceptable for the only recovery path this device
+                # has.  Pin it to device so the gadget is unconditional; the
+                # toggle moves it to host later, and every boot resets it here.
+                for role_sx in /sys/class/usb_role/*/role; do
+                    [ -w "$role_sx" ] || continue
+                    if printf device > "$role_sx" 2>/dev/null; then
+                        log "usb-role-pinned-device:${role_sx#/sys/class/usb_role/}"
+                    else
+                        log "usb-role-pin-failed:${role_sx#/sys/class/usb_role/}"
+                    fi
+                done
+                # Capture one bounded userspace snapshot after the host has had
+                # time to send CNXN.  Never loop: repeated ADB reconnects would
+                # otherwise flood the authoritative UART record.
+                (
+                    $BB sleep 8
+                    log adbd-diagnostic-begin
+                    if $BB kill -0 "$adbd_pid" 2>/dev/null; then
+                        for fd in /proc/"$adbd_pid"/fd/*; do
+                            [ -e "$fd" ] || continue
+                            target=$($BB readlink "$fd" 2>/dev/null)
+                            log "adbd-fd:${fd##*/}:$target"
+                        done
+                        for task in /proc/"$adbd_pid"/task/*; do
+                            [ -d "$task" ] || continue
+                            tid=${task##*/}
+                            comm=$($BB cat "$task/comm" 2>/dev/null)
+                            state=$($BB sed -n 's/^State:[[:space:]]*//p' "$task/status" 2>/dev/null)
+                            wchan=$($BB cat "$task/wchan" 2>/dev/null)
+                            log "adbd-task:$tid:$comm:$state:$wchan"
+                        done
+                    else
+                        log adbd-diagnostic-process-gone
+                    fi
+                    if [ -s /tmp/adbd.log ]; then
+                        $BB tail -n 40 /tmp/adbd.log | while IFS= read -r line; do
+                            log "adbd-log:$line"
+                        done
+                    else
+                        log adbd-log-empty
+                    fi
+                    log adbd-diagnostic-end
+                ) &
+            else
+                ffs_ready=0
+                log configfs-udc-bind-failed
+            fi
+        else
+            log functionfs-not-ready
+            [ -s /tmp/adbd.log ] && \
+                $BB tail -n 8 /tmp/adbd.log | $BB sed 's/^/<3>adbd: /' > /dev/kmsg 2>/dev/null
+        fi
+    else
+        log functionfs-mount-failed
+    fi
+else
+    log configfs-unavailable
+fi
+if [ "$adbd_tcp_configured" -eq 1 ] &&
+        { [ -z "${adbd_pid:-}" ] || ! $BB kill -0 "$adbd_pid" 2>/dev/null; }; then
+    # Dev TCP remains available even when USB FunctionFS cannot be mounted.
+    # Keep the same single daemon and never retry a running USB instance.
+    start_adbd
+    log adbd-tcp-fallback-started
+fi
+
+# Persistent readiness evidence for the control plane.  pmsg survives a forced
+# reboot, so a boot where adb never came up is distinguishable from one where
+# it did -- adbd's own diagnostics live on the ramdisk and are lost with it.
+#
+# The configured transport is immutable image policy. A stable USB-only build
+# reports an absent TCP listener as expected, never as a startup failure.
+if [ "${ffs_ready:-0}" -eq 1 ]; then
+    pmsg_marker adb-ffs-ready
+else
+    pmsg_marker adb-ffs-not-ready
+fi
+# USB endpoint readiness is the transport this build actually uses.
+if [ "${ffs_ready:-0}" -eq 1 ] && [ -e /dev/usb-ffs/adb/ep0 ] &&
+   [ -e /dev/usb-ffs/adb/ep1 ]; then
+    pmsg_marker adb-usb-endpoints-ready
+else
+    pmsg_marker adb-usb-endpoints-missing
+fi
+# Daemon liveness, not a listener guess. The state must be 0A (LISTEN) and the
+# 5555 port must appear in the local address of a listening row, on the
+# wildcard or a loopback address. The remote side must be the wildcard: a
+# listening row with a real remote address is a client socket, and a row whose
+# remote port is 5555 in state 01 is a connection *to* adbd, not a listener.
+adb_listening() {
+    $BB awk 'NR > 1 && $4 == "0A" {
+                 split($2, l, ":")
+                 split($3, r, ":")
+                 if (l[2] == "15B3" && (l[1] == "00000000" || l[1] == "0100007F"))
+                     listening = 1
+                 if (r[2] == "15B3" && r[1] == "00000000") listening = 1
+             }
+             END { exit(listening ? 0 : 1) }' \
+        /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+adb_tcp_ready() {
+    case "${adbd_pid:-}" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$adbd_tcp_configured" -eq 1 ] &&
+        adb_listening && $BB kill -0 "$adbd_pid" 2>/dev/null
+}
+if [ "$adbd_tcp_configured" -eq 1 ]; then
+    i=0
+    while [ "$i" -lt 5 ] && ! adb_listening; do
+        $BB sleep 1
+        i=$((i + 1))
+    done
+    if adb_listening; then
+        pmsg_marker adb-tcp-5555-bound
+    else
+        pmsg_marker adb-tcp-5555-unbound
+    fi
+else
+    # Expected for a USB-only build: the policy, not a failure.
+    pmsg_marker adb-tcp-not-configured
+fi
+
+# The reduced ramdisk does not mount devtmpfs, so create the eMMC block nodes
+# from sysfs rather than assuming MMC minor numbers.  Userdata and the A/B
+# slots depend on these nodes.  Creating a node never writes to a partition.
 i=0
-while [ "$i" -lt 10 ] && [ ! -r "$EXPDB_SYS/dev" ]; do
+while [ "$i" -lt 10 ] && [ ! -r /sys/class/block/mmcblk0p16/dev ]; do
     $BB sleep 1
     i=$((i + 1))
 done
@@ -289,7 +935,7 @@ userdata_mount()
 
     if [ ! -b "$USERDATA" ] ||
        ! $BB grep -qx 'PARTNAME=userdata' "$USERDATA_SYS/uevent" 2>/dev/null ||
-       [ "$($BB cat "$USERDATA_SYS/size" 2>/dev/null)" != 2137088 ]; then
+       ! userdata_size_supported "$($BB cat "$USERDATA_SYS/size" 2>/dev/null)"; then
         log userdata-identity-rejected
         return 1
     fi
@@ -326,6 +972,26 @@ else
     DATA_CLEANUP_OK=0
     log userdata-unavailable
 fi
+
+# Record this boot's slot state before any service starts.  Later writes refine
+# bh_state; this one guarantees a record exists even when the health worker never
+# runs, and it is the line that makes the retry countdown visible across boots.
+if [ "${DATA_CLEANUP_OK:-0}" -eq 1 ]; then
+    bh_boot_count=$(bh_bump_count)
+    bh_mode_value=$(bh_classify_mode)
+    bh_running=$(bh_running_slot)
+    bh_pending=$(bh_pending_slot)
+    bh_bootctl
+    bh_selected=$(bh_value selected_slot)
+    bh_state=booting
+    bh_last_check=none
+    bh_history
+    bh_write
+    log "boot-count:$bh_boot_count"
+    log "boot-slot:$bh_running:$bh_selected"
+else
+    log boot-diagnostics-unavailable
+fi
 VENDOR_ASSETS_OK=0
 if [ "${DATA_CLEANUP_OK:-0}" -eq 1 ] &&
         [ -x /usr/local/sbin/libreecho-vendor-import ] &&
@@ -346,43 +1012,21 @@ else
 fi
 set_boot_hostname || true
 
-expdb_devno=$($BB cat "$EXPDB_SYS/dev" 2>/dev/null)
-expdb_major=${expdb_devno%:*}
-expdb_minor=${expdb_devno#*:}
-expected_rdev=
-case "$expdb_devno" in
-    *:*) expected_rdev=$($BB printf '%x:%x' "$expdb_major" "$expdb_minor") ;;
-esac
+if [ -x /etc/init.d/libreecho-ssh.init ]; then
+    if /etc/init.d/libreecho-ssh.init start >/tmp/libreecho-ssh.init.log 2>&1; then
+        log ssh-supervisor-started
+    else
+        log ssh-supervisor-start-failed
+    fi
+fi
 
 IMAGE_PROFILE=$($BB cat /etc/libreecho/image-profile 2>/dev/null)
 case "$IMAGE_PROFILE" in
     development)
-        # Development images arm the next-reset fastboot escape. OTA images
-        # must not do this because A/B retry and rollback require normal boots.
-        marker_written=0
-        marker_attempt=0
-        while [ "$marker_written" -eq 0 ]; do
-            marker_attempt=$((marker_attempt + 1))
-            if [ -b "$EXPDB" ] && [ -n "$expected_rdev" ] &&
-               [ "$($BB stat -c '%t:%T' "$EXPDB" 2>/dev/null)" = "$expected_rdev" ] &&
-               $BB grep -qx 'PARTNAME=expdb' "$EXPDB_SYS/uevent" 2>/dev/null &&
-               [ "$($BB cat "$EXPDB_SYS/size" 2>/dev/null)" = 20480 ]; then
-                if printf FASTBOOT_PLEASE > "$EXPDB" 2>/tmp/expdb-marker.err; then
-                    $BB sync
-                    marker=$($BB dd if="$EXPDB" bs=15 count=1 2>/dev/null)
-                    [ "$marker" = FASTBOOT_PLEASE ] && marker_written=1
-                fi
-            elif [ $((marker_attempt % 10)) -eq 1 ]; then
-                log expdb-identity-rejected
-            fi
-            if [ "$marker_written" -eq 0 ]; then
-                if [ $((marker_attempt % 10)) -eq 0 ]; then
-                    log fastboot-please-retry
-                fi
-                $BB sleep 1
-            fi
-        done
-        log fastboot-please-written
+        # amonet v2.0.0 stores the LK-stage kaeru payload in expdb.  No marker
+        # is ever armed there; a fastboot request is honoured below only as
+        # Kaeru's one-shot misc command, after the payload is proven.
+        log automatic-fastboot-marker-disabled
         ;;
     ota)
         log automatic-fastboot-marker-disabled
@@ -404,18 +1048,15 @@ reboot_request_loop()
             $BB rm -f /tmp/reboot.request
             case "$request" in
                 fastboot)
-                    log reboot-request-fastboot-accepted
-                    if printf FASTBOOT_PLEASE > "$EXPDB" 2>/tmp/reboot-marker.err; then
+                    # Kaeru one-shot command in misc only (bootctl proves the
+                    # Kaeru payload in expdb read-only first; Platform #195).
+                    if /usr/local/sbin/libreecho-bootctl reboot-bootloader \
+                           >/dev/null 2>&1; then
+                        log reboot-request-fastboot-accepted
                         $BB sync
-                        marker=$($BB dd if="$EXPDB" bs=15 count=1 2>/dev/null)
-                        if [ "$marker" = FASTBOOT_PLEASE ]; then
-                            log reboot-request-marker-verified
-                            $BB reboot -f
-                        else
-                            log reboot-request-marker-readback-failed
-                        fi
+                        $BB reboot -f
                     else
-                        log reboot-request-marker-write-failed
+                        log reboot-request-fastboot-refused
                     fi
                     ;;
                 reboot)
@@ -467,6 +1108,78 @@ log wmt-nodes-created
 # The network stack is build-time opt-in, but activation remains an explicit
 # operator request after ADB.  This preserves the USB diagnostic control plane
 # across the historical WMT/WLAN failure boundary.
+# No Wi-Fi MAC override on this hardware.
+#
+# The driver generates an address when nothing supplies one, and not the same
+# one each boot, so the device takes a new DHCP lease after most restarts. idme
+# records the address the board was built with, and applying it looked like the
+# obvious fix -- but the driver refuses it:
+#
+#     ip link set dev wlan0 address fc:a1:83:70:79:33
+#     ip: ioctl 0x8924 failed: Not supported
+#
+# SIOCSIFHWADDR is rejected with the link up or down, there is no NVRAM file or
+# module parameter exposing it, and nothing in dmesg suggests the address is
+# read from anywhere writable. Setting it would need firmware or driver work
+# rather than a boot script, so there is nothing to run here.
+#
+# The web UI still reports the board's address beside the one in use, which is
+# what makes the difference visible.
+
+# Issue #96 recovery-boot coordination.  The physical recovery detector arms a
+# boot-scoped marker before the boot-path Wi-Fi worker starts, and while the
+# marker is present the recovery access point owns the single radio for the
+# whole boot.  The worker may still load the driver -- that is what creates
+# wlan0 for the AP capability probe and for hostapd -- but it must never start
+# the client supplicant: networkd's handover helper stops the client service
+# through its pidfile, and if this worker had not started it yet the stop is a
+# no-op while the worker then starts wpa_supplicant against hostapd.  The
+# marker is created before this worker is launched, so the check is
+# deterministic rather than a race.  An ordinary boot (no marker) is unchanged.
+recovery_owns_radio()
+{
+    [ -f "${PHYSICAL_RECOVERY_MARKER:-/run/libreecho/recovery-mode}" ]
+}
+
+# Issue #96 recovery-boot service ordering.  While the recovery marker is
+# present the access point owns the single radio, and the boot-path Wi-Fi worker
+# (start_wifi_network_sequence) is still loading WMT and waiting for wlan0 when
+# the UI service graph starts.  networkd's AP capability probe runs as it starts
+# and, if wlan0 does not exist yet, reports the interface absent and the portal
+# stays unavailable for the whole boot.  The worker therefore records a
+# boot-scoped marker once wlan0 exists, and the service graph waits for it --
+# bounded -- before starting networkd.  An ordinary boot has no recovery marker,
+# so recovery_owns_radio is false and this is a no-op: the service ordering on
+# an ordinary boot is unchanged.
+RECOVERY_WLAN0_MARKER=${RECOVERY_WLAN0_MARKER:-/run/libreecho/wlan0-ready}
+RECOVERY_WIFI_FAILED_MARKER=${RECOVERY_WIFI_FAILED_MARKER:-/run/libreecho/wifi-worker-failed}
+# The bound must cover the worker's complete worst-case sequence -- the 1s
+# stale-launcher settle, the 1s responder settle, up to 30s for the one-shot
+# function-on write, up to 10s waiting for the one-shot responder to exit, and
+# up to 30s waiting for wlan0 registration (72s in total) -- so a slower but
+# successful initialization is still waited for instead of being rejected as a
+# radio failure.  The wait also synchronizes on the worker's terminal outcome
+# markers: it returns as soon as the worker has finished, either the ready
+# marker (success) or the failure marker the worker records on a terminal
+# failure, and it never reports success for a worker that failed or timed out.
+RECOVERY_RADIO_WAIT=${RECOVERY_RADIO_WAIT:-90}
+recovery_radio_ready_wait()
+{
+    recovery_owns_radio || return 0
+    waited=0
+    while [ "$waited" -lt "$RECOVERY_RADIO_WAIT" ]; do
+        [ -f "$RECOVERY_WLAN0_MARKER" ] && return 0
+        if [ -f "$RECOVERY_WIFI_FAILED_MARKER" ]; then
+            log recovery-radio-ready-failed
+            return 1
+        fi
+        $BB sleep 1
+        waited=$((waited + 1))
+    done
+    log recovery-radio-ready-timeout
+    return 1
+}
+
 start_wifi_network_sequence()
 {
     packaged_wifi=/etc/wifi/wpa_supplicant.conf
@@ -498,8 +1211,40 @@ start_wifi_network_sequence()
         wifi_profile=$packaged_wifi
         log wifi-packaged-profile-selected
     fi
-    [ -n "$wifi_profile" ] || { log wifi-profile-absent; return 2; }
-    log wifi-profile-present
+    # A recovery boot owns the radio for the access point and never starts the
+    # client supplicant, so it must not require a client profile to exist: a
+    # fresh device with no /data and no packaged profile is the normal recovery
+    # case, and the WMT initialization below must still run because that is
+    # what creates wlan0 for the AP capability probe and hostapd.  An ordinary
+    # boot still needs the profile for the client start and refuses to activate
+    # the radio without one.
+    if [ -z "$wifi_profile" ] && ! recovery_owns_radio; then
+        log wifi-profile-absent
+        return 2
+    fi
+    if [ -n "$wifi_profile" ]; then
+        log wifi-profile-present
+    else
+        log wifi-profile-absent-recovery-boot
+    fi
+    # Persist the selected profile path for the recovery handover.  networkd's
+    # libreecho-recovery-net-down restarts the client service after the portal
+    # is torn down, and it does so without this boot's environment; without the
+    # recorded path it would fall back to the packaged /etc/wifi profile and the
+    # restored client could associate with the wrong config.  Boot-scoped tmpfs,
+    # written before the client start and before the recovery-boot suppression
+    # below, so the handover has the path on both paths.
+    WIFI_PROFILE_STATE=/run/libreecho/wifi-client.conf
+    if [ -n "$wifi_profile" ]; then
+        if $BB mkdir -p /run/libreecho 2>/dev/null &&
+            printf '%s\n' "$wifi_profile" > "$WIFI_PROFILE_STATE" 2>/dev/null; then
+            $BB chmod 0700 /run/libreecho 2>/dev/null
+            $BB chmod 0600 "$WIFI_PROFILE_STATE" 2>/dev/null
+            log wifi-profile-recorded
+        else
+            log wifi-profile-record-failed
+        fi
+    fi
     # This is the proven manual choreography from session e8c21eb3bbae:
     # stock-compatible configure-only init, stale-launcher cleanup, exactly one
     # one-shot command responder, then one timed Wi-Fi function-on write.  Do
@@ -558,6 +1303,22 @@ start_wifi_network_sequence()
         i=$((i + 1))
     done
     [ -e /sys/class/net/wlan0 ] || { log wlan0-registration-timeout; return 1; }
+    # wlan0 now exists: record the boot-scoped radio-ready marker the recovery
+    # service graph waits on before it starts networkd (see
+    # recovery_radio_ready_wait).  Harmless on an ordinary boot.
+    if $BB mkdir -p /run/libreecho 2>/dev/null &&
+        : > "$RECOVERY_WLAN0_MARKER" 2>/dev/null; then
+        log wlan0-ready-recorded
+    else
+        log wlan0-ready-record-failed
+    fi
+    # Recovery boot: the driver is up and wlan0 exists for the AP probe and
+    # hostapd, but the portal owns the radio, so never start the client
+    # supplicant here (see recovery_owns_radio above).
+    if recovery_owns_radio; then
+        log wifi-client-suppressed-recovery-boot
+        return 0
+    fi
     WIFI_CONF="$wifi_profile" /sbin/libreecho-wifi start \
         >/tmp/wifi-client.log 2>&1
     client_rc=$?
@@ -565,11 +1326,30 @@ start_wifi_network_sequence()
     return "$client_rc"
 }
 
+# The recovery service graph's bounded wait (recovery_radio_ready_wait) must
+# return as soon as the single-shot Wi-Fi activation has terminally failed and
+# must report that failure truthfully instead of starting networkd as if the
+# radio were ready.  Record the failing return code in the boot-scoped failure
+# marker once the activation can no longer succeed in this boot.
+wifi_worker_record_failure()
+{
+    $BB mkdir -p /run/libreecho 2>/dev/null || {
+        log wifi-worker-failed-record-failed
+        return 0
+    }
+    if printf '%s\n' "$1" > "$RECOVERY_WIFI_FAILED_MARKER" 2>/dev/null; then
+        log "wifi-worker-failed-recorded:$1"
+    else
+        log wifi-worker-failed-record-failed
+    fi
+}
+
 start_wifi_network()
 {
     if [ "${VENDOR_ASSETS_OK:-0}" -ne 1 ]; then
         printf 'LIBREECHO_WIFI_REJECTED=vendor-assets-unavailable\n' > /tmp/wifi.status
         log wifi-vendor-assets-unavailable
+        wifi_worker_record_failure 4
         return 4
     fi
     # The WMT firmware path is intentionally single-shot per boot.  mkdir is
@@ -583,6 +1363,7 @@ start_wifi_network()
     wifi_rc=$?
     printf 'LIBREECHO_WIFI_RC=%s\n' "$wifi_rc" > /tmp/wifi.status
     log "wifi-activation-complete:$wifi_rc"
+    [ "$wifi_rc" -eq 0 ] || wifi_worker_record_failure "$wifi_rc"
     return "$wifi_rc"
 }
 
@@ -618,7 +1399,187 @@ wifi_request_loop()
         $BB sleep 1
     done
 }
-log wifi-network-worker-deferred
+# The recovery image's minimal userspace does not inherit Android's loopback
+# address.  Bring up IPv4 loopback before manual services such as the web
+# daemon bind to their safe 127.0.0.1 default.
+if $BB ifconfig lo 127.0.0.1 up >/tmp/loopback-config.log 2>&1; then
+    log loopback-configured
+else
+    log loopback-config-failed
+fi
+
+# Physical recovery detector (issue #96).  A ~5 s hold of the action button
+# (KEY_HELP, its own gpio-keys node) arms the recovery access point by dropping
+# a boot-scoped tmpfs marker that networkd validates.  The helper is a compiled
+# evdev reader: it reads the kernel's current key bitmap with EVIOCGKEY, so a
+# button already held before this point is detected even though it produces no
+# further key events, and it measures the hold with CLOCK_MONOTONIC rather than
+# trusting event timestamps.  It is bounded end to end: with no held button the
+# helper returns after its short startup no-key window, and a missing helper or
+# input node leaves the boot completely unaffected.  The helper never reboots,
+# writes persistent storage or touches a partition.
+PHYSICAL_RECOVERY_HELPER=${PHYSICAL_RECOVERY_HELPER:-/usr/local/sbin/libreecho-recovery-button}
+PHYSICAL_RECOVERY_MARKER=${PHYSICAL_RECOVERY_MARKER:-/run/libreecho/recovery-mode}
+# Must not cut the detector short: the compiled detector's own absolute cap is
+# 12000 ms (DEFAULT_MAX_MS), so a 5 s hold that begins ~7 s after the probe
+# starts still arms.  With no held button the detector returns after its 2 s
+# no-key window, so this bound costs nothing on an ordinary boot.
+PHYSICAL_RECOVERY_TIMEOUT=${PHYSICAL_RECOVERY_TIMEOUT:-13}
+# KEY_HELP (138) is bit 10 of a key-bitmap word (138 = 128 + 10).
+KEY_HELP_BIT=138
+
+# Resolve the evdev node that carries the physical action button.  The named
+# "Action Key" node is created by build_wifi_dtb.py and may enumerate after an
+# unrelated PMIC/input node (the mute/home keys), so a first miss must NOT fall
+# back to the first evdev device: the compiled detector filters KEY_HELP, and
+# another node would silently observe the wrong key.  Retry the named lookup for
+# the whole bounded window; only when input names are genuinely unavailable fall
+# back to a node whose key capability actually advertises KEY_HELP.
+physical_recovery_input_node()
+{
+    input_class=${PHYSICAL_RECOVERY_INPUT_CLASS:-/sys/class/input}
+    dev_input=${PHYSICAL_RECOVERY_DEV_INPUT:-/dev/input}
+    tries=${PHYSICAL_RECOVERY_NODE_TRIES:-5}
+    node=
+    names_seen=0
+    i=0
+    while [ "$i" -lt "$tries" ]; do
+        for sys_name in "$input_class"/event*/device/name; do
+            [ -r "$sys_name" ] || continue
+            names_seen=1
+            event=${sys_name#"$input_class"/}
+            event=${event%%/*}
+            case "$($BB cat "$sys_name" 2>/dev/null)" in
+                *[Aa]ction*) node=$dev_input/$event ;;
+            esac
+            [ -n "$node" ] && break
+        done
+        [ -n "$node" ] && break
+        i=$((i + 1))
+        [ "$i" -lt "$tries" ] && $BB sleep 1
+    done
+    if [ -z "$node" ] && [ "$names_seen" -eq 0 ]; then
+        node=$(physical_recovery_key_help_node "$input_class" "$dev_input")
+    fi
+    printf '%s\n' "$node"
+}
+
+# A node's key bitmap is a space-separated list of hex words printed by the
+# kernel's input_print_bitmap: it walks the capability words from the highest
+# nonzero word DOWN to word 0, so the LAST token is word 0 and word k is the
+# (k + 1)-th token counted from the end.  KEY_HELP (138) is word 4 bit 10 on
+# the 32-bit layout (138 = 4*32 + 10, printed "400 0 0 0 0") and word 2 bit 10
+# on the 64-bit layout (138 = 2*64 + 10, printed "400 0 0").  A word wider than
+# 8 hex digits can only come from the 64-bit layout; and when fewer than five
+# words are printed the 32-bit KEY_HELP word (word 4) cannot be present at all,
+# so only the 64-bit layout can still carry KEY_HELP.  The relevant bit is the
+# value-4 bit of that word's third-from-last hex digit, which avoids
+# overflow-prone shell arithmetic on the printed value.
+physical_recovery_key_bitmap_has_help()
+{
+    file=$1
+    # shellcheck disable=SC2046
+    set -- $($BB cat "$file" 2>/dev/null)
+    count=$#
+    [ "$count" -gt 0 ] || return 1
+    wide=0
+    for word in "$@"; do
+        case "$word" in
+            ?????????*) wide=1 ;;
+        esac
+    done
+    if [ "$wide" -eq 1 ] || [ "$count" -lt 5 ]; then
+        want=$((count - 1 - 2))
+    else
+        want=$((count - 1 - 4))
+    fi
+    [ "$want" -ge 0 ] || return 1
+    shift "$want"
+    word=$1
+    rest=${word%??}
+    digit=${rest#"${rest%?}"}
+    case "$digit" in
+        [4567cCdDeEfF]) return 0 ;;
+    esac
+    return 1
+}
+
+physical_recovery_key_help_node()
+{
+    input_class=$1
+    dev_input=$2
+    for cap in "$input_class"/event*/device/capabilities/key; do
+        [ -r "$cap" ] || continue
+        event=${cap#"$input_class"/}
+        event=${event%%/*}
+        if physical_recovery_key_bitmap_has_help "$cap"; then
+            printf '%s\n' "$dev_input/$event"
+            return 0
+        fi
+    done
+    printf '%s\n' ''
+    return 0
+}
+
+physical_recovery_probe()
+{
+    [ -x "$PHYSICAL_RECOVERY_HELPER" ] || {
+        log physical-recovery-helper-absent
+        return 0
+    }
+    node=$(physical_recovery_input_node)
+    if [ -z "$node" ]; then
+        log physical-recovery-no-input-node
+        return 0
+    fi
+    $BB mkdir -p /run/libreecho 2>/dev/null
+    $BB chmod 0700 /run/libreecho 2>/dev/null
+    if $BB timeout -k 1 "$PHYSICAL_RECOVERY_TIMEOUT" \
+            "$PHYSICAL_RECOVERY_HELPER" --device "$node" \
+            --marker "$PHYSICAL_RECOVERY_MARKER"; then
+        if [ -f "$PHYSICAL_RECOVERY_MARKER" ]; then
+            log physical-recovery-armed
+            pmsg_marker physical-recovery-armed
+        else
+            log physical-recovery-not-requested
+        fi
+    else
+        log physical-recovery-probe-timeout
+    fi
+    return 0
+}
+physical_recovery_probe
+
+# Connectivity comes up on the boot path, not at the end of init: reachability
+# (OTA, AirPlay, and the OTA health probes that need the network) must not
+# depend on the service graph having started.  This is the single automatic
+# activation.  Its conditions are unchanged from the original late call -- a
+# profile-bearing image performs one bounded activation after the ADB/FunctionFS
+# control plane is ready (HW61, matching the verified 3.18 baseline), and a
+# diagnostic image keeps connectivity manual/single-shot. Stable requires USB
+# FunctionFS; dev may use its verified TCP listener if USB failed.
+# start_wifi_network keeps its single-shot claim, so a
+# failed activation still refuses a second attempt in the same boot, and the
+# request supervisor below remains available for the free-claim case.
+adb_control_ready=0
+[ "${ffs_ready:-0}" -eq 1 ] && adb_control_ready=1
+adb_tcp_ready && adb_control_ready=1
+if [ "${VENDOR_ASSETS_OK:-0}" -ne 1 ]; then
+    log wifi-network-skipped-vendor-assets-unavailable
+    # VENDOR_ASSETS_OK is fixed by the vendor-assets gate above, and the
+    # single-shot activation refuses the same way, so the radio cannot
+    # initialize this boot.  Record the terminal failure so a recovery boot's
+    # bounded wait fails fast and truthfully instead of waiting out its bound.
+    wifi_worker_record_failure 4
+elif [ "$SERVICE_PROFILE" = diagnostic ]; then
+    log wifi-network-policy-manual-single-shot
+elif [ "$adb_control_ready" -eq 1 ]; then
+    start_wifi_network >>/tmp/wifi-boot.log 2>&1 &
+    log wifi-network-worker-started-after-adb
+    pmsg_marker wifi-boot-activation
+else
+    log wifi-network-skipped-adb-not-ready
+fi
 
 # Preserve v97's root command loop, but never let one experiment monopolize
 # the control plane.  A request is atomically claimed as runme.active, then
@@ -628,17 +1589,19 @@ RUNME_TIMEOUT=${LIBREECHO_RUNME_TIMEOUT:-120}
 runme_loop()
 {
     while true; do
-        if [ -f /tmp/runme ] && [ ! -e /tmp/runme.active ]; then
-            $BB mv /tmp/runme /tmp/runme.active
-            $BB rm -f /tmp/runme.cancel
-            printf 'LIBREECHO_RUNME_STARTED\n' > /tmp/runme.status
-            $BB setsid $BB timeout -k 2 "$RUNME_TIMEOUT" /bin/busybox sh /tmp/runme.active > /tmp/result 2>&1 &
+        if [ -f /run/libreecho-control/runme ] &&
+                [ ! -e /run/libreecho-control/runme.active ]; then
+            $BB mv /run/libreecho-control/runme /run/libreecho-control/runme.active
+            $BB rm -f /run/libreecho-control/runme.cancel
+            printf 'LIBREECHO_RUNME_STARTED\n' > /run/libreecho-control/runme.status
+            $BB setsid $BB timeout -k 2 "$RUNME_TIMEOUT" /bin/busybox sh \
+                /run/libreecho-control/runme.active > /run/libreecho-control/result 2>&1 &
             runme_pid=$!
             cancelled=0
             while $BB kill -0 "$runme_pid" 2>/dev/null; do
-                if [ -f /tmp/runme.cancel ]; then
+                if [ -f /run/libreecho-control/runme.cancel ]; then
                     cancelled=1
-                    $BB rm -f /tmp/runme.cancel
+                    $BB rm -f /run/libreecho-control/runme.cancel
                     log runme-cancel-requested
                     $BB kill -TERM -- "-$runme_pid" 2>/dev/null
                     $BB sleep 1
@@ -651,18 +1614,18 @@ runme_loop()
             runme_rc=$?
             if [ "$cancelled" -eq 1 ]; then
                 runme_rc=125
-                printf 'LIBREECHO_RUNME_CANCELLED\n' >> /tmp/result
-                printf 'LIBREECHO_RUNME_CANCELLED\n' > /tmp/runme.status
+                printf 'LIBREECHO_RUNME_CANCELLED\n' >> /run/libreecho-control/result
+                printf 'LIBREECHO_RUNME_CANCELLED\n' > /run/libreecho-control/runme.status
             elif [ "$runme_rc" -eq 124 ]; then
                 $BB kill -KILL -- "-$runme_pid" 2>/dev/null
-                printf 'LIBREECHO_RUNME_TIMEOUT=%s\n' "$RUNME_TIMEOUT" >> /tmp/result
-                printf 'LIBREECHO_RUNME_TIMEOUT=%s\n' "$RUNME_TIMEOUT" > /tmp/runme.status
+                printf 'LIBREECHO_RUNME_TIMEOUT=%s\n' "$RUNME_TIMEOUT" >> /run/libreecho-control/result
+                printf 'LIBREECHO_RUNME_TIMEOUT=%s\n' "$RUNME_TIMEOUT" > /run/libreecho-control/runme.status
                 log runme-timeout
             else
-                printf 'LIBREECHO_RUNME_RC=%s\n' "$runme_rc" >> /tmp/result
-                printf 'LIBREECHO_RUNME_RC=%s\n' "$runme_rc" > /tmp/runme.status
+                printf 'LIBREECHO_RUNME_RC=%s\n' "$runme_rc" >> /run/libreecho-control/result
+                printf 'LIBREECHO_RUNME_RC=%s\n' "$runme_rc" > /run/libreecho-control/runme.status
             fi
-            $BB rm -f /tmp/runme.active
+            $BB rm -f /run/libreecho-control/runme.active
         fi
         $BB sleep 1
     done
@@ -670,139 +1633,13 @@ runme_loop()
 runme_loop &
 log runme-loop-started
 
-# Linux 6.1 has no Android android_usb class.  Compose an ADB-only gadget with
-# ConfigFS and FunctionFS, and bind the UDC only after adbd publishes endpoints.
-G=/sys/kernel/config/usb_gadget/libreecho
-ffs_ready=0
-$BB mkdir -p /sys/kernel/config
-if ! $BB grep -q ' /sys/kernel/config ' /proc/mounts 2>/dev/null; then
-    if $BB mount -t configfs configfs /sys/kernel/config 2>/tmp/configfs.log; then
-        log configfs-mounted
-    else
-        log configfs-mount-failed
-    fi
-else
-    log configfs-already-mounted
-fi
-
-if $BB grep -q ' /sys/kernel/config ' /proc/mounts 2>/dev/null; then
-    $BB mkdir -p "$G" "$G/strings/0x409" \
-        "$G/configs/c.1/strings/0x409" "$G/functions/ffs.adb"
-    echo 0x18d1 > "$G/idVendor"
-    echo 0xd001 > "$G/idProduct"
-    echo 0x0200 > "$G/bcdUSB"
-    serial=$($BB sed -n 's/.*androidboot.serialno=\([^ ]*\).*/\1/p' /proc/cmdline)
-    echo "${serial:-libreecho}" > "$G/strings/0x409/serialnumber"
-    echo LibreEcho > "$G/strings/0x409/manufacturer"
-    echo MT8163-ARM32-ADB > "$G/strings/0x409/product"
-    echo adb > "$G/configs/c.1/strings/0x409/configuration"
-    echo 120 > "$G/configs/c.1/MaxPower"
-    [ -e "$G/configs/c.1/ffs.adb" ] || \
-        $BB ln -s "$G/functions/ffs.adb" "$G/configs/c.1/ffs.adb"
-    log configfs-adb-composition-created
-
-    if $BB mount -t functionfs -o uid=2000,gid=2000 adb /dev/usb-ffs/adb 2>/tmp/functionfs.log; then
-        log functionfs-mounted
-        # Linux 6.1 is built with DAC as its security model and has no SELinux
-        # filesystem.  Passing Android's root_seclabel makes this static adbd
-        # exit before opening FunctionFS, so retain only its device banner.
-        # HW18 enables adbd's own bounded trace so UART can distinguish a
-        # missing transport thread from a FunctionFS endpoint failure.
-        export ADB_TRACE=all
-        /sbin/adbd --device_banner=device </dev/null >/tmp/adbd.log 2>&1 &
-        adbd_pid=$!
-        log "adbd-started:$adbd_pid"
-
-        i=0
-        while [ "$i" -lt 15 ]; do
-            if [ -e /dev/usb-ffs/adb/ep1 ] && [ -e /dev/usb-ffs/adb/ep2 ]; then
-                ffs_ready=1
-                break
-            fi
-            if ! $BB kill -0 "$adbd_pid" 2>/dev/null; then
-                wait "$adbd_pid" 2>/dev/null
-                log "adbd-exit-status:$?"
-                log adbd-exited-early
-                break
-            fi
-            $BB sleep 1
-            i=$((i + 1))
-        done
-
-        if [ "$ffs_ready" -eq 1 ]; then
-            log functionfs-ready
-            udc=
-            for candidate in /sys/class/udc/*; do
-                [ -e "$candidate" ] || continue
-                udc=${candidate##*/}
-                break
-            done
-            if [ -n "$udc" ] && echo "$udc" > "$G/UDC" 2>/tmp/configfs-udc-bind.err; then
-                log "configfs-udc-bound:$udc"
-                # Capture one bounded userspace snapshot after the host has had
-                # time to send CNXN.  Never loop: repeated ADB reconnects would
-                # otherwise flood the authoritative UART record.
-                (
-                    $BB sleep 8
-                    log adbd-diagnostic-begin
-                    if $BB kill -0 "$adbd_pid" 2>/dev/null; then
-                        for fd in /proc/"$adbd_pid"/fd/*; do
-                            [ -e "$fd" ] || continue
-                            target=$($BB readlink "$fd" 2>/dev/null)
-                            log "adbd-fd:${fd##*/}:$target"
-                        done
-                        for task in /proc/"$adbd_pid"/task/*; do
-                            [ -d "$task" ] || continue
-                            tid=${task##*/}
-                            comm=$($BB cat "$task/comm" 2>/dev/null)
-                            state=$($BB sed -n 's/^State:[[:space:]]*//p' "$task/status" 2>/dev/null)
-                            wchan=$($BB cat "$task/wchan" 2>/dev/null)
-                            log "adbd-task:$tid:$comm:$state:$wchan"
-                        done
-                    else
-                        log adbd-diagnostic-process-gone
-                    fi
-                    if [ -s /tmp/adbd.log ]; then
-                        $BB tail -n 40 /tmp/adbd.log | while IFS= read -r line; do
-                            log "adbd-log:$line"
-                        done
-                    else
-                        log adbd-log-empty
-                    fi
-                    log adbd-diagnostic-end
-                ) &
-            else
-                ffs_ready=0
-                log configfs-udc-bind-failed
-            fi
-        else
-            log functionfs-not-ready
-            [ -s /tmp/adbd.log ] && \
-                $BB tail -n 8 /tmp/adbd.log | $BB sed 's/^/<3>adbd: /' > /dev/kmsg 2>/dev/null
-        fi
-    else
-        log functionfs-mount-failed
-    fi
-else
-    log configfs-unavailable
-fi
-
 log init-ready-pid1-managed
 
-# Keep the one-shot activation manual even when a profile is packaged.  ADB
-# can create /tmp/wifi.request containing "start" after the operator has
-# captured the passive boot boundary.
+# The boot path activates the network above.  This supervisor additionally lets
+# ADB request an activation when the single-shot claim is still free, so an
+# operator can retry after capturing the passive boot boundary.
 wifi_request_loop &
 log wifi-request-supervisor-started
-
-# The recovery image's minimal userspace does not inherit Android's loopback
-# address.  Bring up IPv4 loopback before manual services such as the web
-# daemon bind to their safe 127.0.0.1 default.
-if $BB ifconfig lo 127.0.0.1 up >/tmp/loopback-config.log 2>&1; then
-    log loopback-configured
-else
-    log loopback-config-failed
-fi
 
 # The UI control plane is part of the image contract.  Start each daemon in a
 # fixed order once loopback exists; the init scripts remain idempotent and
@@ -848,19 +1685,386 @@ start_persisted_feature_services()
     return "$rc"
 }
 
+# The shared mDNS responder is boot-contained Platform infrastructure owned by
+# /etc/init.d/libreecho-mdnsd.init.  It is deliberately independent of feature
+# policy and of any AirPlay payload mount: Home Assistant discovery must work
+# when no AirPlay squashfs is installed.  Discovery degradation is reported but
+# never blocks the management UI or startup-ready, which stay separate gates.
+start_shared_discovery_runtime()
+{
+    case "$SERVICE_PROFILE" in
+        production) ;;
+        *)
+            log shared-discovery-runtime-skipped-diagnostic-profile
+            pmsg_marker mdns-skipped-diagnostic
+            return 0
+            ;;
+    esac
+    if [ ! -x /etc/init.d/libreecho-mdnsd.init ]; then
+        log shared-discovery-runtime-unavailable
+        pmsg_marker mdns-init-unavailable
+        return 0
+    fi
+    if /etc/init.d/libreecho-mdnsd.init start >/tmp/libreecho-mdnsd.init.log 2>&1; then
+        log shared-discovery-runtime-started
+        pmsg_marker mdns-started
+    else
+        log shared-discovery-runtime-degraded
+        pmsg_marker mdns-start-failed
+    fi
+    return 0
+}
+
+# Which slot is running. The bootloader on this family writes the suffix empty
+# (`androidboot.slot_suffix=_`), so the kernel command line frequently does not
+# say -- measured on the biscuit Dot, whose cmdline carries the key with no
+# value. The boot control block is then the only thing that knows, which is why
+# ota_health_confirm_worker already falls back to it after
+# running-slot-not-reported. Both the local-install adoption and the candidate
+# mount need the same answer, so they ask the same question.
+running_slot_id()
+{
+    slot_cmdline=${LIBREECHO_CMDLINE_FILE:-/proc/cmdline}
+    slot_bootctl=${LIBREECHO_BOOTCTL_TOOL:-/usr/local/sbin/libreecho-bootctl}
+    slot=$($BB sed -n 's/.*androidboot.slot_suffix=_\([ab]\).*/\1/p' \
+        "$slot_cmdline" 2>/dev/null | $BB head -n 1)
+    if [ -z "$slot" ] && [ -x "$slot_bootctl" ]; then
+        slot=$("$slot_bootctl" status 2>/dev/null |
+            $BB sed -n 's/^selected_slot=//p' | $BB head -n 1)
+    fi
+    case "$slot" in
+        a|b) printf '%s\n' "$slot" ;;
+    esac
+}
+
+# A TWRP install stages a complete tree, writes both boot slots and leaves the
+# release's OTA package on /data -- and stops there. Nothing that runs in
+# recovery can prepare the feature transaction: prepare-boot belongs to this
+# image, and the tree is only complete after the format. So the boot this image
+# is running adopts it, once, under a fingerprint strict enough that nothing
+# else can trigger it: the staged SIGNED manifest must name the exact boot image
+# that is running, which is what binds a staged tree to the install that made
+# it. An existing transaction, a non-OTA image profile, an unreadable manifest
+# or a boot hash that does not match is left alone for a human with the log.
+adopt_staged_local_install()
+{
+    # Environment overrides, the same way libreecho-feature-transaction
+    # exposes its own: this decision lives on the boot path and cannot be reached
+    # by any test that has to boot a device, so the paths it reads are named.
+    install_root=${LIBREECHO_INSTALL_ROOT:-/data/libreecho/update}
+    install_slot_a=${LIBREECHO_SLOT_A_DEVICE:-/dev/mmcblk0p10}
+    install_slot_b=${LIBREECHO_SLOT_B_DEVICE:-/dev/mmcblk0p11}
+    install_transaction=${LIBREECHO_TRANSACTION_TOOL:-/usr/local/sbin/libreecho-feature-transaction}
+    [ "$IMAGE_PROFILE" = ota ] || return 0
+    install_staging=$install_root/staging
+    [ -r "$install_staging/manifest" ] || return 0
+    [ -d "$install_staging/features" ] || return 0
+    for install_live in feature-commit pending installed; do
+        if [ -e "$install_root/$install_live" ]; then
+            # A transaction already exists: this tree is not unattended work.
+            log "local-install-transaction-present:$install_live"
+            return 0
+        fi
+    done
+    install_want=$($BB sed -n 's/^boot_sha256=//p' "$install_staging/manifest" 2>/dev/null |
+        $BB head -n 1)
+    case "$install_want" in
+        ''|*[!0-9a-f]*) log local-install-manifest-unreadable; return 0 ;;
+    esac
+    [ "${#install_want}" -eq 64 ] || { log local-install-manifest-unreadable; return 0; }
+    install_slot=$(running_slot_id)
+    case "$install_slot" in
+        a) install_device=$install_slot_a ;;
+        b) install_device=$install_slot_b ;;
+        *) log local-install-running-slot-unknown; return 0 ;;
+    esac
+    install_hash=$($BB sha256sum "$install_device" 2>/dev/null | $BB awk '{print $1}')
+    [ -n "$install_hash" ] || { log local-install-running-hash-unavailable; return 0; }
+    if [ "$install_hash" != "$install_want" ]; then
+        # The staged tree describes some other image. Adopting it would commit
+        # features against bytes this slot is not running.
+        log "local-install-staged-tree-mismatch:$install_slot"
+        return 0
+    fi
+    if [ ! -x "$install_transaction" ]; then
+        log local-install-transaction-unavailable
+        return 0
+    fi
+    log "local-install-adopting:$install_slot"
+    pmsg_marker local-install-adopting
+    # The transaction is prepared for the slot that is RUNNING, not for the
+    # other one: a TWRP install writes both slots and boots one of them, so
+    # `libreecho-update install` -- which models the OTA case and therefore
+    # targets `inactive_slot` -- would prepare a candidate the booted slot is
+    # not, and this boot would take the failed-candidate path. prepare-boot
+    # takes its slot from this file, and preflight is the free-space check the
+    # OTA path runs immediately before it.
+    if ! $BB printf '%s\n' "$install_slot" > "$install_root/transaction-slot.tmp"; then
+        log local-install-slot-write-failed
+        return 0
+    fi
+    if ! $BB mv "$install_root/transaction-slot.tmp" "$install_root/transaction-slot"; then
+        log local-install-slot-write-failed
+        $BB rm -f "$install_root/transaction-slot.tmp" 2>/dev/null
+        return 0
+    fi
+    if "$install_transaction" preflight "$install_staging/manifest" prewrite \
+            > /tmp/local-install.log 2>&1 &&
+       "$install_transaction" prepare-boot >> /tmp/local-install.log 2>&1; then
+        log local-install-prepared
+        pmsg_marker local-install-prepared
+        return 0
+    fi
+    # Services still start. A staged tree that will not prepare is reported, not
+    # turned into an appliance that cannot be reached without a serial console.
+    log local-install-prepare-failed
+    pmsg_marker local-install-preparation-failed
+    return 0
+}
+
+# A fresh install has nothing committed yet, and the service graph is gated on
+# the live feature tree: the reconciler reads
+# $DATA_ROOT/libreecho/features/<feature>, which stays empty until the
+# transaction commits. So the feature services are deferred, startup-ready is
+# never written, and the commit -- which waits for startup-ready before
+# confirming the slot -- never runs either. That deadlock is why a
+# TWRP-installed unit only came up completely on its second boot.
+#
+# Complete the commit on the boot that installed it. The candidate tree was just
+# validated for this running slot, and there is nothing to roll back to: this
+# path is scoped to a device with no installed record and no committed evidence,
+# so an upgrade, which has a base and a previous version worth falling back to,
+# keeps the confirm-then-commit sequence it has today.
+commit_fresh_install()
+{
+    install_root=${LIBREECHO_INSTALL_ROOT:-/data/libreecho/update}
+    install_bootctl=${LIBREECHO_BOOTCTL_TOOL:-/usr/local/sbin/libreecho-bootctl}
+    install_transaction_tool=${LIBREECHO_TRANSACTION_TOOL:-/usr/local/sbin/libreecho-feature-transaction}
+
+    [ "$IMAGE_PROFILE" = ota ] || return 0
+    [ -r "$install_root/pending" ] || return 0
+    [ -r "$install_root/feature-commit" ] || return 0
+    # Anything already committed means this is not a fresh install.
+    [ -e "$install_root/installed" ] && return 0
+    [ -e "$install_root/committed-manifest" ] && return 0
+    [ -e "$install_root/committed-manifest.sig" ] && return 0
+    [ -x "$install_transaction_tool" ] || return 0
+
+    fresh_slot=$(running_slot_id)
+    case "$fresh_slot" in
+        a|b) ;;
+        *) log fresh-commit-running-slot-unknown; return 0 ;;
+    esac
+    fresh_pending_slot=$($BB sed -n 's/^slot=//p' "$install_root/pending" 2>/dev/null | $BB head -n 1)
+    [ "$fresh_pending_slot" = "$fresh_slot" ] || {
+        # The prepared transaction belongs to another slot: this boot is the
+        # fallback path, not the install it describes.
+        log "fresh-commit-pending-slot-other:$fresh_slot"
+        return 0
+    }
+    [ -x "$install_bootctl" ] || return 0
+    # commit requires a confirmed slot and a boot-control readback, and on a
+    # fresh install the confirmation would otherwise happen later in this boot,
+    # after the commit has already been skipped.
+    "$install_bootctl" confirm "$fresh_slot" >/dev/null 2>&1 || {
+        log fresh-commit-bootctl-confirm-failed
+        return 0
+    }
+    $BB mkdir -p "$install_root/staging" 2>/dev/null
+    "$install_bootctl" status > "$install_root/staging/bootctl.readback" 2>/dev/null || {
+        log fresh-commit-bootctl-readback-failed
+        return 0
+    }
+    if ! "$install_transaction_tool" commit-after-confirm \
+            > /tmp/fresh-install-commit.log 2>&1; then
+        # Services still start: a staged set that will not commit is reported,
+        # and the existing confirm/commit path still gets its chance later.
+        log fresh-commit-rejected
+        pmsg_marker fresh-commit-rejected
+        return 0
+    fi
+    if ! "$install_transaction_tool" activate-committed \
+            >> /tmp/fresh-install-commit.log 2>&1; then
+        log fresh-commit-activation-rejected
+        pmsg_marker fresh-commit-activation-rejected
+        return 0
+    fi
+    log fresh-install-committed
+    pmsg_marker fresh-install-committed
+    return 0
+}
+
+# Issue #231: on the pinned chain LK always loads boot_a, so a rolled-back or
+# interrupted candidate can leave its image there while the committed
+# generation's image waits in the boot_b recovery copy. The transaction restores
+# it only on an exact signed-hash match; this boot is then running the wrong
+# kernel, so reboot once into the restored image instead of activating features
+# against it. The restored store matches on the next boot, so this cannot loop.
+restore_committed_boot_store()
+{
+    restore_output=$("$1" restore-boot-store 2>&1) || {
+        log "boot-store-restore-failed:$(printf '%s\n' "$restore_output" |
+            $BB sed -n 's/^ERROR://p' | $BB head -n 1 | $BB tr -cd 'A-Za-z0-9_:-')"
+        return 0
+    }
+    case "$restore_output" in
+        *BOOT_STORE_RESTORED*)
+            log boot-store-restored-rebooting
+            pmsg_marker boot-store-restored
+            $BB sync
+            $BB sleep 1
+            $BB reboot -f
+            ;;
+    esac
+    return 0
+}
+
+activate_feature_transaction()
+{
+    transaction=/usr/local/sbin/libreecho-feature-transaction
+    update=/data/libreecho/update
+    v3_schema=$($BB sed -n 's/^schema=//p' "$update/pending" 2>/dev/null)
+    if [ "$v3_schema" = 3 ] || [ -r "$update/current" ]; then
+        [ -x "$transaction" ] || return 1
+        if [ -r "$update/pending" ]; then
+            [ "$v3_schema" = 3 ] || { printf 'ERROR:legacy_manifest_unsupported\n'; return 1; }
+            v3_slot=$($BB sed -n 's/^slot=//p' "$update/pending")
+            v3_running=$(running_slot_id)
+            if [ "$v3_slot" != "$v3_running" ]; then
+                "$transaction" rollback || return 1
+            else
+                v3_bcb=$(/usr/local/sbin/libreecho-bootctl status) || return 1
+                v3_success=$(printf '%s\n' "$v3_bcb" | $BB sed -n "s/^slot_${v3_slot}_success=//p")
+                if [ "$v3_success" = 1 ]; then
+                    "$transaction" commit || return 1
+                else
+                    "$transaction" activate
+                    return $?
+                fi
+            fi
+        fi
+        restore_committed_boot_store "$transaction"
+        "$transaction" activate-committed
+        return $?
+    fi
+    adopt_staged_local_install
+    transaction=/usr/local/sbin/libreecho-feature-transaction
+    [ -x "$transaction" ] || return 0
+    update=/data/libreecho/update
+    journal=$update/feature-commit
+    journal_phase=
+    if [ -r "$journal" ]; then
+        journal_phase=$($BB sed -n 's/^phase=//p' "$journal" 2>/dev/null)
+    fi
+    if [ "$journal_phase" = installed ]; then
+        "$transaction" recover-installed || { log feature-transaction-cleanup-recovery-rejected; return 1; }
+    elif [ "$journal_phase" = confirmed ]; then
+        # A commit interrupted after the journal became 'confirmed' -- and after
+        # one or more staged files were already moved -- must be resumed here.
+        # The candidate activation path below still requires the pre-commit
+        # staging files, so it would fail and leave services blocked even though
+        # the BCB is confirmed. commit-after-confirm is idempotent and re-checks
+        # the BCB itself.
+        "$transaction" commit-after-confirm || { log feature-transaction-commit-resume-rejected; return 1; }
+    fi
+    if [ ! -r "$update/pending" ]; then
+        "$transaction" activate-committed || { log feature-transaction-committed-rejected; return 1; }
+        return 0
+    fi
+    schema=$($BB sed -n 's/^schema=//p' "$update/pending" 2>/dev/null)
+    [ "$schema" = 2 ] || return 0
+    pending_slot=$($BB sed -n 's/^slot=//p' "$update/pending" 2>/dev/null)
+    running_slot=$(running_slot_id)
+    [ "$running_slot" = "$pending_slot" ] || { log feature-transaction-fallback-canonical; return 0; }
+    $BB mkdir -p "$update/staging" || { log feature-transaction-staging-failed; return 1; }
+    if /usr/local/sbin/libreecho-bootctl status > "$update/staging/bootctl.readback" 2>/dev/null; then
+        if ! activation_error=$("$transaction" activate-mounts 2>&1); then
+            log feature-transaction-activation-rejected
+            pmsg_marker feature-activation-rejected
+            persist_failure_log feature-activation-rejected "$activation_error" >/dev/null 2>&1
+            return 1
+        fi
+        log feature-transaction-candidate-mounted
+        pmsg_marker feature-candidate-mounted
+        commit_fresh_install
+        return 0
+    fi
+    log feature-transaction-bcb-read-failed
+    pmsg_marker feature-bcb-read-failed
+    return 1
+}
+
+stop_ui_voice_owners()
+{
+    # No protocol selector: integration bit 1 selects only ESPHome. Do not
+    # rewrite voice_pipeline_mode; the saved Local/Custom selection survives.
+    stop_owners=wyomingd
+    if [ "${ha_enabled:-0}" -eq 1 ]; then
+        stop_owners="$stop_owners agentd sttd ttsd"
+    else
+        stop_owners="$stop_owners esphomed"
+    fi
+    for stop_owner in $stop_owners; do
+        stop_script=/etc/init.d/libreecho-$stop_owner.init
+        stop_pidfile=/var/run/libreecho-$stop_owner.pid
+        if [ -x "$stop_script" ]; then
+            "$stop_script" stop >/tmp/libreecho-"$stop_owner".stop.log 2>&1 || return 1
+            if "$stop_script" status >/dev/null 2>&1; then
+                log "ui-conflicting-owner-still-running:$stop_owner"
+                return 1
+            fi
+        fi
+        [ ! -e "$stop_pidfile" ] || {
+            log "ui-conflicting-owner-pid-present:$stop_owner"
+            return 1
+        }
+    done
+    return 0
+}
+
 start_ui_services()
 {
     [ -x /usr/local/sbin/libreecho-web ] || {
         log ui-services-not-installed
         return 0
     }
+    feature_degraded=0
+    feature_error=
+    if activation_error=$(activate_feature_transaction 2>&1); then
+        features_state=ready
+    else
+        feature_degraded=1
+        features_state=degraded
+        feature_error=$(printf '%s\n' "$activation_error" | $BB sed -n 's/^ERROR://p' | $BB head -n 1 | $BB tr -cd 'A-Za-z0-9_:-' | $BB cut -c 1-160)
+        [ -n "$feature_error" ] || feature_error=target_activation_failed
+        log ui-services-degraded-by-feature-transaction
+    fi
+    feature_status=/data/libreecho/update/features-status
+    $BB mkdir -p /data/libreecho/update
+    { printf 'features_state=%s\nfeatures_error=%s\n' "$features_state" "$feature_error"; } > "$feature_status.tmp" &&
+        $BB chmod 0600 "$feature_status.tmp" && $BB mv "$feature_status.tmp" "$feature_status"
+    config_migrate=${CONFIG_MIGRATE:-/usr/local/sbin/libreecho-config-migrate}
+    if [ -x "$config_migrate" ]; then
+        config_schema=1
+        config_tx=$($BB cat /data/libreecho/update/current 2>/dev/null)
+        if [ "$features_state" = ready ] && [ -r /data/libreecho/update/pending ]; then
+            config_tx=$($BB sed -n 's/^transaction_id=//p' /data/libreecho/update/pending)
+        fi
+        if [ -n "$config_tx" ]; then
+            case "$config_tx" in .|..|*[!A-Za-z0-9._+~:-]*) config_schema=unsupported;;
+                *) config_schema=$($BB sed -n 's/^config_schema=//p' "/data/libreecho/generations/$config_tx/target.manifest");;
+            esac
+        fi
+        "$config_migrate" "$config_schema" || log config-schema-degraded
+    fi
+
     apply_timezone
     $BB mkdir -p /var/run /var/log /var/log/libreecho /run/libreecho
-    if [ "$SERVICE_PROFILE" = production ] && [ "${DATA_CLEANUP_OK:-0}" -ne 1 ]; then
+    if [ "$feature_degraded" = 0 ] && [ "$SERVICE_PROFILE" = production ] && [ "${DATA_CLEANUP_OK:-0}" -ne 1 ]; then
         log ui-services-blocked-by-data-contract
         return 1
     fi
-    if [ "$SERVICE_PROFILE" = diagnostic ] || [ "$FEATURE_POLICY" = exclude ]; then
+    if [ "$feature_degraded" = 1 ] || [ "$SERVICE_PROFILE" = diagnostic ] || [ "$FEATURE_POLICY" = exclude ]; then
         services="logd timed web"
         if [ "$FEATURE_POLICY" = exclude ]; then
             log feature-services-excluded
@@ -883,24 +2087,49 @@ start_ui_services()
             [ "$FEATURE_POLICY" = community-noncommercial ]; then
         if [ "$ha_enabled" -eq 1 ]; then
             log ui-home-assistant-mode-enabled
-            services="logd networkd timed audiod micd ledd buttond btd wyomingd web"
+            services="logd networkd timed audiod micd waked ledd buttond btd timerd watchdogd"
+            services="$services airplayd radiod esphomed web"
         else
-            services="logd networkd timed audiod micd ledd buttond btd web"
+            services="logd networkd timed audiod micd waked"
+            services="$services ledd buttond btd timerd watchdogd"
+            services="$services airplayd radiod ttsd web"
         fi
         if [ "$FEATURE_POLICY" = community-noncommercial ]; then
             log ui-services-community-noncommercial-with-wakeword
         fi
     else
         if [ "$ha_enabled" -eq 1 ]; then
-            services="logd networkd timed audiod micd ledd buttond btd wyomingd web"
+            services="logd networkd timed audiod micd waked ledd buttond btd timerd watchdogd"
+            services="$services airplayd radiod esphomed web"
         else
-            services="logd networkd timed audiod micd ledd buttond btd web"
+            services="logd networkd timed audiod micd waked"
+            services="$services ledd buttond btd timerd watchdogd"
+            services="$services airplayd radiod ttsd web"
         fi
         log ui-services-redistributable-without-wakeword
     fi
     fi
+    # Deferred-contract snapshots are retained for the payload reconciler and
+    # its host contract checks:
+    # services="logd networkd timed audiod micd ledd buttond btd web"
+    # services="logd networkd timed audiod micd ledd buttond btd esphomed web"
+    stop_ui_voice_owners || return 1
+    start_shared_discovery_runtime
     log feature-services-deferred-until-staged
     for service in $services; do
+        # On a recovery boot the boot-path Wi-Fi worker may still be creating
+        # wlan0 when this graph starts.  Wait (bounded) for the worker's
+        # terminal outcome before starting networkd so its one-shot AP
+        # capability probe finds wlan0 instead of reporting the interface
+        # absent.  A worker that terminally failed or exceeded the bound is
+        # reported truthfully; the graph still starts networkd, whose other
+        # duties are unaffected.  This is a no-op on an ordinary boot (see
+        # recovery_radio_ready_wait).
+        if [ "$service" = networkd ]; then
+            if ! recovery_radio_ready_wait; then
+                log ui-networkd-radio-unavailable
+            fi
+        fi
         script="/etc/init.d/libreecho-$service.init"
         if [ -x "$script" ]; then
             if [ "$service" = web ] && [ "$SERVICE_PROFILE" = production ]; then
@@ -917,11 +2146,15 @@ start_ui_services()
             fi
             rc=$?
             log "ui-service-start:$service:$rc"
+            if [ "$service" = web ]; then
+                if [ "$rc" -eq 0 ]; then pmsg_marker web-start-ok; else pmsg_marker web-start-failed; fi
+            fi
         else
             log "ui-service-missing:$service"
         fi
     done
-    start_persisted_feature_services
+    [ "$feature_degraded" = 1 ] || start_persisted_feature_services
+    return 0
 }
 start_ui_services &
 log ui-services-autostart-started
@@ -929,10 +2162,541 @@ log ui-services-autostart-started
 ota_health_confirm_worker()
 {
     [ "$IMAGE_PROFILE" = ota ] || return 0
-    [ "$FEATURE_POLICY" != exclude ] || {
-        log ota-health-feature-validation-skipped-by-exclusion-policy
+
+    # Publish the terminal status for a rollback that has actually completed.
+    # Automatic finalization must leave a reader-visible record that the
+    # rollback finished, otherwise `libreecho-update status` and the web API
+    # keep reporting the failed candidate's last health check and a phantom
+    # reboot after the previously confirmed slot is already running again.
+    ota_rollback_publish_terminal()
+    {
+        rollback_failed_slot=$1
+        {
+            echo schema=1
+            echo state=rolled-back
+            echo progress=100
+            echo "detail=$rollback_failed_slot"
+        } > /data/libreecho/update/state.tmp &&
+            $BB mv /data/libreecho/update/state.tmp \
+                /data/libreecho/update/state || {
+                log ota-rollback-state-publish-failed
+                $BB rm -f /data/libreecho/update/state.tmp
+                return 1
+            }
+        # The failed candidate's last act is to leave the check record at
+        # `reboot-pending`.  That record is now false: the rollback completed
+        # and the device is running the previously confirmed slot, so without
+        # this the update check status stays frozen until the next scheduled
+        # check.  Rewrite it only when the newest checked version is the one
+        # that rolled back, so a record belonging to a different candidate is
+        # never relabelled.
+        rollback_version=$($BB sed -n 's/^version=//p' \
+            /data/libreecho/update/rolled-back 2>/dev/null)
+        if [ -n "$rollback_version" ] &&
+           [ "$($BB sed -n 's/^status=//p' /data/libreecho/update/check-status 2>/dev/null)" = reboot-pending ] &&
+           [ "$($BB sed -n 's/^latest_version=//p' /data/libreecho/update/check-status 2>/dev/null)" = "$rollback_version" ]; then
+            $BB sed 's/^status=reboot-pending$/status=update-held-after-rollback/' \
+                /data/libreecho/update/check-status \
+                > /data/libreecho/update/check-status.tmp &&
+                $BB mv /data/libreecho/update/check-status.tmp \
+                    /data/libreecho/update/check-status || {
+                    log ota-rollback-check-status-publish-failed
+                    $BB rm -f /data/libreecho/update/check-status.tmp
+                    return 1
+                }
+            log "ota-rollback-check-status-update-held-after-rollback:$rollback_version"
+        fi
+        $BB sync
+    }
+
+    # The recovery helper reports success by removing the transaction it
+    # validated.  Confirm that post-condition on the filesystem before
+    # claiming the rollback is finalized: a helper that exits early, or a
+    # refusal that still returns zero, must never be turned into a terminal
+    # status asserting that the live transaction is gone.
+    ota_v2_fallback_confirmed()
+    {
+        for rollback_live in pending feature-commit; do
+            [ ! -e "/data/libreecho/update/$rollback_live" ] || {
+                log "ota-v2-fallback-live-evidence-remains:$rollback_live"
+                return 1
+            }
+        done
+        [ ! -e /data/libreecho/update/staging ] || {
+            log ota-v2-fallback-staging-remains
+            return 1
+        }
+        [ -r /data/libreecho/update/rolled-back ] || {
+            log ota-v2-fallback-history-missing
+            return 1
+        }
         return 0
     }
+
+    # The recovery helper validates the rollback history before it acts on it,
+    # and only ever treats a bounded regular non-symlink as evidence, so the
+    # resume that authorizes the same removals from that record applies the
+    # same shape test before it reads a slot or a transaction id out of it.  A
+    # path that is a symlink -- for example one pointing at a surviving live
+    # record -- is never rollback evidence, let alone authorization to remove
+    # the records it names.  The caller decides which refusal to log.
+    ota_rollback_resume_history_bounded()
+    {
+        resume_history=/data/libreecho/update/rolled-back
+        [ -e "$resume_history" ] || [ -L "$resume_history" ] || return 1
+        [ -f "$resume_history" ] || return 1
+        [ ! -L "$resume_history" ] || return 1
+        resume_history_size=$($BB stat -c %s "$resume_history" 2>/dev/null)
+        case "$resume_history_size" in
+            ''|*[!0-9]*) return 1 ;;
+        esac
+        [ "$resume_history_size" -le 8192 ] || return 1
+        return 0
+    }
+
+    # A lock this worker holds is tagged with the boot it was taken in.  The
+    # install lock lives in persistent /data, and the update flow's own protocol
+    # has no answer for a holder that never released it -- and this worker can
+    # be that holder, because it runs on the boot after a power loss, which is
+    # exactly when another loss can land between taking the lock and releasing
+    # it.  An untagged lock (an installation, which never writes this tag) or
+    # one taken by this boot is never reclaimed; only this worker's own tag
+    # naming an earlier boot is.  The tag is required rather than best effort:
+    # a lock that cannot be tagged could not be recovered after a power loss,
+    # so it is given back instead of being held.
+    ota_rollback_resume_tag_lock()
+    {
+        [ -n "$resume_boot_id" ] || return 1
+        printf 'owner=rollback-resume\nboot_id=%s\n' "$resume_boot_id" \
+            > "$resume_lock/owner" 2>/dev/null
+    }
+
+    ota_rollback_resume_install_lock()
+    {
+        resume_lock=/data/libreecho/update/install.lock
+        if $BB mkdir "$resume_lock" 2>/dev/null; then
+            if ota_rollback_resume_tag_lock; then
+                return 0
+            fi
+            $BB rmdir "$resume_lock" 2>/dev/null
+            log ota-rollback-resume-lock-untagged
+            return 1
+        fi
+        # The lock is held.  Only this worker's own tag from an earlier boot is
+        # recoverable; anything else -- the flow's own lock, or one this boot
+        # took -- is an owner that has not finished.
+        [ "$($BB sed -n 's/^owner=//p' "$resume_lock/owner" 2>/dev/null)" = rollback-resume ] || {
+            log ota-rollback-resume-install-locked
+            return 1
+        }
+        resume_held_boot=$($BB sed -n 's/^boot_id=//p' "$resume_lock/owner" 2>/dev/null)
+        case "$resume_held_boot" in
+            ''|"$resume_boot_id")
+                log ota-rollback-resume-install-locked
+                return 1
+                ;;
+        esac
+        $BB rm -f "$resume_lock/owner" 2>/dev/null
+        $BB rmdir "$resume_lock" 2>/dev/null || {
+            log ota-rollback-resume-install-locked
+            return 1
+        }
+        $BB mkdir "$resume_lock" 2>/dev/null || {
+            log ota-rollback-resume-install-locked
+            return 1
+        }
+        if ota_rollback_resume_tag_lock; then
+            log ota-rollback-resume-lock-recovered
+            return 0
+        fi
+        $BB rmdir "$resume_lock" 2>/dev/null
+        log ota-rollback-resume-lock-untagged
+        return 1
+    }
+
+    # Both resumed removals act inside the update root the update flow stages
+    # into, so they are serialized with that flow under its own two locks, taken
+    # in the order the flow takes them: the boot-local fetch lock it holds while
+    # it downloads feature assets straight into the staging tree, then the
+    # persistent install lock it holds while it writes the transaction.  It
+    # releases the install lock before that download and re-takes it for the
+    # install, so the fetch lock is what protects a tree being written, and a
+    # fetch or installation in flight owns the tree until it finishes: this boot
+    # leaves the records unpublished for the next boot to retry instead of
+    # removing what it is writing.
+    ota_rollback_resume_lock()
+    {
+        $BB mkdir -p /run/libreecho 2>/dev/null
+        $BB mkdir /run/libreecho/fetch.lock 2>/dev/null || {
+            log ota-rollback-resume-fetch-locked
+            return 1
+        }
+        if ! ota_rollback_resume_install_lock; then
+            $BB rmdir /run/libreecho/fetch.lock 2>/dev/null
+            return 1
+        fi
+        return 0
+    }
+
+    ota_rollback_resume_unlock()
+    {
+        $BB rm -f /data/libreecho/update/install.lock/owner 2>/dev/null
+        $BB rmdir /data/libreecho/update/install.lock 2>/dev/null
+        $BB rmdir /run/libreecho/fetch.lock 2>/dev/null
+    }
+
+    # The recovery helper retires the transaction and only then removes its
+    # staging tree, and it refuses to run again once the transaction is gone,
+    # so an interruption between those two steps leaves a cleanup that no
+    # other production path finishes: without it a later boot would report
+    # neither a live transaction nor a finished rollback, on every boot.  A
+    # replacement for the legacy single-slot updater and the recovery runner
+    # both own the same tree, so the removal is validated the way the helper
+    # validates it -- a staging tree that is a symlink, is not a directory, or
+    # contains a symlink is left for recovery instead -- and it runs under the
+    # locks its caller took, which is what keeps a tree staged by a concurrent
+    # installation from being removed in this rollback's name.  Validation is
+    # separate from the removal so that a tree which cannot be validated is
+    # refused before anything else is read out of the update root.
+    ota_rollback_resume_staging_validate()
+    {
+        resume_staging=/data/libreecho/update/staging
+        [ -e "$resume_staging" ] || [ -L "$resume_staging" ] || return 0
+        if [ -L "$resume_staging" ] ||
+           [ ! -d "$resume_staging" ] ||
+           [ -n "$($BB find "$resume_staging" -type l -print -quit 2>/dev/null)" ]; then
+            log ota-rollback-resume-staging-unsafe
+            return 1
+        fi
+        return 0
+    }
+
+    ota_rollback_resume_staging_cleanup()
+    {
+        resume_staging=/data/libreecho/update/staging
+        [ -e "$resume_staging" ] || [ -L "$resume_staging" ] || return 0
+        $BB rm -rf "$resume_staging" || {
+            log ota-rollback-resume-staging-cleanup-failed
+            return 1
+        }
+        $BB sync
+        log ota-rollback-resume-staging-cleaned
+        return 0
+    }
+
+    # The helper retires the live transaction with one `rm -f` of the pending
+    # record and the feature commit, and it exits immediately once either is
+    # gone -- `fallback` and `abort-before-activation` both require the pair --
+    # so an interruption between those two unlinks leaves a one-sided record
+    # that no other production path finishes.  The consequence is permanent
+    # rather than cosmetic: the surviving feature commit is the durable v2
+    # journal, so the update flow refuses to stage anything else, and the
+    # resume below would never reach publication.  Only a record that carries
+    # the transaction id of the finalized `rolled-back` history is retired,
+    # and only while its other half is already gone: a complete pair is a live
+    # transaction, whose own rollback branch owns those records.  The records
+    # are only *checked* here -- nothing is removed until the rollback evidence
+    # below has proven, from the helper's own contracts, which transaction this
+    # residue is -- so a shaped-but-forged history record can never authorize
+    # the removal of a record whose identity was taken from it.
+    ota_rollback_resume_live_records_check()
+    {
+        resume_live_survivors=
+        [ ! -e /data/libreecho/update/pending ] ||
+            [ ! -e /data/libreecho/update/feature-commit ] || return 1
+        for resume_live in pending feature-commit; do
+            resume_live_path=/data/libreecho/update/$resume_live
+            [ -e "$resume_live_path" ] || [ -L "$resume_live_path" ] || continue
+            [ -f "$resume_live_path" ] && [ ! -L "$resume_live_path" ] || {
+                log "ota-rollback-resume-live-record-unsafe:$resume_live"
+                return 1
+            }
+            [ "$($BB sed -n 's/^transaction_id=//p' "$resume_live_path" 2>/dev/null)" = \
+                "$resume_transaction" ] || {
+                log "ota-rollback-resume-live-record-foreign:$resume_live"
+                return 1
+            }
+            resume_live_survivors="$resume_live_survivors $resume_live"
+        done
+        return 0
+    }
+
+    ota_rollback_resume_live_records_remove()
+    {
+        for resume_live in $resume_live_survivors; do
+            resume_live_path=/data/libreecho/update/$resume_live
+            $BB rm -f "$resume_live_path" || {
+                log "ota-rollback-resume-live-record-cleanup-failed:$resume_live"
+                return 1
+            }
+            $BB sync
+            log "ota-rollback-resume-live-record-cleaned:$resume_live"
+        done
+        return 0
+    }
+
+    # True while the update root still holds rollback residue: a one-sided live
+    # record, or a staged tree.  Nothing but residue needs evidence -- requiring
+    # it for a finalization that has nothing left to remove would strand the
+    # publication this path exists to complete.
+    ota_rollback_resume_residue()
+    {
+        for resume_residue in pending feature-commit; do
+            [ -e "/data/libreecho/update/$resume_residue" ] ||
+                [ -L "/data/libreecho/update/$resume_residue" ] || continue
+            return 0
+        done
+        resume_residue=/data/libreecho/update/staging
+        [ -e "$resume_residue" ] || [ -L "$resume_residue" ] || return 1
+        return 0
+    }
+
+    # The only authorization this worker accepts for removing a surviving live
+    # record or the staged tree is the packaged helper's read-only rollback
+    # evidence: the signed staged manifest, the durable prepared journal, the
+    # BCB the bootloader fell back from, and the untouched feature state.  The
+    # `rolled-back` record is inert history -- unsigned, in userdata, and
+    # replaceable by any writer -- so its shape and selected fields are never
+    # treated as authorization, and the evidence must name the same transaction
+    # and slot this boot's decision was taken against.  Anything unproven is
+    # refused and left exactly as it was found, for recovery.
+    ota_rollback_resume_rollback_evidence()
+    {
+        resume_evidence=$(/usr/local/sbin/libreecho-feature-transaction rollback-evidence 2>/dev/null) || {
+            log ota-rollback-resume-rollback-evidence-unproven
+            return 1
+        }
+        resume_evidence_transaction=$(printf '%s\n' "$resume_evidence" |
+            $BB sed -n 's/^rollback-evidence transaction_id=\([^ ]*\) slot=.*/\1/p')
+        resume_evidence_slot=$(printf '%s\n' "$resume_evidence" |
+            $BB sed -n 's/^rollback-evidence transaction_id=[^ ]* slot=\([^ ]*\)$/\1/p')
+        case "$resume_evidence_transaction:$resume_evidence_slot" in
+            *:|:*) log ota-rollback-resume-rollback-evidence-unproven; return 1 ;;
+        esac
+        [ "$resume_evidence_transaction" = "$resume_transaction" ] &&
+            [ "$resume_evidence_slot" = "$resume_slot" ] || {
+            log "ota-rollback-resume-rollback-evidence-mismatch:$resume_evidence_transaction:$resume_evidence_slot"
+            return 1
+        }
+        log "ota-rollback-resume-rollback-evidence-proven:$resume_transaction:$resume_slot"
+        return 0
+    }
+
+    # Every input the locked removals and the publication act on is read once
+    # more after the locks are taken, against the values this boot decided with:
+    # a history or progress record that was replaced while the boot was deciding
+    # must not be removed, published over, or used to authorize a removal.
+    ota_rollback_resume_records_unchanged()
+    {
+        [ "$($BB sed -n 's/^slot=//p' "$resume_history" 2>/dev/null)" = \
+            "$resume_slot" ] || {
+            log ota-rollback-resume-history-changed
+            return 1
+        }
+        [ "$($BB sed -n 's/^transaction_id=//p' "$resume_history" 2>/dev/null)" = \
+            "$resume_transaction" ] || {
+            log ota-rollback-resume-history-changed
+            return 1
+        }
+        [ "$($BB sed -n 's/^schema=//p' "$resume_history" 2>/dev/null)" = \
+            "$resume_schema" ] || {
+            log ota-rollback-resume-history-changed
+            return 1
+        }
+        [ "$($BB sed -n 's/^state=//p' /data/libreecho/update/state 2>/dev/null)" = \
+            "$resume_state" ] || {
+            log ota-rollback-resume-state-changed
+            return 1
+        }
+        return 0
+    }
+
+    # The terminal publication writes `state.tmp` and `check-status.tmp`, the
+    # same two staging paths a concurrent update check and install write, so a
+    # publication that is not already inside the flow's locks takes them for the
+    # same reason the cleanup does, in the flow's own order.  Whichever writer
+    # starts first finishes before the other can begin; a lock that is already
+    # held means a writer owns the update root until it finishes, so this boot
+    # leaves the records to the next one instead of racing it.
+    ota_rollback_publish_terminal_locked()
+    {
+        resume_boot_id=$($BB cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+        ota_rollback_resume_lock || return 1
+        ota_rollback_publish_terminal "$1"
+        resume_publish_rc=$?
+        ota_rollback_resume_unlock
+        return "$resume_publish_rc"
+    }
+
+    # A rollback retires the live transaction before its terminal records are
+    # published, so a power loss -- or a failed write -- in between leaves a
+    # device whose only remaining evidence is the finalized `rolled-back`
+    # history record.  No later boot re-enters the rollback branch, because the
+    # transaction that branch retires is already gone, so the interrupted
+    # cleanup and publication are completed here on every boot instead of
+    # waiting for an operator, until both records are written.  Fail closed: a
+    # live transaction keeps its own recovery path, and nothing is published
+    # unless the history record names the slot that actually rolled back.
+    ota_rollback_resume_terminal()
+    {
+        resume_state=$($BB sed -n 's/^state=//p' /data/libreecho/update/state 2>/dev/null)
+        case "$resume_state" in
+            restarting)
+                # The failed candidate's restart record: its terminal state was
+                # never published.
+                case "$($BB sed -n 's/^detail=//p' /data/libreecho/update/state 2>/dev/null)" in
+                    health-confirm-failed:*) ;;
+                    *) return 0 ;;
+                esac
+                ;;
+            rolled-back)
+                # The terminal state is in place, so only its check record can
+                # still be the frozen `reboot-pending` one.  A check record for
+                # any other candidate is left to the publisher, which refuses to
+                # relabel it.
+                [ "$($BB sed -n 's/^status=//p' /data/libreecho/update/check-status 2>/dev/null)" = reboot-pending ] ||
+                    return 0
+                ;;
+            reboot-pending|boot-validating)
+                # A candidate that crashes -- or loses power -- on its boots can
+                # exhaust its attempts before this worker reaches its restart
+                # record, so the last progress record the failed candidate left
+                # is either the installer's `reboot-pending` (written before the
+                # reboot into the candidate) or the `boot-validating` record this
+                # worker writes before its health checks.  Both are the failed
+                # candidate's own records, and the evidence that its transaction
+                # was retired is the finalized history record below, not this
+                # progress record -- which is exactly the state a completed
+                # confirmation overwrites (`state=installed`).
+                ;;
+            *)
+                # A healthy device, a first install, or a state this worker
+                # never wrote: leave it alone.
+                return 0
+                ;;
+        esac
+        # The helper only ever acts on a history record it validated as a
+        # bounded regular non-symlink, and this resume authorizes the same
+        # removals from that record, so it validates it the same way before it
+        # reads anything out of it: a path that is a symlink -- for example one
+        # pointing at the surviving live record -- or that is not a bounded
+        # regular file is never rollback evidence, let alone authorization to
+        # remove what it names.
+        if ! ota_rollback_resume_history_bounded; then
+            if [ -e "$resume_history" ] || [ -L "$resume_history" ]; then
+                log ota-rollback-resume-history-unsafe
+            else
+                log ota-rollback-resume-evidence-invalid
+            fi
+            return 0
+        fi
+        resume_slot=$($BB sed -n 's/^slot=//p' "$resume_history" 2>/dev/null)
+        case "$resume_slot" in
+            a|b) ;;
+            *)
+                log ota-rollback-resume-evidence-invalid
+                return 0
+                ;;
+        esac
+        # A rollback leaves the previously confirmed slot running, which is the
+        # pairing the rollback branch itself acts on: it retires the transaction
+        # only while the slot it staged is not the slot that booted.  A history
+        # record naming the slot that is running is therefore retained evidence
+        # of an earlier rollback -- or of a confirmation this device already
+        # finished -- and never a publication for this boot to complete.
+        [ "$resume_slot" != "$selected_slot" ] || {
+            log ota-rollback-resume-history-slot-still-selected
+            return 0
+        }
+        # Which transaction the finalized history names, so the one-sided live
+        # record left by an interrupted retirement can be matched to it.
+        resume_transaction=$($BB sed -n 's/^transaction_id=//p' "$resume_history" 2>/dev/null)
+        resume_schema=$($BB sed -n 's/^schema=//p' "$resume_history" 2>/dev/null)
+        if [ -n "$resume_transaction" ]; then
+            # The retirement and the staging tree are the two helper steps an
+            # interruption can cut short, and the helper will not resume
+            # either, so the terminal records are only published once both are
+            # finished -- or the boot retries.  Both steps remove something
+            # from the update root a concurrent installation stages into, so
+            # they run under that installation's own locks, and every input
+            # they act on is validated again under the lock: a lock that is
+            # already held, a history or progress record that was replaced
+            # while this boot was deciding, a staged shape the helper would
+            # refuse, or residue the packaged helper cannot prove is this
+            # rollback, all leave the records unpublished for the next boot
+            # instead of removing something this rollback does not own.  The
+            # boot id is what makes a lock this worker left behind by an earlier
+            # power loss recoverable instead of permanent.
+            resume_boot_id=$($BB cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+            ota_rollback_resume_lock || return 0
+            if ! ota_rollback_resume_history_bounded; then
+                log ota-rollback-resume-history-unsafe
+                ota_rollback_resume_unlock
+                return 0
+            fi
+            if ! ota_rollback_resume_records_unchanged; then
+                ota_rollback_resume_unlock
+                return 0
+            fi
+            if ota_rollback_resume_residue; then
+                if ! ota_rollback_resume_live_records_check ||
+                   ! ota_rollback_resume_staging_validate ||
+                   ! ota_rollback_resume_rollback_evidence; then
+                    ota_rollback_resume_unlock
+                    return 0
+                fi
+                if ! ota_rollback_resume_live_records_remove ||
+                   ! ota_rollback_resume_staging_cleanup; then
+                    ota_rollback_resume_unlock
+                    return 0
+                fi
+            fi
+            # Both locks are still held through the publication above: it writes
+            # the same `state.tmp`/`check-status.tmp` pair a concurrent check
+            # and install write, and the records it reads were revalidated under
+            # this same hold, so no other writer can rename over them between
+            # this boot's decision and the write.  Releasing here -- before the
+            # write -- is the race this hold exists to close.
+            if ota_rollback_publish_terminal "$resume_slot"; then
+                log "ota-rollback-terminal-publication-resumed:$resume_slot"
+            else
+                log ota-rollback-terminal-publication-retry-queued
+            fi
+            ota_rollback_resume_unlock
+            return 0
+        else
+            # A legacy schema-1 rollback retires its transaction by moving the
+            # pending record itself, so the record that survives an
+            # interruption carries no transaction id and has no durable v2
+            # journal beside it: the moved record is the rollback evidence and
+            # the publication below is the whole of the remaining step, so
+            # neither v2 cleanup is run for it -- the schema-1 branch does not
+            # run them either.  Anything else without a transaction id is not
+            # this worker's rollback record, and a surviving live record is a
+            # transaction whose own recovery path owns those records.
+            [ "$resume_schema" = 1 ] || {
+                log ota-rollback-resume-evidence-invalid
+                return 0
+            }
+            for resume_live in pending feature-commit; do
+                [ ! -e "/data/libreecho/update/$resume_live" ] || {
+                    log "ota-rollback-resume-live-record-present:$resume_live"
+                    return 0
+                }
+            done
+            log ota-rollback-resume-legacy-publication
+        fi
+        # The legacy record removes nothing, so it has no cleanup to serialize,
+        # but the publication itself is the same pair of staging paths and takes
+        # the flow's locks for the write.
+        if ota_rollback_publish_terminal_locked "$resume_slot"; then
+            log "ota-rollback-terminal-publication-resumed:$resume_slot"
+        else
+            log ota-rollback-terminal-publication-retry-queued
+        fi
+        return 0
+    }
+
     running_slot=$($BB sed -n \
         's/.*androidboot.slot_suffix=_\([ab]\).*/\1/p' /proc/cmdline)
     case "$running_slot" in
@@ -948,29 +2712,58 @@ ota_health_confirm_worker()
             ;;
     esac
 
+    # This boot may be the first one after an interrupted finalization, and
+    # every later boot would skip the rollback branch, so finish it before this
+    # boot decides what it is for.  It runs once the running slot is known, so
+    # the finalized history record it finds can be checked against the slot that
+    # actually booted.
+    ota_rollback_resume_terminal
+    bh_running=$running_slot
+    [ -n "$bh_running" ] || bh_running=-
+    bh_selected=$selected_slot
+    [ -n "$bh_selected" ] || bh_selected=-
+
     if [ -r /data/libreecho/update/pending ]; then
         CONFIRM_MODE=ota
         log ota-health-confirm-pending
+        pmsg_marker ota-health-pending
         pending_slot=$($BB sed -n 's/^slot=//p' /data/libreecho/update/pending)
+        bh_mode_value=ota
+        bh_pending=$pending_slot
+        [ -n "$bh_pending" ] || bh_pending=-
     else
-        if [ ! -r "$FIRST_INSTALL_MARKER" ] ||
-           [ "$($BB sed -n 's/^schema=//p' "$FIRST_INSTALL_MARKER")" != 1 ] ||
-           [ "$($BB sed -n 's/^mode=//p' "$FIRST_INSTALL_MARKER")" != first-install ] ||
-           [ "$($BB sed -n 's/^board=//p' "$FIRST_INSTALL_MARKER")" != radar_puffin ]; then
+        # A first install is a candidate confirmation: only a production boot
+        # opens that transaction and confirms it.  A diagnostic OTA boot runs
+        # the rollback half above -- there is no pending transaction here, so
+        # nothing is skipped -- and must not leave behind a first-install
+        # record it will never confirm.
+        [ "$SERVICE_PROFILE" = production ] || {
+            log ota-health-confirmation-skipped-non-production-profile
+            bh_skipped non-production-profile
+            return 0
+        }
+        if ! first_install_marker_matches; then
             log first-install-marker-absent-or-invalid
+            bh_mode_value=first-boot
+            bh_skipped first-install-marker-absent-or-invalid
             return 0
         fi
         CONFIRM_MODE=first-boot
+        bh_mode_value=first-boot
         case "$selected_slot" in
             a|b) ;;
             *)
                 log "first-boot-slot-unknown:$selected_slot"
+                bh_skipped first-boot-slot-unknown
                 return 0
                 ;;
         esac
         if [ "$(/usr/local/sbin/libreecho-bootctl status 2>/dev/null |
             $BB sed -n "s/^slot_${selected_slot}_success=//p")" = 1 ]; then
             log "first-boot-slot-already-confirmed:$selected_slot"
+            bh_state=confirmed
+            bh_last_check=none
+            bh_write
             return 0
         fi
         if [ "$selected_slot" = a ]; then
@@ -983,6 +2776,7 @@ ota_health_confirm_worker()
         case "$payload_hash" in
             ''|*[!0-9a-f]*)
                 log first-install-payload-hash-unavailable
+                bh_skipped first-install-payload-hash-unavailable
                 return 0
                 ;;
         esac
@@ -992,6 +2786,7 @@ ota_health_confirm_worker()
             recorded_hash=$($BB sed -n 's/^boot_sha256=//p' "$first_install_pending")
             if [ "$recorded_slot" != "$selected_slot" ] || [ "$recorded_hash" != "$payload_hash" ]; then
                 log first-install-transaction-invalid
+                bh_skipped first-install-transaction-invalid
                 return 0
             fi
         else
@@ -1004,6 +2799,7 @@ ota_health_confirm_worker()
             } > "$first_install_pending.tmp" &&
                 $BB mv "$first_install_pending.tmp" "$first_install_pending" || {
                     log first-install-transaction-write-failed
+                    bh_skipped first-install-transaction-write-failed
                     return 0
                 }
             $BB sync
@@ -1011,22 +2807,83 @@ ota_health_confirm_worker()
         fi
         log "first-boot-confirm-pending:$selected_slot"
         pending_slot=$selected_slot
+        bh_pending=-
     fi
+    bh_state=pending
+    bh_last_check=none
+    bh_write
     case "$pending_slot:$selected_slot" in
         a:a|b:b) ;;
         a:b|b:a)
+            if [ "$($BB sed -n 's/^schema=//p' /data/libreecho/update/pending 2>/dev/null)" = 2 ]; then
+                if [ -r /data/libreecho/update/feature-commit ]; then
+                    # The helper acts inside the update root a UI-triggered
+                    # check or install stages into: it records its fallback
+                    # history, retires the live pair, and only then removes the
+                    # staged tree, while `libreecho-update-fetch` may be holding
+                    # the boot-local fetch lock and downloading a replacement
+                    # tree into that same `staging` path.  Its removals would
+                    # therefore delete an active download, or leave a newly
+                    # prepared transaction without its staged artifacts, so the
+                    # whole sequence -- the bootctl readback written into
+                    # staging, `fallback` itself, and the postcondition that
+                    # validates it -- runs under the update flow's own two
+                    # locks, taken in the order it takes them, and they are held
+                    # through the terminal publication that follows, which
+                    # writes the same `state.tmp`/`check-status.tmp` pair a
+                    # concurrent writer renames.  A writer that already holds
+                    # them owns the update root until it finishes, so this boot
+                    # leaves the records to the next boot's resume instead of
+                    # racing it.
+                    resume_boot_id=$($BB cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+                    if ! ota_rollback_resume_lock; then
+                        log ota-v2-fallback-preserved-for-recovery
+                        return 0
+                    fi
+                    $BB mkdir -p /data/libreecho/update/staging
+                    if /usr/local/sbin/libreecho-bootctl status > /data/libreecho/update/staging/bootctl.readback 2>/dev/null &&
+                       /usr/local/sbin/libreecho-feature-transaction fallback &&
+                       ota_v2_fallback_confirmed; then
+                        # Both locks are still held across this write: the
+                        # publication is inside the same hold as the helper and
+                        # its postcondition, so no other writer can rename over
+                        # either record between this boot's decision and it.
+                        if ota_rollback_publish_terminal "$pending_slot"; then
+                            log "ota-v2-fallback-cleaned:$pending_slot:$selected_slot"
+                        else
+                            log ota-rollback-terminal-publication-retry-queued
+                        fi
+                        # Released exactly once, on every path out of the hold.
+                        ota_rollback_resume_unlock
+                        return 0
+                    fi
+                    # The helper refused, or its postcondition did not hold:
+                    # nothing was published, the records stay exactly as they
+                    # were found for recovery, and the locks are given back.
+                    ota_rollback_resume_unlock
+                fi
+                # The durable v2 journal is what makes a staged candidate
+                # prepared and activatable evidence.  Without it this record is
+                # the one-sided intent an interrupted intent publish leaves,
+                # which the update flow rebuilds on a retry -- not rollback
+                # evidence.  Retiring it as a rollback below would publish a
+                # finalization that never happened while the staged tree still
+                # holds the candidate, so fail closed and leave both records for
+                # recovery instead.
+                log ota-v2-fallback-preserved-for-recovery
+                return 0
+            fi
+            # A schema-1 transaction has no journal to retire; the pending
+            # record is itself the rollback evidence, so move it and publish
+            # the same terminal status -- under the same locks, for the same
+            # staged-path race.
             $BB mv /data/libreecho/update/pending \
                 /data/libreecho/update/rolled-back
-            {
-                echo schema=1
-                echo state=rolled-back
-                echo progress=100
-                echo "detail=$pending_slot"
-            } > /data/libreecho/update/state.tmp &&
-                $BB mv /data/libreecho/update/state.tmp \
-                    /data/libreecho/update/state
-            $BB sync
-            log "ota-rollback-complete:$pending_slot:$selected_slot"
+            if ota_rollback_publish_terminal_locked "$pending_slot"; then
+                log "ota-rollback-complete:$pending_slot:$selected_slot"
+            else
+                log ota-rollback-terminal-publication-retry-queued
+            fi
             return 0
             ;;
         *)
@@ -1034,6 +2891,32 @@ ota_health_confirm_worker()
             return 0
             ;;
     esac
+    # The exclusion policy disables candidate feature-health confirmation: an
+    # `exclude` image carries no feature graph to validate.  Rollback detection
+    # and finalization above are not feature health -- they retire a failed
+    # candidate's transaction and publish the rollback's terminal status -- so
+    # they must run for every supported policy.  Returning here instead of at
+    # the top of the worker is what keeps the accepted `exclude:diagnostic`
+    # combination installable: an earlier return skipped the fallback branch
+    # and the resumed cleanup, leaving `pending`/`feature-commit`/staging live
+    # forever, and `transaction_pending()` then rejects every later install.
+    [ "$FEATURE_POLICY" != exclude ] || {
+        log ota-health-feature-validation-skipped-by-exclusion-policy
+        bh_skipped feature-policy-exclude
+        return 0
+    }
+    # Candidate confirmation -- the health-probe progress record, the probes,
+    # the `confirm` call and the restart below -- is production-only.  The
+    # launcher starts this worker on every OTA boot because the rollback
+    # detection and finalization above run for every supported service profile,
+    # and it stops here: a diagnostic slot is deliberately left pending and
+    # unconfirmed for the operator to inspect and recover through the guarded
+    # OTA flow.
+    [ "$SERVICE_PROFILE" = production ] || {
+        log ota-health-confirmation-skipped-non-production-profile
+        bh_skipped non-production-profile
+        return 0
+    }
     if [ "$CONFIRM_MODE" = ota ]; then
         {
             echo schema=1
@@ -1077,8 +2960,20 @@ ota_health_confirm_worker()
                 's/.*"voice_pipeline_mode"[[:space:]]*:[[:space:]]*"\([a-z_-]*\)".*/\1/p' \
                 "$vp_config" 2>/dev/null | $BB head -n 1)
         fi
-        log "ota-health-voice-stack-absent:${vp_mode:-unknown}"
-        return 0
+        case "$vp_mode" in
+            custom|home-assistant)
+                log "ota-health-voice-stack-absent-remote:$vp_mode"
+                return 0
+                ;;
+            local|'')
+                log "ota-health-voice-stack-missing-local:${vp_mode:-unknown}"
+                return 1
+                ;;
+            *)
+                log "ota-health-voice-stack-mode-invalid:$vp_mode"
+                return 1
+                ;;
+        esac
     }
 
     startup_ready_marker_valid()
@@ -1116,6 +3011,18 @@ ota_health_confirm_worker()
         return 0
     }
 
+    shared_discovery_ready()
+    {
+        # The service wrapper now probes the supervisor's STATUS/1 contract,
+        # which is successful only when D-Bus, Avahi and the private bus socket
+        # are live. Keep the explicit host-visible socket check as a second
+        # independent assertion and use the actual chroot runtime path.
+        [ -x /etc/init.d/libreecho-mdnsd.init ] || return 1
+        /etc/init.d/libreecho-mdnsd.init status >/dev/null 2>&1 || return 1
+        [ -S "$MDNS_RUNTIME_ROOT/run/dbus/system_bus_socket" ] || return 1
+        return 0
+    }
+
     home_assistant_integration_enabled()
     {
         config=/data/libreecho/config/web-config.json
@@ -1129,6 +3036,31 @@ ota_health_confirm_worker()
             ''|*[!0-9]*) return 1 ;;
             *) [ $((integrations & 1)) -ne 0 ] ;;
         esac
+    }
+
+    esphome_service_ready()
+    {
+        [ -x /etc/init.d/libreecho-esphomed.init ] || return 1
+        /etc/init.d/libreecho-esphomed.init status >/dev/null 2>&1 || return 1
+        esp_pidfile=/var/run/libreecho-esphomed.pid
+        [ -s "$esp_pidfile" ] || return 1
+        esp_pid=$($BB sed -n '1p' "$esp_pidfile" 2>/dev/null)
+        case "$esp_pid" in ''|*[!0-9]*|0|1) return 1 ;; esac
+        $BB kill -0 "$esp_pid" 2>/dev/null || return 1
+        [ "$($BB readlink "/proc/$esp_pid/exe" 2>/dev/null)" = /usr/local/sbin/libreecho-esphomed ] || return 1
+        # A listener belonging to a different process must not confirm this slot.
+        for esp_table in "/proc/net/tcp" "/proc/net/tcp6"; do
+            [ -r "$esp_table" ] || continue
+            esp_inodes=$($BB awk -v port=17A5 \
+                '$4 == "0A" && $2 ~ (":" port "$") && $10 != "0" { print $10 }' \
+                "$esp_table" 2>/dev/null) || return 1
+            for esp_inode in $esp_inodes; do
+                for esp_fd in "/proc/$esp_pid/fd/"*; do
+                    [ "$($BB readlink "$esp_fd" 2>/dev/null)" = "socket:[$esp_inode]" ] && return 0
+                done
+            done
+        done
+        return 1
     }
 
     ota_health_services_ready()
@@ -1158,10 +3090,23 @@ ota_health_confirm_worker()
                 "$health_config" 2>/dev/null | $BB head -n 1)
         fi
         case "$health_integrations" in
-            ''|*[!0-9]*) health_airplay_enabled=1 ;;
+            ''|*[!0-9]*)
+                # An unreadable config keeps the historical fail-closed graph.
+                health_airplay_enabled=1
+                health_discovery_enabled=1
+                ;;
             *)
                 health_airplay_enabled=0
+                health_discovery_enabled=0
                 [ $((health_integrations & 16)) -ne 0 ] && health_airplay_enabled=1
+                # Home Assistant discovery no longer derives its requirement
+                # from the AirPlay audio bit: the boot-contained shared
+                # responder provides discovery, so an HA-selected system with
+                # no AirPlay payload must not be asked for airplay.sock or the
+                # AirPlay squashfs.  A both-off system waits for no consumer
+                # registration at all.
+                [ $((health_integrations & 1)) -ne 0 ] && health_discovery_enabled=1
+                [ "$health_airplay_enabled" -eq 1 ] && health_discovery_enabled=1
                 ;;
         esac
         if [ "$health_airplay_enabled" -eq 1 ]; then
@@ -1170,25 +3115,19 @@ ota_health_confirm_worker()
                 return 1
             }
         fi
+        if [ "$health_discovery_enabled" -eq 1 ]; then
+            shared_discovery_ready || {
+                log ota-health-shared-discovery-not-ready
+                pmsg_marker mdns-health-not-ready
+                return 1
+            }
+        fi
         led_handoff_ready || return 1
         if home_assistant_integration_enabled; then
-            wyoming_pidfile=/var/run/libreecho-wyomingd.pid
-            [ -s "$wyoming_pidfile" ] || {
-                log ota-health-services-not-ready:wyomingd
+            esphome_service_ready || {
+                log ota-health-services-not-ready:esphomed
                 return 1
             }
-            wyoming_pid=$($BB sed -n '1p' "$wyoming_pidfile" 2>/dev/null)
-            case "$wyoming_pid" in ''|*[!0-9]*) return 1 ;; esac
-            $BB kill -0 "$wyoming_pid" 2>/dev/null || {
-                log ota-health-services-not-ready:wyomingd
-                return 1
-            }
-            $BB awk -v port=29CC \
-                '$4 == "0A" && $2 ~ (":" port "$") { found=1 } END { exit found ? 0 : 1 }' \
-                /proc/net/tcp 2>/dev/null || {
-                    log ota-health-services-not-ready:wyomingd
-                    return 1
-                }
             return 0
         fi
         if [ -S /run/libreecho/stt.sock ] &&
@@ -1214,40 +3153,106 @@ ota_health_confirm_worker()
         if voice_stack_absent; then
             return 0
         fi
+        # A device whose voice pipeline is served by remote Wyoming endpoints
+        # never mounts the local stt/tts/assistant features, so none of the
+        # sockets above can exist and neither branch can ever pass.  Requiring
+        # them would make every OTA on such a device fail confirmation and roll
+        # back, even when the image is completely healthy.  Voice is not what
+        # makes a slot recoverable -- /data, networking and the web/API plane
+        # are, and those are already checked.
+        if voice_stack_absent; then
+            return 0
+        fi
         log ota-health-services-not-ready:voice-sockets
         return 1
     }
 
-    # Require the persistent filesystem, ADB control plane, web service, and
-    # complete selected service graph to remain healthy across three probes
-    # before making the slot permanent.
-    $BB sleep 45
+    # Do not spend the bounded confirmation attempts on services that are still
+    # in their normal boot sequence. The web init script publishes STARTUP_READY
+    # only after the selected core graph is ready, so wait for that boundary
+    # first. The previous fixed 45-second delay began consuming attempts while
+    # 0.14 was still starting, which hardware evidence showed as three early
+    # web-status failures before the daemon became healthy.
     attempt=0
     passed=0
     last_check=unknown
-    while [ "$attempt" -lt 6 ] && [ "$passed" -lt 3 ]; do
-        attempt=$((attempt + 1))
-        if ! $BB grep -q ' /data ' /proc/mounts 2>/dev/null; then
-            last_check=data-mount
-        elif [ "${ffs_ready:-0}" -ne 1 ]; then
-            last_check=ffs-ready
-        elif ! /etc/init.d/libreecho-web.init status >/dev/null 2>&1; then
-            last_check=web-status
-        elif ! ota_health_services_ready; then
-            last_check=services-ready
-        else
-            last_check=none
-        fi
-        if [ "$last_check" != none ]; then
-            passed=0
-            log "ota-health-probe-failed:$attempt:$last_check"
-            $BB sleep 30
-            continue
-        fi
-        passed=$((passed + 1))
-        log "ota-health-probe-passed:$passed"
-        [ "$passed" -lt 3 ] && $BB sleep 15
+    strict_graph=0
+    startup_wait=0
+    log ota-health-waiting-startup-ready
+    pmsg_marker ota-waiting-startup-ready
+    while ! startup_ready_marker_valid && [ "$startup_wait" -lt 180 ]; do
+        $BB sleep 5
+        startup_wait=$((startup_wait + 5))
     done
+    # Require the health a slot confirmation is entitled to, held stable across
+    # three probes, before making the slot permanent.
+    #
+    # A fresh install is gated on the boot/recovery plane only: it has no
+    # previously confirmed slot to fall back to, so a failed *optional*
+    # application service -- or a startup-ready marker that never appears
+    # because one of them failed -- must not be able to expire the only
+    # recoverable slot (platform #60, LibreEcho#28/#180).  The complete selected
+    # service graph stays the stricter OTA acceptance gate, where a rollback
+    # target does exist.
+    if ! startup_ready_marker_valid && [ "$CONFIRM_MODE" != first-boot ]; then
+        last_check=startup-ready
+        log ota-health-startup-ready-timeout
+        pmsg_marker ota-startup-ready-timeout
+    else
+        if startup_ready_marker_valid; then
+            log "ota-health-startup-ready:$startup_wait"
+            pmsg_marker ota-startup-ready
+        else
+            log first-boot-startup-ready-timeout-degraded
+            pmsg_marker first-boot-startup-ready-degraded
+        fi
+        while [ "$attempt" -lt 6 ] && [ "$passed" -lt 3 ]; do
+            attempt=$((attempt + 1))
+            probe_ok=1
+            if ! $BB grep -q ' /data ' /proc/mounts 2>/dev/null; then
+                last_check=data-mount
+                probe_ok=0
+            elif [ "$adbd_tcp_configured" -eq 1 ] && ! adb_tcp_ready; then
+                last_check=adb-tcp-ready
+                probe_ok=0
+            elif [ "$adbd_tcp_configured" -ne 1 ] && [ "${ffs_ready:-0}" -ne 1 ]; then
+                last_check=ffs-ready
+                probe_ok=0
+            elif ! /etc/init.d/libreecho-web.init status >/dev/null 2>&1; then
+                last_check=web-status
+                probe_ok=0
+            elif ota_health_services_ready; then
+                last_check=none
+                strict_graph=1
+            elif [ "$CONFIRM_MODE" = first-boot ]; then
+                last_check=services-degraded
+            else
+                last_check=services-ready
+                probe_ok=0
+            fi
+            bh_attempt=$attempt
+            bh_passed=$passed
+            bh_last_check=$last_check
+            bh_strict=$strict_graph
+            bh_state=pending
+            bh_write
+            if [ "$probe_ok" -ne 1 ]; then
+                passed=0
+                log "ota-health-probe-failed:$attempt:$last_check"
+                pmsg_marker "ota-probe-failed-$last_check"
+                $BB sleep 30
+                continue
+            fi
+            if [ "$last_check" = services-degraded ]; then
+                log "first-boot-probe-passed-degraded:$attempt"
+                pmsg_marker first-boot-probe-passed-degraded
+            fi
+            passed=$((passed + 1))
+            log "ota-health-probe-passed:$passed"
+            pmsg_marker "ota-probe-passed-$passed"
+            [ "$passed" -lt 3 ] && $BB sleep 15
+        done
+    fi
 
     if [ "$CONFIRM_MODE" = first-boot ]; then
         if [ "$passed" -eq 3 ] &&
@@ -1261,25 +3266,51 @@ ota_health_confirm_worker()
                 $BB rm -f /data/libreecho/update/first-install.pending
                 $BB sync
                 log "first-boot-slot-confirmed:$selected_slot"
+                pmsg_marker first-boot-confirmed
+                bh_state=confirmed
+                bh_last_check=none
+                bh_write
                 return 0
             fi
             $BB rm -f "$first_install_confirmed"
             log first-install-confirmation-record-finalization-failed
+            bh_state=confirmed
+            bh_last_check=confirmation-record-finalization-failed
+            bh_write
             return 0
         fi
         # Never restart after a failed first boot: there is no previously
         # confirmed slot to fall back to, so a reboot could only repeat this
         # outcome and would burn the remaining try counter.
         log "first-boot-confirm-failed:$last_check"
+        pmsg_marker "first-boot-confirm-failed-$last_check"
+        bh_state=failed
+        bh_last_check=$last_check
+        bh_write
         return 0
     fi
 
     if [ "$passed" -eq 3 ] &&
        /usr/local/sbin/libreecho-update confirm >/tmp/ota-confirm.log 2>&1; then
         log ota-slot-confirmed
+        pmsg_marker ota-slot-confirmed
+        bh_state=confirmed
+        bh_last_check=none
+        bh_write
         return 0
     fi
+    confirm_detail=
+    if [ "$passed" -eq 3 ]; then
+        last_check=ota-confirm
+        confirm_detail=$(ota_confirm_error_token /tmp/ota-confirm.log)
+    fi
     log ota-health-confirm-failed-rebooting
+    pmsg_marker "ota-confirm-failed-$last_check"
+    bh_state=restarting
+    bh_last_check=$last_check
+    bh_write
+    failure_log=$(persist_failure_log ota-health-confirm-failed \
+        "$last_check${confirm_detail:+:$confirm_detail}" 2>/dev/null) || failure_log=
     # Issue #41: leave persistent evidence for why this worker restarted the
     # device.  The record lives on the persistent userdata filesystem (not
     # tmpfs), is written atomically and synced before the reboot, and is
@@ -1294,6 +3325,7 @@ ota_health_confirm_worker()
         echo pending_slot=$pending_slot
         echo selected_slot=$selected_slot
         echo epoch=$(date -u +%s)
+        echo "failure_log=${failure_log:-none}"
     } > /data/libreecho/update/restart-record.tmp &&
         $BB mv /data/libreecho/update/restart-record.tmp \
             /data/libreecho/update/restart-record
@@ -1305,16 +3337,30 @@ ota_health_confirm_worker()
     } > /data/libreecho/update/state.tmp &&
         $BB mv /data/libreecho/update/state.tmp /data/libreecho/update/state
     $BB sync
+    pmsg_marker ota-rebooting-after-health-failure
     $BB sleep 2
     $BB reboot -f
 }
-if [ "$IMAGE_PROFILE" = ota ] && [ "$SERVICE_PROFILE" = production ]; then
+# The worker is launched for every OTA boot, not only a production one.  Its
+# rollback half is not candidate health: retiring a failed candidate's
+# transaction and publishing the rollback's terminal status must run on the
+# boot after the bootloader fell back whatever the service profile is, or
+# `pending`, `feature-commit` and the staged tree stay live and the update
+# flow's `transaction_pending()` then rejects every later installation.  The
+# candidate-confirmation half stays production-only inside the worker, so a
+# diagnostic slot is still left pending and unconfirmed for the operator.
+if [ "$IMAGE_PROFILE" = ota ]; then
     ota_health_confirm_worker &
     log ota-background-worker-started
+    # Anonymous weekly active-device count (telemetry Tier 0).  Independent of
+    # the updater and never blocks boot: the sender sleeps 5-30 minutes before
+    # its first attempt and only sends once the clock is NTP-synchronised.
+    if [ -x /usr/local/sbin/libreecho-ping ]; then
+        /usr/local/sbin/libreecho-ping loop >/dev/null 2>&1 &
+        log active-device-ping-started
+    fi
 else
-    # Keep diagnostic slots pending and unconfirmed.  The operator can inspect
-    # and recover them through the guarded OTA flow after collecting evidence.
-    log ota-background-workers-disabled-for-diagnostic-profile
+    log ota-background-workers-disabled-for-non-ota-profile
 fi
 
 # Audio playback is always user-initiated.  In particular, boot must never
@@ -1323,21 +3369,9 @@ fi
 # an old audio asset is accidentally present in an overlay or persistent store.
 log audio-startup-disabled
 
-# Connectivity is launched only after the ADB/FunctionFS control plane is
-# ready (HW61, matching the verified 3.18 baseline).  A profile-bearing image
-# performs one bounded Wi-Fi activation; a failed activation is recorded but
-# never takes PID 1 or the recovery runner down.  When USB diagnostic mode is
-# active, connectivity stays manual/single-shot.
-if [ "${VENDOR_ASSETS_OK:-0}" -ne 1 ]; then
-    log wifi-network-skipped-vendor-assets-unavailable
-elif [ "$SERVICE_PROFILE" = diagnostic ]; then
-    log wifi-network-policy-manual-single-shot
-elif [ "${ffs_ready:-0}" -eq 1 ]; then
-    start_wifi_network &
-    log wifi-network-worker-started-after-adb
-else
-    log wifi-network-skipped-adb-not-ready
-fi
+# The single automatic connectivity activation runs on the boot path above.
+# Nothing here starts the network, so a profile-bearing image cannot launch it
+# twice; the diagnostic/manual policy is enforced at that one site.
 
 # Android init remains PID 1.  Keep this service alive so the runme loop and
 # recovery diagnostics survive optional driver failures.

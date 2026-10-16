@@ -53,6 +53,19 @@ REQUIRED_PARTITIONS="boot_a boot_b userdata misc cache system_a"
 RECEIPT=/cache/libreecho-install-receipt
 LOG=/cache/libreecho-install.log
 DRY_RUN_FLAG=/cache/libreecho-install-dry-run
+# The two trees this installer writes inside the formatted userdata. They are
+# the same paths the OS's feature transaction uses, so the names live here
+# rather than at each use site: a typo in one of them stages a tree nothing will
+# ever read.
+LIVE_UPDATE=/data/libreecho/update
+STAGING=$LIVE_UPDATE/staging
+LIVE_FEATURES=/data/libreecho/features
+LIVE_GENERATIONS=/data/libreecho/generations
+# Where the release's OTA tar is left for the device-side local install. The OS
+# cannot read /cache, so this has to live on /data to survive into the boot that
+# completes the transaction.
+LOCAL_PACKAGE="$LIVE_UPDATE/incoming/local-install.ota.tar"
+LOCAL_PACKAGE_MAX_BYTES=33554432          # libreecho-update refuses more
 BUNDLE_DIR=""
 DRY_RUN=0
 
@@ -94,6 +107,81 @@ receipt_reset() {
     fi
 }
 
+# --- target identity ---------------------------------------------------------
+# Boot-chain tokens differ only in case between sources: fastboot/LK reports
+# RADAR/BISCUIT, while the Amonet TWRP builds set ro.product.device and
+# ro.build.product to radar/biscuit. Compare case-insensitively against the
+# target's fastboot products; also accept the exact target id.
+product_matches() {
+    pm_upper=$(printf '%s' "$1" | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')
+    case ",$FASTBOOT_PRODUCTS," in *",$pm_upper,"*) return 0 ;; esac
+    [ "$1" = "$TARGET" ]
+}
+
+check_target() {
+    TARGET=$(sed -n 's/^target=//p' "$BUNDLE_MANIFEST")
+    bundle_device=$(sed -n 's/^device=//p' "$BUNDLE_MANIFEST")
+    FASTBOOT_PRODUCTS=$(sed -n 's/^fastboot_products=//p' "$BUNDLE_MANIFEST")
+    # Older Radar bundles predate the additive identity lines.
+    if [ -z "$TARGET" ] && [ "$bundle_device" = radar_puffin ]; then
+        TARGET=radar_puffin
+        FASTBOOT_PRODUCTS=RADAR
+        ui_print "target-line=missing fallback=radar_puffin"
+    fi
+    receipt_set "target=$TARGET"
+    [ "$bundle_device" = "$TARGET" ] || die "bundle target/device mismatch"
+    case "$TARGET:$FASTBOOT_PRODUCTS" in
+        radar_puffin:RADAR|biscuit:BISCUIT) ;;
+        *) die "unknown target or fastboot product contract: $TARGET:$FASTBOOT_PRODUCTS" ;;
+    esac
+    # An OS identity is normally unavailable in TWRP. Never infer the installed
+    # target from TWRP's default properties or try to mount a current boot slot.
+    if [ -e /etc/libreecho/target ] || [ -L /etc/libreecho/target ]; then
+        [ -f /etc/libreecho/target ] && [ ! -L /etc/libreecho/target ] || die "running target is not regular"
+        running_target=$(sed -n 's/^target_id=//p' /etc/libreecho/target)
+        ui_print "running-image-target=$running_target"
+        [ "$running_target" = "$TARGET" ] || die "running image target mismatch"
+    fi
+    product_found=0
+    product_mismatch=0
+    for product_prop in ro.boot.product ro.product.device ro.build.product; do
+        product_value=$(getprop "$product_prop" 2>/dev/null)
+        ui_print "target-product-source=$product_prop value=${product_value:-<empty>}"
+        [ -n "$product_value" ] || continue
+        product_found=1
+        product_matches "$product_value" || product_mismatch=1
+    done
+    # Only product/device fields are board tokens. androidboot.hardware is a
+    # SoC (mt8163), and serial/slot fields are not product identities.
+    for product_field in $(cat /proc/cmdline 2>/dev/null); do
+        case "$product_field" in
+            androidboot.product=*|androidboot.product.device=*|androidboot.build.product=*|androidboot.device=*)
+                product_value=${product_field#*=}
+                ui_print "target-product-source=${product_field%%=*} value=${product_value:-<empty>}"
+                [ -n "$product_value" ] || continue
+                product_found=1
+                product_matches "$product_value" || product_mismatch=1
+                ;;
+        esac
+    done
+    TARGET_CHECK=match
+    if [ "$product_found" = 0 ]; then
+        TARGET_CHECK=unknown
+        ui_print "target-check=unknown"
+    elif [ "$product_mismatch" = 1 ]; then
+        if [ -e /cache/libreecho-allow-cross-target ]; then
+            TARGET_CHECK=override
+            ui_print "WARNING: CROSS-TARGET OPERATOR OVERRIDE; boot-chain identity differs from target $TARGET"
+            receipt_set "target_override=1" "target_override_marker=/cache/libreecho-allow-cross-target"
+        else
+            receipt_set "target_check=mismatch"
+            die "boot-chain product does not match $TARGET; explicit /cache/libreecho-allow-cross-target required"
+        fi
+    fi
+    receipt_set "target_check=$TARGET_CHECK"
+    ui_print "target-check=$TARGET_CHECK target=$TARGET"
+}
+
 # --- partition helpers ------------------------------------------------------
 # /dev/block/by-name exists in recovery but NOT in the installed OS, which
 # resolves partitions through sysfs PARTNAME. Resolve by PARTNAME first so the
@@ -133,6 +221,54 @@ partition_number() {
     echo "$base" | sed -n 's/^mmcblk0p\([0-9]*\)$/\1/p'
 }
 
+bundle_source_is_userdata() {
+    # True when "$1" lives on the same block device as userdata. The legacy
+    # flow formats userdata, so a legacy bundle staged on userdata is destroyed
+    # by the format step it must survive; the browser's direct-userdata protocol
+    # is the path for payloads that come from userdata, not this one.
+    #
+    # Fail-closed: /data and /sdcard are rejected lexically, and a mount source
+    # that cannot be resolved to a *different* raw mmcblk0 partition is refused
+    # too - a device-mapper/FBE, overlay, bind or loop source may still be
+    # userdata behind indirection, and assuming otherwise destroys the bundle.
+    bsu_path=$1
+    [ -n "$bsu_path" ] || return 1
+    case "$bsu_path" in
+        /data|/data/*|/sdcard|/sdcard/*) return 0 ;;
+    esac
+    bsu_mounts=${LIBREECHO_MOUNTS_FILE:-/proc/mounts}
+    bsu_ud=$(partition_node userdata 2>/dev/null) || return 1
+    [ -n "$bsu_ud" ] || return 1
+    # Longest mount point that is a prefix of the path wins.
+    bsu_dev=
+    bsu_best=0
+    while read -r bsu_line; do
+        bsu_mp=$(printf '%s\n' "$bsu_line" | awk '{ print $2 }')
+        case "$bsu_mp" in ''|/proc*|/sys*|/dev*) continue ;; esac
+        case "$bsu_path" in
+            "$bsu_mp"|"$bsu_mp"/*)
+                bsu_len=${#bsu_mp}
+                if [ "$bsu_len" -gt "$bsu_best" ]; then
+                    bsu_best=$bsu_len
+                    bsu_dev=$(printf '%s\n' "$bsu_line" | awk '{ print $1 }')
+                fi
+                ;;
+        esac
+    done < "$bsu_mounts"
+    [ -n "$bsu_dev" ] || return 1
+    # Resolve a by-name link before judging the source.
+    case "$bsu_dev" in
+        /dev/block/by-name/*) bsu_dev=$(part_node "$bsu_dev") ;;
+    esac
+    # Only a source proven to be a raw mmcblk0 partition can be compared; any
+    # other source is unresolved and therefore refused (fail closed).
+    case "$bsu_dev" in
+        /dev/block/mmcblk0p*) ;;
+        *) return 0 ;;
+    esac
+    [ "$(part_node "$bsu_dev")" = "$(part_node "$bsu_ud")" ]
+}
+
 sha256_of() {
     /sbin/sha256sum "$1" 2>/dev/null | awk '{print $1}'
 }
@@ -169,7 +305,8 @@ verify_pair() {
     vp_want=$2
     vp_label=$3
     vp_path="$BUNDLE_DIR/$vp_file"
-    [ -f "$vp_path" ] || die "$vp_label missing: $vp_file"
+    case "$vp_file" in ''|.*|*[!A-Za-z0-9._+-]*) die "unsafe $vp_label filename: $vp_file" ;; esac
+    [ -f "$vp_path" ] && [ ! -L "$vp_path" ] || die "$vp_label missing or not regular: $vp_file"
     vp_got=$(sha256_of "$vp_path")
     if [ "$vp_got" != "$vp_want" ]; then
         die "$vp_label digest mismatch: $vp_file (got $vp_got want $vp_want)"
@@ -185,8 +322,10 @@ field() {
 check_payloads() {
     ui_print "Verifying payloads against the manifest"
     [ -n "$BUNDLE_DIR" ] || die "bundle directory not set"
-    [ -f "$BUNDLE_DIR/bundle.manifest" ] || die "bundle.manifest not found in $BUNDLE_DIR"
+    [ -f "$BUNDLE_MANIFEST" ] || die "bundle.manifest not found in $BUNDLE_DIR"
     count=0
+    LOCAL_PACKAGE_FILE=
+    LOCAL_PACKAGE_SHA=
     while IFS='=' read -r key value; do
         case "$key" in
             payload)
@@ -195,6 +334,18 @@ check_payloads() {
             install_manifest)
                 verify_pair "$(field 1 "$value")" "$(field 2 "$value")" "install manifest"
                 ;;
+            local_package)
+                # The package the device-side local install consumes. Verified
+                # here with the rest, BEFORE the format: a package that cannot
+                # pass the device's own checks is a bundle that strands a
+                # freshly formatted userdata.
+                verify_pair "$(field 1 "$value")" "$(field 2 "$value")" "local-install package"
+                lp_size=$(wc -c < "$BUNDLE_DIR/$(field 1 "$value")" | tr -d ' ')
+                [ "$lp_size" -le "$LOCAL_PACKAGE_MAX_BYTES" ] || die \
+                    "$(field 1 "$value") is $lp_size bytes; libreecho-update refuses more than $LOCAL_PACKAGE_MAX_BYTES"
+                LOCAL_PACKAGE_FILE=$(field 1 "$value")
+                LOCAL_PACKAGE_SHA=$(field 2 "$value")
+                ;;
             staging)
                 # staging=<feature>:<payload file>:<sha>:<manifest file>:<sha>
                 sname=$(field 1 "$value")
@@ -202,9 +353,88 @@ check_payloads() {
                 verify_pair "$(field 4 "$value")" "$(field 5 "$value")" "$sname manifest"
                 ;;
         esac
-    done < "$BUNDLE_DIR/bundle.manifest"
+    done < "$BUNDLE_MANIFEST"
     [ "$count" -gt 0 ] || die "manifest lists no payloads"
     ui_print "  $count payloads verified"
+}
+
+index_feature_assets() {
+    # Find release aliases by verified bytes, never by a guessed build name.
+    digest_map=$(for candidate in "$BUNDLE_DIR"/*; do
+        [ -f "$candidate" ] && [ ! -L "$candidate" ] || continue
+        case "${candidate##*/}" in
+            manifest|manifest.sig|bundle.manifest|SHA256SUMS|bundle.json) continue ;;
+        esac
+        printf '%s %s\n' "$(sha256_of "$candidate")" "${candidate##*/}"
+    done)
+}
+
+lookup_digest() {
+    echo "$digest_map" | awk -v w="$1" '$1 == w { print $2; exit }'
+}
+
+preflight_features() {
+    # Every file required by the signed transaction MUST be available before
+    # format, GPT reshape, or either boot-slot write. bundle.manifest alone is
+    # insufficient: a preserve record can pin different bytes than its staging
+    # lines (the bb79646 failure). Cryptographic adoption still belongs to the
+    # OS updater, using the embedded trusted key; do not bypass it here.
+    ota_manifest=$BUNDLE_DIR/manifest
+    [ -f "$ota_manifest" ] && [ ! -L "$ota_manifest" ] || die "signed manifest missing"
+    [ -f "$BUNDLE_DIR/manifest.sig" ] && [ ! -L "$BUNDLE_DIR/manifest.sig" ] || die "manifest signature missing"
+    signed_board=$(sed -n 's/^board=//p' "$ota_manifest")
+    [ "$signed_board" = "$TARGET" ] || die "signed manifest target mismatch"
+    feature_ids=$(sed -n 's/^feature_ids=//p' "$ota_manifest")
+    case "$feature_ids" in ''|,*|*,|*,,*|*[!a-z0-9_,]*) die "invalid signed feature set" ;; esac
+    index_feature_assets
+    preflight_seen=
+    for preflight_feature in $(echo "$feature_ids" | tr ',' ' '); do
+        case "$preflight_feature" in airplay2|tts|wakeword|stt|assistant) ;; *) die "unknown signed feature: $preflight_feature" ;; esac
+        case " $preflight_seen " in *" $preflight_feature "*) die "duplicate signed feature" ;; esac
+        preflight_seen="$preflight_seen $preflight_feature"
+        preflight_action=$(sed -n "s/^feature_${preflight_feature}_action=//p" "$ota_manifest")
+        if [ "$(sed -n 's/^format=//p' "$ota_manifest")" = libreecho-ota-v3 ]; then
+            # A v3 target is a complete state: every feature is a full signed
+            # asset, and per-feature composition keys must not exist at all.
+            [ -z "$preflight_action" ] || die "v3 target carries a feature action: $preflight_feature"
+            grep -q "^feature_${preflight_feature}_base_" "$ota_manifest" && die "v3 target carries a base hash: $preflight_feature"
+            preflight_action=replace
+        fi
+        case "$preflight_action" in
+            preserve)
+                preflight_want=$(sed -n "s/^feature_${preflight_feature}_base_payload_sha256=//p" "$ota_manifest")
+                preflight_mwant=$(sed -n "s/^feature_${preflight_feature}_base_manifest_sha256=//p" "$ota_manifest")
+                ;;
+            replace)
+                preflight_want=$(sed -n "s/^feature_${preflight_feature}_sha256=//p" "$ota_manifest")
+                preflight_mwant=$(sed -n "s/^feature_${preflight_feature}_manifest_sha256=//p" "$ota_manifest")
+                preflight_asset=$(sed -n "s/^feature_${preflight_feature}_asset=//p" "$ota_manifest")
+                preflight_masset=$(sed -n "s/^feature_${preflight_feature}_manifest_asset=//p" "$ota_manifest")
+                for preflight_name in "$preflight_asset" "$preflight_masset"; do
+                    case "$preflight_name" in ''|.*|*[!A-Za-z0-9._+-]*) die "unsafe signed feature filename" ;; esac
+                done
+                ;;
+            *) die "unsupported action for $preflight_feature: ${preflight_action:-none}" ;;
+        esac
+        for preflight_hash in "$preflight_want" "$preflight_mwant"; do
+            [ "${#preflight_hash}" = 64 ] || die "invalid signed feature digest"
+            case "$preflight_hash" in *[!0-9a-f]*) die "invalid signed feature digest" ;; esac
+        done
+        preflight_pname=$(lookup_digest "$preflight_want")
+        preflight_mname=$(lookup_digest "$preflight_mwant")
+        [ -n "$preflight_pname" ] || die "no bundled payload matches $preflight_feature ($preflight_want)"
+        [ -n "$preflight_mname" ] || die "no bundled manifest matches $preflight_feature ($preflight_mwant)"
+        verify_pair "$preflight_pname" "$preflight_want" "$preflight_feature signed payload"
+        verify_pair "$preflight_mname" "$preflight_mwant" "$preflight_feature signed manifest"
+        if [ "$preflight_action" = replace ]; then
+            preflight_size=$(sed -n "s/^feature_${preflight_feature}_size=//p" "$ota_manifest")
+            preflight_msize=$(sed -n "s/^feature_${preflight_feature}_manifest_size=//p" "$ota_manifest")
+            [ "$(wc -c < "$BUNDLE_DIR/$preflight_pname" | tr -d ' ')" = "$preflight_size" ] || die "signed payload size mismatch"
+            [ "$(wc -c < "$BUNDLE_DIR/$preflight_mname" | tr -d ' ')" = "$preflight_msize" ] || die "signed manifest size mismatch"
+        fi
+        ui_print "  $preflight_feature: signed payload and manifest preflight verified"
+    done
+    receipt_set "feature_preflight=verified"
 }
 
 fingerprint_ok() {
@@ -287,25 +517,51 @@ unmount_userdata() {
     return 1
 }
 
+prune_empty_dirs() (
+    # Subshell body: POSIX sh has no locals, and this recurses.
+    # Remove "$1" only if it is a real directory tree containing nothing but
+    # empty directories (TWRP recreates /data/media/0/... after a format).
+    # Uses rmdir only: a regular file, symlink, device or socket anywhere in
+    # the tree keeps it, so no user data can be deleted. Depth is bounded.
+    ped_dir=$1
+    ped_depth=${2:-0}
+    [ "$ped_depth" -le 8 ] || return 1
+    [ -L "$ped_dir" ] && return 1
+    [ -d "$ped_dir" ] || return 1
+    for ped_child in "$ped_dir"/* "$ped_dir"/.[!.]* "$ped_dir"/..?*; do
+        [ -e "$ped_child" ] || [ -L "$ped_child" ] || continue
+        prune_empty_dirs "$ped_child" $((ped_depth + 1)) || return 1
+    done
+    rmdir "$ped_dir" 2>/dev/null
+)
+
 tidy_userdata_root() {
     # Recovery creates /data/media whenever it mounts userdata, and the OS's
     # data contract allows exactly two entries at the userdata root
     # (libreecho and lost+found). Left in place it makes the cleanup helper fail
     # its contract on the next boot, which blocks the service graph - and on a
     # first boot is the prime suspect for taking the staged features with it.
-    # Remove anything recovery left at the root, then prove the root is clean.
+    # This never deletes user data: recovery's own *empty* scratch directories
+    # are removed with rmdir; anything holding files is left in place and
+    # reported, because the legacy flow must not destroy unrelated data either.
+    ty_dir=${LIBREECHO_DATA_ROOT:-/data}
     ui_print "Tidying the userdata root for the data contract"
     if [ "$DRY_RUN" = 1 ]; then
-        ui_print "  DRY RUN - would remove recovery's own /data/media and friends"
+        ui_print "  DRY RUN - would remove recovery's own empty /data/media and friends"
         return 0
     fi
-    for stray in /data/media /data/local /data/tmp /data/test; do
-        if [ -e "$stray" ]; then
-            rm -rf "$stray" && ui_print "  removed $stray"
+    for ty_stray in "$ty_dir/media" "$ty_dir/local" "$ty_dir/tmp" "$ty_dir/test"; do
+        [ -e "$ty_stray" ] || continue
+        [ -L "$ty_stray" ] && continue
+        [ -d "$ty_stray" ] || continue
+        if prune_empty_dirs "$ty_stray"; then
+            ui_print "  removed empty $ty_stray"
+        else
+            ui_print "  WARNING: $ty_stray is not empty; left in place (no user data is deleted)"
         fi
     done
     sync
-    for entry in /data/*; do
+    for entry in "$ty_dir"/*; do
         [ -e "$entry" ] || continue
         base=${entry##*/}
         case "$base" in
@@ -353,8 +609,31 @@ write_boot_slots() {
         if [ "$got" != "$want" ]; then
             die "$write_slot readback mismatch (got $got want $want)"
         fi
-        ui_print "  $slot verified ($got)"
+        ui_print "  $write_slot verified ($got)"
     done
+}
+
+ensure_userdata_mounted() {
+    # Every staging step writes into the filesystem the format just created, and
+    # the format leaves it unmounted -- mke2fs refuses to touch a live mount.
+    # Writing to /data while it is not mounted writes into recovery's ramfs
+    # instead: the copies succeed, the digests read back, the receipt says the
+    # features were staged, and the tree is gone at the next boot. Prove the
+    # mount, against the right block device, before anything is staged into it.
+    ud_node=$(partition_node userdata) || die "userdata not found"
+    ud_mounted=$(awk '$2 == "/data" { print $1; exit }' /proc/mounts)
+    if [ -n "$ud_mounted" ]; then
+        ui_print "  /data already mounted ($ud_mounted)"
+        return 0
+    fi
+    mkdir -p /data || die "cannot create the /data mountpoint"
+    /sbin/mount -t ext4 -o rw,nosuid,nodev,noatime "$ud_node" /data \
+        || die "cannot mount the formatted userdata ($ud_node)"
+    ud_mounted=$(awk '$2 == "/data" { print $1; exit }' /proc/mounts)
+    [ -n "$ud_mounted" ] || die "the userdata mount did not take"
+    [ "$(part_node "$ud_mounted")" = "$(part_node "$ud_node")" ] \
+        || die "/data is mounted from $ud_mounted, not $ud_node"
+    ui_print "  /data mounted for staging ($ud_node)"
 }
 
 stage_features() {
@@ -363,6 +642,16 @@ stage_features() {
     #   update/staging/manifest + manifest.sig   the transaction's own input
     #   update/staging/features/<f>/<asset>      for action=replace
     #   /data/libreecho/features/<f>/…           for action=preserve
+    # It also creates the LIVE target directory of every feature the manifest
+    # names. The transaction refuses a target that is not already a real
+    # directory:
+    #
+    #     [ -d "$target_dir" ] && [ ! -L "$target_dir" ] || fail feature-target-dir
+    #
+    # That is deliberate anti-symlink hygiene, so it is not relaxed here. On an
+    # upgrade the directory exists from the previous commit; on an initial
+    # install nothing has ever created it, and the whole staged set is stranded
+    # at prepare-boot.
     # The installer deliberately does not commit: commit_policy is
     # after-slot-confirm, so the OS commits once the slot confirms. Staging the
     # signed manifest *is* the intent.
@@ -371,11 +660,27 @@ stage_features() {
     ota_signature=$BUNDLE_DIR/manifest.sig
     [ -f "$ota_manifest" ] || die "signed manifest missing: $ota_manifest"
     [ -f "$ota_signature" ] || die "manifest signature missing: $ota_signature"
+
+    feature_ids=$(sed -n 's/^feature_ids=//p' "$ota_manifest" | head -n 1)
+    [ -n "$feature_ids" ] || die "the signed manifest declares no features"
+    for check_feature in $(echo "$feature_ids" | tr ',' ' '); do
+        case "$check_feature" in
+            ''|*[!a-zA-Z0-9._-]*) die "unsafe feature name in the signed manifest: $check_feature" ;;
+        esac
+    done
+
     if [ "$DRY_RUN" = 1 ]; then
         ui_print "  DRY RUN - would stage the signed manifest and its features"
+        for dry_feature in $(echo "$feature_ids" | tr ',' ' '); do
+            ui_print "    $dry_feature: live target $LIVE_FEATURES/$dry_feature"
+        done
         return 0
     fi
-    staging=/data/libreecho/update/staging
+    if [ "$(sed -n 's/^format=//p' "$ota_manifest")" = libreecho-ota-v3 ]; then
+        stage_v3_generation
+        return 0
+    fi
+    staging=$STAGING
     mkdir -p "$staging" || die "cannot create $staging"
     cp "$ota_manifest" "$staging/manifest" || die "cannot stage the manifest"
     cp "$ota_signature" "$staging/manifest.sig" || die "cannot stage the signature"
@@ -383,19 +688,24 @@ stage_features() {
     # One hashing pass over the bundle, so a payload is found by its digest
     # rather than by assuming the release's build name matches the manifest's
     # asset name. They do not: the same bytes ship under both schemes.
-    digest_map=$(for candidate in "$BUNDLE_DIR"/*; do
-        [ -f "$candidate" ] || continue
-        case "${candidate##*/}" in
-            manifest|manifest.sig|bundle.manifest|SHA256SUMS|bundle.json) continue ;;
-        esac
-        printf '%s %s\n' "$(sha256_of "$candidate")" "${candidate##*/}"
-    done)
-    lookup_digest() {
-        echo "$digest_map" | awk -v w="$1" '$1 == w { print $2; exit }'
-    }
+    index_feature_assets
 
-    feature_ids=$(sed -n 's/^feature_ids=//p' "$ota_manifest" | head -n 1)
-    [ -n "$feature_ids" ] || die "the signed manifest declares no features"
+    mkdir -p "$LIVE_FEATURES" || die "cannot create $LIVE_FEATURES"
+    live_created=0
+    for fname in $(echo "$feature_ids" | tr ',' ' '); do
+        live_dir=$LIVE_FEATURES/$fname
+        if [ -L "$live_dir" ]; then
+            die "live feature path is a symlink: $live_dir"
+        fi
+        if [ -d "$live_dir" ]; then
+            continue
+        fi
+        [ -e "$live_dir" ] && die "live feature path is not a directory: $live_dir"
+        mkdir "$live_dir" || die "cannot create the live target for $fname"
+        live_created=$((live_created + 1))
+    done
+    ui_print "  $live_created live feature target(s) created for the transaction"
+
     staged_count=0
     for fname in $(echo "$feature_ids" | tr ',' ' '); do
         action=$(sed -n "s/^feature_${fname}_action=//p" "$ota_manifest" | head -n 1)
@@ -425,10 +735,13 @@ stage_features() {
                 pname=$(lookup_digest "$want")
                 mname=$(lookup_digest "$mwant")
                 [ -n "$pname" ] || die "no bundled payload matches preserved $fname ($want)"
-                dest=/data/libreecho/features/$fname
+                [ -n "$mname" ] || die "no bundled manifest matches preserved $fname ($mwant)"
+                dest=$LIVE_FEATURES/$fname
                 mkdir -p "$dest" || die "cannot create $dest"
                 cp "$BUNDLE_DIR/$pname" "$dest/payload.squashfs" || die "cannot place $fname payload"
-                [ -n "$mname" ] && cp "$BUNDLE_DIR/$mname" "$dest/manifest.json"
+                cp "$BUNDLE_DIR/$mname" "$dest/manifest.json" || die "cannot place $fname manifest"
+                got=$(sha256_of "$dest/manifest.json")
+                [ "$got" = "$mwant" ] || die "$fname preserved manifest digest mismatch"
                 got=$(sha256_of "$dest/payload.squashfs")
                 [ "$got" = "$want" ] || die "$fname preserved payload digest mismatch"
                 ui_print "  $fname: preserve satisfied in the live tree"
@@ -444,45 +757,154 @@ stage_features() {
     ui_print "  $staged_count feature(s) staged for the transaction to commit"
 }
 
+stage_v3_generation() {
+    # Publish the signed target as one immutable generation, byte-identical to
+    # what OTA assembly and the browser helper publish for the same release:
+    #   generations/<tx>/target.manifest(.sig)
+    #   generations/<tx>/features/<f>/payload.squashfs + manifest.json
+    #   generations/<tx>/COMPLETE (sha256 of target.manifest)
+    # then point update/current at it. No legacy feature tree, no staging
+    # transaction: the booted OS verifies the signature before using any byte.
+    ota_manifest=$BUNDLE_DIR/manifest
+    v3_tx=$(sed -n 's/^transaction_id=//p' "$ota_manifest" | head -n 1)
+    case "$v3_tx" in ''|.|..|*[!A-Za-z0-9._+~:-]*) die "invalid v3 transaction id" ;; esac
+    [ "${#v3_tx}" -le 96 ] || die "invalid v3 transaction id"
+    v3_partial=$LIVE_GENERATIONS/$v3_tx.partial
+    v3_dest=$LIVE_GENERATIONS/$v3_tx
+    [ ! -e "$v3_partial" ] && [ ! -e "$v3_dest" ] || die "v3 generation already exists: $v3_tx"
+    index_feature_assets
+    mkdir -p "$v3_partial/features" || die "cannot create $v3_partial"
+    cp "$ota_manifest" "$v3_partial/target.manifest" || die "cannot place the target manifest"
+    cp "$BUNDLE_DIR/manifest.sig" "$v3_partial/target.manifest.sig" || die "cannot place the target signature"
+    v3_count=0
+    for fname in $(sed -n 's/^feature_ids=//p' "$ota_manifest" | head -n 1 | tr ',' ' '); do
+        want=$(sed -n "s/^feature_${fname}_sha256=//p" "$ota_manifest" | head -n 1)
+        mwant=$(sed -n "s/^feature_${fname}_manifest_sha256=//p" "$ota_manifest" | head -n 1)
+        pname=$(lookup_digest "$want")
+        mname=$(lookup_digest "$mwant")
+        [ -n "$pname" ] || die "no bundled payload matches $fname ($want)"
+        [ -n "$mname" ] || die "no bundled manifest matches $fname ($mwant)"
+        mkdir -p "$v3_partial/features/$fname" || die "cannot create the $fname generation directory"
+        cp "$BUNDLE_DIR/$pname" "$v3_partial/features/$fname/payload.squashfs" || die "cannot place $fname payload"
+        cp "$BUNDLE_DIR/$mname" "$v3_partial/features/$fname/manifest.json" || die "cannot place $fname manifest"
+        [ "$(sha256_of "$v3_partial/features/$fname/payload.squashfs")" = "$want" ] || die "$fname placed payload digest mismatch"
+        [ "$(sha256_of "$v3_partial/features/$fname/manifest.json")" = "$mwant" ] || die "$fname placed manifest digest mismatch"
+        v3_count=$((v3_count + 1))
+    done
+    [ "$v3_count" -gt 0 ] || die "no features in the v3 target"
+    sha256_of "$v3_partial/target.manifest" > "$v3_partial/COMPLETE.tmp" || die "cannot write COMPLETE"
+    sync
+    mv "$v3_partial/COMPLETE.tmp" "$v3_partial/COMPLETE" || die "cannot publish COMPLETE"
+    find "$v3_partial" -type f -exec chmod 0400 '{}' ';' || die "cannot seal generation files"
+    find "$v3_partial" -type d -exec chmod 0500 '{}' ';' || die "cannot seal generation directories"
+    sync
+    mv "$v3_partial" "$v3_dest" || die "cannot publish the v3 generation"
+    mkdir -p "$LIVE_UPDATE" || die "cannot create $LIVE_UPDATE"
+    printf '%s\n' "$v3_tx" > "$LIVE_UPDATE/current.tmp" || die "cannot write current"
+    chmod 0600 "$LIVE_UPDATE/current.tmp" || die "cannot set current mode"
+    sync
+    mv "$LIVE_UPDATE/current.tmp" "$LIVE_UPDATE/current" || die "cannot publish current"
+    sync
+    receipt_set "v3_generation=$v3_tx"
+    ui_print "  v3 generation $v3_tx published with $v3_count feature(s)"
+}
+
+stage_local_package() {
+    # A staged tree is not an install. Nothing on the device turns one into a
+    # prepared feature transaction except `libreecho-update install <package>`,
+    # which re-checks the SIGNED manifest, stages the feature payloads and runs
+    # the transaction's preflight + prepare-boot. That verb caps the package at
+    # 32 MiB and requires it to be a tar of exactly manifest, manifest.sig and
+    # boot.img, so the release's OTA tar is what is placed here -- the install
+    # bundle is 239 MiB and can never pass.
+    #
+    # It goes on /data, not /cache: the booted OS does not mount /cache.
+    if [ -z "${LOCAL_PACKAGE_FILE:-}" ]; then
+        ui_print "  WARNING: the bundle carries no local-install package"
+        ui_print "  the first boot will find a staged tree it cannot prepare"
+        return 0
+    fi
+    ui_print "Placing the local-install package for the first boot"
+    if [ "$DRY_RUN" = 1 ]; then
+        ui_print "  DRY RUN - would place $LOCAL_PACKAGE_FILE at $LOCAL_PACKAGE"
+        return 0
+    fi
+    mkdir -p "$LIVE_UPDATE/incoming" || die "cannot create $LIVE_UPDATE/incoming"
+    cp "$BUNDLE_DIR/$LOCAL_PACKAGE_FILE" "$LOCAL_PACKAGE" \
+        || die "cannot place the local-install package"
+    lp_got=$(sha256_of "$LOCAL_PACKAGE")
+    [ "$lp_got" = "$LOCAL_PACKAGE_SHA" ] || die "local-install package readback mismatch"
+    lp_size=$(wc -c < "$LOCAL_PACKAGE" | tr -d ' ')
+    [ "$lp_size" -le "$LOCAL_PACKAGE_MAX_BYTES" ] \
+        || die "local-install package is $lp_size bytes; the device refuses more than $LOCAL_PACKAGE_MAX_BYTES"
+    sync
+    ui_print "  $LOCAL_PACKAGE ($lp_size bytes, $lp_got)"
+}
+
 main() {
     ZIPFILE=${3:-}
     BUNDLE_DIR=$(dirname "$ZIPFILE")
     [ -d "$BUNDLE_DIR" ] || die "cannot determine the bundle directory"
+    if bundle_source_is_userdata "$BUNDLE_DIR"; then
+        die "bundle-on-userdata: the legacy install must stage from /cache, not from the partition it formats"
+    fi
+    # Select the manifest bound to the invoked ZIP, not Radar's legacy alias
+    # (both targets can coexist in a combined release directory).
+    case "${ZIPFILE##*/}" in
+        libreecho-radar-puffin-install.zip) BUNDLE_MANIFEST=$BUNDLE_DIR/libreecho-radar-puffin-bundle.manifest ;;
+        libreecho-biscuit-install.zip) BUNDLE_MANIFEST=$BUNDLE_DIR/libreecho-biscuit-bundle.manifest ;;
+        *) BUNDLE_MANIFEST=$BUNDLE_DIR/bundle.manifest ;;
+    esac
 
     receipt_reset
     ui_print "LibreEcho initial-install"
     ui_print "  bundle: $BUNDLE_DIR"
 
-    if [ -f "$BUNDLE_DIR/bundle.manifest" ]; then
+    if [ -f "$BUNDLE_MANIFEST" ]; then
         while IFS='=' read -r key value; do
             case "$key" in
                 release) ui_print "  release: $value" ;;
                 device)  ui_print "  device:  $value" ;;
             esac
-        done < "$BUNDLE_DIR/bundle.manifest"
+        done < "$BUNDLE_MANIFEST"
     fi
 
     DISK=/dev/block/mmcblk0
     check_device
     check_payloads
+    check_target
+    preflight_features
 
     if fingerprint_ok; then
         node=$(partition_node userdata)
         userdata_now=$(partition_sectors "$node")
         ui_print "userdata $userdata_now sectors - matches the contract"
         format_userdata
-        write_boot_slots "$(sed -n 's/^boot_image=//p' "$BUNDLE_DIR/bundle.manifest")"
+        if [ "$DRY_RUN" = 1 ]; then
+            ui_print "  DRY RUN - would mount the formatted userdata before staging"
+        else
+            ensure_userdata_mounted
+        fi
+        write_boot_slots "$(sed -n 's/^boot_image=//p' "$BUNDLE_MANIFEST")"
         stage_features
+        stage_local_package
         tidy_userdata_root
         if [ "$DRY_RUN" = 1 ]; then
             receipt_set "result=dry-run-ok" "phase=install" "dry_run=1" \
                 "userdata_sectors=$userdata_now" \
-                "would_write=boot_a,boot_b,userdata,features"
+                "would_write=boot_a,boot_b,userdata,features,local-package" \
+                "would_mount_userdata=1" \
+                "would_place_local_package=$LOCAL_PACKAGE"
             ui_print "DRY RUN COMPLETE - nothing was written"
         else
             receipt_set "result=installed" "phase=install" \
-                "userdata_sectors=$userdata_now" "reboot_required=1"
+                "userdata_sectors=$userdata_now" "reboot_required=1" \
+                "local_package=$LOCAL_PACKAGE" \
+                "local_install_command=libreecho-update install $LOCAL_PACKAGE --feature-dir $STAGING/features" \
+                "first_boot=prepares-and-commits-the-staged-features"
             ui_print "INSTALL COMPLETE - reboot to start LibreEcho"
+            ui_print "  the first boot prepares and commits the staged features"
+            ui_print "  the package is left at $LOCAL_PACKAGE for a host-driven re-install"
         fi
     else
         node=$(partition_node userdata)

@@ -40,6 +40,13 @@ MT6323_NODE = "/soc/pwrap@1000d000/mt6323"
 MT6323_KEYS_NODE = MT6323_NODE + "/mt6323keys"
 MT6323_POWER_KEY_NODE = MT6323_KEYS_NODE + "/power"
 MT6323_HOME_KEY_NODE = MT6323_KEYS_NODE + "/home"
+ACTION_KEY_NODE = "/action_key"
+ACTION_BUTTON_NODE = ACTION_KEY_NODE + "/action@36"
+PIO_NODE = "/soc/pinctrl@10005000"
+ACTION_GPIO = 0x24
+ACTION_GPIO_FLAGS = 0x01
+ACTION_KEYCODE = 0x8A
+MUTE_KEYCODE = (0x71,)
 CODEC_NODE = "/soc/i2c@11009000/tlv320aic32x4@18"
 CODEC_MCLK_NODE = "/clocks/puffin_codec_mclk"
 CODEC_MCLK_PHANDLE = 0x49
@@ -103,8 +110,8 @@ POWER_KEYCODE = (0x74,)
 HOME_KEYCODE = (0x72,)
 
 MAX_FDT_TOTALSIZE = 0x10000
-WIFI_EVT_SIZE = 52578
-WIFI_EVT_SHA256 = "e0baf06d8552e4a732edac3f258cf37b1c3cc7e97458ad38ba3f26bdce8e33ca"
+WIFI_EVT_SIZE = 52722
+WIFI_EVT_SHA256 = "71ca42fbd21ea1c920a3992250b8b8f62e2c70564ba9f64deb8cab8d4ff458d2"
 TOPRGU_COMPATIBLES = ("mediatek,mt8163-rgu", "mediatek,mt6589-wdt")
 
 # The stock EVT blob is a 3.18-era DTB.  Its pinctrl groups use the old
@@ -403,16 +410,29 @@ def verify_wifi(fdtget: str, dtb: Path, data: bytes) -> int:
         fail("Wi-Fi EVT DTB changed the stock PWRAP resource name")
     if fdt_string(fdtget, dtb, PWRAP_NODE, "clock-names") != STOCK_PWRAP_CLOCK_NAMES:
         fail("Wi-Fi EVT DTB changed the stock PWRAP clock names")
-    if fdt_hex_cells(fdtget, dtb, MT6323_NODE, "interrupt-parent") != PMIC_EINT_PARENT:
+    pio_phandle = fdt_phandle(fdtget, dtb, PIO_NODE)
+    if fdt_hex_cells(fdtget, dtb, MT6323_NODE, "interrupt-parent") != (pio_phandle,):
         fail("Wi-Fi EVT DTB has the wrong MT6323 interrupt parent")
     if fdt_hex_cells(fdtget, dtb, MT6323_NODE, "interrupts") != PMIC_EINT:
         fail("Wi-Fi EVT DTB has the wrong MT6323 PMIC EINT")
     if fdt_string(fdtget, dtb, MT6323_KEYS_NODE, "compatible") != "mediatek,mt6323-keys":
         fail("Wi-Fi EVT DTB is missing the MT6323 keys node")
-    if fdt_hex_cells(fdtget, dtb, MT6323_POWER_KEY_NODE, "linux,keycodes") != POWER_KEYCODE:
-        fail("Wi-Fi EVT DTB has the wrong MT6323 power key")
+    if fdt_hex_cells(fdtget, dtb, MT6323_POWER_KEY_NODE, "linux,keycodes") != MUTE_KEYCODE:
+        fail("Wi-Fi EVT DTB has the wrong MT6323 mute key")
     if fdt_hex_cells(fdtget, dtb, MT6323_HOME_KEY_NODE, "linux,keycodes") != HOME_KEYCODE:
         fail("Wi-Fi EVT DTB has the wrong MT6323 home key")
+    if fdt_string(fdtget, dtb, ACTION_KEY_NODE, "compatible") != "gpio-keys":
+        fail("Wi-Fi EVT DTB is missing the action key node")
+    if fdt_string(fdtget, dtb, ACTION_BUTTON_NODE, "label") != "Action Key":
+        fail("Wi-Fi EVT DTB has the wrong action key label")
+    if fdt_hex_cells(fdtget, dtb, ACTION_BUTTON_NODE, "linux,code") != (ACTION_KEYCODE,):
+        fail("Wi-Fi EVT DTB has the wrong action key code")
+    if fdt_hex_cells(fdtget, dtb, ACTION_BUTTON_NODE, "gpios") != (
+        pio_phandle, ACTION_GPIO, ACTION_GPIO_FLAGS,
+    ):
+        fail("Wi-Fi EVT DTB action key is not bound to PIO GPIO36/KPCOL0")
+    if fdt_hex_cells(fdtget, dtb, ACTION_BUTTON_NODE, "debounce-interval") != (0x14,):
+        fail("Wi-Fi EVT DTB has the wrong action key debounce")
     if fdt_string(fdtget, dtb, IMGSYS_NODE, "status") != "okay":
         fail("Wi-Fi EVT DTB did not enable the MT8163 image-clock provider")
     for property_name in ("iov-supply", "ldoin-supply"):
@@ -956,10 +976,11 @@ def main() -> None:
             [fdtput, "-t", "s", str(candidate_path), IMGSYS_NODE, "status", "okay"],
             "enabling the MT8163 image-clock provider",
         )
+        pio_phandle = fdt_phandle(fdtget, candidate_path, PIO_NODE)
         run(
             [
                 fdtput, "-t", "x", str(candidate_path), MT6323_NODE,
-                "interrupt-parent", "0x09",
+                "interrupt-parent", f"0x{pio_phandle:x}",
             ],
             "adding the MT6323 interrupt parent",
         )
@@ -992,7 +1013,7 @@ def main() -> None:
             "adding the MT6323 power-off policy",
         )
         for node, keycode, label in (
-            (MT6323_POWER_KEY_NODE, "0x74", "power"),
+            (MT6323_POWER_KEY_NODE, f"0x{MUTE_KEYCODE[0]:x}", "mute"),
             (MT6323_HOME_KEY_NODE, "0x72", "home"),
         ):
             run(
@@ -1001,6 +1022,43 @@ def main() -> None:
                     "linux,keycodes", keycode,
                 ],
                 f"adding the MT6323 {label} key",
+            )
+        run(
+            [
+                fdtput, "-p", "-t", "s", str(candidate_path), ACTION_KEY_NODE,
+                "compatible", "gpio-keys",
+            ],
+            "adding the action key controller",
+        )
+        run(
+            [
+                fdtput, "-p", "-t", "s", str(candidate_path), ACTION_BUTTON_NODE,
+                "label", "Action Key",
+            ],
+            "adding the action key label",
+        )
+        run(
+            [
+                fdtput, "-p", "-t", "x", str(candidate_path), ACTION_BUTTON_NODE,
+                "linux,code", f"0x{ACTION_KEYCODE:x}",
+            ],
+            "adding the KEY_HELP action code",
+        )
+        run(
+            [
+                fdtput, "-p", "-t", "x", str(candidate_path), ACTION_BUTTON_NODE,
+                "debounce-interval", "0x14",
+            ],
+            "adding the action key debounce",
+        )
+        for property_name in ("gpios",):
+            run(
+                [
+                    fdtput, "-p", "-t", "x", str(candidate_path), ACTION_BUTTON_NODE,
+                    property_name, f"0x{pio_phandle:x}", f"0x{ACTION_GPIO:x}",
+                    f"0x{ACTION_GPIO_FLAGS:x}",
+                ],
+                "binding the action key to PIO GPIO36/KPCOL0",
             )
         for property_name in ("iov-supply", "ldoin-supply"):
             run(
@@ -1040,6 +1098,35 @@ def main() -> None:
             actual = fdt_hex_cells(fdtget, candidate_path, AFE_NODE, property_name)
             if actual != (expected,):
                 fail(f"final AFE {property_name} does not reference {label}")
+        # The action node and its GPIO property are structural additions.  Bind
+        # both GPIO consumers from the final named PIO provider, then read back
+        # after fdtput has had its last opportunity to resize the blob.
+        for _attempt in range(3):
+            final_pio_phandle = fdt_phandle(fdtget, candidate_path, PIO_NODE)
+            for node, property_name, label in (
+                (MT6323_NODE, "interrupt-parent", "final MT6323 interrupt parent"),
+                (ACTION_BUTTON_NODE, "gpios", "final action key GPIO36/KPCOL0"),
+            ):
+                cells = (final_pio_phandle,) if node == MT6323_NODE else (
+                    final_pio_phandle, ACTION_GPIO, ACTION_GPIO_FLAGS,
+                )
+                run(
+                    [
+                        fdtput, "-p", "-t", "x", str(candidate_path), node,
+                        property_name, *(f"0x{cell:x}" for cell in cells),
+                    ],
+                    f"binding {label}",
+                )
+            rebound_pio_phandle = fdt_phandle(fdtget, candidate_path, PIO_NODE)
+            if (
+                fdt_hex_cells(fdtget, candidate_path, MT6323_NODE, "interrupt-parent")
+                == (rebound_pio_phandle,)
+                and fdt_hex_cells(fdtget, candidate_path, ACTION_BUTTON_NODE, "gpios")
+                == (rebound_pio_phandle, ACTION_GPIO, ACTION_GPIO_FLAGS)
+            ):
+                break
+        else:
+            fail("final GPIO consumers do not reference the named PIO provider")
         candidate = candidate_path.read_bytes()
         total = verify_wifi(fdtget, candidate_path, candidate)
 
@@ -1058,7 +1145,7 @@ def main() -> None:
         f"node={CONSYS_NODE} "
         "reg=stock-three-resource clocks=5,3 clock-names=bus "
         "pwrap-reg-names=stock pwrap-clock-names=stock "
-        "imgsys-status=okay mt6323-eint=0x09:0x18/0x04 "
+        "imgsys-status=okay mt6323-eint=pio-provider:0x18/0x04 "
         "audio-pmic-phandle=0x48 codec-mclk=9.6MHz codec-supplies=0x37"
     )
 

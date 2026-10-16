@@ -1,0 +1,10 @@
+#!/bin/busybox sh
+# shellcheck shell=dash
+#
+# Readiness probe entry point (issue #96, Platform side).  networkd's
+# --recovery-ready-probe expects a single executable path with no arguments, so
+# this delegates to the shared probe with the "ready" subcommand.  See
+# libreecho-recovery-ap-probe for the checks.
+
+set -u
+exec /usr/local/sbin/libreecho-recovery-ap-probe ready "$@"

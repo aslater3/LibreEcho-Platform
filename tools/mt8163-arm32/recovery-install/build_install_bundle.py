@@ -32,6 +32,7 @@ import argparse
 import hashlib
 import io
 import json
+import re
 import shutil
 import sys
 import tarfile
@@ -39,11 +40,25 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from libreecho_platform_targets import add_target_arguments, validate_target_arguments, get_target, DEFAULT_TARGET
+
 SCHEMA = 1
+# The direct-userdata install protocol version. It rides in bundle.manifest and
+# is what the browser's helper requires via an explicit `--protocol 2`; the
+# legacy `/cache` path never reads it.
+PROTOCOL = 2
+DIRECT_HELPER = "libreecho-direct-install.sh"
 ZIP_NAME = "libreecho-install.zip"
 MANIFEST_NAME = "bundle.manifest"
 INSTALL_MANIFEST_NAME = "manifest.json"
 BOOT_SLOT_SECTORS = 32768  # 16 MiB: the boot slot size this family uses
+# The device-side local-install path (`libreecho-update install <package>`)
+# refuses a package larger than this: it stats the package before extracting.
+# The initial-install tar is 239 MiB and can never pass, which is why the
+# bundle ships the release's own OTA tar as the local-install package.
+LOCAL_PACKAGE_MAX_BYTES = 33554432
+LOCAL_PACKAGE_MEMBERS = ["manifest", "manifest.sig", "boot.img"]
 # The install manifest is a contract, not a hint: an unknown key set means the
 # OS and this builder disagree about what an install is.
 REQUIRED_MANIFEST_KEYS = {
@@ -70,15 +85,22 @@ def sha256_file(path: Path) -> str:
 
 
 def _extract_assets(assets_dir: Path, work: Path) -> Path:
-    """Return a directory holding the loose asset files.
+    """Return a directory holding every loose asset file.
 
-    A release ships ``*-initial-install.tar``; that is unpacked. A directory of
-    loose files is used as-is.
+    A release ships ``*-initial-install.tar`` (boot image, feature payloads and
+    the install manifest) and ``*.ota.tar`` (the SIGNED manifest and its
+    signature). Both are unpacked, the tars themselves are kept because one of
+    them is the local-install package, and the directory's own loose files are
+    merged in beside them.
+
+    Merging matters for naming, not for content: a release also ships the
+    version-named feature assets the SIGNED manifest references
+    (``libreecho-radar-puffin-<version>-<feature>.payload.squashfs``), while the
+    initial-install tar carries the same bytes under build-tag names. Only the
+    merged directory can build a bundle that ships the names the manifest
+    names. Tar members win a name collision: the tar is the release's own
+    install bundle, and every digest is re-checked against the manifest anyway.
     """
-    # Two tars, both unpacked. The initial-install bundle carries the boot image
-    # and the feature payloads; the OTA bundle carries the SIGNED manifest the
-    # feature transaction commits against. Order matters only for boot.img, and
-    # the manifest's boot_sha256 is checked against whatever wins.
     tars = sorted(assets_dir.glob("*initial-install.tar")) + \
         sorted(assets_dir.glob("*.ota.tar"))
     if not tars:
@@ -98,7 +120,49 @@ def _extract_assets(assets_dir: Path, work: Path) -> Path:
                     raise BuildError(f"unreadable member: {member.name}")
                 with target.open("wb") as handle:
                     shutil.copyfileobj(source, handle)
+    for loose in sorted(assets_dir.iterdir()):
+        if not loose.is_file() or loose in tars:
+            continue
+        if (unpacked / loose.name).exists():
+            continue
+        shutil.copyfile(loose, unpacked / loose.name)
+    # The OTA tar is the package the device's local-install path consumes, so it
+    # has to survive unpacking as a file of its own.
+    for archive in tars:
+        shutil.copyfile(archive, unpacked / archive.name)
     return unpacked
+
+
+def read_ota_manifest(path: Path) -> dict[str, str]:
+    """Parse the SIGNED OTA manifest into a mapping.
+
+    This is the contract the feature transaction commits against, so the bundle
+    takes its asset names and digests from here rather than from the
+    install-manifest tar, which names the same bytes differently.
+    """
+    values: dict[str, str] = {}
+    try:
+        text = path.read_text()
+    except OSError as error:
+        raise BuildError(f"unreadable OTA manifest: {error}") from error
+    for line in text.splitlines():
+        if not line:
+            continue
+        key, _, value = line.partition("=")
+        if not key or not value:
+            raise BuildError(f"malformed OTA manifest line: {line}")
+        if key in values:
+            raise BuildError(f"duplicate OTA manifest key: {key}")
+        values[key] = value
+    return values
+
+
+def _asset_by_digest(directory: Path, digest: str) -> Path | None:
+    """First file in ``directory`` whose sha256 is ``digest``, or None."""
+    for candidate in sorted(directory.iterdir()):
+        if candidate.is_file() and sha256_file(candidate) == digest:
+            return candidate
+    return None
 
 
 def read_install_manifest(path: Path) -> dict:
@@ -133,7 +197,87 @@ def _checked_asset(record: object, directory: Path, what: str) -> Path:
     return path
 
 
-def discover(assets: Path) -> dict:
+def _resolve_feature_file(
+    assets: Path,
+    declared_name: str,
+    declared_digest: str,
+    install_record: object,
+    what: str,
+    seen: set[str],
+) -> tuple[Path, str]:
+    """Resolve one feature file to (source path, name it ships under).
+
+    The SIGNED manifest decides the name when it declares one, because that is
+    the name the feature transaction stages under on the device; the
+    install-manifest record is the fallback for features the signed manifest
+    names nothing for (``preserve``, whose assets live in the live tree under
+    fixed names). Bytes are always bound by digest, and the two manifests are
+    required to agree, so a disagreement is refused rather than resolved.
+    """
+    if not declared_name:
+        if declared_digest:
+            raise BuildError(f"{what} is pinned by digest but not named by the OTA manifest")
+        path = _checked_asset(install_record, assets, what)
+        if path.name in seen:
+            raise BuildError(f"asset listed twice in the manifests: {path.name}")
+        seen.add(path.name)
+        return path, path.name
+    if not declared_digest:
+        raise BuildError(f"{what} is named by the OTA manifest but not pinned by digest")
+    recorded = _checked_asset(install_record, assets, what)
+    if recorded.name == declared_name:
+        if sha256_file(recorded) != declared_digest:
+            raise BuildError(f"{what} digest disagrees with the OTA manifest")
+        seen.add(declared_name)
+        return recorded, declared_name
+    # The two manifests describe the same bytes under different names: the
+    # install tar ships build-tag names, the signed manifest version-named ones.
+    # Ship the published file when the release carries it, otherwise the same
+    # bytes under the name the manifest references.
+    if sha256_file(recorded) != declared_digest:
+        raise BuildError(
+            f"{what} differs between the install manifest and the OTA manifest")
+    published = assets / declared_name
+    source = published if published.is_file() and \
+        sha256_file(published) == declared_digest else _asset_by_digest(assets, declared_digest)
+    if source is None:
+        raise BuildError(f"{what} has no file matching the OTA manifest digest")
+    if declared_name in seen:
+        raise BuildError(f"asset listed twice in the manifests: {declared_name}")
+    seen.add(declared_name)
+    return source, declared_name
+
+
+def _checked_local_package(package: Path, boot_image: Path) -> Path:
+    """Verify the OTA tar is a package the device's local-install path accepts.
+
+    ``libreecho-update install`` stats the package first and refuses anything
+    over 32 MiB, then requires the tar to hold exactly the signed manifest, its
+    signature and the boot image. A bundle whose package cannot pass is a bundle
+    that strands a freshly formatted device, so the check happens here.
+    """
+    size = package.stat().st_size
+    if size > LOCAL_PACKAGE_MAX_BYTES:
+        raise BuildError(
+            f"local-install package {package.name} is {size} bytes; the device "
+            f"refuses more than {LOCAL_PACKAGE_MAX_BYTES}")
+    with tarfile.open(package) as archive:
+        members = [m.name for m in archive.getmembers()]
+        if members != LOCAL_PACKAGE_MEMBERS:
+            raise BuildError(
+                f"local-install package {package.name} holds {members}, "
+                f"expected {LOCAL_PACKAGE_MEMBERS}")
+        member = archive.extractfile("boot.img")
+        if member is None:
+            raise BuildError(f"local-install package {package.name} has no boot image")
+        digest = hashlib.sha256(member.read()).hexdigest()
+    if digest != sha256_file(boot_image):
+        raise BuildError(
+            "the local-install package carries a different boot image than the one being shipped")
+    return package
+
+
+def discover(assets: Path, target: str = DEFAULT_TARGET) -> dict:
     """Classify the assets, driven by the install manifest.
 
     The manifest is checked against the files on disk rather than believed: a
@@ -144,36 +288,15 @@ def discover(assets: Path) -> dict:
     if not manifest_path.is_file():
         raise BuildError(f"{INSTALL_MANIFEST_NAME} not found in {assets}")
     manifest = read_install_manifest(manifest_path)
+    get_target(target)
+    if manifest["board"] != target:
+        raise BuildError("target does not match install manifest board")
 
     boot_image = _checked_asset(manifest["boot"], assets, "boot image")
     expected = BOOT_SLOT_SECTORS * 512
     if boot_image.stat().st_size != expected:
         raise BuildError(f"boot image is {boot_image.stat().st_size} bytes, expected {expected}")
     ota_key = _checked_asset(manifest["ota_public_key"], assets, "OTA public key")
-
-    features = []
-    seen = {boot_image.name}
-    records = manifest["features"]
-    if not isinstance(records, list) or not records:
-        raise BuildError("install manifest lists no features")
-    for record in records:
-        if not isinstance(record, dict) or set(record) != {"name", "payload", "manifest"}:
-            raise BuildError("feature record is malformed")
-        name = record["name"]
-        if not isinstance(name, str) or not name or "/" in name:
-            raise BuildError(f"unsafe feature name: {name!r}")
-        for entry in (record["payload"], record["manifest"]):
-            filename = entry.get("name") if isinstance(entry, dict) else None
-            if not isinstance(filename, str) or not filename:
-                raise BuildError(f"feature {name} has a malformed asset record")
-            if filename in seen:
-                raise BuildError(f"asset listed twice in the manifest: {filename}")
-            seen.add(filename)
-        features.append({
-            "name": name,
-            "payload": _checked_asset(record["payload"], assets, f"{name} payload"),
-            "manifest": _checked_asset(record["manifest"], assets, f"{name} manifest"),
-        })
 
     # The feature transaction commits against a SIGNED manifest, so the bundle
     # must carry it and its detached signature. Without them the installer fails
@@ -183,17 +306,113 @@ def discover(assets: Path) -> dict:
     ota_signature = assets / "manifest.sig"
     if not ota_manifest.is_file() or not ota_signature.is_file():
         raise BuildError(f"the OTA manifest is required: manifest + manifest.sig in {assets}")
-    declared_release = None
-    declared_boot = None
-    for line in ota_manifest.read_text().splitlines():
-        key, _, value = line.partition("=")
-        if key == "boot_sha256":
-            declared_boot = value
-        elif key == "version":
-            declared_release = value
+    ota = read_ota_manifest(ota_manifest)
+    if ota.get("board") != target:
+        raise BuildError("target does not match signed OTA manifest board")
+
+    declared_boot = ota.get("boot_sha256")
     if declared_boot and declared_boot != sha256_file(boot_image):
         raise BuildError(
             "the OTA manifest describes a different boot image than the one being shipped")
+
+    features = []
+    seen = {boot_image.name}
+    records = manifest["features"]
+    if not isinstance(records, list) or not records:
+        raise BuildError("install manifest lists no features")
+    # The signed manifest's feature_ids is the contract the device feature
+    # transaction commits against: it must name exactly the set the install
+    # manifest ships, once each, and only actions this protocol supports
+    # (replace/preserve; a runtime/unknown action cannot be staged safely).
+    feature_ids = ota.get("feature_ids", "")
+    if not feature_ids:
+        raise BuildError("signed OTA manifest declares no feature ids")
+    id_list = feature_ids.split(",")
+    if any(not re.fullmatch(r"[A-Za-z0-9._-]+", i) or i.startswith(".") for i in id_list):
+        raise BuildError(f"invalid signed feature ids: {feature_ids!r}")
+    if len(id_list) != len(set(id_list)):
+        raise BuildError(f"duplicate signed feature id: {feature_ids!r}")
+    # OTA v3 publishes a complete target state: every feature is a full signed
+    # asset with size and digest, and composition from a device's prior bytes
+    # (actions, base hashes) does not exist. Any such key in a v3 manifest is a
+    # malformed release, not a preference.
+    is_v3 = ota.get("format") == "libreecho-ota-v3"
+    if is_v3:
+        legacy = sorted(k for k in ota if re.fullmatch(
+            r"feature_[A-Za-z0-9._-]+_(action|base_payload_sha256|base_manifest_sha256)", k))
+        if legacy:
+            raise BuildError(f"v3 target manifest carries legacy composition keys: {legacy}")
+    names_seen: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {"name", "payload", "manifest"}:
+            raise BuildError("feature record is malformed")
+        name = record["name"]
+        if not isinstance(name, str) or not name or "/" in name:
+            raise BuildError(f"unsafe feature name: {name!r}")
+        if name in names_seen:
+            raise BuildError(f"feature listed twice in the install manifest: {name}")
+        names_seen.add(name)
+        action = "replace" if is_v3 else ota.get(f"feature_{name}_action")
+        if action not in ("replace", "preserve"):
+            raise BuildError(
+                f"feature {name} has an unsupported signed action: {action or 'none'}")
+        for entry in (record["payload"], record["manifest"]):
+            filename = entry.get("name") if isinstance(entry, dict) else None
+            if not isinstance(filename, str) or not filename:
+                raise BuildError(f"feature {name} has a malformed asset record")
+        payload, payload_name = _resolve_feature_file(
+            assets, ota.get(f"feature_{name}_asset", ""),
+            ota.get(f"feature_{name}_sha256", ""),
+            record["payload"], f"{name} payload", seen)
+        feature_manifest, manifest_name = _resolve_feature_file(
+            assets, ota.get(f"feature_{name}_manifest_asset", ""),
+            ota.get(f"feature_{name}_manifest_sha256", ""),
+            record["manifest"], f"{name} manifest", seen)
+        if action == "replace":
+            # The signed manifest is the authority for the staged bytes: digest
+            # AND size must agree with what the bundle carries. (The legacy
+            # installer required the size; the v2 helper cross-checks both.)
+            for label, path, digest_suffix, size_suffix in (
+                    ("payload", payload, "sha256", "size"),
+                    ("manifest", feature_manifest, "manifest_sha256", "manifest_size")):
+                declared = ota.get(f"feature_{name}_{digest_suffix}", "")
+                if not re.fullmatch(r"[0-9a-f]{64}", declared or ""):
+                    raise BuildError(
+                        f"feature {name} {label} digest is malformed in the signed manifest")
+                size = ota.get(f"feature_{name}_{size_suffix}", "")
+                if not size.isdigit():
+                    raise BuildError(
+                        f"feature {name} {label} size is missing from the signed manifest")
+                if sha256_file(path) != declared:
+                    raise BuildError(
+                        f"feature {name} {label} digest disagrees with the signed OTA manifest")
+                if path.stat().st_size != int(size):
+                    raise BuildError(
+                        f"feature {name} {label} size disagrees with the signed OTA manifest")
+        else:
+            if (sha256_file(payload) != ota.get(f"feature_{name}_base_payload_sha256") or
+                    sha256_file(feature_manifest) != ota.get(f"feature_{name}_base_manifest_sha256")):
+                raise BuildError(f"preserved {name} payload/manifest disagrees with signed OTA identity")
+        features.append({
+            "name": name,
+            "payload": payload,
+            "payload_name": payload_name,
+            "manifest": feature_manifest,
+            "manifest_name": manifest_name,
+        })
+    if set(id_list) != names_seen or len(id_list) != len(names_seen):
+        raise BuildError(
+            "the signed feature set does not match the install manifest features: "
+            f"ids={feature_ids!r} features={sorted(names_seen)!r}")
+
+    # The package the device-side local install consumes. A release always
+    # publishes an OTA tar; if one is present it must be installable.
+    local_package = None
+    candidates = sorted(assets.glob("*.ota.tar"))
+    if candidates:
+        preferred = f"libreecho-{manifest['release']}.ota.tar"
+        chosen = next((c for c in candidates if c.name == preferred), candidates[0])
+        local_package = _checked_local_package(chosen, boot_image)
 
     return {
         "install_manifest": manifest_path,
@@ -203,7 +422,9 @@ def discover(assets: Path) -> dict:
         "features": features,
         "ota_manifest": ota_manifest,
         "ota_signature": ota_signature,
-        "ota_release": declared_release or "",
+        "ota_values": ota,
+        "ota_release": ota.get("version", ""),
+        "local_package": local_package,
     }
 
 
@@ -214,19 +435,47 @@ def render_manifest(roles: dict, userdata_sectors: int) -> str:
     with no jq and no python, and a human debugging on the device has to read it
     too. Feature lines carry five fields because the device needs to know which
     feature directory each pair belongs in.
+
+    The ``transfer=`` lines and ``transfer_bytes_total`` are the protocol-v2
+    controls: they tell the direct-userdata helper which assets the browser
+    pushes onto userdata and how many bytes it will take. They are additive, so
+    the legacy installer (which ignores unknown keys) is unaffected.
     """
     data = roles["manifest_data"]
     boot = roles["boot_image"]
+    transfer_lines: list[str] = []
+    transfer_total = 0
+
+    def _add_transfer(role: str, path: Path) -> None:
+        nonlocal transfer_total
+        transfer_lines.append(f"transfer={role}:{path.name}:{sha256_file(path)}")
+        transfer_total += path.stat().st_size
+
+    _add_transfer("boot", boot)
+    _add_transfer("ota-manifest", roles["ota_manifest"])
+    _add_transfer("ota-signature", roles["ota_signature"])
+    if roles["local_package"] is not None:
+        _add_transfer("local-package", roles["local_package"])
+    for feature in roles["features"]:
+        transfer_total += feature["payload"].stat().st_size
+        transfer_total += feature["manifest"].stat().st_size
+
     lines = [
         f"schema={SCHEMA}",
+        f"protocol={PROTOCOL}",
         f"release={data['release']}",
         f"device={data['board']}",
+        f"target={data['board']}",
+        f"fastboot_products={','.join(get_target(data['board'])['fastboot_products'])}",
         f"soc={data['soc']}",
         f"image_profile={data['image_profile']}",
         f"service_profile={data['service_profile']}",
         f"userdata_sectors={userdata_sectors}",
+        f"transfer_bytes_total={transfer_total}",
         # payload=  verified before use, then written
         # staging=  <feature>:<payload>:<sha>:<manifest>:<sha>
+        # transfer= <role>:<name>:<sha>  (protocol v2; roles: boot, ota-manifest,
+        #           ota-signature, local-package)
         f"install_manifest={roles['install_manifest'].name}:{sha256_file(roles['install_manifest'])}",
         f"boot_image={boot.name}",
         f"boot_image_sha256={sha256_file(boot)}",
@@ -237,12 +486,19 @@ def render_manifest(roles: dict, userdata_sectors: int) -> str:
         f"payload={roles['ota_manifest'].name}:{sha256_file(roles['ota_manifest'])}",
         f"payload={roles['ota_signature'].name}:{sha256_file(roles['ota_signature'])}",
     ]
+    lines.extend(transfer_lines)
     for feature in roles["features"]:
         payload = feature["payload"]
         manifest = feature["manifest"]
         lines.append(
-            f"staging={feature['name']}:{payload.name}:{sha256_file(payload)}"
-            f":{manifest.name}:{sha256_file(manifest)}")
+            f"staging={feature['name']}:{feature['payload_name']}:{sha256_file(payload)}"
+            f":{feature['manifest_name']}:{sha256_file(manifest)}")
+    # The package the local-install path on the device consumes. It is what
+    # turns a staged tree into a prepared feature transaction, and its name is
+    # pinned here so the installer can prove it before copying it to /data.
+    if roles["local_package"] is not None:
+        lines.append(
+            f"local_package={roles['local_package'].name}:{sha256_file(roles['local_package'])}")
     return "\n".join(lines) + "\n"
 
 
@@ -266,14 +522,19 @@ def build_zip(src: Path, out_zip: Path) -> None:
 
 
 def assemble(assets_dir: Path, out_dir: Path, src_dir: Path, release: str,
-             userdata_sectors: int) -> dict:
+             userdata_sectors: int, target: str = DEFAULT_TARGET) -> dict:
     """Build the bundle. Returns a summary dict."""
     if not src_dir.is_dir():
         raise BuildError(f"installer source directory not found: {src_dir}")
+    if not (src_dir / DIRECT_HELPER).is_file():
+        raise BuildError(f"installer source is missing {DIRECT_HELPER}")
+    record = get_target(target)
+    zip_name = f"libreecho-{record['release_slug']}-install.zip"
+    manifest_name = f"libreecho-{record['release_slug']}-bundle.manifest"
     out_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as work:
         source = _extract_assets(assets_dir, Path(work))
-        roles = discover(source)
+        roles = discover(source, target)
         # --release is a cross-check against the manifest, not the source of it:
         # a bundle whose stated release disagrees with its own manifest is
         # exactly the mismatch that should never reach a device.
@@ -282,17 +543,31 @@ def assemble(assets_dir: Path, out_dir: Path, src_dir: Path, release: str,
                 f"--release {release} does not match the install manifest's "
                 f"{roles['manifest_data']['release']}")
         render_manifest(roles, userdata_sectors)  # render once so faults surface early
-        (out_dir / MANIFEST_NAME).write_text(render_manifest(roles, userdata_sectors))
+        (out_dir / manifest_name).write_text(render_manifest(roles, userdata_sectors))
+        if target == DEFAULT_TARGET:
+            shutil.copyfile(out_dir / manifest_name, out_dir / MANIFEST_NAME)
         copied = []
-        for path in [roles["install_manifest"], roles["boot_image"], roles["ota_key"],
-                     roles["ota_manifest"], roles["ota_signature"]] + [
-                p for f in roles["features"] for p in (f["payload"], f["manifest"])]:
-            shutil.copyfile(path, out_dir / path.name)
-            copied.append(path.name)
-    zip_path = out_dir / ZIP_NAME
+        shippable: list[tuple[Path, str]] = [
+            (roles["install_manifest"], roles["install_manifest"].name),
+            (roles["boot_image"], roles["boot_image"].name),
+            (roles["ota_key"], roles["ota_key"].name),
+            (roles["ota_manifest"], roles["ota_manifest"].name),
+            (roles["ota_signature"], roles["ota_signature"].name),
+        ]
+        for feature in roles["features"]:
+            shippable.append((feature["payload"], feature["payload_name"]))
+            shippable.append((feature["manifest"], feature["manifest_name"]))
+        if roles["local_package"] is not None:
+            shippable.append((roles["local_package"], roles["local_package"].name))
+        for path, name in shippable:
+            shutil.copyfile(path, out_dir / name)
+            copied.append(name)
+    zip_path = out_dir / zip_name
     build_zip(src_dir, zip_path)
+    if target == DEFAULT_TARGET:
+        shutil.copyfile(zip_path, out_dir / ZIP_NAME)
 
-    problems = check_bundle(out_dir)
+    problems = check_bundle(out_dir, target)
     if problems:
         raise BuildError("bundle failed self-check: " + "; ".join(problems))
     return {
@@ -304,7 +579,8 @@ def assemble(assets_dir: Path, out_dir: Path, src_dir: Path, release: str,
         "zip_sha256": sha256_file(zip_path),
         "zip_size": zip_path.stat().st_size,
         "payload_files": sorted(copied),
-        "manifest_sha256": sha256_file(out_dir / MANIFEST_NAME),
+        "local_package": roles["local_package"].name if roles["local_package"] else "",
+        "manifest_sha256": sha256_file(out_dir / manifest_name),
     }
 
 
@@ -312,23 +588,35 @@ def _declared_assets(line: str) -> list[tuple[str, str]]:
     """Every (filename, digest) pair a manifest line pins."""
     key, _, value = line.partition("=")
     parts = value.split(":")
-    if key in ("payload", "install_manifest") and len(parts) == 2:
+    if key in ("payload", "install_manifest", "local_package") and len(parts) == 2:
         return [(parts[0], parts[1])]
     if key == "staging" and len(parts) == 5:
         return [(parts[1], parts[2]), (parts[3], parts[4])]
-    if key in ("payload", "staging", "install_manifest"):
+    if key == "transfer" and len(parts) == 3:
+        return [(parts[1], parts[2])]
+    if key in ("payload", "staging", "install_manifest", "local_package", "transfer"):
         raise BuildError(f"malformed manifest line: {line}")
     return []
 
 
-def check_bundle(out_dir: Path) -> list[str]:
+def check_bundle(out_dir: Path, target: str = DEFAULT_TARGET) -> list[str]:
     """Re-verify a bundle from its own manifest. Returns a list of problems."""
     problems: list[str] = []
-    manifest = out_dir / MANIFEST_NAME
+    record = get_target(target)
+    manifest_name = f"libreecho-{record['release_slug']}-bundle.manifest"
+    zip_name = f"libreecho-{record['release_slug']}-install.zip"
+    manifest = out_dir / manifest_name
     if not manifest.is_file():
-        return [f"{MANIFEST_NAME} missing"]
-    if not (out_dir / ZIP_NAME).is_file():
-        problems.append(f"{ZIP_NAME} missing")
+        return [f"{manifest_name} missing"]
+    if not (out_dir / zip_name).is_file():
+        problems.append(f"{zip_name} missing")
+    values = dict(line.split("=", 1) for line in manifest.read_text().splitlines() if "=" in line)
+    if values.get("target") != target or values.get("device") != target or values.get("fastboot_products") != ",".join(record["fastboot_products"]):
+        problems.append("bundle target identity mismatch")
+    if target == DEFAULT_TARGET:
+        for name, alias in ((zip_name, ZIP_NAME), (manifest_name, MANIFEST_NAME)):
+            if not (out_dir / alias).is_file() or sha256_file(out_dir / alias) != sha256_file(out_dir / name):
+                problems.append(f"{alias} is not a byte-copy alias")
     declared: dict[str, str] = {}
     for line in manifest.read_text().splitlines():
         if not line or "=" not in line:
@@ -344,7 +632,10 @@ def check_bundle(out_dir: Path) -> list[str]:
             continue
         if sha256_file(path) != digest:
             problems.append(f"{name} digest mismatch")
-    exempt = {MANIFEST_NAME, ZIP_NAME, "SHA256SUMS", "bundle.json"}
+    exempt = {manifest_name, zip_name, "SHA256SUMS", "bundle.json"}
+    if target == DEFAULT_TARGET:
+        exempt.update((MANIFEST_NAME, ZIP_NAME))
+    exempt.update(p.name for p in out_dir.glob(f"*-{record['release_slug']}-TWRPINSTALL-SHA256SUMS"))
     for extra in sorted(out_dir.iterdir()):
         if extra.is_file() and extra.name not in declared and extra.name not in exempt:
             problems.append(f"{extra.name} present but not declared")
@@ -366,10 +657,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="userdata size the OS contract accepts")
     parser.add_argument("--check", action="store_true",
                         help="only verify an existing bundle in --out")
+    add_target_arguments(parser)
     args = parser.parse_args(argv)
+    validate_target_arguments(parser, args)
 
     if args.check:
-        problems = check_bundle(args.out)
+        problems = check_bundle(args.out, args.target)
         for problem in problems:
             print(f"  PROBLEM: {problem}")
         print("bundle: OK" if not problems else f"bundle: {len(problems)} problem(s)")
@@ -377,7 +670,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         summary = assemble(args.assets, args.out, args.src, args.release,
-                           args.userdata_sectors)
+                           args.userdata_sectors, args.target)
     except BuildError as error:
         print(f"refusing to build: {error}", file=sys.stderr)
         return 1
@@ -387,9 +680,17 @@ def main(argv: list[str] | None = None) -> int:
         for path in sorted(args.out.iterdir()):
             if path.is_file() and path.name not in ("SHA256SUMS", "bundle.json"):
                 handle.write(f"{sha256_file(path)}  {path.name}\n")
+    slug = get_target(args.target)["release_slug"]
+    prefix = f"libreecho-{summary['release']}"
+    qualified = [f"libreecho-{slug}-install.zip", f"libreecho-{slug}-bundle.manifest"]
+    if args.target == DEFAULT_TARGET:
+        qualified.extend((ZIP_NAME, MANIFEST_NAME))
+    (args.out / f"{prefix}-{slug}-TWRPINSTALL-SHA256SUMS").write_text(
+        "".join(f"{sha256_file(args.out / name)}  {name}\n" for name in qualified))
     (args.out / "bundle.json").write_text(json.dumps(
         {**summary, "userdata_sectors": args.userdata_sectors,
-         "schema": SCHEMA, "files": sorted(p.name for p in args.out.iterdir() if p.is_file())},
+         "schema": SCHEMA, "protocol": PROTOCOL,
+         "files": sorted(p.name for p in args.out.iterdir() if p.is_file())},
         indent=2, sort_keys=True) + "\n")
 
     print(f"release      {summary['release']}")

@@ -4,21 +4,41 @@
 from __future__ import annotations
 
 import argparse
-import gzip
 import hashlib
+import importlib.util
 import json
+import lzma
 import os
 import re
 import shutil
+import stat
 import struct
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 from generate_boot_envelope import generate as generate_boot_envelope
+from libreecho_platform_targets import add_target_arguments, validate_target_arguments, identity_bytes, get_target, audio_profile_bytes
+from verify_target_dtb import verify_target_dtb
+
+
+def _load_mdns_contract_module():
+    """Load the checked-in shared mDNS runtime contract."""
+    path = Path(__file__).resolve().parent / "mdns" / "contract.py"
+    spec = importlib.util.spec_from_file_location("libreecho_mdns_contract", path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"ERROR: mDNS runtime contract loader is missing: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+MDNS_RUNTIME_SCHEMA = "libreecho-mdns-runtime/v1"
+MDNS_CONTRACT = _load_mdns_contract_module().load()
 
 
 ANDROID_MAGIC = b"ANDROID!"
@@ -26,6 +46,8 @@ MKIMG_MAGIC = bytes.fromhex("88168858")
 FDT_MAGIC = bytes.fromhex("d00dfeed")
 PAGE_SIZE = 0x800
 MKIMG_SIZE = 0x200
+RAMDISK_COMPRESSION = "xz-crc32-lzma2-8m"
+RAMDISK_XZ_DICT_SIZE = 8 << 20
 IMAGE_SIZE = 0x1000000
 KERNEL_ADDR = 0x40008000
 RAMDISK_ADDR = 0x43478000
@@ -39,12 +61,12 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "fdf851a563b291ab0440b196e46a06905c2beaa1494dadd4f4a0b8eb95042e5a"
+RECOVERY_INIT_SHA256 = "de813146c808eb3cab93977e0ec7e84108c3f60005e28021a873fe3ea20337a4"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
 CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
-CONNECTIVITY_IMPORTER_SHA256 = "7601145a15750abce6a4c21d20326ecbdc1e4dc36e5670c0ca3cc9d1bf1f1326"
+CONNECTIVITY_IMPORTER_SHA256 = "58b907e1a7840fb9135f9b16e3f95b33424255e5d3d4ecb594c5a74b3de3f907"
 WPA_SUPPLICANT_VERSION = "2.10"
 WPA_SOURCE_SHA256 = "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f"
 WPA_SOURCE_URL = "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz"
@@ -58,9 +80,6 @@ LIBNL_SOURCE_URL = (
 WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
-SSH_PASSWORD_HASH_RE = re.compile(
-    r"\$(?:1|5|6|2[abxy]?|y|gy)\$[^$:\r\n]{1,64}\$[^:\r\n]{1,512}\Z"
-)
 
 CONNECTIVITY_ASSET_REQUIREMENTS: dict[str, dict[str, str | int]] = {
     "ROMv2_lm_patch_1_0_hdr.bin": {
@@ -110,6 +129,316 @@ CONNECTIVITY_HELPERS = {
 CONNECTIVITY_RUNTIME_SYMLINKS = {
     "etc/firmware": "../lib/firmware",
 }
+
+# Pinned static recovery-AP dependencies (issue #96).  The compiled hostapd,
+# dnsmasq and iw binaries are staged with their hashes checked against the
+# caller's metadata so an unverified artifact can never enter an image; the
+# shell probes and detector ship through the overlay below.
+RECOVERY_AP_BINARIES = {
+    "hostapd": "usr/local/sbin/hostapd",
+    "dnsmasq": "usr/local/sbin/dnsmasq",
+    "iw": "usr/local/sbin/iw",
+    # The physical boot detector is a compiled evdev reader (EVIOCGKEY), built
+    # by recovery-ap/build_recovery_ap.sh, not a shell overlay file.
+    "libreecho-recovery-button": "usr/local/sbin/libreecho-recovery-button",
+}
+# The metadata document recovery-ap/build_recovery_ap.sh emits and this builder
+# consumes.  It binds the shipped bytes to their SHA-256 and to the licence /
+# corresponding-source provenance that ships on-image with them.
+RECOVERY_AP_METADATA_SCHEMA = "libreecho-recovery-ap-binaries/v1"
+# The checked-in pin document the emitted metadata must agree with.  Metadata is
+# self-declared by whichever build produced it, so the builder refuses any
+# component whose name/version/source URL/source SHA-256/licence does not match
+# this file: a hand-written metadata document cannot smuggle an unlisted or
+# altered component into an image.
+RECOVERY_AP_LOCK_PATH = Path(__file__).resolve().parent / "recovery-ap" / "SOURCE.lock"
+# The staged on-image path of the client Wi-Fi service the recovery handover
+# stops and restores.  It ships as an overlay file (see add_overlay) and the
+# net-up/net-down RECOVERY_AP_WPA_SERVICE defaults must resolve to exactly this
+# path, or the handover would stop/restore a service the image never installed.
+RECOVERY_AP_WPA_SERVICE_PATH = "sbin/libreecho-wifi"
+
+
+def load_recovery_ap_lock(lock_path: Path | None = None) -> dict[str, object]:
+    """Read and structurally validate the checked-in recovery-AP SOURCE.lock."""
+    path = lock_path or RECOVERY_AP_LOCK_PATH
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit(f"ERROR: recovery-AP SOURCE.lock is unavailable: {path}")
+    try:
+        lock = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"ERROR: recovery-AP SOURCE.lock is not valid JSON: {exc}") from exc
+    if not isinstance(lock, dict):
+        raise SystemExit("ERROR: recovery-AP SOURCE.lock is not a JSON object")
+    components = lock.get("components")
+    first_party = lock.get("first_party")
+    if not isinstance(components, dict) or not isinstance(first_party, dict):
+        raise SystemExit("ERROR: recovery-AP SOURCE.lock lacks component records")
+    if set(components) | set(first_party) != set(RECOVERY_AP_BINARIES):
+        raise SystemExit(
+            "ERROR: recovery-AP SOURCE.lock does not describe the pinned set"
+        )
+    return lock
+
+
+def validate_recovery_ap_source_lock(provenance: dict[str, Any],
+                                     source_offer: object,
+                                     lock_path: Path | None = None) -> None:
+    """Bind the emitted provenance to the checked-in SOURCE.lock.
+
+    The metadata document is produced by the recovery-AP builder, but nothing
+    about a JSON file proves its values are the pinned ones: a caller could
+    hand-write matching hashes for an arbitrary binary.  This refuses any
+    component whose name, version, https source URL, source SHA-256, licence or
+    on-image licence copies differ from ``recovery-ap/SOURCE.lock``, so the
+    image can only ever ship the components the repository actually pins.
+    """
+    lock = load_recovery_ap_lock(lock_path)
+    components = lock["components"]
+    first_party = lock["first_party"]
+    on_image = lock.get("on_image")
+    on_image_licenses = on_image.get("licenses") if isinstance(on_image, dict) else None
+    if not isinstance(on_image_licenses, dict):
+        on_image_licenses = {}
+    assert isinstance(components, dict) and isinstance(first_party, dict)
+
+    for name, record in components.items():
+        entry = provenance.get(name)
+        if not isinstance(entry, dict):
+            raise SystemExit(f"ERROR: recovery-AP provenance is missing for {name}")
+        for field in ("version", "license", "source_url", "source_sha256",
+                      "source_license", "artifact"):
+            if entry.get(field) != record.get(field):
+                raise SystemExit(
+                    f"ERROR: recovery-AP metadata {field} does not match "
+                    f"SOURCE.lock: {name}"
+                )
+        if record.get("source_license_secondary") and (
+                entry.get("source_license_secondary") != record["source_license_secondary"]):
+            raise SystemExit(
+                f"ERROR: recovery-AP metadata secondary licence does not match "
+                f"SOURCE.lock: {name}"
+            )
+        if entry.get("image_path") != RECOVERY_AP_BINARIES[name]:
+            raise SystemExit(
+                f"ERROR: recovery-AP metadata image path does not match the "
+                f"pinned target: {name}"
+            )
+        if list(entry.get("image_license", [])) != list(on_image_licenses.get(name, [])):
+            raise SystemExit(
+                f"ERROR: recovery-AP metadata on-image licences do not match "
+                f"SOURCE.lock: {name}"
+            )
+
+    for name, record in first_party.items():
+        entry = provenance.get(name)
+        if not isinstance(entry, dict):
+            raise SystemExit(f"ERROR: recovery-AP provenance is missing for {name}")
+        for field in ("license", "source_url", "source_path", "artifact"):
+            if entry.get(field) != record.get(field):
+                raise SystemExit(
+                    f"ERROR: recovery-AP metadata {field} does not match "
+                    f"SOURCE.lock: {name}"
+                )
+        if entry.get("image_path") != RECOVERY_AP_BINARIES[name]:
+            raise SystemExit(
+                f"ERROR: recovery-AP metadata image path does not match the "
+                f"pinned target: {name}"
+            )
+
+    lock_offer = lock.get("source_offer")
+    if not isinstance(lock_offer, dict) or not isinstance(source_offer, dict):
+        raise SystemExit("ERROR: recovery-AP metadata has no source offer to bind to SOURCE.lock")
+    if sorted(source_offer.get("components", [])) != sorted(lock_offer.get("components", [])):
+        raise SystemExit(
+            "ERROR: recovery-AP source-offer components do not match SOURCE.lock"
+        )
+    if (str(source_offer.get("statement", "")).strip() !=
+            str(lock_offer.get("statement", "")).strip()):
+        raise SystemExit(
+            "ERROR: recovery-AP source-offer statement does not match SOURCE.lock"
+        )
+    if (str(source_offer.get("description", "")).strip() !=
+            str(lock_offer.get("description", "")).strip()):
+        raise SystemExit(
+            "ERROR: recovery-AP source-offer description does not match SOURCE.lock"
+        )
+
+
+def validate_recovery_ap_provenance(metadata: object) -> dict[str, dict[str, object]]:
+    """Validate the licence/source provenance the emitted metadata must carry.
+
+    A hash alone only proves the image got the bytes the caller described; it
+    does not prove the image can attribute them or offer their source.  Every
+    pinned component must therefore declare its licence and source, and every
+    redistributed GPL component must be covered by the corresponding-source
+    offer that ships on-image in the same metadata document.
+    """
+    if not isinstance(metadata, dict):
+        raise SystemExit("ERROR: recovery-AP metadata is not a JSON object")
+    if metadata.get("schema") != RECOVERY_AP_METADATA_SCHEMA:
+        raise SystemExit("ERROR: recovery-AP metadata schema is not the pinned contract")
+    provenance = metadata.get("components")
+    if not isinstance(provenance, dict) or set(provenance) != set(RECOVERY_AP_BINARIES):
+        raise SystemExit(
+            "ERROR: recovery-AP metadata does not carry provenance for the pinned set"
+        )
+    offer = metadata.get("source_offer")
+    offer_components = offer.get("components") if isinstance(offer, dict) else None
+    offered = set(offer_components) if isinstance(offer_components, list) else set()
+    statement = offer.get("statement") if isinstance(offer, dict) else None
+    if not isinstance(statement, str) or not statement.strip():
+        raise SystemExit("ERROR: recovery-AP metadata has no corresponding-source statement")
+    for name, relative in RECOVERY_AP_BINARIES.items():
+        record = provenance[name]
+        if not isinstance(record, dict):
+            raise SystemExit(f"ERROR: recovery-AP provenance for {name} is malformed")
+        license_ = record.get("license")
+        source_url = record.get("source_url")
+        if not isinstance(license_, str) or not license_.strip():
+            raise SystemExit(f"ERROR: recovery-AP provenance for {name} declares no licence")
+        if not isinstance(source_url, str) or not source_url.startswith("https://"):
+            raise SystemExit(f"ERROR: recovery-AP provenance for {name} has no https source URL")
+        if record.get("image_path") != relative:
+            raise SystemExit(f"ERROR: recovery-AP provenance image path mismatch: {name}")
+        source_path = record.get("source_path")
+        if isinstance(source_path, str) and source_path:
+            # First-party component: its corresponding source is this repository.
+            if source_path.startswith("/") or ".." in source_path.split("/"):
+                raise SystemExit(f"ERROR: recovery-AP provenance source path is unsafe: {name}")
+        else:
+            source_sha = record.get("source_sha256")
+            source_license = record.get("source_license")
+            if (not isinstance(source_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", source_sha)):
+                raise SystemExit(
+                    f"ERROR: recovery-AP provenance for {name} has no pinned source SHA-256"
+                )
+            if not isinstance(source_license, str) or not source_license:
+                raise SystemExit(
+                    f"ERROR: recovery-AP provenance for {name} names no licence file"
+                )
+            image_license = record.get("image_license")
+            if (not isinstance(image_license, list) or not image_license
+                    or not all(isinstance(item, str) and item for item in image_license)):
+                raise SystemExit(
+                    f"ERROR: recovery-AP provenance for {name} names no on-image licence copy"
+                )
+            if "GPL" in license_ and name not in offered:
+                raise SystemExit(
+                    f"ERROR: redistributed GPL component {name} has no corresponding-source offer"
+                )
+    return provenance
+
+
+def validate_recovery_ap_prerequisites(recovery_ap_requested: bool,
+                                       connectivity_enabled: bool) -> None:
+    """Refuse recovery-AP staging without the pinned WMT connectivity bundle.
+
+    The recovery portal only reaches the radio once init's vendor-assets gate
+    (``VENDOR_ASSETS_OK``) passes, and that gate requires the pinned WMT helpers
+    and the vendor-asset importer that the connectivity bundle stages.  A build
+    that staged the AP binaries alone would advertise a portal whose ``wlan0``
+    never appears, so the AP inputs are refused unless the connectivity inputs
+    are supplied too.
+    """
+    if recovery_ap_requested and not connectivity_enabled:
+        raise SystemExit(
+            "ERROR: recovery-AP staging requires the WMT connectivity bundle: "
+            "the portal advertises wlan0, which init's vendor-assets gate only "
+            "brings up when the pinned WMT helpers and the vendor importer are "
+            "staged; supply --wmt-config-helper, --wmt-responder, --wmt-bt-on, "
+            "--wmt-stock-compat and --wmt-launcher"
+        )
+
+
+def add_recovery_ap_bundle(stage: Path, binaries: dict[str, Path],
+                           metadata_path: Path, manifest: dict[str, object]) -> None:
+    """Stage the pinned recovery-AP dependencies, hash-checked against metadata.
+
+    The caller supplies the compiled hostapd/dnsmasq/iw artifacts and the
+    compiled evdev button detector plus the JSON metadata file of their expected
+    SHA-256 values and licence/source provenance emitted by
+    recovery-ap/build_recovery_ap.sh.  Every artifact must be a regular file
+    whose bytes match the recorded hash; nothing is staged on a mismatch, so an
+    unverified binary can never reach an image.  The metadata must describe
+    exactly the pinned set and carry licence/source provenance for every member:
+    an incomplete (half-shipped) bundle, or one whose binaries cannot be
+    attributed or have their corresponding source offered, is refused rather
+    than shipped.
+    """
+    metadata_data = read(metadata_path)
+    try:
+        metadata = json.loads(metadata_data.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise SystemExit(f"ERROR: recovery-AP metadata is not valid JSON: {exc}") from exc
+    records = metadata.get("binaries")
+    if not isinstance(records, dict):
+        raise SystemExit("ERROR: recovery-AP metadata lacks a binaries map")
+    if set(records) != set(RECOVERY_AP_BINARIES):
+        missing = sorted(set(RECOVERY_AP_BINARIES) - set(records))
+        extra = sorted(set(records) - set(RECOVERY_AP_BINARIES))
+        raise SystemExit(
+            "ERROR: recovery-AP metadata inventory does not match the pinned set "
+            f"(missing={missing}, unexpected={extra})"
+        )
+    provenance = validate_recovery_ap_provenance(metadata)
+    validate_recovery_ap_source_lock(provenance, metadata.get("source_offer"))
+
+    staged: dict[str, object] = {}
+    for name, target_relative in RECOVERY_AP_BINARIES.items():
+        if name not in binaries or name not in records:
+            raise SystemExit(f"ERROR: recovery-AP component not supplied: {name}")
+        source = binaries[name]
+        if source.is_symlink() or not source.is_file():
+            raise SystemExit(f"ERROR: recovery-AP component is not a regular file: {source}")
+        data = read(source)
+        expected = records[name].get("sha256") if isinstance(records[name], dict) else None
+        if not isinstance(expected, str) or len(expected) != 64 or sha256(data) != expected:
+            actual = sha256(data)
+            raise SystemExit(
+                f"ERROR: recovery-AP component {name} SHA-256 mismatch\n"
+                f"expected={expected}\nactual={actual}"
+            )
+        target = stage / target_relative
+        if target.exists() or target.is_symlink():
+            raise SystemExit(f"ERROR: recovery-AP component collides with {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        target.chmod(0o755)
+        staged[name] = {
+            "path": f"/{target_relative}",
+            "sha256": expected,
+            "size": len(data),
+            "mode": "0755",
+            "elf": require_elf_contract(target, 0x05000400, None, (), False),
+            "source": provenance[name],
+        }
+
+    metadata_target = stage / "etc/libreecho/recovery-ap-binaries.json"
+    metadata_target.parent.mkdir(parents=True, exist_ok=True)
+    metadata_target.write_bytes(metadata_data)
+    metadata_target.chmod(0o644)
+    manifest["recovery_ap"] = {
+        "enabled": True,
+        "ap_probe": "/usr/local/sbin/libreecho-recovery-ap-probe",
+        "ready_probe": "/usr/local/sbin/libreecho-recovery-ap-ready",
+        "net_up": "/usr/local/sbin/libreecho-recovery-net-up",
+        "net_down": "/usr/local/sbin/libreecho-recovery-net-down",
+        "button_detector": "/usr/local/sbin/libreecho-recovery-button",
+        "marker": "/run/libreecho/recovery-mode",
+        "hostapd": "/usr/local/sbin/hostapd",
+        "dhcp": "/usr/local/sbin/dnsmasq",
+        "iw": "/usr/local/sbin/iw",
+        "components": staged,
+        "provenance": provenance,
+        "source_offer": metadata.get("source_offer"),
+        "metadata": {
+            "path": "/etc/libreecho/recovery-ap-binaries.json",
+            "sha256": sha256(metadata_data),
+            "size": len(metadata_data),
+            "mode": "0644",
+        },
+    }
 
 
 def sha256(data: bytes) -> str:
@@ -223,7 +552,7 @@ def pinned_source(root: Path, relative: str, label: str) -> Path:
 
 
 def copy_adbd(adbd: Path, metadata_path: Path, stage: Path,
-              manifest: dict[str, object]) -> None:
+              manifest: dict[str, object], update_channel: str) -> None:
     if adbd.is_symlink() or not adbd.is_file():
         raise SystemExit(f"ERROR: adbd is not a regular file: {adbd}")
     if metadata_path.is_symlink() or not metadata_path.is_file():
@@ -234,7 +563,7 @@ def copy_adbd(adbd: Path, metadata_path: Path, stage: Path,
         raise SystemExit(f"ERROR: invalid adbd source metadata: {exc}") from exc
     required_metadata = {
         "source", "source_url", "source_commit", "source_license", "patch_sha256",
-        "compiler", "kernel_headers", "binary_sha256", "binary_size", "transport", "tcp_listener",
+        "compiler", "kernel_headers", "binary_sha256", "binary_size", "transport", "tcp_listener", "tcp_port",
     }
     if set(metadata) != required_metadata:
         raise SystemExit("ERROR: adbd source metadata schema mismatch")
@@ -248,18 +577,47 @@ def copy_adbd(adbd: Path, metadata_path: Path, stage: Path,
         raise SystemExit("ERROR: adbd source license is not Apache-2.0")
     if not isinstance(metadata["kernel_headers"], str) or not metadata["kernel_headers"]:
         raise SystemExit("ERROR: adbd kernel-header provenance is missing")
-    if metadata["transport"] != "usb-functionfs-only" or metadata["tcp_listener"] is not False:
-        raise SystemExit("ERROR: adbd transport policy is not USB FunctionFS-only")
+    expected_policy = {
+        "dev": ("usb-functionfs-and-tcp", True, 5555),
+        "stable": ("usb-functionfs-only", False, 0),
+    }.get(update_channel)
+    if expected_policy is None or (
+        metadata["transport"] != expected_policy[0]
+        or metadata["tcp_listener"] is not expected_policy[1]
+        or type(metadata["tcp_port"]) is not int
+        or metadata["tcp_port"] != expected_policy[2]
+    ):
+        raise SystemExit("ERROR: adbd transport policy does not match update channel")
     target = stage / "sbin/adbd"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(data)
     target.chmod(0o750)
+    # Stage the transport policy the builder just validated. init reads this
+    # instead of inferring a transport from the running system. Stable is
+    # USB-only; dev carries an explicitly channel-bound TCP listener.
+    policy = stage / "etc/libreecho/adb-transport"
+    policy.parent.mkdir(parents=True, exist_ok=True)
+    policy.write_text(
+        f"schema=1\n"
+        f"transport={metadata['transport']}\n"
+        f"tcp_listener={'true' if metadata['tcp_listener'] else 'false'}\n"
+        f"tcp_port={metadata['tcp_port']}\n"
+        f"binary_sha256={expected}\n"
+    )
+    policy.chmod(0o644)
     manifest["adbd"] = {
         "path": "/sbin/adbd",
         "sha256": expected,
         "size": len(data),
         "mode": "0750",
         "source": metadata,
+        "transport_policy": {
+            "path": "/etc/libreecho/adb-transport",
+            "transport": metadata["transport"],
+            "tcp_listener": metadata["tcp_listener"],
+            "tcp_port": metadata["tcp_port"],
+            "binary_sha256": expected,
+        },
     }
 
 
@@ -395,6 +753,19 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         "init.rc": ("init.rc", 0o644),
         "init.recovery.mt8163.rc": ("init.recovery.mt8163.rc", 0o644),
         "libreecho-init": ("libreecho-init", 0o755),
+        "libreecho-recovery-ap-probe": (
+            "usr/local/sbin/libreecho-recovery-ap-probe", 0o755,
+        ),
+        "libreecho-recovery-ap-ready": (
+            "usr/local/sbin/libreecho-recovery-ap-ready", 0o755,
+        ),
+        "libreecho-recovery-net-up": (
+            "usr/local/sbin/libreecho-recovery-net-up", 0o755,
+        ),
+        "libreecho-recovery-net-down": (
+            "usr/local/sbin/libreecho-recovery-net-down", 0o755,
+        ),
+        "libreecho-mdnsd": ("etc/init.d/libreecho-mdnsd.init", 0o755),
         "libreecho-reconcile-features": (
             "usr/local/sbin/libreecho-reconcile-features", 0o755,
         ),
@@ -407,10 +778,24 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         "vendor-assets/mt8163-v181-stock-v1.tsv": (
             "etc/libreecho/vendor-assets/mt8163-v181-stock-v1.tsv", 0o644,
         ),
+        "vendor-assets/mt8163-v181-stock-v2.tsv": (
+            "etc/libreecho/vendor-assets/mt8163-v181-stock-v2.tsv", 0o644,
+        ),
+        "vendor-assets/mt8163-v181-stock-v3.tsv": (
+            "etc/libreecho/vendor-assets/mt8163-v181-stock-v3.tsv", 0o644,
+        ),
         "libreecho-update": ("usr/local/sbin/libreecho-update", 0o755),
         "libreecho-update-fetch": ("usr/local/sbin/libreecho-update-fetch", 0o755),
+        "libreecho-ping": ("usr/local/sbin/libreecho-ping", 0o755),
+        "libreecho-feature-transaction": (
+            "usr/local/sbin/libreecho-feature-transaction", 0o755,
+        ),
+        "libreecho-target-manifest": ("usr/local/sbin/libreecho-target-manifest", 0o755),
+        "libreecho-generation": ("usr/local/sbin/libreecho-generation", 0o755),
+        "libreecho-config-migrate": ("usr/local/sbin/libreecho-config-migrate", 0o755),
+        "libreecho-generation-transaction": ("usr/local/sbin/libreecho-generation-transaction", 0o755),
         "ota-source.conf": ("etc/libreecho/ota-source.conf", 0o644),
-        "libreecho-wifi": ("sbin/libreecho-wifi", 0o755),
+        "libreecho-wifi": (RECOVERY_AP_WPA_SERVICE_PATH, 0o755),
         "udhcpc.script": ("etc/udhcpc.script", 0o755),
         "wpa_supplicant.conf.example": (
             "etc/wifi/wpa_supplicant.conf.example", 0o600,
@@ -501,9 +886,37 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
     manifest["busybox_applets"] = {"count": len(applets), "names": applets}
 
 
+def add_target_identity(stage: Path, manifest: dict[str, object],
+                        target: str = "radar_puffin", digest: str | None = None) -> None:
+    data = identity_bytes(target, digest)
+    identity = stage / "etc/libreecho/target"
+    identity.parent.mkdir(parents=True, exist_ok=True)
+    identity.write_bytes(data)
+    identity.chmod(0o644)
+    # Per-target speaker policy from the Platform target table; the audio
+    # engine follows it, so new hardware needs a table entry, not code.
+    profile = stage / "etc/libreecho/audio-profile"
+    profile_data = audio_profile_bytes(target)
+    profile.write_bytes(profile_data)
+    profile.chmod(0o644)
+    manifest["audio_profile"] = {"sha256": sha256(profile_data), "size": len(profile_data)}
+    manifest["board"] = target
+    if digest is not None:
+        manifest["target_descriptor_sha256"] = digest
+    props = stage / "default.prop"
+    if target != "radar_puffin" and props.is_file():
+        data = props.read_bytes().replace(b"=radar_puffin\n", b"=" + target.encode("ascii") + b"\n")
+        props.write_bytes(data)
+        overlay = manifest.get("overlay")
+        if isinstance(overlay, dict):
+            overlay["default.prop"] = {"sha256": sha256(data), "size": len(data), "mode": "0644"}
+
+
 def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
                   image_profile: str, service_profile: str, feature_policy: str,
-                  update_channel: str, manifest: dict[str, object]) -> None:
+                  update_channel: str, manifest: dict[str, object],
+                  target: str = "radar_puffin", descriptor_sha256: str | None = None) -> None:
+    add_target_identity(stage, manifest, target, descriptor_sha256)
     sources = (
         ("bootctl", bootctl, "usr/local/sbin/libreecho-bootctl",
          "/lib/ld-musl-armhf.so.1", ("libc.musl-armv7.so.1",), True),
@@ -515,16 +928,16 @@ def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
         if source.is_symlink() or not source.is_file():
             raise SystemExit(f"ERROR: OTA {name} is not a regular file: {source}")
         data = read(source)
-        target = stage / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-        target.chmod(0o755)
+        destination = stage / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+        destination.chmod(0o755)
         records[name] = {
             "sha256": sha256(data),
             "size": len(data),
             "path": "/" + relative,
             "elf": require_elf_contract(
-                target, 0x05000400, interpreter, needed, dynamic,
+                destination, 0x05000400, interpreter, needed, dynamic,
             ),
         }
 
@@ -550,7 +963,7 @@ def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
     update_channel_target.chmod(0o644)
     first_install_target = stage / "etc/libreecho/first-install-confirm"
     first_install_target.write_text(
-        "schema=1\nmode=first-install\nboard=radar_puffin\n"
+        f"schema=1\nmode=first-install\nboard={target}\n"
     )
     first_install_target.chmod(0o644)
     ota_source = stage / "etc/libreecho/ota-source.conf"
@@ -579,7 +992,7 @@ def add_ota_tools(stage: Path, bootctl: Path, verifier: Path, public_key: Path,
     manifest["ota"] = {
         "enabled": True,
         "format": "libreecho-ota-v1",
-        "board": "radar_puffin",
+        "board": target,
         "payload_slots": {"a": "mmcblk0p10", "b": "mmcblk0p11"},
         "wrapper_partitions": ["mmcblk0p17", "mmcblk0p18"],
         "bcb": {"partition": "mmcblk0p8", "offset": 0x360, "record_size": 7},
@@ -739,6 +1152,14 @@ def validate_ui_startup_contract(bundle: Path) -> None:
             ),
         ),
         (
+            "etc/init.d/libreecho-buttond.init",
+            (
+                "DAEMON=${DAEMON:-/usr/local/sbin/libreecho-buttond}",
+                'start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- $ARGS',
+                "start) start_service",
+            ),
+        ),
+        (
             "etc/init.d/libreecho-web.init",
             (
                 "STARTUP_READY_TIMEOUT_TICKS=${STARTUP_READY_TIMEOUT_TICKS:-600}",
@@ -774,10 +1195,8 @@ def validate_ui_startup_contract(bundle: Path) -> None:
             (
                 "AGENT_DEPENDENCY_TIMEOUT_SECONDS=${AGENT_DEPENDENCY_TIMEOUT_SECONDS:-90}",
                 "AGENT_DEPENDENCY_POLL_SECONDS=${AGENT_DEPENDENCY_POLL_SECONDS:-1}",
-                "PAYLOAD=",
                 "RUNTIME_ROOT=",
                 "mount_runtime()",
-                "mount -t squashfs",
                 "unmount_runtime()",
                 "mount_runtime || return 1",
                 "dependency_sockets_ready()",
@@ -792,10 +1211,8 @@ def validate_ui_startup_contract(bundle: Path) -> None:
     )
     payload_contracts = {
         "etc/init.d/libreecho-airplayd.init": (
-            "PAYLOAD=",
             "RUNTIME_ROOT=",
             "mount_runtime()",
-            "mount -t squashfs",
             "unmount_runtime()",
             "mount_runtime || return 1",
             "start) start_service",
@@ -806,28 +1223,22 @@ def validate_ui_startup_contract(bundle: Path) -> None:
             "persistent AirPlay disable",
         ),
         "etc/init.d/libreecho-sttd.init": (
-            "PAYLOAD=",
             "RUNTIME_ROOT=",
             "mount_runtime()",
-            "mount -t squashfs",
             "unmount_runtime()",
             "mount_runtime || return 1",
             "start) start_service",
         ),
         "etc/init.d/libreecho-ttsd.init": (
-            "PAYLOAD=",
             "RUNTIME_ROOT=",
             "mount_runtime()",
-            "mount -t squashfs",
             "unmount_runtime()",
             "mount_runtime || return 1",
             "start) start_service",
         ),
         "etc/init.d/libreecho-waked.init": (
-            "PAYLOAD=",
             "RUNTIME_ROOT=",
             "mount_runtime()",
-            "mount -t squashfs",
             "unmount_runtime()",
             "mount_runtime || return 1",
             "start) start_service",
@@ -918,6 +1329,20 @@ def validate_ui_startup_contract(bundle: Path) -> None:
                 raise SystemExit(
                     "ERROR: agentd start case does not wait for dependencies"
                 )
+        if relative in payload_contracts or relative.endswith("libreecho-agentd.init"):
+            # OTA v3: Platform mounts the authenticated generation; a feature
+            # service only verifies that read-only squashfs mount and must never
+            # mount bytes itself or name the legacy feature tree.
+            mount_body = re.search(r"(?ms)^mount_runtime\(\) \{\n(.*?)^\}", text)
+            if not mount_body:
+                raise SystemExit(f"ERROR: feature service has no mount_runtime: {relative}")
+            if ("mount -t" in mount_body.group(1) or "$PAYLOAD" in text
+                    or "/data/libreecho/features" in text):
+                raise SystemExit(
+                    f"ERROR: feature service mounts legacy payload bytes: {relative}")
+            if "/proc/self/mountinfo" not in mount_body.group(1):
+                raise SystemExit(
+                    f"ERROR: feature service does not verify the generation mount: {relative}")
         if relative in payload_contracts:
             start_service_start = text.index("start_service()")
             dispatch_start = text.index('case "${1:-}" in')
@@ -987,6 +1412,30 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
     )
     if actual_bundle_files != sorted(bundled_files):
         raise SystemExit("ERROR: UI file manifest does not cover the complete bundle")
+    allowed_binaries = {
+        "libreecho-web", "libreecho-logd", "libreecho-networkd",
+        "libreecho-timed", "libreecho-timerd", "libreecho-watchdogd",
+        "libreecho-audiod", "libreecho-micd", "libreecho-ledd", "libreecho-buttond",
+        "libreecho-radiod", "libreecho-btd", "libreecho-airplayd",
+        "libreecho-esphomed", "libreecho-mdnsd",
+        "libreecho-sttd-wyoming", "libreecho-ttsd-wyoming",
+    }
+    allowed_inits = (allowed_binaries - {"libreecho-mdnsd", "libreecho-sttd-wyoming",
+                                       "libreecho-ttsd-wyoming"}) | {
+        "libreecho-sttd", "libreecho-ttsd", "libreecho-agentd", "libreecho-waked",
+    }
+    allowed_fixed = {f"sbin/{name}" for name in allowed_binaries} | {
+        f"etc/init.d/{name}.init" for name in allowed_inits
+    } | {
+        "etc/libreecho/web-config.json", "etc/libreecho/airplay2.conf",
+        "etc/libreecho/ntp.conf", "etc/libreecho/users",
+        "etc/libreecho/avahi-services/esphome.service",
+        "share/libreecho/sounds/action-1.raw", "share/libreecho/sounds/action-2.raw",
+        "share/libreecho/sounds/action-3.raw",
+    }
+    for relative in bundled_files:
+        if relative not in allowed_fixed and not relative.startswith("share/libreecho/web/"):
+            raise SystemExit(f"ERROR: UI bundle has unexpected/forbidden file: {relative}")
     validate_ui_startup_contract(bundle)
 
     files: dict[str, object] = {}
@@ -1022,30 +1471,44 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
 
     for binary in (
         "libreecho-web", "libreecho-logd", "libreecho-networkd",
-        "libreecho-timed", "libreecho-audiod", "libreecho-micd",
-        "libreecho-ledd", "libreecho-btd",
-        "libreecho-airplayd", "libreecho-wyomingd",
+        "libreecho-timed", "libreecho-timerd", "libreecho-watchdogd",
+        "libreecho-audiod", "libreecho-micd",
+        "libreecho-ledd", "libreecho-buttond", "libreecho-radiod", "libreecho-btd",
+        "libreecho-airplayd", "libreecho-esphomed",
         "libreecho-sttd-wyoming", "libreecho-ttsd-wyoming",
+        # The shared discovery supervisor: the 0.14 mDNS re-arch moved
+        # responder ownership here, and without the binary the init falls back
+        # to a bare Avahi that publishes nothing the image's own contract
+        # promises (no AirPlay service definition, no name from the device
+        # configuration). Its init script has always been staged - the binary
+        # was simply never added.
+        "libreecho-mdnsd",
     ):
         copy_file(f"sbin/{binary}", f"usr/local/sbin/{binary}", 0o755, True)
     for script in (
         "libreecho-web.init", "libreecho-logd.init", "libreecho-networkd.init",
-        "libreecho-timed.init", "libreecho-audiod.init",
-        "libreecho-micd.init", "libreecho-ledd.init", "libreecho-btd.init",
+        "libreecho-timed.init", "libreecho-timerd.init", "libreecho-watchdogd.init", "libreecho-audiod.init",
+        "libreecho-micd.init", "libreecho-ledd.init", "libreecho-buttond.init",
+        "libreecho-radiod.init", "libreecho-btd.init",
         "libreecho-airplayd.init", "libreecho-ttsd.init", "libreecho-waked.init",
-        "libreecho-sttd.init", "libreecho-agentd.init", "libreecho-wyomingd.init",
+        "libreecho-sttd.init", "libreecho-agentd.init", "libreecho-esphomed.init",
     ):
         copy_file(f"etc/init.d/{script}", f"etc/init.d/{script}", 0o755)
     copy_file("etc/libreecho/web-config.json", "etc/libreecho/web-config.json", 0o600)
     copy_file("etc/libreecho/airplay2.conf", "etc/libreecho/airplay2.conf", 0o644)
     copy_file("etc/libreecho/ntp.conf", "etc/libreecho/ntp.conf", 0o644)
+    copy_file(
+        "etc/libreecho/avahi-services/esphome.service",
+        "etc/libreecho/avahi-services/esphome.service", 0o644,
+    )
     if "etc/libreecho/users" in bundled_files:
         users_file = pinned_source(bundle, "etc/libreecho/users", "UI users file")
         if users_file.stat().st_mode & 0o077 or not read(users_file).strip():
             raise SystemExit("ERROR: UI users file must be private and non-empty")
         copy_file("etc/libreecho/users", "etc/libreecho/users", 0o600)
     for relative in sorted(bundled_files):
-        if not relative.startswith("share/libreecho/web/"):
+        if not relative.startswith("share/libreecho/web/") and not relative.startswith(
+                "share/libreecho/sounds/"):
             continue
         target_name = "usr/local/" + relative
         copy_file(relative, target_name, 0o644)
@@ -1064,6 +1527,184 @@ def add_ui_bundle(stage: Path, bundle: Path, source: Path,
         "diff_sha256": expected_diff_sha256,
         "manifest_sha256": sha256(manifest_data),
         "files": files,
+    }
+
+
+def stage_mdns_runtime_dirs(stage: Path, contract: dict[str, object]) -> None:
+    """Create the mDNS runtime directories the contract names.
+
+    A directory carries no inventory record, so a staging step that walks the
+    runtime manifest's files silently drops every empty directory. The contract
+    publishes one - ``etc/avahi/services``, where the shared responder looks for
+    a service definition to announce - so it has to be created explicitly or the
+    shipped runtime does not match the contract it is verified against.
+
+    Only directories inside the image runtime root are staged; the control
+    socket and pidfile live outside it and are created at runtime.
+    """
+    runtime_dirs = contract["runtime_dirs"]
+    if not isinstance(runtime_dirs, dict) or not runtime_dirs.get("state_root"):
+        raise SystemExit("ERROR: mDNS runtime directory contract is malformed")
+    state_root = str(runtime_dirs["state_root"]).rstrip("/")
+    resolved_stage = stage.resolve()
+    for name in sorted(set(str(value).rstrip("/") for value in runtime_dirs.values())):
+        if not name.startswith(state_root + "/"):
+            continue
+        directory = stage
+        for part in (component for component in name.split("/") if component):
+            directory = directory / part
+            # Every component, not just the leaf: an intermediate symlink would
+            # carry the remainder of the path outside the stage.
+            if directory.is_symlink():
+                raise SystemExit(f"ERROR: mDNS runtime directory path is a symlink: {directory}")
+        if directory.exists() and not directory.is_dir():
+            raise SystemExit(f"ERROR: mDNS runtime directory collides with {name}")
+        directory.mkdir(parents=True, exist_ok=True)
+        if not directory.resolve().is_relative_to(resolved_stage):
+            raise SystemExit(f"ERROR: mDNS runtime directory escapes the stage: {name}")
+        directory.chmod(0o755)
+
+
+def add_mdns_runtime(stage: Path, runtime: Path, manifest: dict[str, object]) -> None:
+    """Install the boot-contained shared Avahi/D-Bus discovery runtime.
+
+    This runtime is deliberately independent of feature policy and of the
+    AirPlay payload: a production image with no AirPlay squashfs still carries
+    it, and the shared responder never executes the Avahi/D-Bus bytes retained
+    inside legacy AirPlay payloads.
+    """
+    contract = MDNS_CONTRACT
+    if runtime.is_symlink() or not runtime.is_dir():
+        raise SystemExit(f"ERROR: mDNS runtime is not a directory: {runtime}")
+    runtime_manifest = runtime / "manifest.json"
+    if runtime_manifest.is_symlink() or not runtime_manifest.is_file():
+        raise SystemExit("ERROR: mDNS runtime manifest is missing")
+    try:
+        document = json.loads(runtime_manifest.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit("ERROR: mDNS runtime manifest is invalid") from exc
+    if document.get("schema") != MDNS_RUNTIME_SCHEMA:
+        raise SystemExit("ERROR: mDNS runtime manifest contract changed")
+    files = document.get("files")
+    if not isinstance(files, dict) or not files:
+        raise SystemExit("ERROR: mDNS runtime manifest carries no inventory")
+    root = runtime / "root"
+    if root.is_symlink() or not root.is_dir():
+        raise SystemExit("ERROR: mDNS runtime root is not a directory")
+
+    required = {contract["loader"]}
+    for category in ("executables", "libraries", "config", "accounts", "licenses"):
+        required |= set(contract[category])
+    missing = sorted(required - set(files))
+    if missing:
+        # Fail closed on a missing loader, library, executable, config or
+        # license record rather than shipping an unusable responder.
+        raise SystemExit(f"ERROR: mDNS runtime contract is missing {missing[0]}")
+    packages_path = runtime / "packages.json"
+    if packages_path.is_symlink() or not packages_path.is_file():
+        raise SystemExit("ERROR: mDNS runtime package lock is missing")
+    try:
+        packages = json.loads(packages_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit("ERROR: mDNS runtime package lock is invalid") from exc
+    if (packages.get("schema") != "libreecho-mdns-packages/v1" or
+            not set(contract["packages"]).issubset(
+                {record.get("package") for record in packages.get("packages", [])
+                 if isinstance(record, dict)})):
+        raise SystemExit("ERROR: mDNS runtime package lock lost a required package")
+
+    prefix = contract["image_runtime_root"]
+    runtime_records: dict[str, object] = {}
+    for relative in sorted(files):
+        source = pinned_source(root, relative, f"mDNS runtime {relative}")
+        data = read(source)
+        record = files[relative]
+        if (not isinstance(record, dict) or record.get("sha256") != sha256(data) or
+                record.get("size") != len(data) or record.get("mode") not in (0o644, 0o755)):
+            raise SystemExit(
+                f"ERROR: mDNS runtime record mismatch: {relative} "
+                f"manifest_sha256={record.get('sha256')!r} actual_sha256={sha256(data)!r} "
+                f"manifest_size={record.get('size')!r} actual_size={len(data)} "
+                f"manifest_mode={record.get('mode')!r} actual_mode={source.stat().st_mode & 0o777!r}"
+            )
+        target = stage / prefix / relative
+        if target.exists() or target.is_symlink():
+            raise SystemExit(f"ERROR: mDNS runtime collides with {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        target.chmod(int(record["mode"]))
+        entry: dict[str, object] = {
+            "sha256": sha256(data), "size": len(data), "mode": f"{int(record['mode']):04o}",
+        }
+        if elf_identity(target) is not None:
+            info = readelf_contract(target)
+            if info[0] != 0x05000400:
+                raise SystemExit(f"ERROR: mDNS runtime is not ARMHF: {relative}")
+            if relative == contract["loader"]:
+                if info[1] is not None:
+                    raise SystemExit(f"ERROR: mDNS runtime loader has an interpreter: {relative}")
+            elif relative in set(contract["executables"]):
+                if info[1] != contract["abi"]["interpreter"] or not info[3]:
+                    raise SystemExit(f"ERROR: mDNS runtime ELF contract changed: {relative}")
+            entry["elf"] = {
+                "flags": f"0x{info[0]:08x}",
+                "interpreter": info[1],
+                "needed": list(info[2]),
+                "dynamic": info[3],
+            }
+        runtime_records[relative] = entry
+
+    # The contract names runtime *directories* as well as files, and a directory
+    # carries no inventory record, so staging only the manifest's files silently
+    # drops them: the shipped runtime then does not match the contract it is
+    # verified against. That is how usr/local/lib/libreecho-mdns/root/etc/avahi/
+    # services went missing, which is where the shared responder expects a
+    # service definition to be published - so AirPlay discovery had nowhere to
+    # put one and a unit advertised no AirPlay service at all.
+    stage_mdns_runtime_dirs(stage, contract)
+
+    marker = stage / contract["image_marker"]
+    if marker.exists() or marker.is_symlink():
+        raise SystemExit(f"ERROR: mDNS runtime marker collides with {marker}")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    runtime_manifest_sha = sha256(read(runtime_manifest))
+    marker_document = {
+        "schema": "libreecho-mdns-runtime-marker/v1",
+        "component": "libreecho-mdns",
+        "contract": contract["schema"],
+        "runtime_root": "/" + prefix,
+        "init": "/" + contract["init_wrapper"],
+        "abi": contract["abi"],
+        "runtime_dirs": contract["runtime_dirs"],
+        "manifest_sha256": runtime_manifest_sha,
+        "packages_sha256": document.get("packages_sha256"),
+        "files": len(runtime_records),
+        "readiness": "presence-is-not-readiness",
+        "source_offer_verified": document.get("source_offer_verified") is True,
+    }
+    marker_data = (json.dumps(marker_document, indent=2, sort_keys=True) + "\n").encode()
+    marker.write_bytes(marker_data)
+    marker.chmod(0o644)
+
+    manifest["mdns"] = {
+        "enabled": True,
+        "component": "libreecho-mdns",
+        "activation": "automatic-after-writable-runtime",
+        "autostart": True,
+        "ownership": "platform-boot-contained",
+        "discovery": "shared-avahi-dbus",
+        "protocol": "mdns",
+        "feature_payload_dependency": False,
+        "airplay_payload_dependency": False,
+        "single_responder": True,
+        "contract": contract["schema"],
+        "manifest_sha256": runtime_manifest_sha,
+        "runtime_root": "/" + prefix,
+        "marker": "/" + contract["image_marker"],
+        "marker_sha256": sha256(marker_data),
+        "init": "/" + contract["init_wrapper"],
+        "runtime_dirs": contract["runtime_dirs"],
+        "files": runtime_records,
     }
 
 
@@ -1533,6 +2174,18 @@ def add_stt_external_payload(payload: Path, payload_manifest: Path,
     }
 
 
+def add_boot_https_transport(stage: Path, payload: Path, payload_manifest: Path,
+                             manifest: dict[str, object], qemu_arm: str = "qemu-arm") -> None:
+    """Ship authenticated repair transport independently of all feature payloads."""
+    from boot_https_transport import MEMBERS, stage_transport
+    digest, _size, files = read_external_feature(
+        "assistant", payload, payload_manifest, tuple(MEMBERS.values()),
+    )
+    manifest["boot_https_transport"] = stage_transport(
+        stage, payload, digest, sha256(read(payload_manifest)), files, qemu_arm,
+    )
+
+
 def add_assistant_external_payload(payload: Path, payload_manifest: Path,
                                    manifest: dict[str, object]) -> None:
     """Record the provider-neutral streamed voice-assistant runtime."""
@@ -1575,89 +2228,69 @@ def add_assistant_external_payload(payload: Path, payload_manifest: Path,
     }
 
 
-def read_ssh_password_hash(path: Path) -> str:
-    """Read one build-local crypt(3) hash without accepting a plaintext secret."""
-    if path.is_symlink() or not path.is_file():
-        raise SystemExit(f"ERROR: SSH password hash is not a regular file: {path}")
-    if path.stat().st_mode & 0o022:
-        raise SystemExit(f"ERROR: SSH password hash is group/world-writable: {path}")
-    data = read(path)
-    if data.endswith(b"\n"):
-        data = data[:-1]
-    if not data or b"\n" in data or b"\r" in data:
-        raise SystemExit("ERROR: SSH password hash must be exactly one line")
-    try:
-        value = data.decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise SystemExit("ERROR: SSH password hash is not ASCII") from exc
-    if not SSH_PASSWORD_HASH_RE.fullmatch(value):
-        raise SystemExit("ERROR: SSH password hash is not a supported salted crypt(3) hash")
-    return value
-
-
-def add_ssh_bundle(stage: Path, dropbear: Path, dropbearkey: Path,
-                   password_hash: Path, manifest: dict[str, object]) -> None:
-    """Install the opt-in password-only root SSH bundle."""
-    hash_value = read_ssh_password_hash(password_hash)
+def add_ssh_bundle(stage: Path, dropbear: Path, dropbearkey: Path, scp: Path,
+                   manifest: dict[str, object]) -> None:
+    """Install the opt-in deferred WebUI-account SSH bundle."""
     files: dict[str, object] = {}
-
-    (stage / "root").mkdir(parents=True, exist_ok=True)
-    (stage / "root").chmod(0o755)
-    (stage / "etc/dropbear").mkdir(parents=True, exist_ok=True)
-    (stage / "etc/dropbear").chmod(0o700)
+    ssh_init = Path(__file__).resolve().parent / "ssh/libreecho-ssh.init"
+    if ssh_init.is_symlink() or not ssh_init.is_file():
+        raise SystemExit(f"ERROR: SSH supervisor is not a regular file: {ssh_init}")
 
     account_files = {
         "etc/passwd": (b"root:x:0:0:root:/root:/bin/sh\n", 0o644),
-        "etc/group": (b"root:x:0:\n", 0o644),
+        "etc/group": (b"root:x:0:\nlibreecho-ssh:x:1000:\n", 0o644),
         "etc/shells": (b"/bin/sh\n", 0o644),
-        "etc/shadow": (f"root:{hash_value}:0:0:99999:7:::\n".encode("ascii"), 0o600),
     }
     for relative, (data, mode) in account_files.items():
         target = stage / relative
         if target.exists() or target.is_symlink():
             raise SystemExit(f"ERROR: SSH account file collides with {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
         target.chmod(mode)
-        record: dict[str, object] = {
+        files[relative] = {
             "path": "/" + relative,
+            "sha256": sha256(data),
             "size": len(data),
             "mode": f"{mode:04o}",
         }
-        if relative == "etc/shadow":
-            record["secret_content_not_recorded"] = True
-        else:
-            record["sha256"] = sha256(data)
-        files[relative] = record
 
     for relative, source in (
         ("sbin/dropbear", dropbear),
         ("sbin/dropbearkey", dropbearkey),
+        ("usr/bin/scp", scp),
+        ("etc/init.d/libreecho-ssh.init", ssh_init),
     ):
         if source.is_symlink() or not source.is_file():
-            raise SystemExit(f"ERROR: SSH binary is not a regular file: {source}")
+            raise SystemExit(f"ERROR: SSH asset is not a regular file: {source}")
         data = read(source)
-        if b"authorized_keys" in data:
+        if relative in {"sbin/dropbear", "sbin/dropbearkey", "usr/bin/scp"} and b"authorized_keys" in data:
             raise SystemExit(f"ERROR: public-key authorization marker found in {source}")
         target = stage / relative
         if target.exists() or target.is_symlink():
-            raise SystemExit(f"ERROR: SSH binary collides with {target}")
+            raise SystemExit(f"ERROR: SSH asset collides with {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
         target.chmod(0o755)
-        files[relative] = {
+        record: dict[str, object] = {
             "path": str(source.resolve()),
             "sha256": sha256(data),
             "size": len(data),
             "mode": "0755",
-            "elf": require_elf_contract(target, 0x05000400, None, (), False),
         }
+        if relative in {"sbin/dropbear", "sbin/dropbearkey", "usr/bin/scp"}:
+            record["elf"] = require_elf_contract(target, 0x05000400, None, (), False)
+        files[relative] = record
 
     manifest["ssh"] = {
         "enabled": True,
-        "activation": "manual-only",
-        "autostart": False,
-        "authentication": "password-only",
+        "activation": "deferred-after-webui-bootstrap",
+        "autostart": True,
+        "authentication": "webui-users-sha256",
+        "account_source": "/data/libreecho/config/users",
+        "privilege_policy": "non-root-ephemeral-users",
         "public_key_auth": False,
-        "root_login": True,
+        "root_login": False,
         "host_keys": "generated-ephemerally-under-/tmp/dropbear",
         "files": files,
     }
@@ -1754,6 +2387,7 @@ def validate_stage(stage: Path) -> None:
         "etc/libreecho/image-profile", "etc/libreecho/service-profile",
         "etc/libreecho/feature-policy",
         "etc/libreecho/first-install-confirm",
+        "etc/init.d/libreecho-mdnsd.init",
         "usr/local/share/licenses/libreecho-core/THIRD_PARTY_NOTICES.md",
         "usr/local/share/licenses/libreecho-core/COMPONENTS.json",
         "usr/local/share/licenses/libreecho-core/GPL-2.0-only.txt",
@@ -1797,7 +2431,8 @@ def validate_stage(stage: Path) -> None:
     if "Requesting program interpreter" in output:
         raise SystemExit("ERROR: sbin/adbd is not static")
     init_script = read(stage / "init")
-    for relative in ("libreecho-init", "usr/local/sbin/libreecho-reconcile-features"):
+    for relative in ("libreecho-init", "usr/local/sbin/libreecho-reconcile-features",
+                     "etc/init.d/libreecho-mdnsd.init"):
         syntax = subprocess.run(
             ["sh", "-n", str(stage / relative)],
             capture_output=True, text=True,
@@ -1826,12 +2461,16 @@ def validate_stage(stage: Path) -> None:
 
     init_script = read(stage / "libreecho-init")
     for marker in (
-        b"FASTBOOT_PLEASE", b"/tmp/runme", b"functionfs", b"/dev/stpwmt", b"/dev/stpbt",
-        b"PARTNAME=expdb", b"/sys/class/block/mmcblk0p7", b"20480", b"bs=15 count=1",
-        b"stat -c '%t:%T'",
+        b"/run/libreecho-control/runme", b"functionfs", b"/dev/stpwmt", b"/dev/stpbt",
     ):
         if marker not in init_script:
             raise SystemExit(f"ERROR: recovery control script lacks {marker!r}")
+    for forbidden in (
+        b"FASTBOOT_PLEASE", b"PARTNAME=expdb", b"/sys/class/block/mmcblk0p7",
+        b"printf FASTBOOT_PLEASE", b"expdb-sector",
+    ):
+        if forbidden in init_script:
+            raise SystemExit(f"ERROR: recovery control script contains forbidden expdb marker path {forbidden!r}")
     adbd_launches = tuple(
         line.strip() for line in init_script.splitlines()
         if line.lstrip().startswith(b"/sbin/adbd ")
@@ -1874,6 +2513,19 @@ def validate_stage(stage: Path) -> None:
                 )
     if (stage / "init.connectivity.rc").exists():
         raise SystemExit("ERROR: auto-starting init.connectivity.rc is forbidden")
+
+
+def compress_ramdisk(cpio: bytes) -> bytes:
+    """Deterministic xz for the kernel's initramfs decoder (CONFIG_RD_XZ).
+
+    The in-kernel xz_dec verifies only CRC32/None checks, and the 8 MiB LZMA2
+    dictionary bounds its single-call memory. Plain LZMA2 (no BCJ filter):
+    a cpio of mixed text/ELF compresses smaller without the ARM filter.
+    """
+    return lzma.compress(cpio, format=lzma.FORMAT_XZ, check=lzma.CHECK_CRC32, filters=[
+        {"id": lzma.FILTER_LZMA2, "preset": 9 | lzma.PRESET_EXTREME,
+         "dict_size": RAMDISK_XZ_DICT_SIZE},
+    ])
 
 
 def build_cpio(stage: Path, epoch: int) -> bytes:
@@ -2075,6 +2727,8 @@ def main() -> None:
                         help="source/license metadata emitted by build_wireless_tools.sh")
     parser.add_argument("--ui-bundle", type=Path,
                         help="staged static ARM32 LibreEcho-UI bundle")
+    parser.add_argument("--mdns-runtime", type=Path,
+                        help="boot-contained shared ARMHF Avahi/D-Bus discovery runtime")
     parser.add_argument("--ui-source", type=Path,
                         help="LibreEcho-UI source checkout used for the bundle")
     parser.add_argument("--expected-ui-commit",
@@ -2107,19 +2761,23 @@ def main() -> None:
                         help="external SquashFS English streaming STT feature payload")
     parser.add_argument("--stt-payload-manifest", type=Path,
                         help="manifest for the external English STT feature payload")
+    parser.add_argument("--boot-https-payload", type=Path,
+                        help="verified assistant transport input for images without an assistant feature")
+    parser.add_argument("--boot-https-payload-manifest", type=Path,
+                        help="manifest for the build-time boot HTTPS transport input")
     parser.add_argument("--assistant-payload", type=Path,
                         help="external SquashFS streamed assistant feature payload")
     parser.add_argument("--assistant-payload-manifest", type=Path,
                         help="manifest for the external assistant feature payload")
 
     parser.add_argument("--ssh-enabled", action="store_true",
-                        help="explicitly enable the password-only root SSH bundle")
+                        help="explicitly enable deferred WebUI-account SSH")
     parser.add_argument("--dropbear", type=Path,
-                        help="static ARM32 password-only Dropbear server")
+                        help="static ARM32 Dropbear server with WebUI auth")
     parser.add_argument("--dropbearkey", type=Path,
                         help="static ARM32 Dropbear host-key utility")
-    parser.add_argument("--ssh-root-password-hash", type=Path,
-                        help="build-local salted root crypt(3) hash file")
+    parser.add_argument("--scp", type=Path,
+                        help="static ARM32 scp server-side transfer executable")
 
     parser.add_argument("--wmt-config-helper", type=Path,
                         help="reviewed static ARM32 configure-only WMT helper")
@@ -2131,6 +2789,10 @@ def main() -> None:
                         help="proven ARM32 stock-compatible configure-only helper")
     parser.add_argument("--wmt-launcher", type=Path,
                         help="proven ARM32 one-shot WMT command responder")
+    parser.add_argument("--recovery-ap-binaries", type=Path,
+                        help="directory of built static recovery-AP binaries (hostapd/dnsmasq/iw)")
+    parser.add_argument("--recovery-ap-metadata", type=Path,
+                        help="JSON metadata with the pinned SHA-256 of each recovery-AP binary")
     parser.add_argument("--wpa-supplicant", type=Path,
                         help="static ARM32 wpa_supplicant 2.10 client")
     parser.add_argument("--wpa-source-metadata", type=Path,
@@ -2150,7 +2812,9 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--ramdisk-output", type=Path)
     parser.add_argument("--manifest", type=Path)
+    add_target_arguments(parser)
     args = parser.parse_args()
+    validate_target_arguments(parser, args)
 
     connectivity_options = {
         "wmt_config_helper": args.wmt_config_helper,
@@ -2168,6 +2832,18 @@ def main() -> None:
         raise SystemExit(f"ERROR: connectivity bundle is all-or-nothing; missing {missing}")
     if connectivity_enabled and not CONNECTIVITY_HELPERS:
         raise SystemExit("ERROR: connectivity helper identities have not been pinned")
+    if (args.recovery_ap_binaries is None) != (args.recovery_ap_metadata is None):
+        raise SystemExit(
+            "ERROR: recovery-AP staging is all-or-nothing; supply "
+            "--recovery-ap-binaries and --recovery-ap-metadata together"
+        )
+    # An AP bundle is only reachable once init's vendor-assets gate passes,
+    # which requires the connectivity bundle's pinned WMT helpers and vendor
+    # importer; staging the AP binaries alone would advertise a portal whose
+    # wlan0 never appears.
+    validate_recovery_ap_prerequisites(
+        args.recovery_ap_binaries is not None, connectivity_enabled,
+    )
     network_options = {
         "wpa_supplicant": args.wpa_supplicant,
         "wpa_source_metadata": args.wpa_source_metadata,
@@ -2198,7 +2874,7 @@ def main() -> None:
     ssh_options = {
         "dropbear": args.dropbear,
         "dropbearkey": args.dropbearkey,
-        "ssh_root_password_hash": args.ssh_root_password_hash,
+        "scp": args.scp,
     }
     ssh_enabled = args.ssh_enabled
     if ssh_enabled and not all(value is not None for value in ssh_options.values()):
@@ -2296,6 +2972,13 @@ def main() -> None:
         raise SystemExit(
             f"ERROR: STT payload inputs are all-or-nothing; missing {missing}"
         )
+    boot_https_payload = args.boot_https_payload or args.assistant_payload
+    boot_https_manifest = args.boot_https_payload_manifest or args.assistant_payload_manifest
+    if ((args.boot_https_payload is None) != (args.boot_https_payload_manifest is None)):
+        raise SystemExit("ERROR: boot HTTPS payload and manifest inputs are all-or-nothing")
+    if boot_https_payload is None or boot_https_manifest is None:
+        raise SystemExit("ERROR: mandatory boot HTTPS transport input is missing")
+
     assistant_payload_options = {
         "assistant_payload": args.assistant_payload,
         "assistant_payload_manifest": args.assistant_payload_manifest,
@@ -2314,6 +2997,14 @@ def main() -> None:
             f"missing {missing}"
         )
 
+    if args.service_profile == "production" and args.mdns_runtime is None:
+        # Shared discovery is boot-contained Platform infrastructure: it must
+        # not be an optional feature-payload side effect, or an HA-selected
+        # image would silently depend on the AirPlay payload again.
+        raise SystemExit(
+            "ERROR: the production service profile requires --mdns-runtime "
+            "(boot-contained shared discovery runtime)"
+        )
     if args.feature_policy == "exclude":
         if args.service_profile != "diagnostic":
             raise SystemExit("ERROR: feature exclusion requires the diagnostic service profile")
@@ -2362,12 +3053,13 @@ def main() -> None:
     system_map = read(args.system_map)
     require_hash("ARM32 System.map", system_map, args.expected_system_map_sha256)
     raw_dtb, dtb_origin = extract_or_read_dtb(envelope, args.dtb, args.expected_dtb_sha256)
+    verify_target_dtb(args.target, args.dtb)
     qemu_arm = shutil.which(args.qemu_arm)
     if qemu_arm is None:
         raise SystemExit(f"ERROR: ARM user-mode emulator not found: {args.qemu_arm}")
 
     output = args.output.resolve()
-    ramdisk_output = (args.ramdisk_output or output.with_suffix(".ramdisk.cpio.gz")).resolve()
+    ramdisk_output = (args.ramdisk_output or output.with_suffix(".ramdisk.cpio.xz")).resolve()
     manifest_output = (args.manifest or output.with_suffix(".manifest.json")).resolve()
     for path in (output, ramdisk_output, manifest_output):
         if path.exists():
@@ -2416,11 +3108,13 @@ def main() -> None:
         },
         "ssh": {
             "enabled": False,
-            "activation": "manual-only",
-            "autostart": False,
-            "authentication": "password-only",
+            "activation": "deferred-after-webui-bootstrap",
+            "autostart": True,
+            "authentication": "webui-users-sha256",
+            "account_source": "/data/libreecho/config/users",
+            "privilege_policy": "non-root-ephemeral-users",
             "public_key_auth": False,
-            "root_login": True,
+            "root_login": False,
             "host_keys": "generated-ephemerally-under-/tmp/dropbear",
             "files": {},
         },
@@ -2429,6 +3123,20 @@ def main() -> None:
             "activation": "manual-only",
             "autostart": False,
             "hardware_ownership": "existing-control-plane",
+            "files": {},
+        },
+        "mdns": {
+            "enabled": False,
+            "component": "libreecho-mdns",
+            "activation": "manual-only",
+            "autostart": False,
+            "ownership": "platform-boot-contained",
+            "discovery": "shared-avahi-dbus",
+            "protocol": "mdns",
+            "feature_payload_dependency": False,
+            "airplay_payload_dependency": False,
+            "single_responder": True,
+            "runtime_dirs": {},
             "files": {},
         },
         "airplay": {
@@ -2464,7 +3172,8 @@ def main() -> None:
     overlay = Path(__file__).resolve().parent / "initramfs"
     with tempfile.TemporaryDirectory(prefix="libreecho-arm32-initramfs-") as temporary:
         stage = Path(temporary)
-        copy_adbd(args.adbd.resolve(), args.adbd_source_metadata.resolve(), stage, manifest)
+        copy_adbd(args.adbd.resolve(), args.adbd_source_metadata.resolve(), stage, manifest,
+                  args.update_channel)
         add_overlay(
             stage, overlay, args.busybox.resolve(), args.musl_loader.resolve(),
             args.expected_busybox_sha256, args.expected_musl_loader_sha256,
@@ -2474,6 +3183,7 @@ def main() -> None:
             stage, args.bootctl.resolve(), args.update_verifier.resolve(),
             args.ota_public_key.resolve(), args.image_profile,
             args.service_profile, args.feature_policy, args.update_channel, manifest,
+            args.target, args.target_descriptor_sha256,
         )
         if args.audio_probe is not None:
             add_audio_probe(stage, args.audio_probe.resolve(), manifest)
@@ -2494,6 +3204,8 @@ def main() -> None:
                 stage, args.ui_bundle.resolve(), args.ui_source.resolve(),
                 args.expected_ui_commit, args.expected_ui_diff_sha256, manifest,
             )
+        if args.mdns_runtime is not None:
+            add_mdns_runtime(stage, args.mdns_runtime.resolve(), manifest)
         if airplay_payload_enabled:
             add_airplay_external_payload(
                 args.airplay_payload.resolve(), args.airplay_payload_manifest.resolve(), manifest,
@@ -2530,7 +3242,7 @@ def main() -> None:
         if ssh_enabled:
             add_ssh_bundle(
                 stage, args.dropbear.resolve(), args.dropbearkey.resolve(),
-                args.ssh_root_password_hash.resolve(), manifest,
+                args.scp.resolve(), manifest,
             )
         if connectivity_enabled:
             add_connectivity_bundle(
@@ -2543,16 +3255,29 @@ def main() -> None:
                 },
                 manifest,
             )
+        if args.recovery_ap_binaries is not None and args.recovery_ap_metadata is not None:
+            add_recovery_ap_bundle(
+                stage,
+                {
+                    name: (args.recovery_ap_binaries / name).resolve()
+                    for name in RECOVERY_AP_BINARIES
+                },
+                args.recovery_ap_metadata.resolve(),
+                manifest,
+            )
         if network_enabled:
             add_network_bundle(
                 stage, args.wpa_supplicant.resolve(), args.wpa_source_metadata.resolve(),
                 args.wifi_config.resolve(), manifest,
             )
+        add_boot_https_transport(
+            stage, boot_https_payload, boot_https_manifest, manifest, args.qemu_arm,
+        )
         validate_stage(stage)
         cpio = build_cpio(stage, 0)
-    ramdisk = gzip.compress(cpio, compresslevel=9, mtime=0)
-    if ramdisk[:4] != b"\x1f\x8b\x08\x00" or gzip.decompress(ramdisk) != cpio:
-        raise SystemExit("ERROR: deterministic gzip round trip failed")
+    ramdisk = compress_ramdisk(cpio)
+    if lzma.decompress(ramdisk, format=lzma.FORMAT_XZ) != cpio:
+        raise SystemExit("ERROR: deterministic xz round trip failed")
 
     boot, package_record = package_boot(
         envelope, zimage, ramdisk, raw_dtb, args.ramdisk_address,
@@ -2563,8 +3288,9 @@ def main() -> None:
     manifest["initramfs"] = {
         "cpio_sha256": sha256(cpio),
         "cpio_size": len(cpio),
-        "gzip_sha256": sha256(ramdisk),
-        "gzip_size": len(ramdisk),
+        "compression": RAMDISK_COMPRESSION,
+        "ramdisk_sha256": sha256(ramdisk),
+        "ramdisk_size": len(ramdisk),
         "path": str(ramdisk_output),
     }
     manifest["package"] = package_record
