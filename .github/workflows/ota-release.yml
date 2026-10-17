@@ -54,6 +54,8 @@ jobs:
             test_recovery_image_tools.py \
             test_vendor_import_compat.py \
             test_source_offer_tools.py \
+            test_boot_chain_gpt.py \
+            test_boot_chain_repair.py \
             ota/test_ota_v2_implementation.py \
             ota/test_feature_provenance.py \
             ota/test_service_identity.py \
@@ -79,6 +81,7 @@ jobs:
           done < <(git ls-files -z 'tools/mt8163-arm32/*.sh' 'tools/mt8163-arm32/**/*.sh')
           bash tools/mt8163-arm32/tts/test_package_feature_contract.sh
           /bin/busybox sh -n tools/mt8163-arm32/initramfs/libreecho-feature-transaction
+          /bin/busybox sh -n tools/mt8163-arm32/initramfs/libreecho-boot-chain
           /bin/busybox sh -n tools/mt8163-arm32/initramfs/libreecho-update
           /bin/busybox sh -n tools/mt8163-arm32/initramfs/libreecho-update-fetch
           git diff --check

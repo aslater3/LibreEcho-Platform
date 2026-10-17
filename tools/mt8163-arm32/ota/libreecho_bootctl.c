@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Amazon/MediaTek BCB control for the Amonet Biscuit partition layout.
- * This tool never writes a boot image. It can write only the BCB sector in misc.
+ * Amazon/MediaTek BCB control for the legacy Amonet and pinned Kaeru layouts.
+ * This tool never writes a boot image. Its BCB commands write only the BCB
+ * sector in misc; the gpt-restore command (boot-chain repair only) rewrites
+ * the GPT as described in libreecho_gpt.h.
  */
 #define _FILE_OFFSET_BITS 64
 #include <errno.h>
@@ -13,6 +15,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+#include "libreecho_gpt.h"
 
 #define BCB_SECTOR_OFFSET 512
 #define BCB_IN_SECTOR 0x160
@@ -26,7 +30,11 @@ struct partition_contract {
     unsigned long sectors;
 };
 
-static const struct partition_contract partitions[] = {
+/* Legacy Amonet (0.13 BROM install): OS stores are boot_X_x, wrappers follow
+ * userdata. Pinned Kaeru (after boot-chain repair, or a 0.14 install): the
+ * same stores are named boot_X and the wrappers do not exist. Both contracts
+ * match 0.14's libreecho_bootctl.c partitions_amonet/partitions_pinned. */
+static const struct partition_contract partitions_amonet[] = {
     {"/dev/mmcblk0p8", "/sys/class/block/mmcblk0p8", "misc", 1025},
     {"/dev/mmcblk0p9", "/sys/class/block/mmcblk0p9", "persist", 32768},
     {"/dev/mmcblk0p10", "/sys/class/block/mmcblk0p10", "boot_a_x", 32768},
@@ -35,6 +43,20 @@ static const struct partition_contract partitions[] = {
     {"/dev/mmcblk0p17", "/sys/class/block/mmcblk0p17", "boot_a", 225280},
     {"/dev/mmcblk0p18", "/sys/class/block/mmcblk0p18", "boot_b", 225280},
 };
+
+static const struct partition_contract partitions_pinned[] = {
+    {"/dev/mmcblk0p8", "/sys/class/block/mmcblk0p8", "misc", 1025},
+    {"/dev/mmcblk0p9", "/sys/class/block/mmcblk0p9", "persist", 32768},
+    {"/dev/mmcblk0p10", "/sys/class/block/mmcblk0p10", "boot_a", 32768},
+    {"/dev/mmcblk0p11", "/sys/class/block/mmcblk0p11", "boot_b", 32768},
+    {"/dev/mmcblk0p16", "/sys/class/block/mmcblk0p16", "userdata", 2137088},
+};
+
+#define CONTRACT_COUNT(set) (sizeof(set) / sizeof((set)[0]))
+
+static const char *boot_layout = "unknown";
+/* Probing the layout a unit does not use stays quiet. */
+static int contract_reporting = 1;
 
 static int read_text(const char *path, char *output, size_t size)
 {
@@ -76,35 +98,65 @@ static int validate_partition(const struct partition_contract *contract)
     struct stat st;
 
     if (stat(contract->device, &st) || !S_ISBLK(st.st_mode)) {
-        fprintf(stderr, "ERROR: %s is not a block device\n", contract->device);
+        if (contract_reporting)
+            fprintf(stderr, "ERROR: %s is not a block device\n", contract->device);
         return -1;
     }
     snprintf(path, sizeof(path), "%s/size", contract->sysfs);
     if (read_text(path, text, sizeof(text)) ||
         !partition_sectors_match(contract, text)) {
-        fprintf(stderr, "ERROR: %s sector contract failed\n", contract->name);
+        if (contract_reporting)
+            fprintf(stderr, "ERROR: %s sector contract failed\n", contract->name);
         return -1;
     }
     snprintf(path, sizeof(path), "%s/uevent", contract->sysfs);
     if (read_text(path, text, sizeof(text))) {
-        fprintf(stderr, "ERROR: cannot read %s identity\n", contract->name);
+        if (contract_reporting)
+            fprintf(stderr, "ERROR: cannot read %s identity\n", contract->name);
         return -1;
     }
     snprintf(expected, sizeof(expected), "PARTNAME=%s", contract->name);
     if (!strstr(text, expected)) {
-        fprintf(stderr, "ERROR: %s PARTNAME contract failed\n", contract->name);
+        if (contract_reporting)
+            fprintf(stderr, "ERROR: %s PARTNAME contract failed\n", contract->name);
         return -1;
     }
     return 0;
 }
 
-static int validate_layout(void)
+static int validate_set(const struct partition_contract *set, size_t count)
 {
     size_t i;
-    for (i = 0; i < sizeof(partitions) / sizeof(partitions[0]); ++i)
-        if (validate_partition(&partitions[i]))
+    for (i = 0; i < count; ++i)
+        if (validate_partition(&set[i]))
             return -1;
     return 0;
+}
+
+static int partition_absent(const char *sysfs)
+{
+    struct stat st;
+    return stat(sysfs, &st) != 0 && errno == ENOENT;
+}
+
+/* The Amonet set is checked first and reported unchanged; the pinned set is
+ * probed quietly and additionally requires the wrapper nodes to be gone. */
+static int validate_layout(void)
+{
+    if (!validate_set(partitions_amonet, CONTRACT_COUNT(partitions_amonet))) {
+        boot_layout = "amonet";
+        return 0;
+    }
+    contract_reporting = 0;
+    if (!validate_set(partitions_pinned, CONTRACT_COUNT(partitions_pinned)) &&
+        partition_absent("/sys/class/block/mmcblk0p17") &&
+        partition_absent("/sys/class/block/mmcblk0p18")) {
+        contract_reporting = 1;
+        boot_layout = "pinned";
+        return 0;
+    }
+    contract_reporting = 1;
+    return -1;
 }
 
 static int bcb_valid(const uint8_t *bcb)
@@ -183,6 +235,7 @@ static void print_status(const uint8_t *bcb, int running_slot)
     int selected = running_slot >= 0 ? running_slot : selected_slot(bcb);
 
     printf("schema=1\n");
+    printf("boot_layout=%s\n", boot_layout);
     printf("selected_slot=%c\n", selected < 0 ? '-' : 'a' + selected);
     printf("inactive_slot=%c\n", selected < 0 ? '-' : 'a' + 1 - selected);
     printf("slot_suffix=%c\n", selected < 0 ? '-' : 'a' + selected);
@@ -192,7 +245,8 @@ static void print_status(const uint8_t *bcb, int running_slot)
            slot_priority(bcb, 1), slot_tries(bcb, 1), slot_success(bcb, 1));
     printf("slot_a_image=/dev/mmcblk0p10\n");
     printf("slot_b_image=/dev/mmcblk0p11\n");
-    printf("wrapper_a=/dev/mmcblk0p17\nwrapper_b=/dev/mmcblk0p18\n");
+    if (!strcmp(boot_layout, "amonet"))
+        printf("wrapper_a=/dev/mmcblk0p17\nwrapper_b=/dev/mmcblk0p18\n");
 }
 
 static int parse_slot(const char *value)
@@ -236,8 +290,77 @@ static int confirm(uint8_t *bcb, int target)
 
 static void usage(const char *program)
 {
-    fprintf(stderr, "Usage: %s status [a|b] | activate <a|b> | confirm <a|b>\n",
+    fprintf(stderr, "Usage: %s status [a|b] | activate <a|b> | confirm <a|b> |\n"
+            "       gpt-status | gpt-restore --plan | gpt-restore --write\n",
             program);
+}
+
+/* The eMMC user area. Host tests may point at an image file. */
+static const char *gpt_device(void)
+{
+#ifdef LIBREECHO_BOOTCTL_HOST_TEST
+    const char *path = getenv("LIBREECHO_GPT_DEVICE");
+    if (path && *path)
+        return path;
+#endif
+    return "/dev/mmcblk0";
+}
+
+static int gpt_command(int argc, char **argv)
+{
+    struct gpt_disk before, after;
+    int write_mode, fd;
+
+    if (argc == 2 && !strcmp(argv[1], "gpt-status")) {
+        fd = open(gpt_device(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0 || gpt_read(fd, &before)) {
+            fprintf(stderr, "ERROR: gpt_unreadable\n");
+            if (fd >= 0)
+                close(fd);
+            return 1;
+        }
+        close(fd);
+        gpt_print_status(&before);
+        return 0;
+    }
+    if (argc != 3 || strcmp(argv[1], "gpt-restore") ||
+        (strcmp(argv[2], "--plan") && strcmp(argv[2], "--write"))) {
+        usage(argv[0]);
+        return 2;
+    }
+    write_mode = !strcmp(argv[2], "--write");
+    fd = open(gpt_device(), (write_mode ? O_RDWR | O_SYNC : O_RDONLY) | O_CLOEXEC);
+    if (fd < 0 || gpt_read(fd, &before)) {
+        fprintf(stderr, "ERROR: gpt_unreadable\n");
+        if (fd >= 0)
+            close(fd);
+        return 1;
+    }
+    after = before;
+    if (gpt_plan_restore(&after)) {
+        fprintf(stderr, "ERROR: gpt_not_legacy_amonet\n");
+        close(fd);
+        return 1;
+    }
+    if (write_mode && gpt_write(fd, &after)) {
+        fprintf(stderr, "ERROR: gpt_write_failed\n");
+        close(fd);
+        return 1;
+    }
+    if (write_mode) {
+        struct gpt_disk check;
+        if (gpt_read(fd, &check) || gpt_classify(&check.primary) != GPT_LAYOUT_STOCK ||
+            memcmp(&check.primary, &after.primary, sizeof(check.primary)) ||
+            memcmp(&check.backup, &after.backup, sizeof(check.backup))) {
+            fprintf(stderr, "ERROR: gpt_readback_failed\n");
+            close(fd);
+            return 1;
+        }
+    }
+    close(fd);
+    printf("gpt_restore=%s\n", write_mode ? "written" : "planned");
+    gpt_print_status(&after);
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -247,8 +370,10 @@ int main(int argc, char **argv)
     int slot;
     int running_slot = -1;
 
+    if (argc >= 2 && !strncmp(argv[1], "gpt-", 4))
+        return gpt_command(argc, argv);
     if (validate_layout() || read_sector(sector)) {
-        fprintf(stderr, "ERROR: cannot validate/read Biscuit boot control\n");
+        fprintf(stderr, "ERROR: cannot validate/read boot control\n");
         return 1;
     }
     if (!bcb_valid(bcb)) {
