@@ -235,7 +235,6 @@ static void print_status(const uint8_t *bcb, int running_slot)
     int selected = running_slot >= 0 ? running_slot : selected_slot(bcb);
 
     printf("schema=1\n");
-    printf("boot_layout=%s\n", boot_layout);
     printf("selected_slot=%c\n", selected < 0 ? '-' : 'a' + selected);
     printf("inactive_slot=%c\n", selected < 0 ? '-' : 'a' + 1 - selected);
     printf("slot_suffix=%c\n", selected < 0 ? '-' : 'a' + selected);
@@ -243,10 +242,23 @@ static void print_status(const uint8_t *bcb, int running_slot)
            slot_priority(bcb, 0), slot_tries(bcb, 0), slot_success(bcb, 0));
     printf("slot_b_priority=%u\nslot_b_tries=%u\nslot_b_success=%u\n",
            slot_priority(bcb, 1), slot_tries(bcb, 1), slot_success(bcb, 1));
-    printf("slot_a_image=/dev/mmcblk0p10\n");
-    printf("slot_b_image=/dev/mmcblk0p11\n");
-    if (!strcmp(boot_layout, "amonet"))
+    printf("boot_layout=%s\n", boot_layout);
+    /* Same output as 0.14's libreecho_bootctl.c. Measured on the pinned
+     * chain (0.14 issue #231): LK always loads boot_a and the BCB only
+     * chooses the slot suffix it reports and the tries accounting, so both
+     * slots execute the boot_a store and boot_b is a recovery copy. */
+    if (!strcmp(boot_layout, "pinned")) {
+        printf("boot_store_mode=fixed-a\n");
+        printf("slot_a_image=/dev/mmcblk0p10\n");
+        printf("slot_b_image=/dev/mmcblk0p10\n");
+        printf("backup_image=/dev/mmcblk0p11\n");
+        printf("wrapper_a=-\nwrapper_b=-\n");
+    } else {
+        printf("boot_store_mode=slotted\n");
+        printf("slot_a_image=/dev/mmcblk0p10\n");
+        printf("slot_b_image=/dev/mmcblk0p11\n");
         printf("wrapper_a=/dev/mmcblk0p17\nwrapper_b=/dev/mmcblk0p18\n");
+    }
 }
 
 static int parse_slot(const char *value)

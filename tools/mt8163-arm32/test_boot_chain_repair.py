@@ -30,6 +30,7 @@ MIB = 1024 * 1024
 PART_BYTES = {
     "lk_a": MIB, "lk_b": MIB, "tee1": 5 * MIB, "tee2": 5 * MIB,
     "expdb": 10 * MIB, "misc": 0x80200, "recovery": 16 * MIB,
+    "boot_a_x": 16 * MIB, "boot_b_x": 16 * MIB,
 }
 PART_NUMBERS = {name: number for number, (name, _, _) in RADAR_LEGACY.items()}
 
@@ -52,6 +53,10 @@ def preloader(seed: str) -> bytes:
     data[0x600:0x800] = bytes(0x200)  # reviewed images have sector 3 zero-filled
     return bytes(data)
 
+
+# The fake unit runs slot b; slot a holds an older image.
+RUNNING_IMAGE = b"ANDROID!" + blob("libreecho-0.13.21-boot", 12 * MIB)
+OLDER_IMAGE = b"ANDROID!" + blob("libreecho-0.13.17-boot", 11 * MIB)
 
 K32 = {"lk": blob("k32-lk", 372368), "tz": blob("k32-tz", 2641920), "pl": preloader("k32-pl")}
 
@@ -148,6 +153,8 @@ class BootChainRepairTests(unittest.TestCase):
         self.write_part(dev, "tee2", blob("stock-tee2", 1781760))
         self.write_part(dev, "expdb", bytes(15) + blob("expdb-tail", 512))
         self.write_part(dev, "recovery", blob("stock-recovery", 9 * MIB))
+        self.write_part(dev, "boot_a_x", OLDER_IMAGE)
+        self.write_part(dev, "boot_b_x", RUNNING_IMAGE)
         misc = bytearray(PART_BYTES["misc"])
         misc[0:32] = b"boot-recovery".ljust(32, b"\0")
         misc[0x360:0x367] = b"\x00ABB\x01" + bytes([0x0E | 0x80, 0x0F | 0x80])
@@ -275,11 +282,15 @@ class BootChainRepairTests(unittest.TestCase):
         self.assertNotIn(17, table)
         self.assertEqual(table[16], RADAR_LEGACY[16])
         self.assertEqual((self.root / "reboot.request").read_text(), "reboot\n")
+        # Kaeru always loads boot_a: both stores now hold the running image.
+        self.assertEqual(self.part("boot_a_x"), self.part("boot_b_x"))
+        self.assertEqual(self.part("boot_a_x")[:len(RUNNING_IMAGE)], RUNNING_IMAGE)
         backup = self.root / "data/boot-chain/backup"
         check = subprocess.run([BUSYBOX, "sha256sum", "-c", "SHA256SUMS"], cwd=backup,
                                capture_output=True, text=True, timeout=60)
         self.assertEqual(check.returncode, 0, check.stdout)
         self.assertEqual((backup / "lk_a.img").read_bytes()[:len(K32["lk"])], K32["lk"])
+        self.assertEqual((backup / "store_other.img").read_bytes()[:len(OLDER_IMAGE)], OLDER_IMAGE)
         self.assertFalse((self.root / "data/boot-chain/payload").exists())
 
     def test_board_mismatch_refuses_without_writes(self) -> None:

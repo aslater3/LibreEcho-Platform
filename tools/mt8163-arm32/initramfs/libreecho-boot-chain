@@ -54,7 +54,7 @@ if [ "${BOOT_CHAIN_TEST:-0}" = 1 ]; then
     DATA_MOUNT=${BOOT_CHAIN_DATA_MOUNT:-$DATA_MOUNT}
     ASSISTANT_PAYLOAD=${BOOT_CHAIN_ASSISTANT_PAYLOAD:-$ASSISTANT_PAYLOAD}
 fi
-MIN_FREE_KB=196608
+MIN_FREE_KB=262144
 
 umask 077
 
@@ -454,6 +454,7 @@ take_backups()
       backup_region tee1 "$TEE1" && backup_region tee2 "$TEE2" &&
       backup_region expdb "$EXPDB" && backup_region misc "$MISC" &&
       backup_region recovery "$RECOVERY" && backup_region boot0 "$BOOT0" $PL_SIZE &&
+      backup_region store_other "$STORE_OTHER" &&
       backup_region gpt-primary "$DEV/mmcblk0" $((34 * 512)) &&
       $BB dd if="$DEV/mmcblk0" of="$BACKUP/gpt-backup.img" bs=512 skip=$((disk_sectors - 33)) count=33 2>/dev/null &&
       printf '%s  %s\n' "$(sha < "$BACKUP/gpt-backup.img")" gpt-backup.img >> "$BACKUP/SHA256SUMS" &&
@@ -488,11 +489,11 @@ invalid_preloader_header()
 restore_backups()
 {
     ok=1
-    for item in misc expdb lk_a lk_b tee2 tee1 recovery; do
+    for item in misc expdb lk_a lk_b tee2 tee1 recovery store_other; do
         case $item in
             misc) node=$MISC ;; expdb) node=$EXPDB ;; lk_a) node=$LK_A ;;
             lk_b) node=$LK_B ;; tee2) node=$TEE2 ;; tee1) node=$TEE1 ;;
-            recovery) node=$RECOVERY ;;
+            recovery) node=$RECOVERY ;; store_other) node=$STORE_OTHER ;;
         esac
         write_verified "$BACKUP/$item.img" "$node" || ok=0
     done
@@ -536,6 +537,16 @@ repair_run()
     echo $$ > "$STATE/repair.pid"
     board_pins "$TARGET_BOARD"
     "$BOOTCTL" gpt-restore --plan >/dev/null 2>&1 || abort_safe layout_not_legacy
+    # The pinned Kaeru chain always loads boot_a (0.14 issue #231), so both OS
+    # stores must hold the running image before the chain changes.
+    case "$SLOT" in
+        confirmed-a) STORE_RUNNING=$(part_dev boot_a_x); STORE_OTHER=$(part_dev boot_b_x) ;;
+        confirmed-b) STORE_RUNNING=$(part_dev boot_b_x); STORE_OTHER=$(part_dev boot_a_x) ;;
+        *) abort_safe slot_unconfirmed ;;
+    esac
+    [ -n "$STORE_RUNNING" ] && [ -n "$STORE_OTHER" ] &&
+        [ "$(part_bytes "$STORE_RUNNING")" = 16777216 ] &&
+        [ "$(part_bytes "$STORE_OTHER")" = 16777216 ] || abort_safe layout_not_legacy
     fits "$LK_A" $LK_SIZE && fits "$LK_B" $LK_SIZE && fits "$TEE1" $PAY_SIZE &&
         fits "$TEE2" $TZ_SIZE && fits "$EXPDB" $KAERU_SIZE && fits "$RECOVERY" $TWRP_SIZE &&
         [ -w "$SYS_BLOCK/mmcblk0boot0/force_ro" ] || abort_safe layout_not_legacy
@@ -554,6 +565,18 @@ repair_run()
         write_verified "$BACKUP/recovery.img" "$RECOVERY"
         abort_safe emmc_readonly
     }
+
+    # Both stores = the running image. Harmless on the legacy chain (only the
+    # inactive slot changes, to the image already running); on Kaeru it makes
+    # boot_a the running image and boot_b its recovery copy, 0.14's fixed-a
+    # invariant.
+    phase align-stores
+    $BB cat "$STORE_RUNNING" > "$STATE/store-running.img" || abort_safe backup_failed
+    write_verified "$STATE/store-running.img" "$STORE_OTHER" || {
+        write_verified "$BACKUP/store_other.img" "$STORE_OTHER"
+        abort_safe write_failed_restored
+    }
+    $BB rm -f "$STATE/store-running.img"
 
     # The new preloader, carrying this unit's own sector 3 (bootcount).
     { $BB dd if="$B/preloader.img" bs=512 count=3 2>/dev/null
@@ -592,7 +615,8 @@ repair_run()
     [ "$(prefix_sha "$LK_A" $LK_SIZE)" = $LK_SHA ] && [ "$(prefix_sha "$LK_B" $LK_SIZE)" = $LK_SHA ] &&
         [ "$(prefix_sha "$TEE1" $PAY_SIZE)" = $PAY_SHA ] && [ "$(prefix_sha "$TEE2" $TZ_SIZE)" = $TZ_SHA ] &&
         [ "$(prefix_sha "$EXPDB" $KAERU_SIZE)" = $KAERU_SHA ] && [ "$(preloader_sha "$BOOT0")" = $PL_SHA ] &&
-        [ "$("$BOOTCTL" gpt-status 2>/dev/null | $BB sed -n 's/^gpt_layout=//p')" = stock ] || critical_failed
+        [ "$("$BOOTCTL" gpt-status 2>/dev/null | $BB sed -n 's/^gpt_layout=//p')" = stock ] &&
+        [ "$(sha < "$STORE_RUNNING")" = "$(sha < "$STORE_OTHER")" ] || critical_failed
 
     $BB rm -rf "$PAYLOAD" "$STATE/preloader-final.bin" "$STATE/preloader-invalid.bin"
     atomic_state "phase=reboot" "result=rebooting" "board=$TARGET_BOARD" "reason=repaired" "chain=$inspect_expect"
