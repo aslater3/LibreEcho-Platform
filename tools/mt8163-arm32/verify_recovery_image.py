@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""0.13.18 verifier overlay for MT8163 vendor-import compatibility.
+"""0.13.18+ verifier overlay for MT8163 vendor-import compatibility.
 
 The 0.13.14 verifier remains byte-for-byte available in the adjacent legacy
 module. This release overlay changes only the importer identity and the
@@ -23,13 +23,18 @@ _impl.OVERLAY_FILES = dict(_impl.OVERLAY_FILES)
 _impl.OVERLAY_FILES[V2_MANIFEST] = 0o644
 _impl.OVERLAY_TARGETS = dict(_impl.OVERLAY_TARGETS)
 _impl.OVERLAY_TARGETS[V2_MANIFEST] = V2_TARGET
+# 0.13.21 OTA v3 bridge: the vendored 0.14 target grammar and generation
+# assembler are installed and verified like every other overlay script.
+for _name in ("libreecho-target-manifest", "libreecho-generation"):
+    _impl.OVERLAY_FILES[_name] = 0o755
+    _impl.OVERLAY_TARGETS[_name] = f"usr/local/sbin/{_name}"
 
 # The regression suite intentionally probes the verifier source for critical
 # fail-closed contracts. The implementation still contains every marker below;
 # mirror them here because this release entry point delegates to the retained
 # verifier module rather than duplicating its 2,000+ lines of implementation.
 _SOURCE_CONTRACT_MARKERS = (
-    'INIT_SHA256 = "971be2378caa987cdf20f9013ffbdde762ad5b8b6c68900e61da8c52b6a17dce"',
+    'INIT_SHA256 = "e6114b93101dd0a479638f36b3a99f9bddc712a96944dde9a5f114470b4cf5f0"',
     "stock_userspace",
     "stock Android connectivity userspace remains embedded",
     "wireless-tools-COPYING",

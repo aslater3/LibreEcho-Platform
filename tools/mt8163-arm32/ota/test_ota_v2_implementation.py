@@ -132,6 +132,8 @@ def updater_fixture(root: Path, env: dict[str, str], transaction: Path) -> Path:
         "PUBLIC_KEY=/etc/libreecho/ota-public-key.hex": f"PUBLIC_KEY={shlex.quote(env['LIBREECHO_PUBLIC_KEY'])}",
         "PACKAGED_CHANNEL_FILE=/etc/libreecho/update-channel": f"PACKAGED_CHANNEL_FILE={shlex.quote(env['LIBREECHO_PACKAGED_CHANNEL_FILE'])}",
         "FEATURE_TRANSACTION=/usr/local/sbin/libreecho-feature-transaction": f"FEATURE_TRANSACTION={shlex.quote(str(transaction))}",
+        "TARGET_MANIFEST=/usr/local/sbin/libreecho-target-manifest": f"TARGET_MANIFEST={shlex.quote(str(TOOLS / 'initramfs/libreecho-target-manifest'))}",
+        "GENERATION_TOOL=/usr/local/sbin/libreecho-generation": f"GENERATION_TOOL={shlex.quote(str(TOOLS / 'initramfs/libreecho-generation'))}",
         "USERDATA_DEVICE=/dev/mmcblk0p16": f"USERDATA_DEVICE={shlex.quote(str(device / 'mmcblk0p16'))}",
         "USERDATA_SYS=/sys/class/block/mmcblk0p16": f"USERDATA_SYS={shlex.quote(str(sys_block / 'mmcblk0p16'))}",
         "MOUNTS_FILE=/proc/mounts": f"MOUNTS_FILE={shlex.quote(str(mounts))}",
@@ -178,6 +180,8 @@ def fetch_fixture(root: Path, env: dict[str, str], updater: Path, transaction: P
         "CURL_STDERR=/run/libreecho/ota-curl.stderr": f"CURL_STDERR={shlex.quote(env['LIBREECHO_FETCH_CURL_STDERR'])}",
         "CURL_HEADERS=/run/libreecho/ota-curl.headers": f"CURL_HEADERS={shlex.quote(env.get('LIBREECHO_FETCH_CURL_HEADERS', str(root / 'curl.headers')))}",
         "FEATURE_TRANSACTION=/usr/local/sbin/libreecho-feature-transaction": f"FEATURE_TRANSACTION={shlex.quote(str(transaction))}",
+        "TARGET_MANIFEST=/usr/local/sbin/libreecho-target-manifest": f"TARGET_MANIFEST={shlex.quote(str(TOOLS / 'initramfs/libreecho-target-manifest'))}",
+        "GENERATION_TOOL=/usr/local/sbin/libreecho-generation": f"GENERATION_TOOL={shlex.quote(str(TOOLS / 'initramfs/libreecho-generation'))}",
         "DATA_ROOT=/data": f"DATA_ROOT={shlex.quote(env['LIBREECHO_DATA_ROOT'])}",
         "PROC_ROOT=/proc": f"PROC_ROOT={shlex.quote(env['LIBREECHO_PROC_ROOT'])}",
         "RUN_ROOT=/run": f"RUN_ROOT={shlex.quote(str(root / 'run'))}",
@@ -1228,7 +1232,11 @@ cp "$src" "$out" || exit 23
         (self.update_root / "incoming/github-update.ota.tar.part").write_bytes(self.package.read_bytes())
         complete = fetch()
         self.assertEqual(complete.returncode, 0, complete.stderr + complete.stdout)
-        self.assertFalse((self.root / "control-part.log").exists())
+        # 0.13.21: a stable check makes one bounded mirror health probe to pick
+        # its transport; the complete part itself is never fetched again.
+        control_log = self.root / "control-part.log"
+        requests = control_log.read_text().splitlines() if control_log.exists() else []
+        self.assertEqual([line for line in requests if "ota-mirror-probe" not in line], [])
         self.assertEqual((self.update_root / "incoming/github-update.ota.tar").read_bytes(), self.package.read_bytes())
 
         reset_stage()
