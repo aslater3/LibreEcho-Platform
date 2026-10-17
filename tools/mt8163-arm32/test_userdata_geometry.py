@@ -62,14 +62,17 @@ class UserdataBootctlGeometryTests(unittest.TestCase):
         source = (ROOT / 'ota/libreecho_bootctl.c').read_text()
         self.assertIn('!partition_sectors_match(contract, text)', source)
         contract = re.search(r'struct partition_contract \{.*?\n\};', source, re.S)[0]
-        table = re.search(r'static const struct partition_contract partitions\[\] = \{.*?\n\};', source, re.S)[0]
+        # Legacy Amonet and pinned Kaeru layouts carry the same userdata contract.
+        tables = re.findall(r'static const struct partition_contract partitions_(?:amonet|pinned)\[\] = \{.*?\n\};', source, re.S)
+        self.assertEqual(len(tables), 2)
         helper = re.search(r'static int partition_sectors_match\(.*?\n\}', source, re.S)[0]
-        code = '#include <stdio.h>\n#include <string.h>\n' + contract + '\n' + table + '\n' + helper + r'''
+        code = '#include <stdio.h>\n#include <string.h>\n' + contract + '\n' + '\n'.join(tables) + '\n' + helper + r'''
+#define DUMP(set) for (size_t i = 0; i < sizeof(set)/sizeof(set[0]); ++i) \
+        printf("%s:%lu:%d\n", set[i].name, set[i].sectors, partition_sectors_match(&set[i], argv[1]));
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
-    for (size_t i = 0; i < sizeof(partitions)/sizeof(partitions[0]); ++i)
-        printf("%s:%lu:%d\n", partitions[i].name, partitions[i].sectors,
-               partition_sectors_match(&partitions[i], argv[1]));
+    DUMP(partitions_amonet)
+    DUMP(partitions_pinned)
     struct partition_contract wrong = {"/dev/mmcblk0p99", "unused", "userdata", 2137088};
     if (partition_sectors_match(&wrong, "2153472")) return 3;
     return 0;

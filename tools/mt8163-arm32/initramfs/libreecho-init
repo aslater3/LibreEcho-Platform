@@ -563,8 +563,25 @@ case "$expdb_devno" in
     *:*) expected_rdev=$($BB printf '%x:%x' "$expdb_major" "$expdb_minor") ;;
 esac
 
+# FASTBOOT_PLEASE in expdb is the legacy Amonet (0.13 BROM chain) fastboot
+# escape. On a Kaeru chain (after a boot-chain repair) expdb holds the
+# LK-stage Kaeru payload, and overwriting it bricks the unit on the next boot,
+# so every expdb marker write below first requires the legacy layout and a
+# non-Kaeru expdb.
+expdb_marker_allowed()
+{
+    $BB grep -qx 'PARTNAME=boot_a_x' /sys/class/block/mmcblk0p10/uevent 2>/dev/null &&
+        [ -e /sys/class/block/mmcblk0p17 ] || return 1
+    [ "$($BB head -c 4 "$EXPDB" 2>/dev/null | $BB od -v -An -tx1 | $BB tr -d ' \n')" != 88168858 ]
+}
+
 IMAGE_PROFILE=$($BB cat /etc/libreecho/image-profile 2>/dev/null)
-case "$IMAGE_PROFILE" in
+if [ "$IMAGE_PROFILE" = development ] && ! expdb_marker_allowed; then
+    log automatic-fastboot-marker-skipped-kaeru-chain
+    IMAGE_PROFILE_MARKER=skip
+fi
+case "$IMAGE_PROFILE${IMAGE_PROFILE_MARKER:+-$IMAGE_PROFILE_MARKER}" in
+    development-skip) ;;
     development)
         # Development images arm the next-reset fastboot escape. OTA images
         # must not do this because A/B retry and rollback require normal boots.
@@ -613,8 +630,10 @@ reboot_request_loop()
             $BB rm -f /tmp/reboot.request
             case "$request" in
                 fastboot)
-                    log reboot-request-fastboot-accepted
-                    if printf FASTBOOT_PLEASE > "$EXPDB" 2>/tmp/reboot-marker.err; then
+                    if ! expdb_marker_allowed; then
+                        log reboot-request-fastboot-rejected-kaeru-chain
+                    elif log reboot-request-fastboot-accepted &&
+                         printf FASTBOOT_PLEASE > "$EXPDB" 2>/tmp/reboot-marker.err; then
                         $BB sync
                         marker=$($BB dd if="$EXPDB" bs=15 count=1 2>/dev/null)
                         if [ "$marker" = FASTBOOT_PLEASE ]; then

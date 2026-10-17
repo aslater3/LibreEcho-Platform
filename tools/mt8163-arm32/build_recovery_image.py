@@ -39,7 +39,7 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "e6114b93101dd0a479638f36b3a99f9bddc712a96944dde9a5f114470b4cf5f0"
+RECOVERY_INIT_SHA256 = "bc275ff77539efbbfac5b031dfbb65833f0966f1e6a80a08057af5d56b608b42"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
@@ -418,6 +418,7 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
             "usr/local/sbin/libreecho-target-manifest", 0o755,
         ),
         "libreecho-generation": ("usr/local/sbin/libreecho-generation", 0o755),
+        "libreecho-boot-chain": ("usr/local/sbin/libreecho-boot-chain", 0o755),
         "libreecho-feature-transaction": (
             "usr/local/sbin/libreecho-feature-transaction", 0o755,
         ),
@@ -1771,6 +1772,7 @@ def validate_stage(stage: Path) -> None:
         "usr/local/sbin/libreecho-update-fetch",
         "usr/local/sbin/libreecho-target-manifest",
         "usr/local/sbin/libreecho-generation",
+        "usr/local/sbin/libreecho-boot-chain",
         "usr/local/libexec/libreecho-update-verify",
         "etc/libreecho/ota-public-key.hex", "etc/libreecho/ota-source.conf",
         "etc/libreecho/image-profile", "etc/libreecho/service-profile",

@@ -168,9 +168,12 @@ target_device_for_slot()
     # as 122f090f libreecho-update:178-189 does.
     [ "$OTA_FORMAT" = v3 ] || target_partname_pinned=$target_partname
 
+    # Same node on both layouts: boot_X_x on legacy Amonet, boot_X on the
+    # pinned Kaeru layout a boot-chain repair leaves (no wrapper partitions).
     [ -b "$target_device" ] &&
         { $BB grep -qx "PARTNAME=$target_partname" "$target_sys/uevent" 2>/dev/null ||
-          $BB grep -qx "PARTNAME=$target_partname_pinned" "$target_sys/uevent" 2>/dev/null; } &&
+          { $BB grep -qx "PARTNAME=$target_partname_pinned" "$target_sys/uevent" 2>/dev/null &&
+            [ ! -e "$BOOT_SYS_ROOT/mmcblk0p17" ] && [ ! -e "$BOOT_SYS_ROOT/mmcblk0p18" ]; }; } &&
         [ "$($BB cat "$target_sys/size" 2>/dev/null)" = "$BOOT_SECTORS" ] ||
         die boot_target_identity
 }

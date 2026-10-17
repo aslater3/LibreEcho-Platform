@@ -29,12 +29,17 @@ for _name in ("libreecho-target-manifest", "libreecho-generation"):
     _impl.OVERLAY_FILES[_name] = 0o755
     _impl.OVERLAY_TARGETS[_name] = f"usr/local/sbin/{_name}"
 
+# 0.13.21: boot-chain status/repair tool.
+BOOT_CHAIN = "libreecho-boot-chain"
+_impl.OVERLAY_FILES[BOOT_CHAIN] = 0o755
+_impl.OVERLAY_TARGETS[BOOT_CHAIN] = "usr/local/sbin/libreecho-boot-chain"
+
 # The regression suite intentionally probes the verifier source for critical
 # fail-closed contracts. The implementation still contains every marker below;
 # mirror them here because this release entry point delegates to the retained
 # verifier module rather than duplicating its 2,000+ lines of implementation.
 _SOURCE_CONTRACT_MARKERS = (
-    'INIT_SHA256 = "e6114b93101dd0a479638f36b3a99f9bddc712a96944dde9a5f114470b4cf5f0"',
+    'INIT_SHA256 = "bc275ff77539efbbfac5b031dfbb65833f0966f1e6a80a08057af5d56b608b42"',
     "stock_userspace",
     "stock Android connectivity userspace remains embedded",
     "wireless-tools-COPYING",

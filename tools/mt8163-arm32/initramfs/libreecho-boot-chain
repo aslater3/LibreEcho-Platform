@@ -1,0 +1,662 @@
+#!/bin/busybox sh
+# libreecho-boot-chain: boot-chain status (read-only) and the opt-in repair
+# that moves a unit installed by the 0.13 BROM method (amonet-k32: cross-flashed
+# LK reporting BISCUIT, wrapper partitions, no TWRP) onto its own board's
+# community Kaeru chain: amonet-radar v1.0.0 (Echo 2nd Gen) or amonet-biscuit
+# v2.0.0 (Echo Dot 2nd Gen).
+#
+# The repair is the upstream ZIP's META-INF update-binary (k4y0z, R0rt1z2), with
+# these LibreEcho changes:
+#   - exact fingerprints of the 0.13 BROM chain and a hardware board identity
+#     (IDME serial family plus the owner's own confirmation) gate every write;
+#   - every region it touches is backed up to /data first;
+#   - the preloader header is invalidated before any boot-critical write (the
+#     same "EMMC_BOOT"+zeros 4 KiB amonet-k32 writes), so an interruption leaves
+#     the unit in bootrom USB download mode, recoverable without opening it, and
+#     the preloader is written last with its header sector last of all;
+#   - the GPT keeps userdata as it is (0.14's pinned contract requires it);
+#   - misc keeps its Amazon BCB; only the bootloader message is cleared;
+#   - every write is read back after dropping caches; on failure the backups are
+#     written back in reverse order;
+#   - the unit reboots into the installed LibreEcho, not recovery.
+#
+# Usage: libreecho-boot-chain status
+#        libreecho-boot-chain repair-start --board radar_puffin|biscuit
+BB=/bin/busybox
+BOOTCTL=/usr/local/sbin/libreecho-bootctl
+STATE=/data/libreecho/boot-chain
+SYS_BLOCK=/sys/class/block
+DEV=/dev
+IDME_SERIAL=/proc/idme/serial
+PROFILE_FILE=/etc/libreecho/image-profile
+DROP_CACHES=/proc/sys/vm/drop_caches
+REBOOT_REQUEST=/tmp/reboot.request
+PROC_MOUNTS=/proc/mounts
+DATA_MOUNT=/data
+ASSISTANT_PAYLOAD=/data/libreecho/features/assistant/payload.squashfs
+ASSISTANT_MANIFEST=/data/libreecho/features/assistant/manifest.json
+CLIENT_ROOT=/run/libreecho/boot-chain-client
+DOWNLOAD_BASE=https://dl.libreecho.org/amonet
+TEST_MODE=0
+# Host tests only: a production run never reads these variables.
+if [ "${BOOT_CHAIN_TEST:-0}" = 1 ]; then
+    TEST_MODE=1
+    BB=${BOOT_CHAIN_BB:-$BB}
+    BOOTCTL=${BOOT_CHAIN_BOOTCTL:-$BOOTCTL}
+    STATE=${BOOT_CHAIN_STATE:-$STATE}
+    SYS_BLOCK=${BOOT_CHAIN_SYS_BLOCK:-$SYS_BLOCK}
+    DEV=${BOOT_CHAIN_DEV:-$DEV}
+    IDME_SERIAL=${BOOT_CHAIN_IDME_SERIAL:-$IDME_SERIAL}
+    PROFILE_FILE=${BOOT_CHAIN_PROFILE_FILE:-$PROFILE_FILE}
+    DROP_CACHES=${BOOT_CHAIN_DROP_CACHES:-$DROP_CACHES}
+    REBOOT_REQUEST=${BOOT_CHAIN_REBOOT_REQUEST:-$REBOOT_REQUEST}
+    PROC_MOUNTS=${BOOT_CHAIN_PROC_MOUNTS:-$PROC_MOUNTS}
+    DATA_MOUNT=${BOOT_CHAIN_DATA_MOUNT:-$DATA_MOUNT}
+    ASSISTANT_PAYLOAD=${BOOT_CHAIN_ASSISTANT_PAYLOAD:-$ASSISTANT_PAYLOAD}
+fi
+MIN_FREE_KB=262144
+
+umask 077
+
+# --- pinned inputs -----------------------------------------------------------
+# 0.13 BROM chain (aslater3/amonet-k32 dfefe52f, the commit 0.13 installers pin).
+K32_LK_SIZE=372368
+K32_LK_SHA=5cb92494340417b1e5d18c3eaa34844dbcfec2cc8086451f087867cd06b15472
+K32_TZ_SIZE=2641920
+K32_TZ_SHA=fe1de9f18aa0f82a308f0c08da3be1f7c7ac2fd65832e26a3a6bdeb0e6e10136
+K32_PL_SHA=49193a8c06f3ac4c70691cb8bcaa3e2ddcefbd36d54b8d425a014aa2318846ff
+PL_SIZE=1048576
+
+# Per-board community packages, identical to the installer's amonet pins.
+board_pins()
+{
+    case "$1" in
+        radar_puffin)
+            ZIP=amonet-radar-v1.0.0.zip
+            ZIP_SIZE=58531162
+            ZIP_SHA=ecdb07bc05a508532e5ffed77121592d492b1a91572839e0f17545421f398f1a
+            KAERU=radar-kaeru.bin
+            PL_SHA=4c7aac4efa7a1bce6922a355c3636e1da575f99bee960d6afd07e1ba107668f8
+            LK_SIZE=356856
+            LK_SHA=5070e18839496f18ce8c7e4d3f07e27e3376b96f487ca9c63b081e35e2230db3
+            TZ_SIZE=1781760
+            TZ_SHA=15cd40caafa6cd8bb8c4e4ed173c973569a8a2b026235d81776ec888f1522c72
+            PAY_SIZE=1107464
+            PAY_SHA=91bed859bbcfc3347d9fa5d732332fb1947311dbcb9384b0d7a9c1863af4709f
+            KAERU_SIZE=264544
+            KAERU_SHA=02e981b2e055e08e09c71c34f9d88a22d9b1ad316adafb0986e203246566013b
+            TWRP_SIZE=14424064
+            TWRP_SHA=3c73511b33854977d36a2505a5d31d0839d2c44d0616d67136107c4c42bece51
+            CHAIN_NAME=kaeru-radar-v1
+            ;;
+        biscuit)
+            ZIP=amonet-biscuit-v2.0.0.zip
+            ZIP_SIZE=55989416
+            ZIP_SHA=98297293701082bc7272efe077f941c56fc7b6e1f27ef6f2e93b6e4c6fc7b62d
+            KAERU=biscuit-kaeru.bin
+            PL_SHA=96595ba2415e4e2b443dc85cc69cfe1cd32a1670b6d05b7b5494b783a21d971d
+            LK_SIZE=359744
+            LK_SHA=c8a0b1f234647d9899a3975c08045903a9ac595c1f2cbab7c040e09bcd20668e
+            TZ_SIZE=1781760
+            TZ_SHA=d363175c9f2a4f1dad5fb317303d12758f0c5617848dc3564b6f574581a86a71
+            PAY_SIZE=1107464
+            PAY_SHA=24857d2e26cf58e41ca7469d936e25f8b4e82766f2700a7475831fb6560e02ee
+            KAERU_SIZE=266640
+            KAERU_SHA=eaa3b053f9326d06ac81294c17449a3436df36f8e59e8b8bf2bf4b521f8c5ecc
+            TWRP_SIZE=13568000
+            TWRP_SHA=1dc701a1d931adf37bb55c5b438989b40136a297579a83cf0ee514eac0f165a9
+            CHAIN_NAME=kaeru-biscuit-v2
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# Host tests substitute synthetic payloads (and their pins) for the real ones.
+if [ "$TEST_MODE" = 1 ] && [ -n "${BOOT_CHAIN_PINS:-}" ]; then
+    . "$BOOT_CHAIN_PINS"
+fi
+
+# --- helpers -----------------------------------------------------------------
+fail() { printf 'ERROR:%s\n' "$1"; exit 1; }
+sha() { $BB sha256sum | $BB cut -c1-64; }
+
+is_block() { [ -b "$1" ] || { [ "$TEST_MODE" = 1 ] && [ -f "$1" ]; }; }
+
+# /dev node of the single partition whose PARTNAME is $1.
+part_dev()
+{
+    found=
+    for sys in "$SYS_BLOCK"/mmcblk0p*; do
+        [ -r "$sys/uevent" ] || continue
+        $BB grep -qx "PARTNAME=$1" "$sys/uevent" 2>/dev/null || continue
+        [ -z "$found" ] || return 1
+        found=${sys##*/}
+    done
+    [ -n "$found" ] && is_block "$DEV/$found" || return 1
+    printf '%s\n' "$DEV/$found"
+}
+
+part_bytes()
+{
+    sectors=$($BB cat "$SYS_BLOCK/${1##*/}/size" 2>/dev/null)
+    case "$sectors" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' $((sectors * 512))
+}
+
+prefix_sha() { $BB head -c "$2" "$1" 2>/dev/null | sha; }
+
+# boot0 preloader region, with sector 3 masked: LK keeps the IDME bootcount
+# there (amonet-k32 reset_bootcount), and every reviewed preloader image has
+# that sector zero-filled.
+preloader_sha()
+{
+    {
+        $BB dd if="$1" bs=512 count=3 2>/dev/null
+        $BB dd if=/dev/zero bs=512 count=1 2>/dev/null
+        $BB dd if="$1" bs=512 skip=4 count=2044 2>/dev/null
+    } | sha
+}
+
+file_ok() { [ -f "$1" ] && [ ! -L "$1" ] && [ "$($BB stat -c %s "$1")" = "$2" ] && [ "$(sha < "$1")" = "$3" ]; }
+
+drop_caches() { $BB sync; [ -w "$DROP_CACHES" ] && echo 3 > "$DROP_CACHES"; return 0; }
+
+atomic_state()
+{
+    $BB mkdir -p "$STATE" || return 1
+    printf '%s\n' "$@" > "$STATE/repair-state.tmp" &&
+        $BB sync && $BB mv "$STATE/repair-state.tmp" "$STATE/repair-state"
+}
+
+state_value() { $BB sed -n "s/^$1=//p" "$STATE/repair-state" 2>/dev/null | $BB head -n 1; }
+
+# --- read-only inspection ----------------------------------------------------
+inspect()
+{
+    LAYOUT=unknown
+    gpt=$("$BOOTCTL" gpt-status 2>/dev/null)
+    case "$(printf '%s\n' "$gpt" | $BB sed -n 's/^gpt_layout=//p')" in
+        legacy-amonet) LAYOUT=legacy-amonet ;;
+        stock) LAYOUT=stock ;;
+    esac
+    GPT_END=$(printf '%s\n' "$gpt" | $BB sed -n 's/^gpt_last_usable_lba=//p')
+
+    LK_A=$(part_dev lk_a); LK_B=$(part_dev lk_b)
+    TEE1=$(part_dev tee1); TEE2=$(part_dev tee2)
+    EXPDB=$(part_dev expdb); MISC=$(part_dev misc); RECOVERY=$(part_dev recovery)
+    BOOT0=$DEV/mmcblk0boot0
+
+    LK=unknown
+    if [ -n "$LK_A" ] && [ -n "$LK_B" ]; then
+        a=$(prefix_sha "$LK_A" $K32_LK_SIZE)
+        [ "$a" = $K32_LK_SHA ] && [ "$(prefix_sha "$LK_B" $K32_LK_SIZE)" = $K32_LK_SHA ] && LK=k32
+        for b in radar_puffin biscuit; do
+            board_pins $b
+            [ "$(prefix_sha "$LK_A" $LK_SIZE)" = $LK_SHA ] &&
+                [ "$(prefix_sha "$LK_B" $LK_SIZE)" = $LK_SHA ] && LK=$b
+        done
+    fi
+    PL=unknown
+    if is_block "$BOOT0"; then
+        p=$(preloader_sha "$BOOT0")
+        [ "$p" = $K32_PL_SHA ] && PL=k32
+        for b in radar_puffin biscuit; do board_pins $b; [ "$p" = $PL_SHA ] && PL=$b; done
+    fi
+    TEE=unknown
+    if [ -n "$TEE1" ] && [ -n "$TEE2" ]; then
+        [ "$(prefix_sha "$TEE1" $K32_TZ_SIZE)" = $K32_TZ_SHA ] && TEE=k32
+        for b in radar_puffin biscuit; do
+            board_pins $b
+            [ "$(prefix_sha "$TEE1" $PAY_SIZE)" = $PAY_SHA ] &&
+                [ "$(prefix_sha "$TEE2" $TZ_SIZE)" = $TZ_SHA ] && TEE=$b
+        done
+    fi
+    EXPDB_STATE=other
+    KAERU_BOARD=
+    if [ -n "$EXPDB" ]; then
+        head=$($BB head -c 15 "$EXPDB" 2>/dev/null)
+        magic=$($BB head -c 4 "$EXPDB" 2>/dev/null | $BB od -v -An -tx1 | $BB tr -d ' \n')
+        zeros=$($BB head -c 15 "$EXPDB" 2>/dev/null | $BB od -v -An -tx1 | $BB tr -d ' 0\n')
+        if [ "$head" = FASTBOOT_PLEASE ]; then
+            EXPDB_STATE=fastboot-marker
+        elif [ "$magic" = 88168858 ]; then
+            EXPDB_STATE=kaeru
+            for b in radar_puffin biscuit; do
+                board_pins $b
+                [ "$(prefix_sha "$EXPDB" $KAERU_SIZE)" = $KAERU_SHA ] && KAERU_BOARD=$b
+            done
+        elif [ -z "$zeros" ]; then
+            # 0.13's updater zeroes the 15-byte marker after an OTA.
+            EXPDB_STATE=empty
+        fi
+    fi
+    RECOVERY_STATE=other
+    if [ -n "$RECOVERY" ]; then
+        board_pins radar_puffin; [ "$(prefix_sha "$RECOVERY" $TWRP_SIZE)" = $TWRP_SHA ] && RECOVERY_STATE=twrp-radar
+        board_pins biscuit; [ "$(prefix_sha "$RECOVERY" $TWRP_SIZE)" = $TWRP_SHA ] && RECOVERY_STATE=twrp-biscuit
+    else
+        RECOVERY_STATE=unknown
+    fi
+
+    CHAIN=unknown
+    if [ "$LK" = k32 ] && [ "$PL" = k32 ] && [ "$TEE" = k32 ] && [ "$LAYOUT" = legacy-amonet ]; then
+        CHAIN=legacy-0.13
+    fi
+    for b in radar_puffin biscuit; do
+        board_pins $b
+        [ "$LK" = $b ] && [ "$PL" = $b ] && [ "$TEE" = $b ] && [ "$KAERU_BOARD" = $b ] &&
+            CHAIN=$CHAIN_NAME
+    done
+
+    # Physical board. The LK-reported product is not evidence: 0.13 cross-flashed
+    # the same LK onto both boards. IDME is factory data; its serial family
+    # (first four characters only, never logged in full) is G2A0 on every
+    # captured Echo (2nd Gen) and G090 on every captured Echo Dot (2nd Gen).
+    family=$($BB dd if="$IDME_SERIAL" bs=1 count=4 2>/dev/null | $BB tr -cd 'A-Z0-9')
+    case "$family" in
+        G2A0) idme=radar_puffin; idme_token=idme-family:radar ;;
+        G090) idme=biscuit; idme_token=idme-family:biscuit ;;
+        *) idme=; idme_token=idme-family:unknown ;;
+    esac
+    case "$GPT_END" in
+        0x747fde) gpt_token=gpt-end:radar-size ;;
+        0x74bfde) gpt_token=gpt-end:biscuit-size ;;
+        *) gpt_token=gpt-end:other ;;
+    esac
+    BOARD=unknown
+    BOARD_CONFIDENCE=unconfirmed
+    if [ -n "$idme" ]; then
+        BOARD=$idme
+        # A biscuit-size disk is never a Radar; some Dots have the Radar-size
+        # disk, so that size is only "not contradicting".
+        case "$idme:$gpt_token" in
+            radar_puffin:gpt-end:radar-size|biscuit:gpt-end:radar-size|biscuit:gpt-end:biscuit-size)
+                BOARD_CONFIDENCE=confirmed ;;
+            *) BOARD=unknown ;;
+        esac
+    fi
+    BOARD_EVIDENCE=$idme_token,$gpt_token
+    # A converted unit's own chain is also board evidence.
+    case "$CHAIN" in kaeru-radar-v1) chain_board=radar_puffin ;; kaeru-biscuit-v2) chain_board=biscuit ;; *) chain_board= ;; esac
+    if [ -n "$chain_board" ]; then
+        BOARD_EVIDENCE=$BOARD_EVIDENCE,chain:$chain_board
+        [ "$BOARD" = "$chain_board" ] || { BOARD=unknown; BOARD_CONFIDENCE=unconfirmed; }
+    fi
+
+    SLOT=unconfirmed
+    bcb=$("$BOOTCTL" status 2>/dev/null)
+    selected=$(printf '%s\n' "$bcb" | $BB sed -n 's/^selected_slot=//p')
+    case "$selected" in
+        a|b) [ "$(printf '%s\n' "$bcb" | $BB sed -n "s/^slot_${selected}_success=//p")" = 1 ] &&
+                 SLOT=confirmed-$selected ;;
+    esac
+
+    PROFILE=$($BB cat "$PROFILE_FILE" 2>/dev/null)
+    case "$PROFILE" in ota|development) ;; *) PROFILE=unknown ;; esac
+
+    life=$($BB cat /sys/block/mmcblk0/device/life_time 2>/dev/null | $BB tr -cd '0-9a-fx ' | $BB tr ' ' '-')
+    eol=$($BB cat /sys/block/mmcblk0/device/pre_eol_info 2>/dev/null | $BB tr -cd '0-9a-fx')
+    EMMC_LIFE=${life:-unknown}${eol:+-eol$eol}
+
+    free_kb=$($BB df -k "$DATA_MOUNT" 2>/dev/null | $BB awk 'NR==2 {print $4}')
+    case "$free_kb" in ''|*[!0-9]*) free_kb=0 ;; esac
+
+    PACKAGE=
+    [ "$BOARD" != unknown ] && board_pins "$BOARD" && PACKAGE=$ZIP
+
+    # Repair verdict.
+    running_pid=$($BB cat "$STATE/repair.pid" 2>/dev/null)
+    if [ -n "$running_pid" ] && $BB kill -0 "$running_pid" 2>/dev/null; then
+        REPAIR=in-progress; REASON=running
+    elif [ "$CHAIN" = kaeru-radar-v1 ] || [ "$CHAIN" = kaeru-biscuit-v2 ]; then
+        if [ "$LAYOUT" = stock ]; then
+            REPAIR=not-needed; REASON=chain_current
+            [ "$(state_value result)" = rebooting ] && { REPAIR=done; REASON=repaired; }
+        else
+            REPAIR=blocked; REASON=layout_not_legacy
+        fi
+    elif [ "$(state_value result)" = failed ] && [ "$(state_value reason)" = write_failed_unrestored ]; then
+        REPAIR=failed; REASON=write_failed_unrestored
+    elif [ "$LAYOUT" != legacy-amonet ]; then
+        REPAIR=blocked; REASON=layout_not_legacy
+    elif [ "$CHAIN" != legacy-0.13 ] || [ "$EXPDB_STATE" = kaeru ] || [ "$EXPDB_STATE" = other ]; then
+        REPAIR=blocked; REASON=bootloader_unrecognised
+    elif [ "$BOARD" = unknown ] || [ "$BOARD_CONFIDENCE" != confirmed ]; then
+        REPAIR=blocked; REASON=board_unconfirmed
+    elif [ "$SLOT" = unconfirmed ]; then
+        REPAIR=blocked; REASON=slot_unconfirmed
+    elif [ "$free_kb" -lt $MIN_FREE_KB ]; then
+        REPAIR=blocked; REASON=low_space
+    else
+        REPAIR=available; REASON=ready
+        [ "$(state_value result)" = failed ] && { REPAIR=failed; REASON=$(state_value reason); }
+    fi
+}
+
+print_status()
+{
+    phase=$(state_value phase)
+    printf 'schema=1\n'
+    printf 'layout=%s\nchain=%s\n' "$LAYOUT" "$CHAIN"
+    printf 'board=%s\nboard_confidence=%s\nboard_evidence=%s\n' "$BOARD" "$BOARD_CONFIDENCE" "$BOARD_EVIDENCE"
+    printf 'expdb=%s\nrecovery=%s\nprofile=%s\nslot=%s\nemmc_life=%s\n' \
+        "$EXPDB_STATE" "$RECOVERY_STATE" "$PROFILE" "$SLOT" "$EMMC_LIFE"
+    printf 'repair=%s\nreason=%s\npackage=%s\nphase=%s\n' "$REPAIR" "$REASON" "$PACKAGE" "${phase:-none}"
+}
+
+status()
+{
+    inspect
+    out=$(print_status)
+    printf '%s\n' "$out"
+    if $BB mkdir -p "$STATE" 2>/dev/null; then
+        printf '%s\n' "$out" > "$STATE/status.tmp" && $BB mv "$STATE/status.tmp" "$STATE/status"
+    fi
+    return 0
+}
+
+# --- repair --------------------------------------------------------------
+phase() { PHASE=$1; atomic_state "phase=$1" "result=running" "board=$TARGET_BOARD" "reason=" ; echo "phase=$1"; }
+
+abort_safe()
+{
+    atomic_state "phase=${PHASE:-start}" "result=failed" "board=$TARGET_BOARD" "reason=$1"
+    echo "ERROR:$1"
+    cleanup_client
+    $BB rm -f "$STATE/repair.pid"
+    exit 1
+}
+
+cleanup_client()
+{
+    $BB grep -q " $CLIENT_ROOT " "$PROC_MOUNTS" 2>/dev/null && $BB umount "$CLIENT_ROOT" 2>/dev/null
+    return 0
+}
+
+# Same trust rules as libreecho-update-fetch's prepare_https_client: a
+# root-owned assistant payload whose size and sha256 match its root-owned
+# manifest supplies libreecho-curl and its CA bundle. The ZIP's own pinned
+# sha256 is what makes the download trustworthy; HTTPS is transport.
+https_client()
+{
+    [ -f "$ASSISTANT_PAYLOAD" ] && [ ! -L "$ASSISTANT_PAYLOAD" ] &&
+        [ -f "$ASSISTANT_MANIFEST" ] && [ ! -L "$ASSISTANT_MANIFEST" ] || return 1
+    [ "$($BB stat -c %u "$ASSISTANT_PAYLOAD")" = 0 ] && [ "$($BB stat -c %u "$ASSISTANT_MANIFEST")" = 0 ] || return 1
+    case "$($BB stat -c %a "$ASSISTANT_PAYLOAD"):$($BB stat -c %a "$ASSISTANT_MANIFEST")" in
+        6[04][04]:6[04][04]) ;;
+        *) return 1 ;;
+    esac
+    want_size=$($BB awk '/"payload"[[:space:]]*:/ {p=1; next} p && /"size"/ {gsub(/[^0-9]/, ""); print; exit}' "$ASSISTANT_MANIFEST")
+    want_sha=$($BB awk '/"payload"[[:space:]]*:/ {p=1; next} p && /"sha256"/ {sub(/^[^:]*:[[:space:]]*"/, ""); sub(/".*/, ""); print; exit}' "$ASSISTANT_MANIFEST")
+    file_ok "$ASSISTANT_PAYLOAD" "$want_size" "$want_sha" || return 1
+    $BB mkdir -p "$CLIENT_ROOT" || return 1
+    $BB grep -q " $CLIENT_ROOT " "$PROC_MOUNTS" 2>/dev/null ||
+        $BB mount -t squashfs -o loop,ro,nosuid,nodev,noatime "$ASSISTANT_PAYLOAD" "$CLIENT_ROOT" || return 1
+    CURL=$CLIENT_ROOT/usr/local/libexec/libreecho-curl
+    CA=$CLIENT_ROOT/usr/local/share/libreecho/cacert.pem
+    [ -x "$CURL" ] && [ -f "$CA" ] && [ ! -L "$CURL" ] && [ ! -L "$CA" ]
+}
+
+obtain_zip()
+{
+    if file_ok "$STATE/upload/$ZIP" $ZIP_SIZE $ZIP_SHA; then
+        ZIP_PATH=$STATE/upload/$ZIP
+        return 0
+    fi
+    ZIP_PATH=$STATE/$ZIP
+    file_ok "$ZIP_PATH" $ZIP_SIZE $ZIP_SHA && return 0
+    https_client || abort_safe download_client_missing
+    $BB rm -f "$ZIP_PATH.part"
+    "$CURL" --proto '=https' --tlsv1.2 --cacert "$CA" --fail --silent --show-error --location \
+        --connect-timeout 20 --max-time 1800 --max-filesize $ZIP_SIZE \
+        --output "$ZIP_PATH.part" "$DOWNLOAD_BASE/$ZIP" || abort_safe download_failed
+    file_ok "$ZIP_PATH.part" $ZIP_SIZE $ZIP_SHA || { $BB rm -f "$ZIP_PATH.part"; abort_safe package_mismatch; }
+    $BB mv "$ZIP_PATH.part" "$ZIP_PATH" || abort_safe download_failed
+    cleanup_client
+}
+
+extract_payloads()
+{
+    PAYLOAD=$STATE/payload
+    $BB rm -rf "$PAYLOAD" && $BB mkdir -p "$PAYLOAD" || abort_safe extract_failed
+    $BB unzip -o -q "$ZIP_PATH" amonet/bin/preloader.img amonet/bin/lk.bin amonet/bin/tz.img \
+        amonet/bin/tee-payload.bin "amonet/bin/$KAERU" amonet/bin/twrp.img -d "$PAYLOAD" ||
+        abort_safe extract_failed
+    B=$PAYLOAD/amonet/bin
+    file_ok "$B/preloader.img" $PL_SIZE $PL_SHA && file_ok "$B/lk.bin" $LK_SIZE $LK_SHA &&
+        file_ok "$B/tz.img" $TZ_SIZE $TZ_SHA && file_ok "$B/tee-payload.bin" $PAY_SIZE $PAY_SHA &&
+        file_ok "$B/$KAERU" $KAERU_SIZE $KAERU_SHA && file_ok "$B/twrp.img" $TWRP_SIZE $TWRP_SHA ||
+        abort_safe package_mismatch
+}
+
+# The partition must exist and hold the payload.
+fits() { size=$(part_bytes "$1") && [ "$size" -ge "$2" ]; }
+
+backup_region()
+{
+    # $1 label, $2 device, $3 bytes (whole partition when empty)
+    if [ -n "$3" ]; then
+        $BB head -c "$3" "$2" > "$BACKUP/$1.img" || return 1
+    else
+        $BB cat "$2" > "$BACKUP/$1.img" || return 1
+    fi
+    printf '%s  %s\n' "$(sha < "$BACKUP/$1.img")" "$1.img" >> "$BACKUP/SHA256SUMS"
+}
+
+take_backups()
+{
+    BACKUP=$STATE/backup
+    $BB rm -rf "$BACKUP.tmp" && $BB mkdir -p "$BACKUP.tmp" || abort_safe backup_failed
+    real_backup=$BACKUP; BACKUP=$BACKUP.tmp
+    disk_sectors=$($BB cat "$SYS_BLOCK/mmcblk0/size" 2>/dev/null)
+    case "$disk_sectors" in ''|*[!0-9]*) abort_safe backup_failed ;; esac
+    { backup_region lk_a "$LK_A" && backup_region lk_b "$LK_B" &&
+      backup_region tee1 "$TEE1" && backup_region tee2 "$TEE2" &&
+      backup_region expdb "$EXPDB" && backup_region misc "$MISC" &&
+      backup_region recovery "$RECOVERY" && backup_region boot0 "$BOOT0" $PL_SIZE &&
+      backup_region store_other "$STORE_OTHER" &&
+      backup_region gpt-primary "$DEV/mmcblk0" $((34 * 512)) &&
+      $BB dd if="$DEV/mmcblk0" of="$BACKUP/gpt-backup.img" bs=512 skip=$((disk_sectors - 33)) count=33 2>/dev/null &&
+      printf '%s  %s\n' "$(sha < "$BACKUP/gpt-backup.img")" gpt-backup.img >> "$BACKUP/SHA256SUMS" &&
+      printf 'board=%s\ndisk_sectors=%s\n' "$TARGET_BOARD" "$disk_sectors" > "$BACKUP/INFO"; } ||
+        abort_safe backup_failed
+    $BB sync
+    ( cd "$BACKUP" && $BB sha256sum -c SHA256SUMS >/dev/null ) || abort_safe backup_failed
+    $BB rm -rf "$real_backup" && $BB mv "$BACKUP" "$real_backup" || abort_safe backup_failed
+    BACKUP=$real_backup
+    $BB sync
+}
+
+# Write file $1 to device $2 at byte offset 0, then verify from media.
+write_verified()
+{
+    bytes=$($BB stat -c %s "$1")
+    want=$(sha < "$1")
+    $BB dd if="$1" of="$2" bs=4096 conv=notrunc,fsync 2>/dev/null || return 1
+    drop_caches
+    [ "$(prefix_sha "$2" "$bytes")" = "$want" ]
+}
+
+boot0_writable() { echo "$1" > "$SYS_BLOCK/mmcblk0boot0/force_ro" 2>/dev/null; }
+
+# The 4 KiB amonet-k32 writes to send the bootrom to USB download mode.
+invalid_preloader_header()
+{
+    { printf 'EMMC_BOOT'; $BB dd if=/dev/zero bs=1 count=4087 2>/dev/null; } > "$STATE/preloader-invalid.bin"
+    [ "$($BB stat -c %s "$STATE/preloader-invalid.bin")" = 4096 ]
+}
+
+restore_backups()
+{
+    ok=1
+    for item in misc expdb lk_a lk_b tee2 tee1 recovery store_other; do
+        case $item in
+            misc) node=$MISC ;; expdb) node=$EXPDB ;; lk_a) node=$LK_A ;;
+            lk_b) node=$LK_B ;; tee2) node=$TEE2 ;; tee1) node=$TEE1 ;;
+            recovery) node=$RECOVERY ;; store_other) node=$STORE_OTHER ;;
+        esac
+        write_verified "$BACKUP/$item.img" "$node" || ok=0
+    done
+    disk_sectors=$($BB sed -n 's/^disk_sectors=//p' "$BACKUP/INFO")
+    $BB dd if="$BACKUP/gpt-backup.img" of="$DEV/mmcblk0" bs=512 seek=$((disk_sectors - 33)) conv=notrunc,fsync 2>/dev/null || ok=0
+    write_verified "$BACKUP/gpt-primary.img" "$DEV/mmcblk0" || ok=0
+    boot0_writable 0
+    # Body first, header sector last.
+    $BB dd if="$BACKUP/boot0.img" of="$BOOT0" bs=4096 skip=1 seek=1 conv=notrunc,fsync 2>/dev/null || ok=0
+    $BB dd if="$BACKUP/boot0.img" of="$BOOT0" bs=4096 count=1 conv=notrunc,fsync 2>/dev/null || ok=0
+    drop_caches
+    [ "$(prefix_sha "$BOOT0" $PL_SIZE)" = "$(sha < "$BACKUP/boot0.img")" ] || ok=0
+    boot0_writable 1
+    [ "$ok" = 1 ]
+}
+
+critical_failed()
+{
+    if restore_backups; then
+        abort_safe write_failed_restored
+    fi
+    atomic_state "phase=$PHASE" "result=failed" "board=$TARGET_BOARD" "reason=write_failed_unrestored"
+    echo "ERROR:write_failed_unrestored"
+    $BB rm -f "$STATE/repair.pid"
+    exit 1
+}
+
+repair_run()
+{
+    TARGET_BOARD=$1
+    board_pins "$TARGET_BOARD" || abort_safe board_mismatch
+
+    phase gate
+    # The gate runs before this process records itself, so "in-progress" can
+    # never stand in for a passed gate.
+    $BB rm -f "$STATE/repair.pid"
+    inspect
+    [ "$REPAIR" = available ] || [ "$REPAIR" = failed ] || abort_safe "$REASON"
+    [ "$REASON" != write_failed_unrestored ] || abort_safe write_failed_unrestored
+    [ "$BOARD" = "$TARGET_BOARD" ] || abort_safe board_mismatch
+    echo $$ > "$STATE/repair.pid"
+    board_pins "$TARGET_BOARD"
+    "$BOOTCTL" gpt-restore --plan >/dev/null 2>&1 || abort_safe layout_not_legacy
+    # The pinned Kaeru chain always loads boot_a (0.14 issue #231), so both OS
+    # stores must hold the running image before the chain changes.
+    case "$SLOT" in
+        confirmed-a) STORE_RUNNING=$(part_dev boot_a_x); STORE_OTHER=$(part_dev boot_b_x) ;;
+        confirmed-b) STORE_RUNNING=$(part_dev boot_b_x); STORE_OTHER=$(part_dev boot_a_x) ;;
+        *) abort_safe slot_unconfirmed ;;
+    esac
+    [ -n "$STORE_RUNNING" ] && [ -n "$STORE_OTHER" ] &&
+        [ "$(part_bytes "$STORE_RUNNING")" = 16777216 ] &&
+        [ "$(part_bytes "$STORE_OTHER")" = 16777216 ] || abort_safe layout_not_legacy
+    fits "$LK_A" $LK_SIZE && fits "$LK_B" $LK_SIZE && fits "$TEE1" $PAY_SIZE &&
+        fits "$TEE2" $TZ_SIZE && fits "$EXPDB" $KAERU_SIZE && fits "$RECOVERY" $TWRP_SIZE &&
+        [ -w "$SYS_BLOCK/mmcblk0boot0/force_ro" ] || abort_safe layout_not_legacy
+
+    phase download
+    obtain_zip
+    phase extract
+    extract_payloads
+    phase backup
+    take_backups
+
+    # TWRP first: the legacy chain never boots recovery on its own, and a failed
+    # write here doubles as a read-only-eMMC probe before anything critical.
+    phase recovery
+    write_verified "$B/twrp.img" "$RECOVERY" || {
+        write_verified "$BACKUP/recovery.img" "$RECOVERY"
+        abort_safe emmc_readonly
+    }
+
+    # Both stores = the running image. Harmless on the legacy chain (only the
+    # inactive slot changes, to the image already running); on Kaeru it makes
+    # boot_a the running image and boot_b its recovery copy, 0.14's fixed-a
+    # invariant.
+    phase align-stores
+    $BB cat "$STORE_RUNNING" > "$STATE/store-running.img" || abort_safe backup_failed
+    write_verified "$STATE/store-running.img" "$STORE_OTHER" || {
+        write_verified "$BACKUP/store_other.img" "$STORE_OTHER"
+        abort_safe write_failed_restored
+    }
+    $BB rm -f "$STATE/store-running.img"
+
+    # The new preloader, carrying this unit's own sector 3 (bootcount).
+    { $BB dd if="$B/preloader.img" bs=512 count=3 2>/dev/null
+      $BB dd if="$BACKUP/boot0.img" bs=512 skip=3 count=1 2>/dev/null
+      $BB dd if="$B/preloader.img" bs=512 skip=4 2>/dev/null; } > "$STATE/preloader-final.bin"
+    [ "$($BB stat -c %s "$STATE/preloader-final.bin")" = $PL_SIZE ] || abort_safe extract_failed
+    invalid_preloader_header || abort_safe extract_failed
+
+    phase critical
+    boot0_writable 0 || abort_safe layout_not_legacy
+    write_verified "$STATE/preloader-invalid.bin" "$BOOT0" || critical_failed
+    write_verified "$B/tee-payload.bin" "$TEE1" || critical_failed
+    write_verified "$B/tz.img" "$TEE2" || critical_failed
+    write_verified "$B/lk.bin" "$LK_B" || critical_failed
+    write_verified "$B/lk.bin" "$LK_A" || critical_failed
+    write_verified "$B/$KAERU" "$EXPDB" || critical_failed
+    "$BOOTCTL" gpt-restore --write >/dev/null 2>&1 || critical_failed
+    # Clear the Android bootloader message (command, status, recovery: 0x340
+    # bytes) and nothing else: the Amazon BCB at 0x360 selects the running,
+    # confirmed slot and must survive.
+    $BB dd if=/dev/zero of="$MISC" bs=832 count=1 conv=notrunc,fsync 2>/dev/null || critical_failed
+    drop_caches
+    [ -z "$($BB head -c 832 "$MISC" | $BB od -v -An -tx1 | $BB tr -d ' 0\n')" ] || critical_failed
+    [ "$($BB dd if="$MISC" bs=1 skip=$((0x360)) count=7 2>/dev/null | sha)" = \
+      "$($BB dd if="$BACKUP/misc.img" bs=1 skip=$((0x360)) count=7 2>/dev/null | sha)" ] || critical_failed
+    # Preloader body, then the header sector last.
+    $BB dd if="$STATE/preloader-final.bin" of="$BOOT0" bs=4096 skip=1 seek=1 conv=notrunc,fsync 2>/dev/null || critical_failed
+    $BB dd if="$STATE/preloader-final.bin" of="$BOOT0" bs=4096 count=1 conv=notrunc,fsync 2>/dev/null || critical_failed
+    drop_caches
+    [ "$(prefix_sha "$BOOT0" $PL_SIZE)" = "$(sha < "$STATE/preloader-final.bin")" ] || critical_failed
+    boot0_writable 1
+
+    phase verify
+    drop_caches
+    inspect_expect=$CHAIN_NAME
+    [ "$(prefix_sha "$LK_A" $LK_SIZE)" = $LK_SHA ] && [ "$(prefix_sha "$LK_B" $LK_SIZE)" = $LK_SHA ] &&
+        [ "$(prefix_sha "$TEE1" $PAY_SIZE)" = $PAY_SHA ] && [ "$(prefix_sha "$TEE2" $TZ_SIZE)" = $TZ_SHA ] &&
+        [ "$(prefix_sha "$EXPDB" $KAERU_SIZE)" = $KAERU_SHA ] && [ "$(preloader_sha "$BOOT0")" = $PL_SHA ] &&
+        [ "$("$BOOTCTL" gpt-status 2>/dev/null | $BB sed -n 's/^gpt_layout=//p')" = stock ] &&
+        [ "$(sha < "$STORE_RUNNING")" = "$(sha < "$STORE_OTHER")" ] || critical_failed
+
+    $BB rm -rf "$PAYLOAD" "$STATE/preloader-final.bin" "$STATE/preloader-invalid.bin"
+    atomic_state "phase=reboot" "result=rebooting" "board=$TARGET_BOARD" "reason=repaired" "chain=$inspect_expect"
+    $BB rm -f "$STATE/repair.pid"
+    $BB sync
+    $BB sleep 3
+    printf 'reboot\n' > "$REBOOT_REQUEST"
+    echo "phase=reboot"
+}
+
+repair_start()
+{
+    [ "$1" = --board ] && board_pins "$2" || fail usage
+    inspect
+    case "$REPAIR" in
+        available|failed) ;;
+        *) fail "$REASON" ;;
+    esac
+    [ "$REASON" != write_failed_unrestored ] || fail write_failed_unrestored
+    [ "$BOARD" = "$2" ] || fail board_mismatch
+    $BB mkdir -p "$STATE" || fail state_unwritable
+    # One repair at a time.
+    $BB mkdir "$STATE/repair.lock" 2>/dev/null || {
+        pid=$($BB cat "$STATE/repair.pid" 2>/dev/null)
+        if [ -n "$pid" ] && $BB kill -0 "$pid" 2>/dev/null; then fail running; fi
+        $BB rmdir "$STATE/repair.lock" 2>/dev/null
+        $BB mkdir "$STATE/repair.lock" 2>/dev/null || fail running
+    }
+    atomic_state "phase=queued" "result=running" "board=$2" "reason="
+    $BB setsid "$0" repair-run --board "$2" >> "$STATE/repair.log" 2>&1 < /dev/null &
+    echo "started=1"
+}
+
+case "${1:-}" in
+    status) [ "$#" = 1 ] || fail usage; status ;;
+    repair-start) [ "$#" = 3 ] || fail usage; repair_start "$2" "$3" ;;
+    repair-run)
+        [ "$#" = 3 ] && [ "$2" = --board ] || fail usage
+        trap '$BB rmdir "$STATE/repair.lock" 2>/dev/null' EXIT
+        repair_run "$3"
+        ;;
+    *) fail usage ;;
+esac
