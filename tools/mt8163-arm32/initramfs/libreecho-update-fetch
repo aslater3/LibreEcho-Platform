@@ -29,6 +29,26 @@ DATA_ROOT=/data
 PROC_ROOT=/proc
 RUN_ROOT=/run
 FEATURE_ROOT=$DATA_ROOT/libreecho/features
+# OTA v3 bridge (0.14 immutable targets). v1/v2 routing is unchanged; a
+# package is treated as v3 only after `libreecho-update inspect` has verified
+# its signature and libreecho-target-manifest has accepted the signed grammar.
+TARGET_MANIFEST=/usr/local/sbin/libreecho-target-manifest
+GENERATION_TOOL=/usr/local/sbin/libreecho-generation
+GENERATIONS=$DATA_ROOT/libreecho/generations
+V3_CANDIDATE=$ROOT/bridge-v3-candidate
+# Stable transport: the project download domain first (it serves the pinned v3
+# stable release at /latest/download/), GitHub Releases as the fallback. Both
+# are untrusted transport; every byte is signature- or hash-checked.
+RELEASE_MIRROR=https://dl.libreecho.org
+RELEASE_GITHUB=https://github.com/aslater3/LibreEcho/releases
+RELEASE_BASE=$RELEASE_GITHUB
+TARGET_SLUG=radar-puffin
+# Free space left on /data after a v3 generation is assembled. The 0.14 tool
+# defaults to 256 KiB; a 0.13 device still carries its legacy feature tree and
+# must keep room for logs and config writes, so refuse well before full.
+BRIDGE_SPACE_RESERVE_BYTES=33554432
+STATUS_OTA_FORMAT=
+STATUS_TARGET_RELEASE=
 
 sanitize_status_value()
 {
@@ -56,6 +76,12 @@ check_status_write()
     error_exit=${5:-}
     error_detail=${6:-}
     http_status=${7:-}
+    # Optional v3 bridge keys; empty unless an authenticated candidate set them.
+    ota_format=$STATUS_OTA_FORMAT
+    case "$ota_format" in v1|v2|v3) ;; *) ota_format= ;; esac
+    target_release=$(sanitize_status_value "$STATUS_TARGET_RELEASE")
+    printf '%s\n' "$target_release" | $BB grep -Eq '^[A-Za-z0-9][A-Za-z0-9._+~:-]{0,95}$' ||
+        target_release=
     status=$(sanitize_status_value "$status")
     latest=$(sanitize_status_value "$latest")
     error=$(sanitize_status_value "$error")
@@ -101,6 +127,8 @@ check_status_write()
         echo "error_exit=$error_exit"
         echo "error_detail=$error_detail"
         echo "http_status=$http_status"
+        echo "ota_format=$ota_format"
+        echo "target_release=$target_release"
     } > "$CHECK_STATUS.tmp" &&
         $BB mv "$CHECK_STATUS.tmp" "$CHECK_STATUS"
 }
@@ -200,8 +228,41 @@ validate_source()
     expected_channel=$(channel_value)
     [ "$expected_channel" = dev ] || [ "$expected_channel" = stable ] || die source_channel
     channel=$expected_channel
+    load_fetch_target
+    # The 0.13 GitHub URL, unchanged. For stable, select_release_source
+    # replaces it with the selected transport and the image target's asset.
     expected_url="https://github.com/aslater3/LibreEcho/releases/latest/download/libreecho-radar-puffin-$channel.ota.tar"
     url=$expected_url
+}
+
+# One target loader for the whole bridge: libreecho-target-manifest (absent
+# /etc/libreecho/target -> radar_puffin unless the boot-chain status confirms
+# biscuit). For radar_puffin the stable URL above is the 0.13 URL unchanged.
+load_fetch_target()
+{
+    target_record=$("$TARGET_MANIFEST" target 2>/dev/null) || die source_target
+    TARGET_SLUG=$(printf '%s\n' "$target_record" | $BB sed -n 's/^target_slug=//p')
+    case "$TARGET_SLUG" in radar-puffin|biscuit) ;; *) die source_target;; esac
+}
+
+# Stable only: a bounded health probe of the project domain picks the
+# transport for this whole check (122f090f libreecho-update-fetch:254-266).
+# Any failure keeps GitHub. Dev discovery keeps its 0.13 GitHub pointer.
+select_release_source()
+{
+    RELEASE_BASE=$RELEASE_GITHUB
+    [ "$channel" = stable ] || return 0
+    probe=$RUN_ROOT/libreecho/ota-mirror-probe.$$
+    $BB rm -f "$probe"
+    if "$CURL" --fail --silent --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --cacert "$CA" --connect-timeout 10 --max-time 20 --max-filesize 64 \
+            --output "$probe" "$RELEASE_MIRROR/healthz" >/dev/null 2>&1 &&
+        [ -f "$probe" ] && [ ! -L "$probe" ] &&
+        [ "$($BB head -n 1 "$probe" 2>/dev/null)" = "libreecho-dl ok" ]; then
+        RELEASE_BASE=$RELEASE_MIRROR
+    fi
+    $BB rm -f "$probe"
+    url="$RELEASE_BASE/latest/download/libreecho-$TARGET_SLUG-$channel.ota.tar"
 }
 
 resolve_dev_release()
@@ -342,6 +403,7 @@ prepare_https_client()
     CA=$CLIENT_ROOT/usr/local/share/libreecho/cacert.pem
     [ -x "$CURL" ] && [ -f "$CA" ] && [ ! -L "$CURL" ] && [ ! -L "$CA" ] ||
         die https_client_missing
+    select_release_source
 }
 
 record_channel()
@@ -1118,6 +1180,135 @@ candidate_matches_record()
     [ "$candidate_boot" = "$recorded_boot" ]
 }
 
+rolled_back_value()
+{
+    [ -f "$ROOT/rolled-back" ] && [ ! -L "$ROOT/rolled-back" ] || return 0
+    [ "$(check_value_from_file "$ROOT/rolled-back" schema)" = 3 ] || return 0
+    check_value_from_file "$ROOT/rolled-back" "$1" | $BB head -n 1
+}
+
+valid_generation_id()
+{
+    case "$1" in ''|.|..|*[!A-Za-z0-9._+~:-]*) return 1;; esac
+    [ "${#1}" -le 96 ]
+}
+
+# Remove whole bridge-assembled generations this 0.13 image no longer needs:
+# everything except $1 (the authenticated candidate, or nothing). Runs under
+# the fetch and install locks. It never runs beside a target image's own
+# state (current/previous), a pending transaction or a live generation lock,
+# never follows a symlink and never descends into a tree that holds one.
+gc_bridge_generations()
+{
+    keep=$1
+    for pointer in current previous pending generation.lock; do
+        [ ! -e "$ROOT/$pointer" ] && [ ! -L "$ROOT/$pointer" ] || return 0
+    done
+    # A SIGKILLed assembler can leave an unpublished lock temp (owner file
+    # only). Nothing else can hold it while the fetch lock is ours.
+    for entry in "$ROOT"/generation.lock.tmp.*; do
+        [ -d "$entry" ] && [ ! -L "$entry" ] || continue
+        [ ! -L "$entry/owner" ] || continue
+        $BB rm -f "$entry/owner" && $BB rmdir "$entry" 2>/dev/null
+    done
+    if [ -z "$keep" ] && [ -d "$ROOT/asset-cache" ] && [ ! -L "$ROOT/asset-cache" ]; then
+        for entry in "$ROOT"/asset-cache/*; do
+            [ -f "$entry" ] && [ ! -L "$entry" ] && $BB rm -f "$entry"
+        done
+        $BB rmdir "$ROOT/asset-cache" 2>/dev/null
+    elif [ -d "$ROOT/asset-cache" ] && [ ! -L "$ROOT/asset-cache" ]; then
+        for entry in "$ROOT"/asset-cache/*.bad; do
+            [ -f "$entry" ] && [ ! -L "$entry" ] && $BB rm -f "$entry"
+        done
+    fi
+    [ -d "$GENERATIONS" ] && [ ! -L "$GENERATIONS" ] || return 0
+    for entry in "$GENERATIONS"/*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        [ ! -L "$entry" ] || continue
+        name=${entry##*/}
+        id=${name%.pin}; id=${id%.partial}
+        valid_generation_id "$id" || continue
+        [ "$id" != "$keep" ] || continue
+        if [ -d "$entry" ]; then
+            [ -z "$($BB find "$entry" -type l 2>/dev/null)" ] || continue
+            $BB find "$entry" -type d -exec $BB chmod 0700 '{}' ';' 2>/dev/null
+            $BB rm -rf "$entry"
+        elif [ -f "$entry" ] && [ "$name" = "$id.pin" ]; then
+            $BB rm -f "$entry"
+        fi
+    done
+    [ -n "$keep" ] || $BB rmdir "$GENERATIONS" 2>/dev/null
+    $BB sync
+    return 0
+}
+
+gc_bridge_generations_locked()
+{
+    install_lock
+    gc_bridge_generations "${1:-}"
+    install_unlock
+}
+
+assemble_v3_generation()
+{
+    assembly_log=$RUN_ROOT/libreecho/ota-generation.stderr
+    ROOT="$ROOT" GENERATIONS="$GENERATIONS" TARGET_MANIFEST="$TARGET_MANIFEST" \
+        CURL="$CURL" CA="$CA" RELEASE_BASE="$RELEASE_BASE" \
+        SPACE_RESERVE_BYTES="$BRIDGE_SPACE_RESERVE_BYTES" \
+        "$GENERATION_TOOL" assemble "$ROOT/staging/manifest" "$ROOT/staging/manifest.sig" \
+        >/dev/null 2>"$assembly_log" && { $BB rm -f "$assembly_log"; return 0; }
+    reason=$($BB sed -n 's/^ERROR://p' "$assembly_log" 2>/dev/null | $BB head -n 1 |
+        $BB tr -cd 'A-Za-z0-9_-')
+    $BB rm -f "$assembly_log"
+    case "$reason" in
+        generation-space) die download_space true "" "$reason" ;;
+        download-asset-transport) die download_asset_transport false "" "$reason" ;;
+        download-asset-http) die download_asset_http true "" "$reason" ;;
+        download-asset-hash) die download_asset_hash true "" "$reason" ;;
+        generation-busy) die download_busy unknown "" "$reason" ;;
+        target-invalid) die downloaded_package_invalid true "" "$reason" ;;
+        *) die generation_assembly unknown "" "$reason" ;;
+    esac
+}
+
+# A signed 0.14 target. Suppression metadata never authorizes bytes: the
+# candidate already passed signed inspect. A candidate whose transaction or
+# OTA package digest matches the retained v3 rollback is held for check and
+# install alike (the 0.13 watcher drives `install`), so a failed target boot
+# cannot re-download and re-install in a loop.
+v3_check_or_install()
+{
+    STATUS_OTA_FORMAT=v3
+    STATUS_TARGET_RELEASE=$(check_value_from_file "$ROOT/staging/manifest" release | $BB head -n 1)
+    candidate_tx=$(check_value_from_file "$ROOT/staging/manifest" transaction_id | $BB head -n 1)
+    valid_generation_id "$candidate_tx" || die downloaded_package_invalid true
+    candidate_ota=$($BB sha256sum "$PACKAGE" | $BB awk '{print $1}')
+    if [ "$candidate_tx" = "$(rolled_back_value transaction_id)" ] ||
+        [ "$candidate_ota" = "$(rolled_back_value ota_sha256)" ]; then
+        gc_bridge_generations_locked ""
+        check_status_write_candidate update-held-after-rollback "$version"
+        echo "UPDATE_HELD version=$version"
+        return 0
+    fi
+    gc_bridge_generations_locked "$candidate_tx"
+    assemble_v3_generation
+    if [ "$requested_action" = check ]; then
+        check_status_write_candidate update-available "$version"
+        echo "UPDATE_AVAILABLE version=$version"
+        return 0
+    fi
+    "$UPDATE" install "$PACKAGE" || {
+        check_status_write error "$version" install_failed true
+        return 1
+    }
+    check_status_write_candidate reboot-pending "$version"
+}
+
+check_status_write_candidate()
+{
+    check_status_write "$1" "$2" "" true
+}
+
 check_or_install()
 {
     requested_action=$1
@@ -1129,10 +1320,31 @@ check_or_install()
     prepare_https_client
     resolve_dev_release || return 1
     install_unlock
+    # Dev discovery names the package digest before any download: a pointer at
+    # the OTA that just rolled back is held without fetching it again.
+    if [ "$channel" = dev ] && [ -n "$(rolled_back_value ota_sha256)" ] &&
+        [ "$DEV_OTA_SHA256" = "$(rolled_back_value ota_sha256)" ]; then
+        STATUS_OTA_FORMAT=v3
+        STATUS_TARGET_RELEASE=$(rolled_back_value release)
+        gc_bridge_generations_locked ""
+        held_version=$(rolled_back_value version)
+        check_status_write update-held-after-rollback "$held_version" "" true
+        echo "UPDATE_HELD version=$held_version"
+        return 0
+    fi
     version=$(download_and_inspect) || return 1
     if [ "$channel" = dev ]; then
         [ "$(sha256sum "$PACKAGE" | $BB awk '{print $1}')" = "$DEV_OTA_SHA256" ] || { quarantine_file "$PACKAGE"; die dev_control_identity; }
         [ "$(check_value_from_file "$ROOT/staging/manifest" update_channel)" = dev ] || die dev_control_channel
+    fi
+    case "$(check_value_from_file "$ROOT/staging/manifest" format)" in
+        libreecho-ota-v3) v3_check_or_install; return $? ;;
+        libreecho-ota-v2) STATUS_OTA_FORMAT=v2 ;;
+        *) STATUS_OTA_FORMAT=v1 ;;
+    esac
+    # A v1/v2 candidate leaves no use for a bridge-assembled generation.
+    if [ -e "$GENERATIONS" ] || [ -e "$ROOT/asset-cache" ]; then
+        gc_bridge_generations_locked ""
     fi
     installed=$($BB sed -n 's/^version=//p' "$ROOT/installed" 2>/dev/null)
     installed_channel=$(record_channel "$ROOT/installed")
