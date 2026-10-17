@@ -52,6 +52,18 @@ TRANSACTION_SLOT_FILE=$UPDATE_ROOT/transaction-slot
 TRANSACTION_BCB_FILE=$STAGING/bootctl.readback
 FEATURE_DIR=
 OTA_FORMAT=v1
+# OTA v3 (0.14 immutable target) bridge. The generation tree, the schema-3
+# pending record and the BCB activation follow Platform 122f090f
+# libreecho-update install_package exactly; the 0.14 image's own init then
+# activates, confirms and commits the generation.
+GENERATIONS=$DATA_ROOT/libreecho/generations
+TARGET_MANIFEST=/usr/local/sbin/libreecho-target-manifest
+GENERATION_TOOL=/usr/local/sbin/libreecho-generation
+# Bridge-only identity of the v3 candidate handed to the target image. 0.14
+# requires the exact four-key schema-3 pending grammar, so the release and the
+# OTA package digest needed for rollback suppression on this image live here.
+V3_CANDIDATE=$UPDATE_ROOT/bridge-v3-candidate
+INSTALL_PIN=
 
 abort_v2_before_activation()
 {
@@ -84,6 +96,13 @@ die()
         } > "$STATE.tmp" 2>/dev/null &&
             $BB mv "$STATE.tmp" "$STATE" 2>/dev/null || $BB rm -f "$STATE.tmp" 2>/dev/null
         $BB sync 2>/dev/null || true
+    fi
+    # v3: on an ordinary aborted install release only this candidate's
+    # lifecycle pin (122f090f libreecho-update:111-116). A published pending
+    # target owns it instead.
+    if [ -n "${INSTALL_PIN:-}" ] && [ ! -e "$PENDING" ] && [ ! -L "$PENDING" ]; then
+        $BB rm -f "$INSTALL_PIN" "$V3_CANDIDATE"
+        $BB sync
     fi
     exit 1
 }
@@ -134,17 +153,24 @@ target_device_for_slot()
             target_device=$BOOT_DEVICE_ROOT/mmcblk0p10
             target_sys=$BOOT_SYS_ROOT/mmcblk0p10
             target_partname=boot_a_x
+            target_partname_pinned=boot_a
             ;;
         b)
             target_device=$BOOT_DEVICE_ROOT/mmcblk0p11
             target_sys=$BOOT_SYS_ROOT/mmcblk0p11
             target_partname=boot_b_x
+            target_partname_pinned=boot_b
             ;;
         *) die boot_control_target ;;
     esac
+    # v1/v2 keep the legacy Amonet store names only. A v3 target accepts the
+    # pinned-chain name for the same reviewed node and sector count, exactly
+    # as 122f090f libreecho-update:178-189 does.
+    [ "$OTA_FORMAT" = v3 ] || target_partname_pinned=$target_partname
 
     [ -b "$target_device" ] &&
-        $BB grep -qx "PARTNAME=$target_partname" "$target_sys/uevent" 2>/dev/null &&
+        { $BB grep -qx "PARTNAME=$target_partname" "$target_sys/uevent" 2>/dev/null ||
+          $BB grep -qx "PARTNAME=$target_partname_pinned" "$target_sys/uevent" 2>/dev/null; } &&
         [ "$($BB cat "$target_sys/size" 2>/dev/null)" = "$BOOT_SECTORS" ] ||
         die boot_target_identity
 }
@@ -395,8 +421,30 @@ stage_v2_assets()
     done
 }
 
+# Signed OTA v3 target. Routing happens only after extract_and_verify has
+# checked the detached signature; libreecho-target-manifest then re-verifies
+# the signature and enforces the complete 0.14 grammar and image target.
+verify_v3_manifest()
+{
+    "$TARGET_MANIFEST" check "$STAGING/manifest" "$STAGING/manifest.sig" ||
+        die target_manifest_invalid
+    OTA_FORMAT=v3
+    version=$(manifest_value version)
+    case "$version" in
+        ''|*[!A-Za-z0-9._+~-]*) die manifest_version_value ;;
+    esac
+    SERVICE_PROFILE=$(manifest_value service_profile)
+    UPDATE_CHANNEL=$(manifest_value update_channel)
+    [ "$UPDATE_CHANNEL" = "$(channel_value)" ] || die update_channel_mismatch
+    boot_sha=$(manifest_value boot_sha256)
+}
+
 verify_manifest()
 {
+    if [ "$(manifest_value format)" = libreecho-ota-v3 ]; then
+        verify_v3_manifest
+        return 0
+    fi
     if [ "$(manifest_value format)" = libreecho-ota-v2 ]; then
         verify_v2_manifest
         return 0
@@ -537,6 +585,7 @@ reject_unsigned_v2_package()
     [ -f "$package" ] && [ ! -L "$package" ] || die package_not_regular
     format=$($BB tar -xOf "$package" manifest 2>/dev/null |
         $BB sed -n 's/^format=//p' | $BB head -n 1)
+    [ "$format" = libreecho-ota-v3 ] && die unsigned_target_unsupported
     [ "$format" = libreecho-ota-v2 ] || return 0
     die unsigned_v2_rejected
 }
@@ -556,6 +605,86 @@ bootctl_status()
     [ "$selected_success" = 1 ] || die current_slot_not_confirmed
     target=$inactive
     target_device_for_slot "$target"
+    write_device=$target_device
+    backup_device=
+    [ "$OTA_FORMAT" = v3 ] || return 0
+    # v3 only: the store-mode contract of 122f090f libreecho-update:332-346.
+    # Today's 0.13 bootctl never reports a mode (slotted). If the boot chain
+    # reports fixed-a, LK always loads boot_a and boot_b keeps the running
+    # image as the recovery copy.
+    store_mode=$($BB sed -n 's/^boot_store_mode=//p' "$STAGING/bootctl.status")
+    case "$store_mode" in
+        ''|slotted) ;;
+        fixed-a)
+            target_device_for_slot b
+            backup_device=$target_device
+            target_device_for_slot a
+            write_device=$target_device
+            ;;
+        *) die boot_store_mode ;;
+    esac
+}
+
+# v3 fixed-a only (122f090f libreecho-update:352-370). A 0.13 device has no
+# committed generation, so the running image is copied as-is.
+backup_running_boot()
+{
+    [ -n "$backup_device" ] || return 0
+    running_sha=$($BB dd if="$write_device" bs=4096 count=4096 2>/dev/null |
+        $BB sha256sum | $BB awk '{print $1}')
+    if [ -r "$UPDATE_ROOT/current" ]; then
+        committed=$($BB cat "$UPDATE_ROOT/current")
+        case "$committed" in ''|.|..|*[!A-Za-z0-9._+~:-]*) die boot_store_committed_pointer;; esac
+        committed_sha=$($BB sed -n 's/^boot_sha256=//p' \
+            "$GENERATIONS/$committed/target.manifest" 2>/dev/null | $BB head -n 1)
+        [ -n "$committed_sha" ] && [ "$running_sha" = "$committed_sha" ] ||
+            die boot_store_not_committed
+    fi
+    $BB dd if="$write_device" of="$backup_device" bs=4096 count=4096 \
+        conv=fsync 2>"$STAGING/boot-backup.log" || die boot_backup_write
+    backup_sha=$($BB dd if="$backup_device" bs=4096 count=4096 2>/dev/null |
+        $BB sha256sum | $BB awk '{print $1}')
+    [ "$backup_sha" = "$running_sha" ] || die boot_backup_hash
+}
+
+# The generation must already be assembled by libreecho-update-fetch; this
+# mirrors 122f090f libreecho-update:470-480.
+verify_v3_generation()
+{
+    [ ! -e "$PENDING" ] && [ ! -L "$PENDING" ] || die transaction_pending
+    tx=$(manifest_value transaction_id)
+    case "$tx" in ''|.|..|*[!A-Za-z0-9._+~:-]*) die generation_manifest_mismatch;; esac
+    generation=$GENERATIONS/$tx
+    [ -f "$generation/target.manifest" ] && [ ! -L "$generation/target.manifest" ] ||
+        die generation_manifest_mismatch
+    manifest_sha=$($BB sha256sum "$STAGING/manifest" | $BB awk '{print $1}')
+    [ "$($BB sha256sum "$generation/target.manifest" | $BB awk '{print $1}')" = "$manifest_sha" ] ||
+        die generation_manifest_mismatch
+    INSTALL_PIN=$GENERATIONS/$tx.pin
+    "$GENERATION_TOOL" verify "$generation" || die generation_invalid
+    # A live 0.13 v2 journal is an unfinished transaction of this image; never
+    # hand the device to a target image while it exists.
+    [ ! -e "$UPDATE_ROOT/feature-commit" ] && [ ! -L "$UPDATE_ROOT/feature-commit" ] ||
+        die feature_transaction_pending
+}
+
+write_v3_candidate()
+{
+    ota_sha=$($BB sha256sum "$package" | $BB awk '{print $1}')
+    case "$ota_sha" in ''|*[!0-9a-f]*) die v3_candidate_identity;; esac
+    [ "${#ota_sha}" -eq 64 ] || die v3_candidate_identity
+    {
+        echo schema=1
+        echo "transaction_id=$tx"
+        echo "manifest_sha256=$manifest_sha"
+        echo "release=$(manifest_value release)"
+        echo "version=$version"
+        echo "update_channel=$UPDATE_CHANNEL"
+        echo "ota_sha256=$ota_sha"
+    } > "$V3_CANDIDATE.tmp" || die v3_candidate_write
+    $BB chmod 0600 "$V3_CANDIDATE.tmp" || die v3_candidate_write
+    $BB mv "$V3_CANDIDATE.tmp" "$V3_CANDIDATE" || die v3_candidate_write
+    $BB sync
 }
 
 feature_file_sha256()
@@ -747,9 +876,12 @@ install_package()
     STATE_DIRTY=1
     state_write verifying 5 package
     extract_and_verify "$package"
+    [ "$OTA_FORMAT" != v3 ] || verify_v3_generation
     state_write verified 20 "$version"
     bootctl_status
-    if [ "$OTA_FORMAT" = v2 ]; then
+    if [ "$OTA_FORMAT" = v3 ]; then
+        :
+    elif [ "$OTA_FORMAT" = v2 ]; then
         stage_v2_assets
         [ -x "$FEATURE_TRANSACTION" ] || die feature_transaction_missing
         printf '%s\n' "$target" > "$TRANSACTION_SLOT_FILE.tmp" || die transaction_slot_write
@@ -763,6 +895,9 @@ install_package()
     fi
 
     state_write writing 30 "$target"
+    [ "$OTA_FORMAT" != v3 ] || backup_running_boot
+    # target_device is the store LK loads for the activated slot (boot_a in a
+    # v3 fixed-a store, see bootctl_status).
     $BB dd if="$STAGING/boot.img" of="$target_device" bs=4096 \
         conv=fsync 2>"$STAGING/boot-write.log" || die boot_write
     state_write verifying-write 75 "$target"
@@ -770,7 +905,24 @@ install_package()
         $BB sha256sum | $BB awk '{print $1}')
     [ "$written" = "$boot_sha" ] || die boot_write_hash
 
-    if [ "$OTA_FORMAT" != v2 ]; then
+    if [ "$OTA_FORMAT" = v3 ]; then
+        # Exact 0.14 schema-3 grammar: schema slot transaction_id
+        # manifest_sha256, in this order (122f090f
+        # libreecho-generation-transaction:186-196).
+        write_v3_candidate
+        {
+            echo schema=3
+            echo "slot=$target"
+            echo "transaction_id=$tx"
+            echo "manifest_sha256=$manifest_sha"
+        } > "$PENDING.tmp" || die pending_write
+        $BB chmod 0600 "$PENDING.tmp" || die pending_mode
+        $BB sync
+        $BB mv "$PENDING.tmp" "$PENDING" || die pending_commit
+        $BB sync
+        $BB rm -f "$INSTALL_PIN" || die generation_unpin
+        $BB sync
+    elif [ "$OTA_FORMAT" != v2 ]; then
         {
             echo schema=1
             echo "version=$version"
@@ -803,6 +955,9 @@ confirm_pending()
     lock_take
     [ -r "$PENDING" ] || die no_pending_update
     pending_schema=$($BB sed -n 's/^schema=//p' "$PENDING")
+    # A schema-3 target is confirmed and committed only by the 0.14 image
+    # that owns it; this image never confirms it.
+    [ "$pending_schema" != 3 ] || die v3_target_confirm_requires_target_image
     if [ "$pending_schema" = 2 ]; then
         slot=$($BB sed -n 's/^slot=//p' "$PENDING")
         version=$($BB sed -n 's/^version=//p' "$PENDING")
@@ -919,6 +1074,7 @@ case "${1:-}" in
         echo allow-unsigned
         echo feature-transaction-v2
         echo runtime-capsules
+        echo immutable-target-v3
         ;;
     *)
         echo "Usage: libreecho-update status | inspect PACKAGE.tar | install [--allow-unsigned] PACKAGE.tar | confirm | capabilities" >&2

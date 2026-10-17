@@ -57,7 +57,8 @@ jobs:
             ota/test_ota_v2_implementation.py \
             ota/test_feature_provenance.py \
             ota/test_service_identity.py \
-            ota/test_dev_discovery.py
+            ota/test_dev_discovery.py \
+            ota/test_ota_v3_bridge.py
 
       - name: Validate tracked Python and shell source
         shell: bash

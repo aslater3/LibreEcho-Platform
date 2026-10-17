@@ -181,6 +181,18 @@ else
     printf '%s\n' DATA_CLEANUP_V2_TRANSACTION_PRESERVED
 fi
 
+# OTA v3 bridge: libreecho-generation publishes its lock by renaming an owned
+# temporary directory (owner file only). At boot no assembler can be alive, so
+# a temp left by a power loss is inert; remove only that exact shape.
+for v3_lock_temp in "$DATA_ROOT/libreecho/update"/generation.lock.tmp.*; do
+    [ -d "$v3_lock_temp" ] && [ ! -L "$v3_lock_temp" ] || continue
+    [ ! -L "$v3_lock_temp/owner" ] || continue
+    rm -f "$v3_lock_temp/owner" || true
+    if rmdir "$v3_lock_temp" 2>/dev/null; then
+        printf 'DATA_CLEANUP_REMOVED=%s\n' "${v3_lock_temp#"$DATA_ROOT"/}"
+    fi
+done
+
 unknown=0
 unknown_item() {
     printf 'DATA_CLEANUP_UNKNOWN=%s\n' "${1#"$DATA_ROOT"/}" >&2
@@ -228,7 +240,18 @@ TOLERATE_UNKNOWN_FILES=0
 # Steady-state allowlist.  Feature IDs are checked separately below because
 # they are extensible; the files inside each feature remain fixed.
 check_children "$DATA_ROOT" libreecho lost+found
-check_children "$DATA_ROOT/libreecho" config secrets features update data-manifest.json
+# OTA v3 bridge: generations/ holds the immutable 0.14 target trees the
+# updater assembles (and incoming/ the 0.14 recovery landing zone). Neither is
+# descended into here; libreecho-generation verifies them. Same rule as
+# Platform 122f090f libreecho-data-cleanup, so a rollback from 0.14 to this
+# image keeps its service graph.
+check_children "$DATA_ROOT/libreecho" config secrets features update data-manifest.json \
+    generations incoming
+for v3_directory in "$DATA_ROOT/libreecho/generations" "$DATA_ROOT/libreecho/incoming"; do
+    if [ -e "$v3_directory" ] || [ -L "$v3_directory" ]; then
+        [ ! -L "$v3_directory" ] && [ -d "$v3_directory" ] || unknown_item "$v3_directory"
+    fi
+done
 # /data is shared between the A and B slots, so a configuration file written
 # by a newer image is still present after a rollback to an older one.  With a
 # strict allowlist that file is an unknown item and the older image blocks
@@ -256,7 +279,9 @@ TOLERATE_UNKNOWN_FILES=1
 check_children "$DATA_ROOT/libreecho/update" \
     channel incoming staging state pending installed rolled-back check-status \
     automatic-updates install.lock bootctl.confirm bootctl.confirmed feature-commit committed-manifest committed-manifest.sig restart-record first-install.pending \
-    first-install.confirmed boot-health boot-count boot-history
+    first-install.confirmed boot-health boot-count boot-history \
+    current previous generation.lock asset-cache fetch.lock \
+    config-status features-status transaction-slot bridge-v3-candidate
 TOLERATE_UNKNOWN_FILES=0
 
 if [ -d "$DATA_ROOT/libreecho/features" ]; then

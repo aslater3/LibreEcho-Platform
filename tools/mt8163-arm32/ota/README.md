@@ -304,3 +304,78 @@ rollback. They remain available only in an explicit development build profile.
 A release/OTA image does not write `expdb` automatically and does not reset the
 BCB. An explicit operator request to reboot to fastboot may still write the
 marker after validating the `expdb` identity.
+
+## OTA v3 bridge (0.13.21)
+
+0.13.21 accepts a signed 0.14 OTA v3 package (`format=libreecho-ota-v3`) in
+addition to v1/v2, so a 0.13 unit moves to 0.14 without a reinstall. v1/v2
+routing, keys and states are unchanged; a package is routed to v3 only after
+`libreecho-update inspect` has verified its detached signature and
+`libreecho-target-manifest check` has accepted the signed 0.14 grammar.
+
+- `libreecho-target-manifest` and `libreecho-generation` are vendored from
+  Platform `122f090f`. Deviations: target selection (an absent
+  `/etc/libreecho/target` means `radar_puffin`, or `biscuit` only when
+  `/data/libreecho/boot-chain/status` has exactly one `board=biscuit` and one
+  `board_confidence=confirmed`), a read-only `target` verb, and the asset
+  download-base allowlist (`https://dl.libreecho.org`,
+  `https://github.com/aslater3/LibreEcho/releases`, and 0.14's
+  `https://github.com/LibreEcho/LibreEcho/releases`).
+- Stable fetch probes `https://dl.libreecho.org/healthz` and then downloads
+  `<base>/latest/download/libreecho-<slug>-stable.ota.tar`, where `<base>` is
+  the mirror or, if the probe fails, the unchanged 0.13 GitHub base. The dev
+  pointer (`release-pointer.txt`) is unchanged.
+- For v3, the fetcher assembles `/data/libreecho/generations/<transaction_id>`
+  with the 0.14 tool, keeping 32 MiB free on `/data` (`error=download_space`
+  otherwise). The updater verifies that tree, writes the inactive boot slot,
+  writes the exact 0.14 four-key schema-3 `pending`, and activates the slot
+  in the BCB. It never confirms a schema-3 target. Feature payloads are
+  always downloaded: they are never hardlinked from the legacy `features/`
+  tree, because the generation would then share mutable inodes and the 0400
+  mode with 0.13.
+- `bridge-v3-candidate` (in `update/`) holds the release and the OTA package
+  SHA-256. If the 0.14 boot fails and the BCB falls back to 0.13.21, init writes
+  a schema-3 `rolled-back` record carrying `transaction_id`, `release` and
+  `ota_sha256`. The fetcher holds a candidate with that transaction or package
+  digest (`update-held-after-rollback`), for `check` and `install` alike; on dev
+  it does so before downloading. It then removes the orphaned generation whole.
+- `check-status` gains the optional `ota_format=` and `target_release=` keys,
+  and `libreecho-update capabilities` adds `immutable-target-v3`.
+
+What the 0.14 image does with this state was checked by reading `122f090f`.
+It was not checked on hardware.
+
+- The init takes the v3 branch for a schema-3 pending
+  (`initramfs/libreecho-init:1926-1944`):
+  - If the running slot is the pending slot and success is 0, it runs
+    `activate`.
+  - If success is 1, it runs `commit`.
+  - If another slot is running, it runs `rollback`.
+- That branch returns before `adopt_staged_local_install` and
+  `commit_fresh_install` (`:1950`, `:1989`). The legacy `installed`,
+  `feature-commit` and `features/` are never read there.
+- `validate_pending` requires exactly `schema slot transaction_id
+  manifest_sha256` (`libreecho-generation-transaction:186-196`).
+- `commit` with no `current` writes the first `current`, rewrites `installed`
+  and runs gc (`:359-381`). gc tolerates only directories and `*.pin` under
+  `generations/` (`:436-442`). That is why the bridge leaves nothing else
+  there.
+- The health worker confirms through `libreecho-update confirm`
+  (`libreecho-init:3293-3294`). That runs `verify-running`, then
+  `bootctl confirm`, then `commit` (`libreecho-update:546-548`).
+- 0.14 `libreecho-data-cleanup` allows `generations/` and every 0.13 record
+  name (`:270`, `:309-318`). Unknown regular files in `update/` are only
+  tolerated.
+- `libreecho-config-migrate` reads the root `schema`/`schema_version` from
+  `web-config.json` (`:66-72`). A mismatch only raises `config_error`; it never
+  blocks confirmation.
+- 0.14 has no restore source on a `fixed-a` boot store without `current`
+  (`libreecho-generation-transaction:389-395`). A failed first 0.14 boot on that
+  store therefore stays on the 0.14 kernel instead of returning to 0.13.21.
+  Today's 0.13 `libreecho-bootctl` reports no store mode (slotted).
+
+0.13.21's own `libreecho-data-cleanup` now allows `generations/`,
+`update/asset-cache` and `update/generation.lock`, and drops stale
+`generation.lock.tmp.*` at boot. Without that, a bridge boot (or a rollback to
+it) would fail the userdata contract and stop the production services.
+Host coverage is in `ota/test_ota_v3_bridge.py`.

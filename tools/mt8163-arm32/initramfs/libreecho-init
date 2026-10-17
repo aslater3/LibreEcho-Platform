@@ -1167,6 +1167,52 @@ start_ui_services()
 start_ui_services &
 log ui-services-autostart-started
 
+# OTA v3 bridge rollback. The 0.14 target image did not confirm and the BCB
+# fell back to this slot. 0.14 owns the exact four-key schema-3 pending
+# grammar, so the release and OTA package digest come from the bridge
+# candidate record the updater wrote just before pending, and only when it
+# names the same transaction and signed manifest. The retained rolled-back
+# record lets the fetcher hold that exact OTA instead of re-installing it.
+record_v3_rollback()
+{
+    v3_root=/data/libreecho/update
+    v3_candidate=$v3_root/bridge-v3-candidate
+    v3_tx=$($BB sed -n 's/^transaction_id=//p' "$v3_root/pending" 2>/dev/null | $BB head -n 1 | $BB tr -cd 'A-Za-z0-9._+~:-')
+    v3_manifest=$($BB sed -n 's/^manifest_sha256=//p' "$v3_root/pending" 2>/dev/null | $BB head -n 1 | $BB tr -cd '0-9a-f')
+    v3_release=
+    v3_version=
+    v3_channel=
+    v3_ota=
+    if [ -f "$v3_candidate" ] && [ ! -L "$v3_candidate" ] &&
+       [ -n "$v3_tx" ] &&
+       [ "$($BB sed -n 's/^transaction_id=//p' "$v3_candidate" | $BB head -n 1)" = "$v3_tx" ] &&
+       [ "$($BB sed -n 's/^manifest_sha256=//p' "$v3_candidate" | $BB head -n 1)" = "$v3_manifest" ]; then
+        v3_release=$($BB sed -n 's/^release=//p' "$v3_candidate" | $BB head -n 1 | $BB tr -cd 'A-Za-z0-9._+~:-')
+        v3_version=$($BB sed -n 's/^version=//p' "$v3_candidate" | $BB head -n 1 | $BB tr -cd 'A-Za-z0-9._+~-')
+        v3_channel=$($BB sed -n 's/^update_channel=//p' "$v3_candidate" | $BB head -n 1 | $BB tr -cd 'a-z')
+        v3_ota=$($BB sed -n 's/^ota_sha256=//p' "$v3_candidate" | $BB head -n 1 | $BB tr -cd '0-9a-f')
+    fi
+    if {
+        echo schema=3
+        echo "slot=$pending_slot"
+        echo "transaction_id=$v3_tx"
+        echo "version=$v3_version"
+        echo "update_channel=$v3_channel"
+        echo "manifest_sha256=$v3_manifest"
+        echo "release=$v3_release"
+        echo "ota_sha256=$v3_ota"
+    } > "$v3_root/rolled-back.tmp" &&
+       $BB chmod 0600 "$v3_root/rolled-back.tmp" &&
+       $BB mv "$v3_root/rolled-back.tmp" "$v3_root/rolled-back"; then
+        $BB sync
+        $BB rm -f "$v3_root/pending" "$v3_candidate"
+        log "ota-v3-rollback-recorded:$v3_tx"
+        return 0
+    fi
+    $BB rm -f "$v3_root/rolled-back.tmp"
+    $BB mv "$v3_root/pending" "$v3_root/rolled-back"
+}
+
 ota_health_confirm_worker()
 {
     [ "$IMAGE_PROFILE" = ota ] || return 0
@@ -1289,8 +1335,12 @@ ota_health_confirm_worker()
                 log ota-v2-fallback-preserved-for-recovery
                 return 0
             fi
-            $BB mv /data/libreecho/update/pending \
-                /data/libreecho/update/rolled-back
+            if [ "$($BB sed -n 's/^schema=//p' /data/libreecho/update/pending 2>/dev/null)" = 3 ]; then
+                record_v3_rollback
+            else
+                $BB mv /data/libreecho/update/pending \
+                    /data/libreecho/update/rolled-back
+            fi
             {
                 echo schema=1
                 echo state=rolled-back
