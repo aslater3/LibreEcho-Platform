@@ -184,8 +184,14 @@ committed. `test_music_trace.py` checks it in CI: silence is inert, beatless
 material reports no tempo, click tracks get a confident tempo, and level does
 not move tempo or confidence, and 90, 120 and 150 BPM are reported at the
 right metrical level. One known gap is an expected failure until fixed: energy
-and density follow the playback level because the engine analyses the
-post-volume mix (#44).
+and density follow the recording level, so a -20 dB master reads quieter.
+
+The engine analyses a unity-gain tap (#44): the media and AirPlay buses summed
+in stereo before sender volume, master volume, speaker EQ and limiting.  Volume
+changes the speaker output but not the features; a bus at zero gain is left out
+so a muted sender does not animate the LEDs.  `test_music_analysis_tap.sh` runs
+the engine's own tap and analyser and checks that a -20 dB sender gain leaves
+every feature byte-identical.
 
 To evaluate on real music, keep the recordings and a list of them outside the
 repository and run `music-trace` over them; never commit copyrighted audio.
