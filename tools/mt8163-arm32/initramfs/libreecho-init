@@ -3426,8 +3426,12 @@ ota_health_confirm_worker()
 # flow's `transaction_pending()` then rejects every later installation.  The
 # candidate-confirmation half stays production-only inside the worker, so a
 # diagnostic slot is still left pending and unconfirmed for the operator.
+# Persistent local services (#170) wait for this marker, so they can never
+# affect a candidate's health check. A worker that reboots for a rollback never
+# writes it, which is correct: user services do not run on a failed candidate.
+OTA_HEALTH_SETTLED=${OTA_HEALTH_SETTLED:-/run/libreecho/ota-health-settled}
 if [ "$IMAGE_PROFILE" = ota ]; then
-    ota_health_confirm_worker &
+    ( ota_health_confirm_worker; : > "$OTA_HEALTH_SETTLED" ) &
     log ota-background-worker-started
     # Anonymous weekly active-device count (telemetry Tier 0).  Independent of
     # the updater and never blocks boot: the sender sleeps 5-30 minutes before
@@ -3439,6 +3443,50 @@ if [ "$IMAGE_PROFILE" = ota ]; then
 else
     log ota-background-workers-disabled-for-non-ota-profile
 fi
+# Without an OTA health worker there is nothing for local services to wait on.
+[ "$IMAGE_PROFILE" = ota ] || : > "$OTA_HEALTH_SETTLED"
+
+# Persistent local services (#170): the owner's own services under
+# /data/libreecho/local, run by libreecho-local. They start only after the core
+# graph has published startup-ready and OTA health has settled, so a broken
+# service can neither block boot nor cause a rollback. The supervisor always
+# runs in production so the WebUI switch applies live; it starts nothing until
+# /data/libreecho/local/enabled exists. Holding the Action button at power-on
+# (physical recovery) skips it for that boot.
+start_local_services()
+{
+    [ -x /usr/local/sbin/libreecho-local ] || return 0
+    if [ "${DATA_CLEANUP_OK:-0}" -ne 1 ]; then
+        log local-services-skipped-data-contract
+        return 0
+    fi
+    if [ "$SERVICE_PROFILE" != production ]; then
+        log local-services-skipped-diagnostic-profile
+        return 0
+    fi
+    if [ -f "$PHYSICAL_RECOVERY_MARKER" ]; then
+        log local-services-skipped-recovery-mode
+        return 0
+    fi
+    waited=0
+    while [ ! -e "$STARTUP_READY" ] && [ "$waited" -lt 180 ]; do
+        $BB sleep 1
+        waited=$((waited + 1))
+    done
+    [ -e "$STARTUP_READY" ] || log local-services-degraded-start-no-startup-ready
+    waited=0
+    while [ ! -e "$OTA_HEALTH_SETTLED" ] && [ "$waited" -lt 900 ]; do
+        $BB sleep 1
+        waited=$((waited + 1))
+    done
+    if [ ! -e "$OTA_HEALTH_SETTLED" ]; then
+        log local-services-skipped-ota-health-unsettled
+        return 0
+    fi
+    log local-services-supervisor-started
+    exec /usr/local/sbin/libreecho-local run
+}
+start_local_services </dev/null >/dev/null 2>&1 &
 
 # Audio playback is always user-initiated.  In particular, boot must never
 # touch the codec, amplifier, or TinyALSA playback device.  This is a hard

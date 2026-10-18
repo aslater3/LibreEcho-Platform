@@ -3349,7 +3349,9 @@ start_feature_service_if_enabled
 
     def test_production_ota_health_worker_checks_full_service_graph(self) -> None:
         source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
-        self.assertIn('ota_health_confirm_worker &', source)
+        # The worker is launched in the background and, unless it reboots,
+        # publishes ota-health-settled for the local services gate (#170).
+        self.assertIn('( ota_health_confirm_worker; : > "$OTA_HEALTH_SETTLED" ) &', source)
         self.assertIn('[ "$SERVICE_PROFILE" = production ]', source)
         for socket_path in (
             "/run/libreecho/network.sock",
@@ -3809,11 +3811,11 @@ start_feature_service_if_enabled
         # Every boot is counted and recorded before the worker is launched.
         self.assertLess(
             init.index("bh_boot_count=$(bh_bump_count)"),
-            init.index("ota_health_confirm_worker &"),
+            init.index("( ota_health_confirm_worker;"),
         )
         self.assertLess(
             init.index("boot-diagnostics-unavailable"),
-            init.index("ota_health_confirm_worker &"),
+            init.index("( ota_health_confirm_worker;"),
         )
         # The record is only taken once the userdata cleanup contract passed.
         self.assertLess(
