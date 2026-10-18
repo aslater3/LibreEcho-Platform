@@ -4,8 +4,9 @@ Builds music-trace from the shipped sources, generates the synthetic corpus
 (corpus/gen_corpus.py) and checks the traces. Properties that hold are
 asserted; known gaps are expected failures so they stay visible and flip to
 unexpected successes when fixed:
-  - level dependence: the engine analyses the post-volume mix, so a -20 dB copy
-    halves energy and density (#44 analysis tap).
+  - recording level: a -20 dB master halves energy and density.  Playback
+    volume no longer reaches the analyser (the engine's unity-gain tap, #44,
+    covered by test_music_analysis_tap.sh); a quieter recording still does.
 """
 import json
 import os

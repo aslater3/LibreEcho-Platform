@@ -108,6 +108,7 @@ struct music_visualizer {
 	unsigned int frame_periods;
 	unsigned int silent_periods;
 	int active;
+	int16_t analysis[PERIOD_SIZE * INPUT_CHANNELS];
 };
 
 static volatile sig_atomic_t stopping;
@@ -444,9 +445,43 @@ static int higher_priority_active(const struct source_bus *sources)
 		sources[SOURCE_ALARM].received >= period_bytes;
 }
 
+static int source_period_ready(const struct source_bus *source);
+
+/*
+ * Music analysis tap (#44): the media and AirPlay buses summed in stereo at
+ * unity gain, ahead of sender volume, master volume, speaker EQ and limiting,
+ * so the features describe the programme rather than the playback level.  A
+ * bus at zero gain is left out so a muted sender does not animate the LEDs.
+ */
+static void music_analysis_period(const struct source_bus *sources,
+				  int16_t *analysis)
+{
+	static const unsigned int music_sources[] = {
+		SOURCE_MEDIA, SOURCE_AIRPLAY
+	};
+	size_t sample;
+	unsigned int i;
+
+	memset(analysis, 0, PERIOD_SIZE * INPUT_CHANNELS * sizeof(*analysis));
+	for (i = 0; i < sizeof(music_sources) / sizeof(music_sources[0]); ++i) {
+		const struct source_bus *source = &sources[music_sources[i]];
+
+		if (!source_period_ready(source) || source->gain_q15 <= 0 ||
+		    (music_sources[i] == SOURCE_AIRPLAY &&
+		     source->airplay_volume_missing))
+			continue;
+		for (sample = 0; sample < PERIOD_SIZE * INPUT_CHANNELS; ++sample) {
+			int32_t sum = (int32_t)analysis[sample] +
+				source->samples[sample];
+
+			analysis[sample] = (int16_t)(sum > 32767 ? 32767 :
+						     sum < -32768 ? -32768 : sum);
+		}
+	}
+}
+
 static void process_music_visualizer(struct music_visualizer *visualizer,
-				     const struct source_bus *sources,
-				     const int16_t *rendered)
+				     const struct source_bus *sources)
 {
 	unsigned int band;
 	int audible = 0;
@@ -467,8 +502,10 @@ static void process_music_visualizer(struct music_visualizer *visualizer,
 	 */
 	(void)music_feature_transport_begin_tick(&visualizer->transport,
 						 music_visualizer_seed);
-	audio_visualizer_process_features(&visualizer->analyzer, rendered,
-					  PERIOD_SIZE, OUTPUT_CHANNELS,
+	music_analysis_period(sources, visualizer->analysis);
+	audio_visualizer_process_features(&visualizer->analyzer,
+					  visualizer->analysis,
+					  PERIOD_SIZE, INPUT_CHANNELS,
 					  visualizer->levels,
 					  &visualizer->features);
 	for (band = 0; band < AUDIO_VISUALIZER_BANDS; ++band)
@@ -1565,7 +1602,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 					      &visualizer, &status);
 			continue;
 		}
-		process_music_visualizer(&visualizer, sources, output);
+		process_music_visualizer(&visualizer, sources);
 		consume_period(sources);
 
 		while (!stopping && sources_active(sources)) {
@@ -1594,7 +1631,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 					pcm_get_error(pcm));
 				break;
 			}
-			process_music_visualizer(&visualizer, sources, output);
+			process_music_visualizer(&visualizer, sources);
 			consume_period(sources);
 		}
 		clear_source_activity(sources, &announcement_led_active,
