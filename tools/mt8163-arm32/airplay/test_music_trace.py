@@ -4,7 +4,6 @@ Builds music-trace from the shipped sources, generates the synthetic corpus
 (corpus/gen_corpus.py) and checks the traces. Properties that hold are
 asserted; known gaps are expected failures so they stay visible and flip to
 unexpected successes when fixed:
-  - metrical level: 90 BPM tracks at 45 and 150 BPM at 50 (#45);
   - level dependence: the engine analyses the post-volume mix, so a -20 dB copy
     halves energy and density (#44 analysis tap).
 """
@@ -80,7 +79,6 @@ class MusicTraceCorpus(unittest.TestCase):
         bpm = median(self.settled["clicks-120"], "bpm_x100") / 100
         self.assertAlmostEqual(bpm, 120, delta=6)
 
-    @unittest.expectedFailure
     def test_90_and_150_bpm_track_at_the_right_metrical_level(self):
         for name, target in (("clicks-090", 90), ("clicks-150", 150)):
             self.assertAlmostEqual(median(self.settled[name], "bpm_x100") / 100, target, delta=target * 0.06)

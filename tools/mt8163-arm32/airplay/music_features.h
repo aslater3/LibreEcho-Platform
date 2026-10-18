@@ -239,6 +239,8 @@ static inline void music_features_state_init(struct music_features_state *state)
    detrended onset level (per frame) for any tempo to be considered. */
 #define MF_DETREND_FRAMES 8U
 #define MF_BEAT_MIN_VARIANCE 16U
+/* A faster metrical level is chosen when it scores at least this fraction (Q8) of the best lag. */
+#define MF_METRICAL_RATIO_Q8 205U
 #define MF_BEAT_CONFIDENCE_LEVEL 32U
 #define MF_BEAT_PHASE_LEVEL 64U
 #define MF_BEAT_COHERENT_LEVEL 48U
@@ -533,6 +535,9 @@ static inline void music_features_update(struct music_features_state *state,
 			den += (uint32_t)((int32_t)detrended[k] * detrended[k]);
 		}
 		if (den >= MF_BEAT_MIN_VARIANCE * MUSIC_FEATURES_ONSET_HISTORY) {
+			int32_t scores[MUSIC_FEATURES_MAX_LAG + 1U];
+			unsigned int divisor;
+
 			for (lag = MUSIC_FEATURES_MIN_LAG;
 			     lag <= MUSIC_FEATURES_MAX_LAG; ++lag) {
 				int32_t num = 0;
@@ -543,9 +548,26 @@ static inline void music_features_update(struct music_features_state *state,
 						detrended[k - lag];
 				score = num > 0 ? (int32_t)((int64_t)num * 256 /
 							      (int64_t)den) : 0;
+				scores[lag] = score;
 				if (score > best_score) {
 					best_score = score;
 					best_lag = lag;
+				}
+			}
+			/*
+			 * Metrical level: a periodic onset train also correlates at two
+			 * and three periods, and the longer lag can win by a hair.  If
+			 * the lag a half or a third as long scores nearly as well, the
+			 * beat is the faster one (#45).
+			 */
+			for (divisor = 3U; divisor >= 2U; --divisor) {
+				unsigned int fast = (unsigned int)(best_lag + divisor / 2U) / divisor;
+
+				if (best_score > 0 && fast >= MUSIC_FEATURES_MIN_LAG &&
+				    scores[fast] * 256 >= best_score * (int32_t)MF_METRICAL_RATIO_Q8) {
+					best_lag = fast;
+					best_score = scores[fast];
+					break;
 				}
 			}
 		}
