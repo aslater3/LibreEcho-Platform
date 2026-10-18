@@ -182,14 +182,17 @@ and 150 BPM, a beatless pad, white noise, a sweep, silence and a -20 dB copy)
 with integer synthesis, so every host produces identical files and no audio is
 committed. `test_music_trace.py` checks it in CI: silence is inert, beatless
 material reports no tempo, click tracks get a confident tempo, and level does
-not move tempo or confidence. Two known gaps are expected failures until fixed:
-90 and 150 BPM are tracked at 45 and 50 BPM (metrical level), and energy and
-density follow the playback level because the engine analyses the post-volume
-mix.
+not move tempo or confidence, and 90, 120 and 150 BPM are reported at the
+right metrical level. One known gap is an expected failure until fixed: energy
+and density follow the playback level because the engine analyses the
+post-volume mix (#44).
 
 To evaluate on real music, keep the recordings and a list of them outside the
 repository and run `music-trace` over them; never commit copyrighted audio.
 
 The tempo search correlates a detrended onset envelope (each value minus its
 trailing 8-frame mean), so a smooth or slowly swelling envelope no longer
-produces a confident tempo on beatless material.
+produces a confident tempo on beatless material. A periodic onset train also
+correlates at two and three periods, so when the lag a half or a third as long
+scores at least 80% (`MF_METRICAL_RATIO_Q8`) of the best lag, the faster level
+is reported.
