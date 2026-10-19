@@ -30,6 +30,51 @@ class WebStatusTests(FailurePolicyTests):
         self.assertIn("printf 'ui_ota_adapter_sha256=%s\\n' \"$ui_ota_adapter_sha256\"", source)
         self.assertIn("printf 'source_diff_sha256=%s\\n' \"$ui_diff_sha256\"", source)
 
+    def test_build_identity_comes_from_the_callers_checkout(self):
+        # Issue #257: the snapshot has no .git, so without explicit values the
+        # UI Makefile embeds source_commit/source_digest "unknown".
+        source = (TOOLS / 'ui/build_ui_bundle.sh').read_text()
+        probe = 'ui_provenance=$(sh "$UI_SOURCE/tools/source-provenance.sh" --field all)'
+        export = 'export SOURCE_COMMIT SOURCE_DIRTY SOURCE_DIGEST'
+        self.assertIn(probe, source)
+        self.assertIn('[[ "$SOURCE_COMMIT" == "$ui_commit"', source)
+        self.assertLess(source.index(probe), source.index('ota_v3_health.py" --source'))
+        self.assertLess(source.index(export), source.index('"$MAKE_BIN" -C "$UI_SOURCE" clean'))
+
+    def test_snapshot_build_embeds_the_callers_identity(self):
+        # Behavioural replay against the real companion: run the builder's own
+        # provenance block on the caller checkout, then ask the UI Makefile in a
+        # git-less snapshot which identity it would compile in.
+        import shutil, tempfile
+        ui = os.environ.get('LIBREECHO_OTA_UI_SOURCE')
+        if not ui or not (Path(ui) / 'tools/source-provenance.sh').is_file() or \
+                not (Path(ui) / '.git').exists() or not shutil.which('make'):
+            self.skipTest('companion UI git checkout is not available')
+        source = (TOOLS / 'ui/build_ui_bundle.sh').read_text()
+        block = source[source.index('ui_provenance=$('):
+                       source.index('export SOURCE_COMMIT SOURCE_DIRTY SOURCE_DIGEST')]
+        show = ['make', '-s', '--no-print-directory', '--eval',
+                'show-id:;@echo $(SOURCE_COMMIT) $(SOURCE_DIRTY) $(SOURCE_DIGEST)', 'show-id']
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot = Path(tmp) / 'ui'
+            shutil.copytree(ui, snapshot, ignore=shutil.ignore_patterns('.git', 'build'))
+            env = {k: v for k, v in os.environ.items() if not k.startswith('SOURCE_')}
+            bare = subprocess.run(show, cwd=snapshot, env=env, check=True,
+                                  capture_output=True, text=True).stdout.split()
+            self.assertEqual(bare, ['unknown', 'unknown', 'unknown'])
+            script = ('set -euo pipefail\nUI_SOURCE="$1"; SNAPSHOT="$2"; shift 2\n'
+                      'ui_commit=$(git -C "$UI_SOURCE" rev-parse HEAD)\n' + block +
+                      'export SOURCE_COMMIT SOURCE_DIRTY SOURCE_DIGEST\ncd "$SNAPSHOT"\n'
+                      'exec "$@"\n')
+            built = subprocess.run(['bash', '-c', script, 'replay', ui, str(snapshot)] + show,
+                                   capture_output=True, text=True, env=env,
+                                   check=True).stdout.split()
+            commit = subprocess.run(['git', '-C', ui, 'rev-parse', 'HEAD'], check=True,
+                                    capture_output=True, text=True).stdout.strip()
+            self.assertEqual(built[0], commit)
+            self.assertIn(built[1], ('0', '1'))
+            self.assertRegex(built[2], '^[0-9a-f]{64}$')
+
     def test_adapted_feature_init_scripts_pass_the_image_startup_contract(self):
         # The image builder validates the packaged init scripts. After the v3
         # adapter, a feature service no longer owns its payload: Platform mounts
