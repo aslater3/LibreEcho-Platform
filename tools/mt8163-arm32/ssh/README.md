@@ -24,7 +24,11 @@ sessions without a service restart; reboot and explicit restart regenerate the
 ephemeral state.
 
 The host key is generated once at `/data/libreecho/config/ssh-host-ed25519-key`
-with mode 0600, so strict host-key verification survives reboots. Public-key
+with mode 0600, so strict host-key verification survives reboots. The new key is
+flushed to storage before it is renamed into place, and a zero-length key left
+by a power loss is discarded and regenerated. Dropbear is stopped whenever the
+saved SSH switch is off, and a repeating start failure is logged once per state
+change rather than every poll. Public-key
 authentication is disabled. Root is present only as non-authenticating system
 scaffolding; the WebUI SSH policy assigns users UIDs starting at 1000 and never
 permits root login. The persisted host key is device-specific and must never be

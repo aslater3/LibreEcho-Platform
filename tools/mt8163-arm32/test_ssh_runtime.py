@@ -9,6 +9,10 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parent
+# The device runs BusyBox applets, so prefer BusyBox's awk/stat/sync/kill when
+# the host has it; fall back to host tools otherwise.
+BUSYBOX = shutil.which('busybox')
+BUSYBOX_EXEC = ('exec %s "$@"' % BUSYBOX) if BUSYBOX else 'exec "$@"'
 
 
 class SSHRuntimeTests(unittest.TestCase):
@@ -27,7 +31,7 @@ if [ "$1" = stat ]; then
         %s) printf '128\\n'; exit 0;;
     esac
 fi
-exec "$@"
+''' + BUSYBOX_EXEC + '''
 ''')
             wrapper.chmod(0o755)
             env = dict(os.environ, BB=str(wrapper), CONFIG_FILE=str(config))
@@ -45,6 +49,128 @@ exec "$@"
             config.unlink()
             self.assertFalse(subprocess.run(['sh', '-c', function + '\nssh_config_enabled'],
                                             env=env, timeout=5).returncode == 0)
+
+    def _dropbear_env(self, root):
+        """Fake dropbear/dropbearkey plus a stat shim that reports root-owned 0700/0600."""
+        bb = root / 'bb'
+        bb.write_text("""#!/bin/sh
+if [ "$1" = stat ]; then
+    case "$3" in
+        %u) printf '0\\n'; exit 0;;
+        %a) case "$4" in */keydir) printf '700\\n';; *) printf '600\\n';; esac; exit 0;;
+    esac
+fi
+""" + BUSYBOX_EXEC + "\n")
+        bb.chmod(0o755)
+        keydir = root / 'keydir'
+        keydir.mkdir(mode=0o700)
+        state = root / 'state'
+        state.mkdir()
+        gen = root / 'dropbearkey'
+        # Writes a different key every call so a regenerated key is detectable.
+        gen.write_text('#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -f ] && f=$2; shift; done\n'
+                       'printf "key-%s-%s\\n" "$$" "$(date +%N)" > "$f"\n')
+        gen.chmod(0o755)
+        drop = root / 'dropbear'
+        drop.write_text('#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -P ] && p=$2; shift; done\n'
+                        'printf "%s\\n" "$$" > "$p"\nexec sleep 60\n')
+        drop.chmod(0o755)
+        return dict(os.environ, BB=str(bb), HOSTKEY_FILE=str(keydir / 'ssh-host-ed25519-key'),
+                    STATE_ROOT=str(state), DROPBEAR=str(drop), DROPBEARKEY=str(gen),
+                    DROPBEAR_PIDFILE=str(root / 'dropbear.pid'),
+                    SUPERVISOR_PIDFILE=str(root / 'sup.pid')), keydir
+
+    def _ssh_functions(self, *names, state=None):
+        source = (ROOT / 'ssh/libreecho-ssh.init').read_text()
+        if state is not None:
+            source = source.replace('/run/libreecho-ssh', str(state))
+        out = []
+        for name in names:
+            start = source.index(name + '()')
+            out.append(source[start:source.index('\n}\n', start) + 3])
+        return '\n'.join(out)
+
+    def test_host_key_persists_across_restarts_and_empty_key_is_regenerated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env, keydir = self._dropbear_env(root)
+            funcs = self._ssh_functions('dropbear_running', 'stop_dropbear', 'start_dropbear',
+                                        state=root / 'state')
+            key = keydir / 'ssh-host-ed25519-key'
+
+            def run(action):
+                return subprocess.run(['sh', '-c', funcs + '\n' + action], env=env,
+                                      capture_output=True, text=True, timeout=30)
+
+            first = run('start_dropbear && stop_dropbear')
+            self.assertEqual(first.returncode, 0, first.stderr)
+            original = key.read_text()
+            self.assertTrue(original.startswith('key-'))
+            self.assertEqual(oct(key.stat().st_mode & 0o777), '0o600')
+            # A restart (new process, same persistent store) must keep the identity.
+            second = run('start_dropbear && stop_dropbear')
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(key.read_text(), original)
+            # A power loss can leave a zero-length key; it must be regenerated.
+            key.write_text('')
+            third = run('start_dropbear && stop_dropbear')
+            self.assertEqual(third.returncode, 0, third.stderr)
+            self.assertTrue(key.read_text().startswith('key-'))
+            self.assertNotEqual(key.read_text(), original)
+            # No temporary key files are left behind.
+            self.assertEqual([p.name for p in keydir.iterdir()], ['ssh-host-ed25519-key'])
+
+    def test_turning_the_switch_off_stops_dropbear(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env, _ = self._dropbear_env(root)
+            funcs = self._ssh_functions('log', 'log_change', 'ssh_config_enabled', 'dropbear_running',
+                                        'stop_dropbear', 'start_dropbear', 'clear_runtime_accounts',
+                                        'run_supervisor', state=root / 'state')
+            config = root / 'web-config.json'
+            config.write_text('{"ssh":true}')
+            config.chmod(0o600)
+            env['CONFIG_FILE'] = str(config)
+            script = (funcs + '\nusers_file_ready() { return 0; }\nsync_accounts() { return 0; }\n'
+                      'write_status() { return 0; }\nwrite_static_accounts() { return 0; }\n'
+                      'HOME_ROOT=' + str(root / 'home') + '\nrun_supervisor\n')
+            proc = subprocess.Popen(['sh', '-c', script], env=env, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, start_new_session=True)
+            pidfile = root / 'dropbear.pid'
+            try:
+                def alive():
+                    try:
+                        pid = int(pidfile.read_text().split()[0])
+                        os.kill(pid, 0)
+                        return True
+                    except (OSError, ValueError, IndexError):
+                        return False
+
+                def wait(want, seconds):
+                    deadline = __import__('time').time() + seconds
+                    while __import__('time').time() < deadline:
+                        if alive() == want:
+                            return True
+                        __import__('time').sleep(0.2)
+                    return alive() == want
+
+                self.assertTrue(wait(True, 10), 'dropbear should start while the switch is on')
+                config.write_text('{"ssh":false}')
+                self.assertTrue(wait(False, 15), 'dropbear should stop when the switch is turned off')
+                config.write_text('{"ssh":true}')
+                self.assertTrue(wait(True, 10), 'dropbear should return when the switch is turned on')
+            finally:
+                import signal
+                os.killpg(proc.pid, signal.SIGKILL)
+                subprocess.run(['pkill', '-f', str(root / 'dropbear')], check=False)
+                proc.wait(timeout=5)
+
+    def test_supervisor_logs_each_state_change_once(self):
+        funcs = self._ssh_functions('log_change')
+        result = subprocess.run(['sh', '-c', 'log() { printf "%s\\n" "$1"; }\n' + funcs +
+                                 '\nlast_logged=\nfor s in start-failed start-failed start-failed started started start-failed; do log_change $s; done'],
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.stdout.split(), ['start-failed', 'started', 'start-failed'])
 
     def test_web_binding_survives_first_account_lifecycle(self):
         source = (ROOT / 'initramfs/libreecho-init').read_text()

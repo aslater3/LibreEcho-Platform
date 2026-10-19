@@ -222,6 +222,11 @@ start_dropbear()
     [ "$($BB stat -c %u "$key_dir" 2>/dev/null)" = 0 ] || return 1
     [ "$($BB stat -c %a "$key_dir" 2>/dev/null)" = 700 ] || return 1
     [ ! -L "$HOSTKEY_FILE" ] || return 1
+    # A power loss between create and rename can leave a zero-length key, and
+    # dropbear never regenerates one. Discard only an empty regular file.
+    if [ -f "$HOSTKEY_FILE" ] && [ ! -s "$HOSTKEY_FILE" ]; then
+        $BB rm -f "$HOSTKEY_FILE" || return 1
+    fi
     if [ ! -e "$HOSTKEY_FILE" ]; then
         umask 077
         key_tmp="$HOSTKEY_FILE.$$.tmp"
@@ -232,7 +237,11 @@ start_dropbear()
             return 1
         fi
         $BB chmod 0600 "$key_tmp" || return 1
+        # Flush the key contents before it becomes visible under its final
+        # name, then flush the rename itself.
+        $BB sync || return 1
         $BB mv -f "$key_tmp" "$HOSTKEY_FILE" || return 1
+        $BB sync || return 1
     fi
     [ -s "$HOSTKEY_FILE" ] || return 1
     [ "$($BB stat -c %u "$HOSTKEY_FILE" 2>/dev/null)" = 0 ] || return 1
@@ -251,24 +260,39 @@ clear_runtime_accounts()
     write_static_accounts || true
 }
 
+# Log a supervisor event only when it differs from the previous one, so a
+# persistent fault does not write to the console every poll.
+log_change()
+{
+    [ "$1" = "$last_logged" ] && return 0
+    last_logged=$1
+    log "$1"
+}
+
 run_supervisor()
 {
+    last_logged=
     while :; do
         if ! ssh_config_enabled; then
             clear_runtime_accounts
+            log_change disabled
             write_status disabled || true
         elif users_file_ready && sync_accounts; then
             if ! dropbear_running; then
                 if start_dropbear; then
-                    log started
+                    log_change started
                 else
-                    log start-failed
+                    log_change start-failed
                 fi
+            else
+                log_change started
             fi
             write_status ready || true
         else
             if dropbear_running; then
-                log users-invalid-stopping
+                log_change users-invalid-stopping
+            else
+                log_change waiting-for-users
             fi
             clear_runtime_accounts
             write_status waiting-for-valid-webui-users || true
