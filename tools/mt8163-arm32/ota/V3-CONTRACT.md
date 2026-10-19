@@ -225,8 +225,10 @@ Fail-closed rules (all `result=failed`):
 
 ## 9. Deliberately preserved safety gates
 
-Target + product identity; userdata layout fingerprint (sectors must be one of
-`2137088 2153472`); explicit write-set (`boot_a`, `boot_b`, `userdata`) with
+Target + product identity; userdata layout fingerprint for the TWRP helper
+(sectors must be one of `2137088 2153472`; the booted OS instead accepts any
+`PARTNAME=userdata` partition of at least 2137088 sectors whose ext4 label is
+`LIBREECHO_DATA`, legacy exact sizes excepted — LibreEcho #257); explicit write-set (`boot_a`, `boot_b`, `userdata`) with
 `expdb`/LK/TEE/preloader/GPT never written; partition identity resolved by
 `PARTNAME` **and** sector count (a same-size wrong node is refused); mount
 verification against the real userdata node, never a ramfs; digest readback of

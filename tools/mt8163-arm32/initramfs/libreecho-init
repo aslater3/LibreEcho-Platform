@@ -4,14 +4,58 @@
 
 BB=/bin/busybox
 
-# Exact reviewed post-Amonet Biscuit userdata sizes, in 512-byte sectors.
-# Do not accept arbitrary larger partitions or change any other partition.
+# Userdata identity (LibreEcho-Platform #249, LibreEcho #257).
+#
+# The partition must be mmcblk0p16 with PARTNAME=userdata.  The two reviewed
+# legacy sizes (2137088/2153472 sectors) are accepted exactly as before.  Any
+# other size must be at least the smallest reviewed layout, within a sane upper
+# bound, and must already carry an ext4 superblock labelled LIBREECHO_DATA --
+# the label the one-shot installer writes -- so a foreign or unformatted
+# partition of an unexpected size is never mounted.  Nothing here formats,
+# repairs or writes the partition.
+USERDATA_MIN_SECTORS=2137088
+USERDATA_MAX_SECTORS=33554432
+USERDATA_LABEL=LIBREECHO_DATA
+
 userdata_size_supported()
+{
+    case "$1" in
+        ''|0*|*[!0-9]*) return 1 ;;
+    esac
+    [ "${#1}" -le 8 ] || return 1
+    [ "$1" -ge "$USERDATA_MIN_SECTORS" ] && [ "$1" -le "$USERDATA_MAX_SECTORS" ]
+}
+
+userdata_size_legacy()
 {
     case "$1" in
         2137088|2153472) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+# ext2/3/4 superblock at byte 1024: s_magic (le16 0xEF53) at +0x38 and the
+# 16-byte NUL-padded s_volume_name at +0x78.
+userdata_label_ok()
+{
+    ul_hex=$($BB dd if="$1" bs=1 skip=1080 count=2 2>/dev/null | $BB od -An -tx1 | $BB tr -d ' \n')
+    [ "$ul_hex" = 53ef ] || return 1
+    ul_hex=$($BB dd if="$1" bs=1 skip=1144 count=16 2>/dev/null | $BB od -An -tx1 | $BB tr -d ' \n')
+    ul_want=$(printf '%s' "$USERDATA_LABEL" | $BB od -An -tx1 | $BB tr -d ' \n')
+    while [ "${#ul_want}" -lt 32 ]; do ul_want=${ul_want}00; done
+    [ "$ul_hex" = "$ul_want" ]
+}
+
+# $1=block device, $2=sysfs directory.  Status: 0 accepted, 1 not the userdata
+# partition, 2 unsupported size, 3 not a LibreEcho-formatted filesystem.
+userdata_identity()
+{
+    [ -b "$1" ] && $BB grep -qx 'PARTNAME=userdata' "$2/uevent" 2>/dev/null || return 1
+    ui_size=$($BB cat "$2/size" 2>/dev/null)
+    userdata_size_legacy "$ui_size" && return 0
+    userdata_size_supported "$ui_size" || return 2
+    userdata_label_ok "$1" || return 3
+    return 0
 }
 
 PATH=/bin:/sbin:/system/bin
@@ -933,12 +977,13 @@ userdata_mount()
         i=$((i + 1))
     done
 
-    if [ ! -b "$USERDATA" ] ||
-       ! $BB grep -qx 'PARTNAME=userdata' "$USERDATA_SYS/uevent" 2>/dev/null ||
-       ! userdata_size_supported "$($BB cat "$USERDATA_SYS/size" 2>/dev/null)"; then
-        log userdata-identity-rejected
-        return 1
-    fi
+    userdata_identity "$USERDATA" "$USERDATA_SYS"
+    case $? in
+        0) ;;
+        2) log userdata-size-unsupported; log userdata-identity-rejected; return 1 ;;
+        3) log userdata-not-libreecho; log userdata-identity-rejected; return 1 ;;
+        *) log userdata-identity-rejected; return 1 ;;
+    esac
 
     $BB mkdir -p "$USERDATA_MOUNT"
     if $BB grep -q " $USERDATA_MOUNT " /proc/mounts 2>/dev/null; then
