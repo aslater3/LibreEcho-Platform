@@ -78,19 +78,46 @@ static int read_text(const char *path, char *output, size_t size)
     return 0;
 }
 
-/* Accept the alternate size only for the reviewed userdata contract.
- * Exact decimal matching also rejects signs, suffixes and overflow input. */
+/* Every partition except userdata must match its reviewed size exactly.
+ *
+ * userdata is never written by this tool and only proves which device node is
+ * the data partition, so its size is a floor (the smallest reviewed layout)
+ * with a sane upper bound, not an allowlist: stock Radar keeps its full
+ * 2588639-sector userdata (LibreEcho #257, Platform #249).  Filesystem identity
+ * is enforced where /data is mounted (libreecho-init).  Strict decimal parsing
+ * still rejects signs, leading zeros, suffixes, whitespace and overflow. */
+#define USERDATA_MAX_SECTORS 33554432UL
+
+static int parse_sectors(const char *text, unsigned long *value)
+{
+    unsigned long result = 0;
+    size_t i;
+
+    if (!text[0] || text[0] == '0' || strlen(text) > 8)
+        return -1;
+    for (i = 0; text[i]; ++i) {
+        if (text[i] < '0' || text[i] > '9')
+            return -1;
+        result = result * 10UL + (unsigned long)(text[i] - '0');
+    }
+    *value = result;
+    return 0;
+}
+
 static int partition_sectors_match(const struct partition_contract *contract,
                                    const char *text)
 {
     char expected[32];
+    unsigned long sectors;
 
     snprintf(expected, sizeof(expected), "%lu", contract->sectors);
     if (strcmp(text, expected) == 0)
         return 1;
-    return strcmp(contract->device, "/dev/mmcblk0p16") == 0 &&
-           strcmp(contract->name, "userdata") == 0 &&
-           contract->sectors == 2137088UL && strcmp(text, "2153472") == 0;
+    if (strcmp(contract->device, "/dev/mmcblk0p16") ||
+        strcmp(contract->name, "userdata") || contract->sectors != 2137088UL)
+        return 0;
+    return parse_sectors(text, &sectors) == 0 &&
+           sectors >= contract->sectors && sectors <= USERDATA_MAX_SECTORS;
 }
 
 /* Probing a layout the unit does not use must stay quiet: printing its contract
