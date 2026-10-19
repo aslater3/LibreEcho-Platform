@@ -3579,6 +3579,7 @@ start_feature_service_if_enabled
                 "SERVICE_PROFILE=$1\n"
                 "FEATURE_POLICY=$2\n"
                 "DATA_CLEANUP_OK=1\n"
+                "DATA_MOUNTED=1\n"
                 f'INIT_TEST_LOG="{sandbox}/log"\n'
                 ': >"$INIT_TEST_LOG"\n'
                 "log() { printf '%s\\n' \"$*\" >>\"$INIT_TEST_LOG\"; }\n"
@@ -4588,6 +4589,27 @@ start_feature_service_if_enabled
             (data / "libreecho/generations").symlink_to(real)
             result = self._run_cleanup(data)
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+
+    def test_init_never_blocks_boot_on_the_advisory_data_cleanup(self) -> None:
+        """A cleanup/contract failure must not stop health reporting or services.
+
+        Regression: a user directory at the root of /data failed the helper, and
+        init then skipped boot-health bookkeeping and refused to start any
+        service, so the OTA never confirmed and rolled back.  Only an
+        unavailable userdata partition may block the production service graph.
+        """
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertNotIn("ui-services-blocked-by-data-contract", init)
+        self.assertIn("log data-contract-advisory-continuing", init)
+        self.assertIn("DATA_MOUNTED=1", init)
+        # Boot bookkeeping and vendor import key off the mount, not the helper.
+        self.assertRegex(init, r'if \[ "\$\{DATA_MOUNTED:-0\}" -eq 1 \]; then\n    bh_boot_count=')
+        self.assertRegex(init, r'if \[ "\$\{DATA_MOUNTED:-0\}" -eq 1 \] &&\n\s+\[ -x /usr/local/sbin/libreecho-vendor-import \]')
+        # The services gate no longer reads the cleanup verdict as a blocker.
+        gate = init[init.index("ui-services-blocked-userdata-unavailable") - 300:
+                    init.index("ui-services-blocked-userdata-unavailable") + 80]
+        self.assertIn("DATA_MOUNTED", gate)
+        self.assertNotIn('DATA_CLEANUP_OK:-0}" -ne 1', gate)
 
     def test_userdata_cleanup_accepts_the_timer_schedule(self) -> None:
         """timerd's saved schedule, and the temporary it renames over it.

@@ -999,7 +999,14 @@ userdata_mount()
     log userdata-mount-failed
     return 1
 }
+# DATA_MOUNTED means userdata is identified and mounted: boot bookkeeping, vendor
+# import and the service graph depend on that alone.  DATA_CLEANUP_OK records
+# whether the migration/cleanup helper was happy; it is advisory.  A cleanup
+# failure must never stop the device booting, reporting health or networking --
+# userdata is the user's to modify.
+DATA_MOUNTED=0
 if userdata_mount; then
+    DATA_MOUNTED=1
     if [ -x /usr/local/sbin/libreecho-data-cleanup ]; then
         if DATA_ROOT=/data /usr/local/sbin/libreecho-data-cleanup \
                 >/tmp/data-cleanup.log 2>&1; then
@@ -1021,7 +1028,7 @@ fi
 # Record this boot's slot state before any service starts.  Later writes refine
 # bh_state; this one guarantees a record exists even when the health worker never
 # runs, and it is the line that makes the retry countdown visible across boots.
-if [ "${DATA_CLEANUP_OK:-0}" -eq 1 ]; then
+if [ "${DATA_MOUNTED:-0}" -eq 1 ]; then
     bh_boot_count=$(bh_bump_count)
     bh_mode_value=$(bh_classify_mode)
     bh_running=$(bh_running_slot)
@@ -1038,7 +1045,7 @@ else
     log boot-diagnostics-unavailable
 fi
 VENDOR_ASSETS_OK=0
-if [ "${DATA_CLEANUP_OK:-0}" -eq 1 ] &&
+if [ "${DATA_MOUNTED:-0}" -eq 1 ] &&
         [ -x /usr/local/sbin/libreecho-vendor-import ] &&
         [ -x /sbin/wmt_configure ] &&
         [ -x /sbin/wmt_responder ] &&
@@ -2105,9 +2112,14 @@ start_ui_services()
 
     apply_timezone
     $BB mkdir -p /var/run /var/log /var/log/libreecho /run/libreecho
-    if [ "$feature_degraded" = 0 ] && [ "$SERVICE_PROFILE" = production ] && [ "${DATA_CLEANUP_OK:-0}" -ne 1 ]; then
-        log ui-services-blocked-by-data-contract
+    if [ "$feature_degraded" = 0 ] && [ "$SERVICE_PROFILE" = production ] &&
+            [ "${DATA_MOUNTED:-0}" -ne 1 ]; then
+        log ui-services-blocked-userdata-unavailable
         return 1
+    fi
+    if [ "${DATA_CLEANUP_OK:-0}" -ne 1 ] && [ "${DATA_MOUNTED:-0}" -eq 1 ]; then
+        # Keep going.  The helper's own report is in /tmp/data-cleanup.log.
+        log data-contract-advisory-continuing
     fi
     if [ "$feature_degraded" = 1 ] || [ "$SERVICE_PROFILE" = diagnostic ] || [ "$FEATURE_POLICY" = exclude ]; then
         services="logd timed web"
