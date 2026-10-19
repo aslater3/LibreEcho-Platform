@@ -40,8 +40,11 @@ jobs:
           path: .test-ui
           persist-credentials: false
           sparse-checkout: |
+            Makefile
+            VERSION
             src/adapter/sleep_generator.h
             src/api.c
+            tools/source-provenance.sh
             web/js/app.js
           sparse-checkout-cone-mode: false
 

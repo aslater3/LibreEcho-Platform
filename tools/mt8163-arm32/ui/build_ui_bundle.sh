@@ -382,6 +382,24 @@ source_state_sha256() {
     } | sha256sum | awk '{print $1}'
 }
 ui_diff_sha256=$(source_state_sha256 "$UI_SOURCE")
+# Build identity (issue #257). The compile below runs in a private snapshot with
+# no .git, where the UI Makefile's own git probe embeds "unknown" for the
+# commit and digest shown under Settings > Build identity. Take the identity
+# from the caller's checkout with the UI's own tool and export it, so every
+# make invocation (and its recursive release build) uses these values.
+ui_provenance=$(sh "$UI_SOURCE/tools/source-provenance.sh" --field all) || {
+    echo "ERROR: cannot read LibreEcho-UI source provenance" >&2
+    exit 1
+}
+SOURCE_COMMIT=$(sed -n 's/^SOURCE_COMMIT=//p' <<<"$ui_provenance")
+SOURCE_DIRTY=$(sed -n 's/^SOURCE_DIRTY=//p' <<<"$ui_provenance")
+SOURCE_DIGEST=$(sed -n 's/^SOURCE_DIGEST=//p' <<<"$ui_provenance")
+[[ "$SOURCE_COMMIT" == "$ui_commit" && "$SOURCE_DIRTY" =~ ^[01]$ &&
+   "$SOURCE_DIGEST" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "ERROR: LibreEcho-UI source provenance is incomplete" >&2
+    exit 1
+}
+export SOURCE_COMMIT SOURCE_DIRTY SOURCE_DIGEST
 # V3 control-plane health belongs to Platform. Build the companion against a
 # private snapshot, so the supplied checkout and its source identity stay intact.
 ui_input_source=$UI_SOURCE
