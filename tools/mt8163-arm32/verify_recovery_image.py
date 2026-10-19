@@ -632,14 +632,14 @@ def validate_ssh(entries: dict[str, Entry], manifest: dict[str, object],
     assert expected_scp_sha256 is not None
     expected_policy = {
         "enabled": True,
-        "activation": "deferred-after-webui-bootstrap",
-        "autostart": True,
+        "activation": "saved-ssh-setting-and-webui-users",
+        "autostart": False,
         "authentication": "webui-users-sha256",
         "account_source": "/data/libreecho/config/users",
         "privilege_policy": "non-root-ephemeral-users",
         "public_key_auth": False,
         "root_login": False,
-        "host_keys": "generated-ephemerally-under-/tmp/dropbear",
+        "host_keys": "persistent-/data/libreecho/config/ssh-host-ed25519-key",
     }
     for key, value in expected_policy.items():
         if ssh.get(key) != value:
