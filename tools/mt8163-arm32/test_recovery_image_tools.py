@@ -5432,7 +5432,8 @@ class UiTlsPackagingTests(unittest.TestCase):
             # Use the same pinned companion handler/overview as source CI, not
             # an invented stub that can omit the shipped health contract.
             companion = Path(os.environ.get("LIBREECHO_OTA_UI_SOURCE", str(TOOLS_DIR.parents[1] / ".test-ui")))
-            for relative in ("src/api.c", "web/js/app.js"):
+            # tools/source-provenance.sh supplies the embedded build identity (#257).
+            for relative in ("src/api.c", "web/js/app.js", "tools/source-provenance.sh"):
                 origin = companion / relative
                 self.assertTrue(origin.is_file(), f"pinned companion source missing: {origin}")
                 destination = source / relative
