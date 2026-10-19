@@ -4539,20 +4539,46 @@ start_feature_service_if_enabled
                 self.assertTrue((data / "libreecho/generations/txn-a/COMPLETE").is_file())
                 self.assertTrue((data / "libreecho/update/current").is_file())
 
-    def test_userdata_cleanup_still_rejects_unknown_v3_shapes(self) -> None:
-        """Allowlisting v3 names must not open the contract to other shapes."""
+    def test_userdata_cleanup_preserves_unknown_user_data_and_rejects_symlinks(self) -> None:
+        """Userdata is the user's: unknown names are kept and never block boot.
+
+        Only a symlink is fatal, because the cleanup and the services after it
+        traverse these paths.  Regression: a user-created hidden directory at
+        the root of /data (``.kaeru``) failed the contract on every boot and
+        took the whole service graph down after an OTA.
+        """
         for relative, make_dir in (
+            (".kaeru", True),
+            (".kaeru-file", False),
+            ("my-notes", True),
             ("libreecho/generations-old", True),
             ("libreecho/update/generation.lock.stale", True),
+            ("libreecho/config/user-dir", True),
+            ("libreecho/secrets/other.json", False),
         ):
             with self.subTest(path=relative), tempfile.TemporaryDirectory() as temporary:
                 data = Path(temporary) / "data"
                 self._v3_layout(data, fresh=False)
                 path = data / relative
                 path.mkdir() if make_dir else path.write_text("x")
+                (path / "keep").write_text("x") if make_dir else None
                 result = self._run_cleanup(data)
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertIn("DATA_CLEANUP_UNKNOWN", result.stderr)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("DATA_CLEANUP_OK", result.stdout)
+                self.assertNotIn("DATA_CLEANUP_UNKNOWN", result.stderr)
+                self.assertIn("DATA_CLEANUP_TOLERATED=" + relative, result.stderr)
+                self.assertTrue(path.exists(), "unknown user data must be preserved")
+                if make_dir:
+                    self.assertTrue((path / "keep").exists())
+        # A symlink at the root of /data is never followed.
+        with tempfile.TemporaryDirectory() as temporary:
+            data = Path(temporary) / "data"
+            self._v3_layout(data, fresh=False)
+            (data / "elsewhere").mkdir()
+            (data / "link").symlink_to(data / "elsewhere")
+            result = self._run_cleanup(data)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("DATA_CLEANUP_UNKNOWN=link", result.stderr)
         # A generations root that is a symlink is tampering, not version skew.
         with tempfile.TemporaryDirectory() as temporary:
             data = Path(temporary) / "data"

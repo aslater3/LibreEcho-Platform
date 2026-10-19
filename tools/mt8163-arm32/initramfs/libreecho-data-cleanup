@@ -246,21 +246,17 @@ check_children() {
             esac
             continue
         fi
-        # Symlinks and directories are still hard failures everywhere; only a
-        # plain file in the tolerant set is downgraded.
-        if [ "$TOLERATE_UNKNOWN_FILES" = 1 ] && [ -f "$child" ]; then
-            tolerated_item "$child"
-        else
-            unknown_item "$child"
-        fi
+        # Userdata belongs to the user.  Anything we do not recognise -- a
+        # file or a directory -- is reported and preserved, never a reason to
+        # refuse to boot.  Only a symlink (rejected above) stays fatal, because
+        # this helper and the services that follow it traverse these paths.
+        tolerated_item "$child"
     done
 }
 
-# Directories whose unrecognised regular files are reported but not fatal.
-TOLERATE_UNKNOWN_FILES=0
-
-# Steady-state allowlist.  Feature IDs are checked separately below because
-# they are extensible; the files inside each feature remain fixed.
+# Known names.  Entries outside this list are reported and preserved, not
+# rejected.  Feature IDs are checked separately below because they are
+# extensible.
 check_children "$DATA_ROOT" libreecho lost+found
 # OTA v3: generations/ holds the immutable target trees, owned and garbage-
 # collected by libreecho-generation-transaction; incoming/ is the recovery
@@ -295,17 +291,14 @@ done
 # at this level -- hence https-cert.pem and https-key.pem rather than a tls/
 # directory -- and should be listed here so it is known rather than merely
 # tolerated.
-TOLERATE_UNKNOWN_FILES=1
 check_children "$DATA_ROOT/libreecho/config" \
     web-config.json web-config.json.bak users wpa_supplicant.conf ntp.conf \
     agent.json agent.json.bak tts-voice vad-floor-rms \
     led-state.json led-state.json.tmp \
     users.sessions radio-stations.json radio-stations.json.bak \
     https-cert.pem https-key.pem bypass-capture-mux timers timers.tmp
-TOLERATE_UNKNOWN_FILES=0
 check_children "$DATA_ROOT/libreecho/secrets" openai-codex.json
 
-TOLERATE_UNKNOWN_FILES=1
 check_children "$DATA_ROOT/libreecho/update" \
     channel incoming staging state pending installed rolled-back check-status \
     automatic-updates install.lock bootctl.confirm bootctl.confirmed feature-commit committed-manifest committed-manifest.sig restart-record first-install.pending \
@@ -316,7 +309,6 @@ check_children "$DATA_ROOT/libreecho/update" \
     ping-install-counted \
     ping-last-week.tmp ping-last-month.tmp ping-last-year.tmp ping-next-payload.tmp ping-status.tmp \
     ping-install-counted.tmp
-TOLERATE_UNKNOWN_FILES=0
 
 if [ -d "$DATA_ROOT/libreecho/features" ]; then
     for feature_dir in "$DATA_ROOT/libreecho/features"/*; do

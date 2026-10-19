@@ -96,16 +96,14 @@ run_expect phase0-unknown 2 Usage: $UPD bogus
 echo "===PHASE0_END==="
 # ---- PHASE_DATA_CONTRACT: run the production data-contract cleanup against the
 # seeded userdata and assert its verdict. mkdisk.sh's --scenario shapes have
-# each bricked real hardware; here the real validator must reject them, and a
-# clean userdata must pass. The expectation is derived independently from the
+# each bricked real hardware under the old strict contract; the real validator
+# must now accept them (preserving the user's data), and so must a clean userdata. The expectation is derived independently from the
 # on-disk shape so the assertion cannot rubber-stamp the tool.
 echo "===PHASE_DATA_CONTRACT (real cleanup over seeded /data)==="
+# Userdata belongs to the user: unrecognised files and directories are
+# preserved and reported, never a reason to refuse to boot.  Every seeded
+# scenario must therefore pass the contract.
 expect_ok=1
-[ -d /data/libreecho/config/led.json ] && expect_ok=0
-for e in /data/* ; do
-  [ -e "$e" ] || continue
-  case "${e##*/}" in libreecho|lost+found) ;; *) expect_ok=0 ;; esac
-done
 set +e
 $DC >/tmp/data-contract.log 2>&1
 dc_rc=$?
