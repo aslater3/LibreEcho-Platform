@@ -3251,7 +3251,12 @@ ota_health_confirm_worker()
     # recoverable slot (platform #60, LibreEcho#28/#180).  The complete selected
     # service graph stays the stricter OTA acceptance gate, where a rollback
     # target does exist.
-    if ! startup_ready_marker_valid && [ "$CONFIRM_MODE" != first-boot ]; then
+    # The device is the user's: they may disable, replace or break optional
+    # services.  A slot is confirmed on the recovery plane alone (userdata,
+    # adb transport, management UI).  The full service graph and the
+    # startup-ready marker are reported but are no longer reasons to roll an
+    # update back; set HEALTH_STRICT_SERVICES=1 to restore the strict gate.
+    if ! startup_ready_marker_valid && [ "${HEALTH_STRICT_SERVICES:-0}" = 1 ]; then
         last_check=startup-ready
         log ota-health-startup-ready-timeout
         pmsg_marker ota-startup-ready-timeout
@@ -3281,7 +3286,7 @@ ota_health_confirm_worker()
             elif ota_health_services_ready; then
                 last_check=none
                 strict_graph=1
-            elif [ "$CONFIRM_MODE" = first-boot ]; then
+            elif [ "${HEALTH_STRICT_SERVICES:-0}" != 1 ]; then
                 last_check=services-degraded
             else
                 last_check=services-ready

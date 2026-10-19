@@ -3021,13 +3021,14 @@ start_feature_service_if_enabled
         services = init_script[init_script.index("ota_health_services_ready()"):]
         services = services[: services.index("\n    }\n")]
         self.assertIn("startup_ready_marker_valid || {", services)
-        # A startup-ready timeout ends the probes only outside first boot.
+        # A startup-ready timeout ends the probes only under the opt-in strict gate;
+        # by default the user's service choices never roll an update back.
         self.assertIn(
-            'if ! startup_ready_marker_valid && [ "$CONFIRM_MODE" != first-boot ]; then',
+            'if ! startup_ready_marker_valid && [ "${HEALTH_STRICT_SERVICES:-0}" = 1 ]; then',
             init_script,
         )
         self.assertIn("first-boot-startup-ready-timeout-degraded", init_script)
-        gated = init_script.index('elif [ "$CONFIRM_MODE" = first-boot ]; then')
+        gated = init_script.index('elif [ "${HEALTH_STRICT_SERVICES:-0}" != 1 ]; then')
         first_boot_branch = init_script[gated:]
         first_boot_branch = first_boot_branch[: first_boot_branch.index("            else")]
         self.assertIn("services-degraded", first_boot_branch)
