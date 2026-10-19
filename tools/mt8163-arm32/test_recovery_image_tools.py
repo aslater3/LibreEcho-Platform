@@ -4591,6 +4591,24 @@ start_feature_service_if_enabled
             result = self._run_cleanup(data)
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
 
+    def test_feature_failure_keeps_the_platform_running(self) -> None:
+        """A feature-activation failure drops only payload-backed daemons.
+
+        Network, audio, buttons, LEDs, Bluetooth and the web UI must still
+        start, and a conflicting owner that will not stop is logged, not fatal.
+        """
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        body = init[init.index("start_ui_services()"):]
+        body = body[: body.index("\nstart_ui_services &")]
+        self.assertNotIn('if [ "$feature_degraded" = 1 ] || [ "$SERVICE_PROFILE" = diagnostic ]', body)
+        degraded = body[body.index('if [ "$feature_degraded" = 1 ]; then\n        # Feature payloads'):]
+        degraded = degraded[: degraded.index("ui-services-platform-only-features-degraded")]
+        self.assertIn("waked|ttsd|airplayd|sttd|agentd", degraded)
+        for kept in ("networkd", "audiod", "ledd", "buttond", "btd", "web"):
+            self.assertNotIn(kept, degraded.split("case")[1].split(")")[0])
+        self.assertIn("stop_ui_voice_owners || log ui-conflicting-owner-continuing", body)
+        self.assertNotIn("stop_ui_voice_owners || return 1", body)
+
     def test_init_never_blocks_boot_on_the_advisory_data_cleanup(self) -> None:
         """A cleanup/contract failure must not stop health reporting or services.
 

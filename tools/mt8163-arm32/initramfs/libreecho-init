@@ -2084,6 +2084,9 @@ start_ui_services()
     feature_error=
     if activation_error=$(activate_feature_transaction 2>&1); then
         features_state=ready
+        # User modifications are reported, not enforced.
+        feature_error=$(printf '%s\n' "$activation_error" | $BB sed -n 's/^WARN://p' | $BB tr '\n' ' ' | $BB tr -cd 'A-Za-z0-9_: -' | $BB cut -c 1-160)
+        [ -z "$feature_error" ] || log "features-user-modified:$(printf '%s' "$feature_error" | $BB tr ' ' ',')"
     else
         feature_degraded=1
         features_state=degraded
@@ -2121,7 +2124,7 @@ start_ui_services()
         # Keep going.  The helper's own report is in /tmp/data-cleanup.log.
         log data-contract-advisory-continuing
     fi
-    if [ "$feature_degraded" = 1 ] || [ "$SERVICE_PROFILE" = diagnostic ] || [ "$FEATURE_POLICY" = exclude ]; then
+    if [ "$SERVICE_PROFILE" = diagnostic ] || [ "$FEATURE_POLICY" = exclude ]; then
         services="logd timed web"
         if [ "$FEATURE_POLICY" = exclude ]; then
             log feature-services-excluded
@@ -2166,11 +2169,23 @@ start_ui_services()
         log ui-services-redistributable-without-wakeword
     fi
     fi
+    if [ "$feature_degraded" = 1 ]; then
+        # Feature payloads are unavailable: keep the platform (network, audio,
+        # buttons, LEDs, Bluetooth, web) and drop only payload-backed daemons.
+        degraded_services=
+        for kept in $services; do
+            case "$kept" in waked|ttsd|airplayd|sttd|agentd) ;;
+                *) degraded_services="$degraded_services $kept" ;;
+            esac
+        done
+        services=$degraded_services
+        log ui-services-platform-only-features-degraded
+    fi
     # Deferred-contract snapshots are retained for the payload reconciler and
     # its host contract checks:
     # services="logd networkd timed audiod micd ledd buttond btd web"
     # services="logd networkd timed audiod micd ledd buttond btd esphomed web"
-    stop_ui_voice_owners || return 1
+    stop_ui_voice_owners || log ui-conflicting-owner-continuing
     start_shared_discovery_runtime
     log feature-services-deferred-until-staged
     for service in $services; do

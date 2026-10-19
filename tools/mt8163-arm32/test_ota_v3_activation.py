@@ -159,17 +159,18 @@ for daemon in ('libreecho-audio-engine','libreecho-ttsd','libreecho-waked','libr
         self.assertFalse((self.control / 'pending').exists())
         self.assertFalse((self.generations / 'test-target').exists())
 
-    def test_committed_activation_refuses_running_boot_mismatch(self):
+    def test_committed_activation_boots_a_user_modified_boot_image(self):
         self.prepared()
         (self.control / 'current').write_text('test-target\n')
         (self.control / 'pending').unlink()
         self.boot.write_bytes(b'other release boot')
         result = self.verb('activate-committed')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('committed-boot-hash', result.stderr)
-        self.assertFalse(self.mount_log.exists())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('WARN:boot-image-modified', result.stderr)
+        self.assertIn('COMMITTED_ACTIVATED_WITH_WARNINGS', result.stdout)
+        self.assertTrue(self.mount_log.exists(), 'features still mount')
 
-    def test_activate_committed_rehashes_payload(self):
+    def test_activate_committed_reports_a_modified_payload_and_keeps_booting(self):
         self.prepared()
         (self.control / 'current').write_text('test-target\n')
         (self.control / 'pending').unlink()
@@ -178,7 +179,9 @@ for daemon in ('libreecho-audio-engine','libreecho-ttsd','libreecho-waked','libr
         p = self.generations / 'test-target/features/stt/payload.squashfs'
         p.chmod(0o600)
         p.write_bytes(b'corrupted')
-        self.assertNotEqual(self.verb('activate-committed').returncode, 0)
+        result = self.verb('activate-committed')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('WARN:generation-modified', result.stderr)
 
     def test_https_client_ignores_corrupt_unrelated_feature(self):
         self.prepared()

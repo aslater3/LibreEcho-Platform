@@ -240,8 +240,13 @@ verify_boot() {
 }
 
 activate_generation() {
-    local feature source target daemon
+    local feature
     for feature in airplay2 tts wakeword stt assistant; do
+        activate_feature "$feature"
+    done
+}
+activate_feature() {
+    local feature=$1 source target daemon
         source=$GENERATIONS/$TX/features/$feature/payload.squashfs
         target=$RUN_ROOT/libreecho/features/$feature/root
         safe_path "$target"
@@ -254,7 +259,6 @@ activate_generation() {
         daemon=$(value "feature_${feature}_daemon_path" "$MANIFEST")
         regular "$target/$daemon" feature-daemon
         [ "$(hash_state "$target/$daemon")" = "$(value "feature_${feature}_daemon_sha256" "$MANIFEST")" ] || fail "feature-$feature-daemon-hash"
-    done
 }
 
 # The only permitted link is the kernel executable handle for a numeric PID.
@@ -342,14 +346,25 @@ activate() {
     verify_boot
     activate_generation
 }
+# Every-boot activation of the already-committed generation.  The device is the
+# owner's: a boot image or feature payload they replaced is reported (WARN:) and
+# booted anyway, and one feature that will not mount does not take the others
+# down.  Signature and hash checks stay mandatory where bytes arrive from the
+# network (assemble/https-client) and for an OTA candidate (activate/commit).
 activate_committed() {
+    local feature warned=0
     [ -e "$ROOT/current" ] || return 0
     read_pointer current
-    verify_generation
-    read_bcb
-    SLOT=$SELECTED
-    verify_boot committed-boot-hash
-    activate_generation
+    MANIFEST=$GENERATIONS/$TX/target.manifest
+    regular "$MANIFEST" committed-manifest
+    ( verify_generation ) || { printf 'WARN:generation-modified\n' >&2; warned=1; }
+    ( read_bcb; SLOT=$SELECTED; verify_boot committed-boot-hash ) ||
+        { printf 'WARN:boot-image-modified\n' >&2; warned=1; }
+    for feature in airplay2 tts wakeword stt assistant; do
+        ( activate_feature "$feature" ) || { printf 'WARN:feature-%s-unavailable\n' "$feature" >&2; warned=1; }
+    done
+    [ "$warned" = 0 ] || printf 'COMMITTED_ACTIVATED_WITH_WARNINGS\n'
+    return 0
 }
 write_result() {
     printf 'schema=3\nslot=%s\ntransaction_id=%s\nversion=%s\nupdate_channel=%s\nmanifest_sha256=%s\n' \
