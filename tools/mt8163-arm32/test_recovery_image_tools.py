@@ -3021,13 +3021,14 @@ start_feature_service_if_enabled
         services = init_script[init_script.index("ota_health_services_ready()"):]
         services = services[: services.index("\n    }\n")]
         self.assertIn("startup_ready_marker_valid || {", services)
-        # A startup-ready timeout ends the probes only outside first boot.
+        # A startup-ready timeout ends the probes only under the opt-in strict gate;
+        # by default the user's service choices never roll an update back.
         self.assertIn(
-            'if ! startup_ready_marker_valid && [ "$CONFIRM_MODE" != first-boot ]; then',
+            'if ! startup_ready_marker_valid && [ "${HEALTH_STRICT_SERVICES:-0}" = 1 ]; then',
             init_script,
         )
         self.assertIn("first-boot-startup-ready-timeout-degraded", init_script)
-        gated = init_script.index('elif [ "$CONFIRM_MODE" = first-boot ]; then')
+        gated = init_script.index('elif [ "${HEALTH_STRICT_SERVICES:-0}" != 1 ]; then')
         first_boot_branch = init_script[gated:]
         first_boot_branch = first_boot_branch[: first_boot_branch.index("            else")]
         self.assertIn("services-degraded", first_boot_branch)
@@ -3579,6 +3580,7 @@ start_feature_service_if_enabled
                 "SERVICE_PROFILE=$1\n"
                 "FEATURE_POLICY=$2\n"
                 "DATA_CLEANUP_OK=1\n"
+                "DATA_MOUNTED=1\n"
                 f'INIT_TEST_LOG="{sandbox}/log"\n'
                 ': >"$INIT_TEST_LOG"\n'
                 "log() { printf '%s\\n' \"$*\" >>\"$INIT_TEST_LOG\"; }\n"
@@ -4539,20 +4541,46 @@ start_feature_service_if_enabled
                 self.assertTrue((data / "libreecho/generations/txn-a/COMPLETE").is_file())
                 self.assertTrue((data / "libreecho/update/current").is_file())
 
-    def test_userdata_cleanup_still_rejects_unknown_v3_shapes(self) -> None:
-        """Allowlisting v3 names must not open the contract to other shapes."""
+    def test_userdata_cleanup_preserves_unknown_user_data_and_rejects_symlinks(self) -> None:
+        """Userdata is the user's: unknown names are kept and never block boot.
+
+        Only a symlink is fatal, because the cleanup and the services after it
+        traverse these paths.  Regression: a user-created hidden directory at
+        the root of /data (``.kaeru``) failed the contract on every boot and
+        took the whole service graph down after an OTA.
+        """
         for relative, make_dir in (
+            (".kaeru", True),
+            (".kaeru-file", False),
+            ("my-notes", True),
             ("libreecho/generations-old", True),
             ("libreecho/update/generation.lock.stale", True),
+            ("libreecho/config/user-dir", True),
+            ("libreecho/secrets/other.json", False),
         ):
             with self.subTest(path=relative), tempfile.TemporaryDirectory() as temporary:
                 data = Path(temporary) / "data"
                 self._v3_layout(data, fresh=False)
                 path = data / relative
                 path.mkdir() if make_dir else path.write_text("x")
+                (path / "keep").write_text("x") if make_dir else None
                 result = self._run_cleanup(data)
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertIn("DATA_CLEANUP_UNKNOWN", result.stderr)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("DATA_CLEANUP_OK", result.stdout)
+                self.assertNotIn("DATA_CLEANUP_UNKNOWN", result.stderr)
+                self.assertIn("DATA_CLEANUP_TOLERATED=" + relative, result.stderr)
+                self.assertTrue(path.exists(), "unknown user data must be preserved")
+                if make_dir:
+                    self.assertTrue((path / "keep").exists())
+        # A symlink at the root of /data is never followed.
+        with tempfile.TemporaryDirectory() as temporary:
+            data = Path(temporary) / "data"
+            self._v3_layout(data, fresh=False)
+            (data / "elsewhere").mkdir()
+            (data / "link").symlink_to(data / "elsewhere")
+            result = self._run_cleanup(data)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("DATA_CLEANUP_UNKNOWN=link", result.stderr)
         # A generations root that is a symlink is tampering, not version skew.
         with tempfile.TemporaryDirectory() as temporary:
             data = Path(temporary) / "data"
@@ -4562,6 +4590,45 @@ start_feature_service_if_enabled
             (data / "libreecho/generations").symlink_to(real)
             result = self._run_cleanup(data)
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+
+    def test_feature_failure_keeps_the_platform_running(self) -> None:
+        """A feature-activation failure drops only payload-backed daemons.
+
+        Network, audio, buttons, LEDs, Bluetooth and the web UI must still
+        start, and a conflicting owner that will not stop is logged, not fatal.
+        """
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        body = init[init.index("start_ui_services()"):]
+        body = body[: body.index("\nstart_ui_services &")]
+        self.assertNotIn('if [ "$feature_degraded" = 1 ] || [ "$SERVICE_PROFILE" = diagnostic ]', body)
+        degraded = body[body.index('if [ "$feature_degraded" = 1 ]; then\n        # Feature payloads'):]
+        degraded = degraded[: degraded.index("ui-services-platform-only-features-degraded")]
+        self.assertIn("waked|ttsd|airplayd|sttd|agentd", degraded)
+        for kept in ("networkd", "audiod", "ledd", "buttond", "btd", "web"):
+            self.assertNotIn(kept, degraded.split("case")[1].split(")")[0])
+        self.assertIn("stop_ui_voice_owners || log ui-conflicting-owner-continuing", body)
+        self.assertNotIn("stop_ui_voice_owners || return 1", body)
+
+    def test_init_never_blocks_boot_on_the_advisory_data_cleanup(self) -> None:
+        """A cleanup/contract failure must not stop health reporting or services.
+
+        Regression: a user directory at the root of /data failed the helper, and
+        init then skipped boot-health bookkeeping and refused to start any
+        service, so the OTA never confirmed and rolled back.  Only an
+        unavailable userdata partition may block the production service graph.
+        """
+        init = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
+        self.assertNotIn("ui-services-blocked-by-data-contract", init)
+        self.assertIn("log data-contract-advisory-continuing", init)
+        self.assertIn("DATA_MOUNTED=1", init)
+        # Boot bookkeeping and vendor import key off the mount, not the helper.
+        self.assertRegex(init, r'if \[ "\$\{DATA_MOUNTED:-0\}" -eq 1 \]; then\n    bh_boot_count=')
+        self.assertRegex(init, r'if \[ "\$\{DATA_MOUNTED:-0\}" -eq 1 \] &&\n\s+\[ -x /usr/local/sbin/libreecho-vendor-import \]')
+        # The services gate no longer reads the cleanup verdict as a blocker.
+        gate = init[init.index("ui-services-blocked-userdata-unavailable") - 300:
+                    init.index("ui-services-blocked-userdata-unavailable") + 80]
+        self.assertIn("DATA_MOUNTED", gate)
+        self.assertNotIn('DATA_CLEANUP_OK:-0}" -ne 1', gate)
 
     def test_userdata_cleanup_accepts_the_timer_schedule(self) -> None:
         """timerd's saved schedule, and the temporary it renames over it.

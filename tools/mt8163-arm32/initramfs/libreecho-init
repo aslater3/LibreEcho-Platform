@@ -999,7 +999,14 @@ userdata_mount()
     log userdata-mount-failed
     return 1
 }
+# DATA_MOUNTED means userdata is identified and mounted: boot bookkeeping, vendor
+# import and the service graph depend on that alone.  DATA_CLEANUP_OK records
+# whether the migration/cleanup helper was happy; it is advisory.  A cleanup
+# failure must never stop the device booting, reporting health or networking --
+# userdata is the user's to modify.
+DATA_MOUNTED=0
 if userdata_mount; then
+    DATA_MOUNTED=1
     if [ -x /usr/local/sbin/libreecho-data-cleanup ]; then
         if DATA_ROOT=/data /usr/local/sbin/libreecho-data-cleanup \
                 >/tmp/data-cleanup.log 2>&1; then
@@ -1021,7 +1028,7 @@ fi
 # Record this boot's slot state before any service starts.  Later writes refine
 # bh_state; this one guarantees a record exists even when the health worker never
 # runs, and it is the line that makes the retry countdown visible across boots.
-if [ "${DATA_CLEANUP_OK:-0}" -eq 1 ]; then
+if [ "${DATA_MOUNTED:-0}" -eq 1 ]; then
     bh_boot_count=$(bh_bump_count)
     bh_mode_value=$(bh_classify_mode)
     bh_running=$(bh_running_slot)
@@ -1038,7 +1045,7 @@ else
     log boot-diagnostics-unavailable
 fi
 VENDOR_ASSETS_OK=0
-if [ "${DATA_CLEANUP_OK:-0}" -eq 1 ] &&
+if [ "${DATA_MOUNTED:-0}" -eq 1 ] &&
         [ -x /usr/local/sbin/libreecho-vendor-import ] &&
         [ -x /sbin/wmt_configure ] &&
         [ -x /sbin/wmt_responder ] &&
@@ -2077,6 +2084,9 @@ start_ui_services()
     feature_error=
     if activation_error=$(activate_feature_transaction 2>&1); then
         features_state=ready
+        # User modifications are reported, not enforced.
+        feature_error=$(printf '%s\n' "$activation_error" | $BB sed -n 's/^WARN://p' | $BB tr '\n' ' ' | $BB tr -cd 'A-Za-z0-9_: -' | $BB cut -c 1-160)
+        [ -z "$feature_error" ] || log "features-user-modified:$(printf '%s' "$feature_error" | $BB tr ' ' ',')"
     else
         feature_degraded=1
         features_state=degraded
@@ -2105,11 +2115,16 @@ start_ui_services()
 
     apply_timezone
     $BB mkdir -p /var/run /var/log /var/log/libreecho /run/libreecho
-    if [ "$feature_degraded" = 0 ] && [ "$SERVICE_PROFILE" = production ] && [ "${DATA_CLEANUP_OK:-0}" -ne 1 ]; then
-        log ui-services-blocked-by-data-contract
+    if [ "$feature_degraded" = 0 ] && [ "$SERVICE_PROFILE" = production ] &&
+            [ "${DATA_MOUNTED:-0}" -ne 1 ]; then
+        log ui-services-blocked-userdata-unavailable
         return 1
     fi
-    if [ "$feature_degraded" = 1 ] || [ "$SERVICE_PROFILE" = diagnostic ] || [ "$FEATURE_POLICY" = exclude ]; then
+    if [ "${DATA_CLEANUP_OK:-0}" -ne 1 ] && [ "${DATA_MOUNTED:-0}" -eq 1 ]; then
+        # Keep going.  The helper's own report is in /tmp/data-cleanup.log.
+        log data-contract-advisory-continuing
+    fi
+    if [ "$SERVICE_PROFILE" = diagnostic ] || [ "$FEATURE_POLICY" = exclude ]; then
         services="logd timed web"
         if [ "$FEATURE_POLICY" = exclude ]; then
             log feature-services-excluded
@@ -2154,11 +2169,23 @@ start_ui_services()
         log ui-services-redistributable-without-wakeword
     fi
     fi
+    if [ "$feature_degraded" = 1 ]; then
+        # Feature payloads are unavailable: keep the platform (network, audio,
+        # buttons, LEDs, Bluetooth, web) and drop only payload-backed daemons.
+        degraded_services=
+        for kept in $services; do
+            case "$kept" in waked|ttsd|airplayd|sttd|agentd) ;;
+                *) degraded_services="$degraded_services $kept" ;;
+            esac
+        done
+        services=$degraded_services
+        log ui-services-platform-only-features-degraded
+    fi
     # Deferred-contract snapshots are retained for the payload reconciler and
     # its host contract checks:
     # services="logd networkd timed audiod micd ledd buttond btd web"
     # services="logd networkd timed audiod micd ledd buttond btd esphomed web"
-    stop_ui_voice_owners || return 1
+    stop_ui_voice_owners || log ui-conflicting-owner-continuing
     start_shared_discovery_runtime
     log feature-services-deferred-until-staged
     for service in $services; do
@@ -3239,7 +3266,12 @@ ota_health_confirm_worker()
     # recoverable slot (platform #60, LibreEcho#28/#180).  The complete selected
     # service graph stays the stricter OTA acceptance gate, where a rollback
     # target does exist.
-    if ! startup_ready_marker_valid && [ "$CONFIRM_MODE" != first-boot ]; then
+    # The device is the user's: they may disable, replace or break optional
+    # services.  A slot is confirmed on the recovery plane alone (userdata,
+    # adb transport, management UI).  The full service graph and the
+    # startup-ready marker are reported but are no longer reasons to roll an
+    # update back; set HEALTH_STRICT_SERVICES=1 to restore the strict gate.
+    if ! startup_ready_marker_valid && [ "${HEALTH_STRICT_SERVICES:-0}" = 1 ]; then
         last_check=startup-ready
         log ota-health-startup-ready-timeout
         pmsg_marker ota-startup-ready-timeout
@@ -3269,7 +3301,7 @@ ota_health_confirm_worker()
             elif ota_health_services_ready; then
                 last_check=none
                 strict_graph=1
-            elif [ "$CONFIRM_MODE" = first-boot ]; then
+            elif [ "${HEALTH_STRICT_SERVICES:-0}" != 1 ]; then
                 last_check=services-degraded
             else
                 last_check=services-ready

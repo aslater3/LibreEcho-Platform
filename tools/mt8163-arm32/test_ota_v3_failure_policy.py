@@ -65,7 +65,7 @@ class FailurePolicyTests(grammar.SignedFixture):
             p.write_text('#!/bin/sh\necho ' + service + ' >> "$CALLS"\n')
             p.chmod(0o755)
         script = root / 'init'
-        script.write_text('BB=/bin/busybox\nSERVICE_PROFILE=production\nFEATURE_POLICY=community-noncommercial\nDATA_CLEANUP_OK=1\n'
+        script.write_text('BB=/bin/busybox\nSERVICE_PROFILE=production\nFEATURE_POLICY=community-noncommercial\nDATA_CLEANUP_OK=1\nDATA_MOUNTED=1\n'
                           'log() { :; }\npmsg_marker() { :; }\napply_timezone() { :; }\n'
                           'activate_feature_transaction() { echo ERROR:feature-stt-payload-hash; return 1; }\n'
                           'stop_ui_voice_owners() { :; }\nstart_shared_discovery_runtime() { :; }\n'
