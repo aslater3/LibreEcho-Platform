@@ -48,6 +48,7 @@ class WebStatusTests(FailurePolicyTests):
         import shutil, tempfile
         ui = os.environ.get('LIBREECHO_OTA_UI_SOURCE')
         if not ui or not (Path(ui) / 'tools/source-provenance.sh').is_file() or \
+                not (Path(ui) / 'Makefile').is_file() or \
                 not (Path(ui) / '.git').exists() or not shutil.which('make'):
             self.skipTest('companion UI git checkout is not available')
         source = (TOOLS / 'ui/build_ui_bundle.sh').read_text()
