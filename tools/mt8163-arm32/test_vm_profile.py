@@ -131,7 +131,7 @@ class BootTests(unittest.TestCase):
                     self.assertNotIn('DATA_CLEANUP_CONTRACT_FAILED', log)
                     self.assertIn('installed into a; b preserved as bootable rollback', log)
                     self.assertIn('===PHASE_PROFILE_END===', log)
-                        self.assertIn('===PHASE3_END===', log)
+                    self.assertIn('===PHASE3_END===', log)
 
 
 if __name__ == '__main__':
