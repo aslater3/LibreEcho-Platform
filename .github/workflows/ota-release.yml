@@ -27,7 +27,7 @@ jobs:
       LIBREECHO_OTA_UI_SOURCE: ${{ github.workspace }}/.test-ui
     steps:
       - name: Check out Platform source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0  # immutable release-base staging diff
@@ -52,7 +52,7 @@ jobs:
         run: bash tools/mt8163-arm32/airplay/test_sleep_media_arbitration.sh
 
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.11'
 
@@ -172,6 +172,8 @@ jobs:
             ota/test_ota_v2_implementation.py \
             test_ota_v3_activation.py \
             test_issue_231_fixed_boot_store.py \
+            test_reboot_bootloader.py \
+            test_issue_195_no_expdb_marker.py \
             test_ota_v3_config.py \
             test_ota_v3_convergence.py \
             test_ota_v3_failure_policy.py \
@@ -183,7 +185,9 @@ jobs:
             test_ota_v3_web_status.py \
             ota/test_feature_provenance.py \
             ota/test_service_identity.py \
-            ota/test_dev_discovery.py
+            ota/test_dev_discovery.py \
+            ota/test_release_source.py \
+            test_active_device_ping.py
 
       - name: Run pinned Opus decode provenance suites
         shell: bash

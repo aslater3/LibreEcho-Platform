@@ -43,7 +43,7 @@ ZIMAGE_MAGIC = 0x016F2818
 ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
 CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
-CONNECTIVITY_IMPORTER_SHA256 = "078b0b5ee29ffb952a9c2f3df64fb11ce57dc79046e48159d990a89c4905c902"
+CONNECTIVITY_IMPORTER_SHA256 = "58b907e1a7840fb9135f9b16e3f95b33424255e5d3d4ecb594c5a74b3de3f907"
 CONNECTIVITY_STOCK_SYSTEM_SHA256 = "56540b3a9ac4437901a5510d9fb5e09b1a8d0cc229548f0b08bb5c22d78684fe"
 CONNECTIVITY_EVIDENCE_MANIFEST_SHA256 = "d1eedd04efe0dbc78853f2b0f9357c092b4ca66242648908c0369956538441eb"
 WPA_SUPPLICANT_VERSION = "2.10"
@@ -58,7 +58,7 @@ WIRELESS_TOOLS_VERSION = "30~pre9"
 WIRELESS_TOOLS_SOURCE_SHA256 = "abd9c5c98abf1fdd11892ac2f8a56737544fe101e1be27c6241a564948f34c63"
 WIRELESS_TOOLS_SOURCE_URL = "https://archive.ubuntu.com/ubuntu/pool/main/w/wireless-tools/wireless-tools_30~pre9.orig.tar.gz"
 
-INIT_SHA256 = "40eb6573a8418ddd2452cbf6c5aa256cba1aee0404e5ae0245c689c955425e08"
+INIT_SHA256 = "cd08f44f7d0d604467df7f59a290fcfb5176a1a8004aa2dab0edd28c68481c1a"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 OVERLAY_FILES = {
     "default.prop": 0o644,
@@ -79,6 +79,7 @@ OVERLAY_FILES = {
     "vendor-assets/mt8163-v181-stock-v3.tsv": 0o644,
     "libreecho-update": 0o755,
     "libreecho-update-fetch": 0o755,
+    "libreecho-ping": 0o755,
     "libreecho-feature-transaction": 0o755,
     "libreecho-target-manifest": 0o755,
     "libreecho-generation": 0o755,
@@ -109,6 +110,7 @@ OVERLAY_TARGETS = {
     ),
     "libreecho-update": "usr/local/sbin/libreecho-update",
     "libreecho-update-fetch": "usr/local/sbin/libreecho-update-fetch",
+    "libreecho-ping": "usr/local/sbin/libreecho-ping",
     "libreecho-feature-transaction": "usr/local/sbin/libreecho-feature-transaction",
     "libreecho-target-manifest": "usr/local/sbin/libreecho-target-manifest",
     "libreecho-generation": "usr/local/sbin/libreecho-generation",

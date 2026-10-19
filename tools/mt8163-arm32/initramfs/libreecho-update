@@ -3,14 +3,58 @@
 
 BB=/bin/busybox
 
-# Exact reviewed post-Amonet Biscuit userdata sizes, in 512-byte sectors.
-# Do not accept arbitrary larger partitions or change any other partition.
+# Userdata identity (LibreEcho-Platform #249, LibreEcho #257).
+#
+# The partition must be mmcblk0p16 with PARTNAME=userdata.  The two reviewed
+# legacy sizes (2137088/2153472 sectors) are accepted exactly as before.  Any
+# other size must be at least the smallest reviewed layout, within a sane upper
+# bound, and must already carry an ext4 superblock labelled LIBREECHO_DATA --
+# the label the one-shot installer writes -- so a foreign or unformatted
+# partition of an unexpected size is never mounted.  Nothing here formats,
+# repairs or writes the partition.
+USERDATA_MIN_SECTORS=2137088
+USERDATA_MAX_SECTORS=33554432
+USERDATA_LABEL=LIBREECHO_DATA
+
 userdata_size_supported()
+{
+    case "$1" in
+        ''|0*|*[!0-9]*) return 1 ;;
+    esac
+    [ "${#1}" -le 8 ] || return 1
+    [ "$1" -ge "$USERDATA_MIN_SECTORS" ] && [ "$1" -le "$USERDATA_MAX_SECTORS" ]
+}
+
+userdata_size_legacy()
 {
     case "$1" in
         2137088|2153472) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+# ext2/3/4 superblock at byte 1024: s_magic (le16 0xEF53) at +0x38 and the
+# 16-byte NUL-padded s_volume_name at +0x78.
+userdata_label_ok()
+{
+    ul_hex=$($BB dd if="$1" bs=1 skip=1080 count=2 2>/dev/null | $BB od -An -tx1 | $BB tr -d ' \n')
+    [ "$ul_hex" = 53ef ] || return 1
+    ul_hex=$($BB dd if="$1" bs=1 skip=1144 count=16 2>/dev/null | $BB od -An -tx1 | $BB tr -d ' \n')
+    ul_want=$(printf '%s' "$USERDATA_LABEL" | $BB od -An -tx1 | $BB tr -d ' \n')
+    while [ "${#ul_want}" -lt 32 ]; do ul_want=${ul_want}00; done
+    [ "$ul_hex" = "$ul_want" ]
+}
+
+# $1=block device, $2=sysfs directory.  Status: 0 accepted, 1 not the userdata
+# partition, 2 unsupported size, 3 not a LibreEcho-formatted filesystem.
+userdata_identity()
+{
+    [ -b "$1" ] && $BB grep -qx 'PARTNAME=userdata' "$2/uevent" 2>/dev/null || return 1
+    ui_size=$($BB cat "$2/size" 2>/dev/null)
+    userdata_size_legacy "$ui_size" && return 0
+    userdata_size_supported "$ui_size" || return 2
+    userdata_label_ok "$1" || return 3
+    return 0
 }
 
 DATA_ROOT=/data
@@ -120,10 +164,7 @@ die()
 
 require_userdata()
 {
-    [ -b "$USERDATA_DEVICE" ] &&
-        $BB grep -qx 'PARTNAME=userdata' \
-            "$USERDATA_SYS/uevent" 2>/dev/null &&
-        userdata_size_supported "$($BB cat "$USERDATA_SYS/size" 2>/dev/null)" &&
+    userdata_identity "$USERDATA_DEVICE" "$USERDATA_SYS" &&
         $BB grep -q " $DATA_ROOT " "$MOUNTS_FILE" 2>/dev/null ||
         die userdata_identity_or_mount_failed
     $BB mkdir -p "$INCOMING" "$UPDATE_ROOT" || die update_directory_failed
@@ -514,6 +555,26 @@ install_package()
     echo "UPDATE_READY slot=$target version=$version"
 }
 
+# The installer's check record ends at `reboot-pending`, which the web UI shows
+# as "Ready to restart".  Once the candidate is confirmed that is no longer
+# true: the device is running the release that check resolved.  Relabel only
+# that exact record, keeping its release identity, so the UI reports the
+# confirmed install as current instead of asking for a restart that already
+# happened.  Best effort: the slot is already confirmed, and the next check
+# rewrites the record whole anyway.
+publish_confirmed_check_status()
+{
+    check=$UPDATE_ROOT/check-status
+    [ "$($BB sed -n 's/^status=//p' "$check" 2>/dev/null)" = reboot-pending ] || return 0
+    if $BB sed 's/^status=reboot-pending$/status=up-to-date/' "$check" > "$check.confirm.tmp" &&
+       $BB mv "$check.confirm.tmp" "$check"; then
+        $BB sync
+        return 0
+    fi
+    $BB rm -f "$check.confirm.tmp"
+    return 0
+}
+
 confirm_pending()
 {
     require_userdata
@@ -527,6 +588,7 @@ confirm_pending()
         "$BOOTCTL" confirm "$slot" > "$UPDATE_ROOT/bootctl.confirm" || die boot_control_confirm
         ROOT="$UPDATE_ROOT" "$FEATURE_TRANSACTION" commit || die generation_commit_pending
         state_write installed 100 "$slot"
+        publish_confirmed_check_status
         echo "UPDATE_CONFIRMED slot=$slot"
         return 0
     fi

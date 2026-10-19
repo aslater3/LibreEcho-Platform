@@ -450,3 +450,13 @@ Development and OTA images never write or erase `expdb`. On amonet v2.0.0,
 valid marker there. The development kernel may still reset the Amazon BCB retry
 counters in `misc` at offset `0x360`; the separate expdb fastboot escape and
 its updater cleanup path are disabled.
+
+Restart to fastboot uses Kaeru's own one-shot command instead: writing
+`fastboot` to `/tmp/reboot.request` makes init run
+`libreecho-bootctl reboot-bootloader`, which proves the Kaeru payload header in
+`expdb` read-only, then writes `bootonce-bootloader` into the 32-byte
+bootloader_message command at `misc` offset 0 (never the BCB at `0x360`) and
+reads it back. Kaeru enters fastboot and clears the command, so `fastboot
+reboot` returns to LibreEcho. The request is refused, with nothing written, on
+the legacy layout, without a proven payload, or when misc already holds a
+different command.

@@ -35,6 +35,14 @@ FEATURE_ASSET_MAX_BYTES=67108864
 CURL_STDERR=/run/libreecho/ota-curl.stderr
 CURL_HEADERS=/run/libreecho/ota-curl.headers
 CURL_DIAGNOSTIC_MAX=160
+# Release transport. The project-owned download domain is tried first so that a
+# repository or account move never strands installed devices; GitHub Releases
+# is the direct fallback when the domain is unreachable. Both are untrusted
+# transport: the control package is signature-checked and every feature asset
+# is size- and hash-pinned by the signed manifest before use.
+RELEASE_MIRROR=https://dl.libreecho.org
+RELEASE_GITHUB=https://github.com/LibreEcho/LibreEcho/releases
+RELEASE_BASE=$RELEASE_GITHUB
 DATA_ROOT=/data
 PROC_ROOT=/proc
 RUN_ROOT=/run
@@ -241,8 +249,20 @@ validate_source()
     [ "$expected_channel" = dev ] || [ "$expected_channel" = stable ] || die source_channel
     channel=$expected_channel
     load_fetch_target
-    expected_url="https://github.com/aslater3/LibreEcho/releases/latest/download/libreecho-$TARGET_SLUG-$channel.ota.tar"
-    url=$expected_url
+}
+
+select_release_source()
+{
+    # One bounded health probe per check picks the transport for every request
+    # in it. Any failure, including an unexpected body, selects GitHub.
+    RELEASE_BASE=$RELEASE_GITHUB
+    probe=$ROOT/.control-range-probe.$$
+    bounded_curl "$probe" "$CURL_HEADERS" 64 20 "$RELEASE_MIRROR/healthz" || STREAM_CURL_RC=1
+    if [ "$STREAM_CURL_RC" -eq 0 ] && [ "$($BB head -n 1 "$probe" 2>/dev/null)" = "libreecho-dl ok" ]; then
+        RELEASE_BASE=$RELEASE_MIRROR
+    fi
+    $BB rm -f "$probe" "$CURL_HEADERS" "$CURL_STDERR"
+    url="$RELEASE_BASE/latest/download/libreecho-$TARGET_SLUG-$channel.ota.tar"
 }
 
 resolve_dev_release()
@@ -264,7 +284,7 @@ resolve_dev_release()
     # Product releases are combined: one radar-puffin-* tag carries every
     # target, and each target's assets are named libreecho-<slug>-<build id>.
     load_fetch_target
-    url="https://github.com/aslater3/LibreEcho/releases/download/$DEV_RELEASE_TAG/libreecho-$TARGET_SLUG-${DEV_RELEASE_TAG#radar-puffin-}.ota.tar"
+    url="$RELEASE_BASE/download/$DEV_RELEASE_TAG/libreecho-$TARGET_SLUG-${DEV_RELEASE_TAG#radar-puffin-}.ota.tar"
 }
 
 load_fetch_target()
@@ -282,7 +302,7 @@ read_dev_release_pointer()
     # Reuse the registered bounded-probe temporary lifecycle.
     pointer=$ROOT/.control-range-probe.$$
     load_fetch_target
-    pointer_url=https://github.com/aslater3/LibreEcho/releases/download/$TARGET_SLUG-dev-channel/release-pointer-v3.txt
+    pointer_url=$RELEASE_BASE/download/$TARGET_SLUG-dev-channel/release-pointer-v3.txt
     bounded_curl "$pointer" "$CURL_HEADERS" 257 60 "$pointer_url"
     curl_detail=$(downloader_stderr)
     parse_response_headers "$CURL_HEADERS" || die dev_discovery_headers
@@ -1074,7 +1094,7 @@ download_and_inspect()
 download_feature_assets()
 {
     [ "$(check_value_from_file "$ROOT/staging/manifest" format)" = libreecho-ota-v3 ] || die legacy_manifest_unsupported
-    ROOT="$ROOT" CURL="$CURL" CA="$CA" "${GENERATION_TOOL:-/usr/local/sbin/libreecho-generation}" assemble "$ROOT/staging/manifest" "$ROOT/staging/manifest.sig" || die generation_assembly
+    ROOT="$ROOT" CURL="$CURL" CA="$CA" RELEASE_BASE="$RELEASE_BASE" "${GENERATION_TOOL:-/usr/local/sbin/libreecho-generation}" assemble "$ROOT/staging/manifest" "$ROOT/staging/manifest.sig" || die generation_assembly
 }
 
 cleanup_refused_install_artifacts()
@@ -1165,6 +1185,7 @@ check_or_install()
     seed_channel
     validate_source
     prepare_https_client
+    select_release_source
     resolve_dev_release || return 1
     install_unlock
     version=$(download_and_inspect) || return 1

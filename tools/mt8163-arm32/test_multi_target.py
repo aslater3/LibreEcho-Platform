@@ -489,6 +489,11 @@ class RadarTreeDiffTests(unittest.TestCase):
     # copies), which the combined tree necessarily stages on top of the base.
     ALLOWED = {'etc/libreecho/target', 'etc/libreecho/audio-profile', 'usr/local/sbin/libreecho-update',
                'usr/local/sbin/libreecho-update-fetch',
+               # Owner-independent OTA transport: dl.libreecho.org first,
+               # organisation GitHub Releases as fallback.
+               'etc/libreecho/ota-source.conf',
+               # Anonymous active-device ping (telemetry Tier 0).
+               'usr/local/sbin/libreecho-ping',
                'usr/local/sbin/libreecho-feature-transaction', 'init', 'libreecho-init',
                'usr/local/sbin/libreecho-target-manifest',
                'usr/local/sbin/libreecho-generation',
@@ -497,6 +502,9 @@ class RadarTreeDiffTests(unittest.TestCase):
                'usr/local/sbin/libreecho-data-cleanup',
                # mDNS wrapper status resolves the live supervisor, not a pidfile.
                'etc/init.d/libreecho-mdnsd.init',
+               # Owner-local enrolment readback forward-ported from 0.13.18
+               # (#172); its bytes are pinned by CONNECTIVITY_IMPORTER_SHA256.
+               'usr/local/sbin/libreecho-vendor-import',
                'usr/local/sbin/libreecho-generation-transaction',
                'usr/local/sbin/libreecho-bootctl',
                'usr/local/sbin/libreecho-recovery-ap-probe',

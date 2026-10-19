@@ -61,12 +61,12 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "40eb6573a8418ddd2452cbf6c5aa256cba1aee0404e5ae0245c689c955425e08"
+RECOVERY_INIT_SHA256 = "cd08f44f7d0d604467df7f59a290fcfb5176a1a8004aa2dab0edd28c68481c1a"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
 CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
-CONNECTIVITY_IMPORTER_SHA256 = "078b0b5ee29ffb952a9c2f3df64fb11ce57dc79046e48159d990a89c4905c902"
+CONNECTIVITY_IMPORTER_SHA256 = "58b907e1a7840fb9135f9b16e3f95b33424255e5d3d4ecb594c5a74b3de3f907"
 WPA_SUPPLICANT_VERSION = "2.10"
 WPA_SOURCE_SHA256 = "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f"
 WPA_SOURCE_URL = "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz"
@@ -786,6 +786,7 @@ def add_overlay(stage: Path, overlay: Path, busybox: Path, loader: Path,
         ),
         "libreecho-update": ("usr/local/sbin/libreecho-update", 0o755),
         "libreecho-update-fetch": ("usr/local/sbin/libreecho-update-fetch", 0o755),
+        "libreecho-ping": ("usr/local/sbin/libreecho-ping", 0o755),
         "libreecho-feature-transaction": (
             "usr/local/sbin/libreecho-feature-transaction", 0o755,
         ),

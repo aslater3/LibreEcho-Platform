@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Amazon/MediaTek BCB control for the supported Biscuit boot layouts.
- * This tool never writes a boot image. It can write only the BCB sector in misc.
+ * This tool never writes a boot image. It can write only misc: the BCB sector,
+ * and (reboot-bootloader) the one-shot bootloader command at misc offset 0.
  */
 #define _FILE_OFFSET_BITS 64
 #include <errno.h>
@@ -77,19 +78,46 @@ static int read_text(const char *path, char *output, size_t size)
     return 0;
 }
 
-/* Accept the alternate size only for the reviewed userdata contract.
- * Exact decimal matching also rejects signs, suffixes and overflow input. */
+/* Every partition except userdata must match its reviewed size exactly.
+ *
+ * userdata is never written by this tool and only proves which device node is
+ * the data partition, so its size is a floor (the smallest reviewed layout)
+ * with a sane upper bound, not an allowlist: stock Radar keeps its full
+ * 2588639-sector userdata (LibreEcho #257, Platform #249).  Filesystem identity
+ * is enforced where /data is mounted (libreecho-init).  Strict decimal parsing
+ * still rejects signs, leading zeros, suffixes, whitespace and overflow. */
+#define USERDATA_MAX_SECTORS 33554432UL
+
+static int parse_sectors(const char *text, unsigned long *value)
+{
+    unsigned long result = 0;
+    size_t i;
+
+    if (!text[0] || text[0] == '0' || strlen(text) > 8)
+        return -1;
+    for (i = 0; text[i]; ++i) {
+        if (text[i] < '0' || text[i] > '9')
+            return -1;
+        result = result * 10UL + (unsigned long)(text[i] - '0');
+    }
+    *value = result;
+    return 0;
+}
+
 static int partition_sectors_match(const struct partition_contract *contract,
                                    const char *text)
 {
     char expected[32];
+    unsigned long sectors;
 
     snprintf(expected, sizeof(expected), "%lu", contract->sectors);
     if (strcmp(text, expected) == 0)
         return 1;
-    return strcmp(contract->device, "/dev/mmcblk0p16") == 0 &&
-           strcmp(contract->name, "userdata") == 0 &&
-           contract->sectors == 2137088UL && strcmp(text, "2153472") == 0;
+    if (strcmp(contract->device, "/dev/mmcblk0p16") ||
+        strcmp(contract->name, "userdata") || contract->sectors != 2137088UL)
+        return 0;
+    return parse_sectors(text, &sectors) == 0 &&
+           sectors >= contract->sectors && sectors <= USERDATA_MAX_SECTORS;
 }
 
 /* Probing a layout the unit does not use must stay quiet: printing its contract
@@ -329,10 +357,110 @@ static int confirm(uint8_t *bcb, int target)
     return 0;
 }
 
+/* Restart-to-fastboot on the pinned Kaeru chain (Platform #195 follow-up).
+ *
+ * Kaeru reads the Android bootloader_message command at misc offset 0 and
+ * enters fastboot for "bootonce-bootloader", then clears that command itself,
+ * so a later plain reboot boots LibreEcho again.  The sticky FASTBOOT_PLEASE
+ * form is deliberately never written here: it survives until erased.
+ *
+ * expdb holds the Kaeru payload on this chain and is only ever opened
+ * read-only, to prove the payload is present before misc is touched.  Without
+ * Kaeru nothing reads the command, so the request is refused instead.
+ */
+#define MISC_COMMAND_SIZE 32
+static const char bootonce_bootloader[] = "bootonce-bootloader";
+static const struct partition_contract expdb_contract =
+    {"/dev/mmcblk0p7", "/sys/class/block/mmcblk0p7", "expdb", 20480};
+
+static int kaeru_payload_present(void)
+{
+    static const uint8_t magic[4] = {0x88, 0x16, 0x88, 0x58};
+    uint8_t header[48];
+    int fd;
+    ssize_t length;
+
+    contract_reporting = 1;
+    if (validate_partition(&expdb_contract))
+        return 0;
+    fd = open(expdb_contract.device, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    length = pread(fd, header, sizeof(header), 0);
+    close(fd);
+    /* MTK image header: magic, payload size, then the image name "LK". */
+    return length == (ssize_t)sizeof(header) &&
+           !memcmp(header, magic, sizeof(magic)) &&
+           header[8] == 'L' && header[9] == 'K' && header[10] == '\0';
+}
+
+/* An empty command, or our own one-shot request, may be replaced.  Anything
+ * else belongs to another writer and is left exactly as it is. */
+static int misc_command_replaceable(const uint8_t *command)
+{
+    size_t i = 0;
+
+    if (command[0] != '\0') {
+        if (memcmp(command, bootonce_bootloader, sizeof(bootonce_bootloader)))
+            return 0;
+        i = sizeof(bootonce_bootloader);
+    }
+    for (; i < MISC_COMMAND_SIZE; ++i)
+        if (command[i])
+            return 0;
+    return 1;
+}
+
+static int request_bootloader(void)
+{
+    uint8_t sector[SECTOR_SIZE], verify[SECTOR_SIZE];
+    uint8_t bcb_before[SECTOR_SIZE], bcb_after[SECTOR_SIZE];
+    int fd;
+    ssize_t length;
+
+    if (strcmp(boot_layout, "pinned")) {
+        fprintf(stderr, "ERROR: restart to fastboot needs the pinned Kaeru chain\n");
+        return -1;
+    }
+    if (!kaeru_payload_present()) {
+        fprintf(stderr, "ERROR: Kaeru payload not proven in expdb; misc untouched\n");
+        return -1;
+    }
+    if (read_sector(bcb_before))
+        return -1;
+    fd = open("/dev/mmcblk0p8", O_RDWR | O_CLOEXEC | O_SYNC);
+    if (fd < 0)
+        return -1;
+    length = pread(fd, sector, SECTOR_SIZE, 0);
+    if (length != SECTOR_SIZE || !misc_command_replaceable(sector)) {
+        close(fd);
+        fprintf(stderr, "ERROR: misc already holds another bootloader command\n");
+        return -1;
+    }
+    memset(sector, 0, MISC_COMMAND_SIZE);
+    memcpy(sector, bootonce_bootloader, sizeof(bootonce_bootloader));
+    length = pwrite(fd, sector, SECTOR_SIZE, 0);
+    if (length != SECTOR_SIZE || fsync(fd) ||
+        pread(fd, verify, SECTOR_SIZE, 0) != SECTOR_SIZE ||
+        memcmp(sector, verify, SECTOR_SIZE)) {
+        close(fd);
+        fprintf(stderr, "ERROR: misc command write/readback failed\n");
+        return -1;
+    }
+    close(fd);
+    /* The slot record shares the partition; prove it was not disturbed. */
+    if (read_sector(bcb_after) || memcmp(bcb_before, bcb_after, SECTOR_SIZE)) {
+        fprintf(stderr, "ERROR: BCB changed during misc command write\n");
+        return -1;
+    }
+    printf("misc_command=%s\n", bootonce_bootloader);
+    return 0;
+}
+
 static void usage(const char *program)
 {
-    fprintf(stderr, "Usage: %s status [a|b] | activate <a|b> | confirm <a|b>\n",
-            program);
+    fprintf(stderr, "Usage: %s status [a|b] | activate <a|b> | confirm <a|b> | "
+            "reboot-bootloader\n", program);
 }
 
 int main(int argc, char **argv)
@@ -355,6 +483,8 @@ int main(int argc, char **argv)
         print_status(bcb, running_slot);
         return 0;
     }
+    if (argc == 2 && !strcmp(argv[1], "reboot-bootloader"))
+        return request_bootloader() ? 1 : 0;
     if (argc != 3 || (slot = parse_slot(argv[2])) < 0) {
         usage(argv[0]);
         return 2;
