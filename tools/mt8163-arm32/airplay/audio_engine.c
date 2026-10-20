@@ -60,6 +60,11 @@
 #define OUTPUT_CHANNELS 2U
 #define PERIOD_SIZE 2048U
 #define PERIOD_COUNT 2U
+/* 24-bit output: S32_LE (24 bits MSB-aligned) at 8 bytes per frame.  The
+ * MT8163 DL1 SRAM holds 3072 such frames, so ALSA gets 3 x 1024-frame periods
+ * (64 ms) while the engine still renders and writes 2048-frame periods. */
+#define WIDE_PERIOD_SIZE 1024U
+#define WIDE_PERIOD_COUNT 3U
 #define AMP_SETTLE_US 30000U
 #define SOURCE_COUNT 5U
 #define SOURCE_IDLE_PERIODS 8U
@@ -1214,6 +1219,28 @@ static void select_speaker_profile(void)
 		biscuit_chain = &biscuit_storage;
 }
 
+/*
+ * Wide output state.  With a 24-bit-capable kernel the PCM is S32_LE and the
+ * chain stays in float from the master gain to the DAC: 16-bit volume
+ * arithmetic otherwise drops one bit per 6 dB of attenuation.  The int16
+ * period is still produced for the AEC reference and the visualizer.
+ * wide_supported: -1 unknown, 0 kernel refused S32_LE (S16 fallback), 1 ok.
+ * wide_output: the open PCM is S32_LE, so write_period sends wide_samples.
+ */
+static int wide_output;
+static int wide_supported = -1;
+static int32_t wide_samples[PERIOD_SIZE * OUTPUT_CHANNELS];
+
+static int32_t wide_from_s16_units(float y)
+{
+	if (y > 32767.0f)
+		y = 32767.0f;
+	else if (y < -32767.0f)
+		y = -32767.0f;
+	/* 24 significant bits; the DL1 MSB-aligned fetch ignores the low byte. */
+	return (int32_t)lrintf(y * 256.0f) * 256;
+}
+
 static int16_t biscuit_render_s16(struct biscuit_dsp *dsp, int32_t mixed)
 {
 	/* The Dot chain has no OutputTrim; its own full-band limiter already
@@ -1240,6 +1267,31 @@ static void render_period(struct source_bus *sources, int16_t *output,
 		int16_t rendered;
 		*current_master_q15 += (target_master_q15 - *current_master_q15) /
 			(int32_t)(PERIOD_SIZE - frame);
+		if (wide_supported != 0) {
+			/* Same chain without integer requantisation after the master.
+			 * Rendered before the PCM opens, so this fills both forms. */
+			float wide = (float)mixed *
+				((float)*current_master_q15 / 32768.0f);
+			float y;
+
+			if (biscuit_chain)
+				y = biscuit_dsp_process(biscuit_chain,
+					wide * speaker_profile.pre_gain);
+			else
+				y = puffin_render_mono_f(dynamics,
+					speaker_dsp_process_f(speaker, wide));
+			wide_samples[frame * OUTPUT_CHANNELS] =
+				wide_samples[frame * OUTPUT_CHANNELS + 1] =
+				wide_from_s16_units(y);
+			if (y > 32767.0f)
+				y = 32767.0f;
+			else if (y < -32767.0f)
+				y = -32767.0f;
+			rendered = (int16_t)lrintf(y);
+			output[frame * OUTPUT_CHANNELS] = rendered;
+			output[frame * OUTPUT_CHANNELS + 1] = rendered;
+			continue;
+		}
 		mixed = (int32_t)(((int64_t)mixed * *current_master_q15) >> 15);
 		/* All producer buses meet here: mono EQ, then multiband
 		 * protection, then the +3 dB trim and final PCM safety limiter. */
@@ -1388,7 +1440,9 @@ static int write_period(struct pcm *pcm, const int16_t *samples,
 			struct le_aec_reference_sender *reference,
 			unsigned int activity_mask)
 {
-	if (pcm_writei(pcm, samples, PERIOD_SIZE) != (int)PERIOD_SIZE)
+	if (pcm_writei(pcm, wide_output ? (const void *)wide_samples :
+				   (const void *)samples,
+		       PERIOD_SIZE) != (int)PERIOD_SIZE)
 		return -1;
 	/*
 	 * Reference delivery is intentionally lossy.  A missing or slow AEC
@@ -1397,6 +1451,44 @@ static int write_period(struct pcm *pcm, const int16_t *samples,
 	(void)le_aec_reference_publish(reference, samples, PERIOD_SIZE,
 				       OUTPUT_CHANNELS, activity_mask);
 	return 0;
+}
+
+/* Prefer 24-bit output; an older kernel rejects S32_LE at hw_params and the
+ * engine then stays on the original S16 configuration for this process. */
+static struct pcm *open_output_pcm(unsigned int card, unsigned int device,
+				   struct pcm_config *s16)
+{
+	struct pcm_config wide = *s16;
+	struct pcm *pcm;
+
+	wide_output = 0;
+	if (wide_supported != 0) {
+		wide.format = PCM_FORMAT_S32_LE;
+		wide.period_size = WIDE_PERIOD_SIZE;
+		wide.period_count = WIDE_PERIOD_COUNT;
+		wide.stop_threshold = WIDE_PERIOD_SIZE * WIDE_PERIOD_COUNT;
+		wide.silence_threshold = WIDE_PERIOD_SIZE * WIDE_PERIOD_COUNT;
+		pcm = pcm_open(card, device, PCM_OUT, &wide);
+		if (pcm && pcm_is_ready(pcm)) {
+			if (wide_supported < 0)
+				fprintf(stderr, "audio-engine: output S32_LE (24-bit)\n");
+			wide_supported = 1;
+			wide_output = 1;
+			return pcm;
+		}
+		if (pcm)
+			pcm_close(pcm);
+		pcm = pcm_open(card, device, PCM_OUT, s16);
+		/* Only a working S16 open proves the format, not the device,
+		 * was refused; a busy or absent PCM retries 24-bit next time. */
+		if (pcm && pcm_is_ready(pcm) && wide_supported < 0) {
+			fprintf(stderr, "audio-engine: output S16_LE "
+				"(kernel has no 24-bit playback)\n");
+			wide_supported = 0;
+		}
+		return pcm;
+	}
+	return pcm_open(card, device, PCM_OUT, s16);
 }
 
 static int run_engine(const char *root, unsigned int card, unsigned int device)
@@ -1524,7 +1616,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 					      &visualizer, &status);
 			continue;
 		}
-		pcm = pcm_open(card, device, PCM_OUT, &config);
+		pcm = open_output_pcm(card, device, &config);
 		if (!pcm || !pcm_is_ready(pcm)) {
 			fprintf(stderr, "audio-engine: PCM %u,%u unavailable: %s\n",
 				card, device,

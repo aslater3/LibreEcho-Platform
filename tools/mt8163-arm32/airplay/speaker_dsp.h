@@ -243,16 +243,16 @@ static inline float speaker_dsp_step(struct speaker_dsp_biquad *bq, float x)
 }
 
 /* Equalise on the wide mono bus; no S16 conversion happens before MBCL. */
-static inline float speaker_dsp_equalize(struct speaker_dsp *dsp, int32_t sample)
+static inline float speaker_dsp_equalize_f(struct speaker_dsp *dsp, float sample)
 {
-	float x = (float)sample;
+	float x = sample;
 	int i;
 
 	if (dsp->active)
 		for (i = 0; i < SPEAKER_DSP_SECTIONS; ++i)
 			x = speaker_dsp_step(&dsp->sections[i], x);
 	if (dsp->volume_ramp_remaining > 0) {
-		float next = (float)sample;
+		float next = sample;
 		float fraction = 1.0f - (float)dsp->volume_ramp_remaining /
 			(float)SPEAKER_DSP_VOLUME_RAMP_FRAMES;
 
@@ -273,11 +273,17 @@ static inline float speaker_dsp_equalize(struct speaker_dsp *dsp, int32_t sample
 	return x;
 }
 
-/* Stock-like multiband protection acts once on the mixed programme, before
- * OutputTrim.  The later linked limiter remains an emergency PCM guard. */
-static inline int32_t speaker_dsp_process(struct speaker_dsp *dsp, int32_t sample)
+static inline float speaker_dsp_equalize(struct speaker_dsp *dsp, int32_t sample)
 {
-	float x = speaker_dsp_equalize(dsp, sample);
+	return speaker_dsp_equalize_f(dsp, (float)sample);
+}
+
+/* Stock-like multiband protection acts once on the mixed programme, before
+ * OutputTrim.  The later linked limiter remains an emergency PCM guard.
+ * The float form keeps sub-LSB resolution for a 24-bit output PCM. */
+static inline float speaker_dsp_process_f(struct speaker_dsp *dsp, float sample)
+{
+	float x = speaker_dsp_equalize_f(dsp, sample);
 
 	x = speaker_mbcl_process(&dsp->mbcl, x);
 	/* This guard is for pathological filter state, never normal EQ overshoot. */
@@ -285,7 +291,12 @@ static inline int32_t speaker_dsp_process(struct speaker_dsp *dsp, int32_t sampl
 		x = (float)(INT32_MAX / 4);
 	else if (x < (float)(-INT32_MAX / 4))
 		x = (float)(-INT32_MAX / 4);
-	return (int32_t)lrintf(x);
+	return x;
+}
+
+static inline int32_t speaker_dsp_process(struct speaker_dsp *dsp, int32_t sample)
+{
+	return (int32_t)lrintf(speaker_dsp_process_f(dsp, (float)sample));
 }
 
 #endif /* LIBREECHO_SPEAKER_DSP_H */
