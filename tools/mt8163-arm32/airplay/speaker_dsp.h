@@ -76,12 +76,18 @@ struct speaker_dsp {
 /*
  * Loudness ladder: fixed topology (Fc/Q shared by every step), gain per step.
  * Ladder order is 50, 60, 70, 80, 100 percent.
+ *
+ * The shelves use the maximally flat RBJ Q of 0.707.  The stock shelf "Q"
+ * values (1.9 and 3.9) are not RBJ Q -- see the parametric note below -- and
+ * read literally they made resonant shelves: about +10 dB at 100 Hz with a
+ * -3 dB dip at 200 Hz, and a -3.9 dB dip at 2.2 kHz followed by a +7.9 dB
+ * spike at 3 kHz where a +3.4 dB lift was intended (0.14.0-0.14.2).
  */
 static const struct speaker_dsp_section speaker_loudness_topology[SPEAKER_DSP_LOUDNESS_SECTIONS] = {
-	{ SPEAKER_SHAPE_LOWSHELF,  140.0f, 1.90f, 0.0f },
+	{ SPEAKER_SHAPE_LOWSHELF,  140.0f, 0.707f, 0.0f },
 	{ SPEAKER_SHAPE_PEAK,       60.0f, 0.60f, 0.0f },
 	{ SPEAKER_SHAPE_PEAK,     1770.0f, 3.60f, 0.0f },
-	{ SPEAKER_SHAPE_HIGHSHELF, 2550.0f, 3.90f, 0.0f },
+	{ SPEAKER_SHAPE_HIGHSHELF, 2550.0f, 0.707f, 0.0f },
 	{ SPEAKER_SHAPE_PEAK,     3000.0f, 0.30f, 0.0f }
 };
 
