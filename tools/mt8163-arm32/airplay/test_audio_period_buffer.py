@@ -106,6 +106,9 @@ int main(void)
     int32_t master_gain = 32768;
     size_t period_bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
     size_t i;
+#ifdef MUSIC_AVL_UP_RATIO
+    avl_enabled = 0; /* music levelling has its own tests */
+#endif
 
     memset(sources, 0, sizeof(sources));
     for (i = 0; i < SOURCE_COUNT; ++i) {
@@ -288,7 +291,7 @@ int mixer_ctl_get_value(struct mixer_ctl *ctl, unsigned int index);
 PCM_HEADER = """#ifndef TINYALSA_PCM_H
 #define TINYALSA_PCM_H
 #define PCM_OUT 0x00000000U
-enum pcm_format { PCM_FORMAT_S16_LE = 0 };
+enum pcm_format { PCM_FORMAT_S16_LE = 0, PCM_FORMAT_S32_LE = 1 };
 struct pcm_config {
     unsigned int channels;
     unsigned int rate;

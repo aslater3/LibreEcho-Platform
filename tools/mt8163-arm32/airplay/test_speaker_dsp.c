@@ -393,6 +393,27 @@ static void test_mid_ramp_volume_retarget_is_continuous(void)
 	      10.0 * log10(candidate_rms / target_rms), 0.0, 0.5);
 }
 
+/* Stock presence lift that compensates the codec crossover notch (~3.3 kHz).
+ * Shape only; no vendor coefficients.  Regression guard for the 0.14.3
+ * candidate that flattened the loudness shelves. */
+static void test_loudness_keeps_stock_presence_lift(void)
+{
+	static const int volumes[] = {50, 70, 100};
+	unsigned int v;
+
+	for (v = 0; v < sizeof(volumes) / sizeof(volumes[0]); ++v) {
+		double k1 = chain_gain_db(volumes[v], 1000.0);
+		double k2 = chain_gain_db(volumes[v], 2000.0) - k1;
+		double k3 = chain_gain_db(volumes[v], 3000.0) - k1;
+		char label[96];
+
+		(void)snprintf(label, sizeof(label), "volume %d keeps the >= +5 dB lift at 3 kHz", volumes[v]);
+		check(k3 >= 5.0, label, k3, 7.0, 2.0);
+		(void)snprintf(label, sizeof(label), "volume %d keeps the stock dip at 2 kHz", volumes[v]);
+		check(k2 <= -1.5, label, k2, -3.0, 1.5);
+	}
+}
+
 int main(void)
 {
 	test_biquad_shapes();
@@ -407,6 +428,7 @@ int main(void)
 	test_bass_band_protection_keeps_full_bus_limiter_idle();
 	test_live_volume_change_updates_loudness_without_stream_restart();
 	test_mid_ramp_volume_retarget_is_continuous();
+	test_loudness_keeps_stock_presence_lift();
 
 	if (failures) {
 		printf("\nspeaker_dsp: %d check(s) FAILED\n", failures);

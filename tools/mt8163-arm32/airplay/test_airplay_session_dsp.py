@@ -92,6 +92,9 @@ int main(void)
     int16_t output[PERIOD_SIZE * OUTPUT_CHANNELS];
     struct puffin_dynamics dyn; struct speaker_dsp dsp;
     size_t i; int reference, attenuated; int32_t smoothed = 32768;
+#ifdef MUSIC_AVL_UP_RATIO
+    avl_enabled = 0; /* music levelling has its own tests */
+#endif
     assert(getenv("TMPDIR"));
     assert(snprintf(root, sizeof(root), "%s/le-session-XXXXXX", getenv("TMPDIR")) < (int)sizeof(root));
     assert(mkdtemp(root));

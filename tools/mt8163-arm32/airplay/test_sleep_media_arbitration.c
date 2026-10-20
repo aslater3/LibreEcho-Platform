@@ -169,6 +169,9 @@ int main(int argc, char **argv)
     long ready_frames;
     int32_t current_master;
     int result = 1;
+#ifdef MUSIC_AVL_UP_RATIO
+    avl_enabled = 0; /* music levelling has its own tests */
+#endif
 
     memset(sources, 0, sizeof(sources));
     memset(&reference, 0, sizeof(reference));

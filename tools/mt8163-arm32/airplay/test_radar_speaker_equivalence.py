@@ -96,6 +96,13 @@ int main(int argc, char **argv)
         if (speaker_profile.biscuit_chain) biscuit_chain = &biscuit_storage;
     }
 #endif
+#ifdef WIDE_PERIOD_SIZE
+    /* A kernel without 24-bit playback: S16 output must stay byte-identical. */
+    wide_supported = 0;
+#endif
+#ifdef MUSIC_AVL_UP_RATIO
+    avl_enabled = 0; /* music levelling has its own tests */
+#endif
     arm_output_controls(0);
     for (i = 0; i < SOURCE_COUNT; ++i) {
         sources[i].fd = -1;
