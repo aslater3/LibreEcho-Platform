@@ -106,6 +106,9 @@ int main(void)
     int32_t master_gain = 32768;
     size_t period_bytes = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t);
     size_t i;
+#ifdef MUSIC_AVL_UP_RATIO
+    avl_enabled = 0; /* music levelling has its own tests */
+#endif
 
     memset(sources, 0, sizeof(sources));
     for (i = 0; i < SOURCE_COUNT; ++i) {
