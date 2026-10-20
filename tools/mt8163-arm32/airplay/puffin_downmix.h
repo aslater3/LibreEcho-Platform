@@ -17,12 +17,11 @@ static inline void puffin_dynamics_init(struct puffin_dynamics *dynamics)
 	dynamics->gain_q15 = PUFFIN_OUTPUT_TRIM_Q15;
 }
 
-static inline int16_t puffin_render_mono(struct puffin_dynamics *dynamics,
-					int32_t mixed)
+/* Shared gain law: instantaneous attack, ~21 ms release toward the trim. */
+static inline void puffin_dynamics_track(struct puffin_dynamics *dynamics,
+					 int64_t magnitude)
 {
-	int64_t magnitude = mixed < 0 ? -(int64_t)mixed : mixed;
 	int32_t target_gain = PUFFIN_OUTPUT_TRIM_Q15;
-	int32_t mono;
 
 	if (magnitude > 0) {
 		int32_t limited_gain = (int32_t)(
@@ -39,6 +38,31 @@ static inline int16_t puffin_render_mono(struct puffin_dynamics *dynamics,
 			 ((1 << PUFFIN_LIMITER_RELEASE_SHIFT) - 1)) >>
 			PUFFIN_LIMITER_RELEASE_SHIFT;
 	}
+}
+
+/* 24-bit output path: same limiter, result kept in fractional S16 units. */
+static inline float puffin_render_mono_f(struct puffin_dynamics *dynamics,
+					 float mixed)
+{
+	float magnitude = mixed < 0.0f ? -mixed : mixed;
+	float mono;
+
+	puffin_dynamics_track(dynamics, (int64_t)(magnitude + 0.5f));
+	mono = mixed * ((float)dynamics->gain_q15 / 32768.0f);
+	if (mono > (float)PUFFIN_OUTPUT_CEILING)
+		mono = (float)PUFFIN_OUTPUT_CEILING;
+	if (mono < -(float)PUFFIN_OUTPUT_CEILING)
+		mono = -(float)PUFFIN_OUTPUT_CEILING;
+	return mono;
+}
+
+static inline int16_t puffin_render_mono(struct puffin_dynamics *dynamics,
+					int32_t mixed)
+{
+	int64_t magnitude = mixed < 0 ? -(int64_t)mixed : mixed;
+	int32_t mono;
+
+	puffin_dynamics_track(dynamics, magnitude);
 	mono = (int32_t)(((int64_t)mixed * dynamics->gain_q15) >> 15);
 	if (mono > PUFFIN_OUTPUT_CEILING)
 		mono = PUFFIN_OUTPUT_CEILING;

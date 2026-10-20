@@ -297,7 +297,7 @@ int mixer_ctl_get_value(struct mixer_ctl *ctl, unsigned int index);
 PCM_HEADER = """#ifndef TINYALSA_PCM_H
 #define TINYALSA_PCM_H
 #define PCM_OUT 0x00000000U
-enum pcm_format { PCM_FORMAT_S16_LE = 0 };
+enum pcm_format { PCM_FORMAT_S16_LE = 0, PCM_FORMAT_S32_LE = 1 };
 struct pcm_config {
     unsigned int channels;
     unsigned int rate;
