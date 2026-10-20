@@ -76,6 +76,14 @@ struct speaker_dsp {
 /*
  * Loudness ladder: fixed topology (Fc/Q shared by every step), gain per step.
  * Ladder order is 50, 60, 70, 80, 100 percent.
+ *
+ * The shelf Q values above 0.707 are deliberate fit parameters, not a
+ * convention slip: they reproduce the stock FIR's dip near 2 kHz and its
+ * +7..9 dB lift from 2.8 to 3.5 kHz, which fills the codec crossover's
+ * -10 dB notch at ~3.3 kHz (both HPL and HPR are -10 dB there) and carries
+ * vocal presence.  Flattening them to 0.707 (0.14.3 candidate) moved the
+ * chain 2.3-3.7 dB RMS away from stock and dulled vocals; keep them unless a
+ * new fit against the stock curve says otherwise.
  */
 static const struct speaker_dsp_section speaker_loudness_topology[SPEAKER_DSP_LOUDNESS_SECTIONS] = {
 	{ SPEAKER_SHAPE_LOWSHELF,  140.0f, 1.90f, 0.0f },
