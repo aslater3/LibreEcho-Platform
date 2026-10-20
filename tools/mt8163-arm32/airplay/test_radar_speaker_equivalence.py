@@ -191,6 +191,11 @@ def baseline_source(work: Path) -> Path | None:
     if archive.returncode:
         return None
     subprocess.run(["tar", "-x", "-C", str(tree)], input=archive.stdout, check=True)
+    # Speaker tuning is a deliberate, separately tested input (test_speaker_dsp.c):
+    # the 0.14.3 loudness-shelf Q fix changes Radar PCM on purpose.  Render the
+    # baseline engine with the candidate tuning so this test still proves the
+    # engine plumbing and mixer writes are unchanged.
+    (tree / "speaker_dsp.h").write_bytes((AIRPLAY / "speaker_dsp.h").read_bytes())
     return tree / "audio_engine.c"
 
 
