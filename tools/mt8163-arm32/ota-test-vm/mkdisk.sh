@@ -16,9 +16,9 @@ set -e
 #                      stray-data-file   an unallowlisted file under /data, which
 #                                        has left both A/B slots unbootable
 #
-# Both scenarios reproduce failures that have each bricked hardware, and the OTA
-# test VM's /init runs the production data-contract cleanup against the seeded
-# userdata and asserts the rejection -- so these are exercised, not just present.
+# Both shapes bricked hardware under the old strict contract.  The OTA test VM's
+# /init runs the production data-contract cleanup against the seeded userdata
+# and asserts it is now ACCEPTED and preserved -- user data never blocks boot.
 PROFILE=""; SCENARIO=""
 while [ $# -gt 0 ]; do
   case "$1" in

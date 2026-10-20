@@ -128,13 +128,10 @@ class BootTests(unittest.TestCase):
                     log = (VM / 'boot-test.log').read_text()
                     self.assertNotIn('ASSERT:', log)
                     self.assertIn('===PHASE_DATA_CONTRACT_END===', log)
-                    if scenario:
-                        self.assertIn('brick reproduced and rejected; OTA phases skipped', log)
-                        self.assertIn('DATA_CLEANUP_CONTRACT_FAILED', log)
-                    else:
-                        self.assertIn('installed into a; b preserved as bootable rollback', log)
-                        self.assertIn('===PHASE_PROFILE_END===', log)
-                        self.assertIn('===PHASE3_END===', log)
+                    self.assertNotIn('DATA_CLEANUP_CONTRACT_FAILED', log)
+                    self.assertIn('installed into a; b preserved as bootable rollback', log)
+                    self.assertIn('===PHASE_PROFILE_END===', log)
+                    self.assertIn('===PHASE3_END===', log)
 
 
 if __name__ == '__main__':

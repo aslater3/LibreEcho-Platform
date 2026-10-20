@@ -144,7 +144,8 @@ class VendorImporterCompatTests(unittest.TestCase):
                 self.assertEqual((root / "runtime-firmware" / name).read_bytes(), payload)
             self.assertEqual((root / "runtime-firmware/WIFI_RAM_CODE").read_bytes(), payloads["WIFI_RAM_CODE_8163"])
 
-    def test_changed_enrolled_set_fails_closed(self) -> None:
+    def test_changed_enrolled_set_is_reimported_and_reenrolled(self) -> None:
+        """An owner who updates their stock ROM keeps Wi-Fi: the new set is used."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "system-a"
@@ -155,10 +156,13 @@ class VendorImporterCompatTests(unittest.TestCase):
             self.assertTrue(enrolled.exists())
 
             (layout / "WIFI_RAM_CODE_8163").write_bytes(b"changed-after-enrolment")
-            second, _, status = self.run_importer(root, source)
-            self.assertEqual(second.returncode, 2)
-            self.assertIn("VENDOR_IMPORT_ENROLLED_SET_MISMATCH", second.stderr)
-            self.assertIn("error=VENDOR_IMPORT_ENROLLED_SET_MISMATCH\n", status.read_text())
+            payloads["WIFI_RAM_CODE_8163"] = b"changed-after-enrolment"
+            shutil.rmtree(root / "runtime-firmware")  # a cold boot starts from RAM
+            shutil.rmtree(root / "run")
+            second, enrolled_again, status = self.run_importer(root, source)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertIn("verification=forced-unverified\n", status.read_text())
+            self.assertEqual(enrolled_again.read_text(), manifest_lines(payloads))
 
     def test_rows_from_different_approved_revisions_are_never_mixed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -187,7 +191,8 @@ class VendorImporterCompatTests(unittest.TestCase):
             self.assertIn("VENDOR_IMPORT_NO_HASH_PINNED_SET", result.stderr)
             self.assertIn("error=VENDOR_IMPORT_NO_HASH_PINNED_SET\n", status.read_text())
 
-    def test_safe_structurally_compatible_unknown_set_is_offerable(self) -> None:
+    def test_safe_structurally_compatible_unknown_set_is_imported(self) -> None:
+        """An uncatalogued stock revision is the owner's firmware: import it."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "system-a"
@@ -198,13 +203,12 @@ class VendorImporterCompatTests(unittest.TestCase):
             (source / "vendor/firmware").symlink_to(outside, target_is_directory=True)
             write_payloads(source, unknown_payloads())
 
-            result, _, status = self.run_importer(root, source)
-            self.assertEqual(result.returncode, 2)
-            self.assertNotIn("VENDOR_IMPORT_SOURCE_PATH_SYMLINK", result.stderr)
-            self.assertIn("VENDOR_IMPORT_UNKNOWN_COMPATIBLE_SET", result.stderr)
+            result, enrolled, status = self.run_importer(root, source)
+            self.assertEqual(result.returncode, 0, result.stderr)
             status_text = status.read_text()
-            self.assertIn("error=VENDOR_IMPORT_UNKNOWN_COMPATIBLE_SET\n", status_text)
+            self.assertIn("verification=forced-unverified\n", status_text)
             self.assertIn("source_layout=system/vendor/firmware\n", status_text)
+            self.assertTrue(enrolled.exists(), "the imported set is enrolled for later boots")
 
     def test_malformed_unknown_set_is_not_offerable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

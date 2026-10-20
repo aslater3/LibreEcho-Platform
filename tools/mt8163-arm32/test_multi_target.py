@@ -644,7 +644,10 @@ class RadarTreeDiffTests(unittest.TestCase):
             self.assertEqual(esphome_changed, {'add_ui_bundle'})
             # OTA v3 moved feature payload mounting to the generation. The
             # reviewed v3 startup contract is pinned to its exact source.
-            v3_reviewed = {'validate_ui_startup_contract': '8dd95bb9682fe8ddddc2f746a875354b76bb19af2bbefbcc2818d618ed0e18de'}
+            # The saved-SSH-switch change (activation contract and persistent
+            # host key) edits add_ssh_bundle; pin its reviewed source too.
+            v3_reviewed = {'validate_ui_startup_contract': '8dd95bb9682fe8ddddc2f746a875354b76bb19af2bbefbcc2818d618ed0e18de',
+                           'add_ssh_bundle': 'b82b051f1e05d650aa5ac9387c7f1ed46b14e0ca3db86b7b1083382b57a976c1'}
             for name, digest in v3_reviewed.items():
                 self.assertEqual(hashlib.sha256(new_functions[name].encode()).hexdigest(), digest, name)
             for name in old_functions.keys() & new_functions.keys() - {'main', 'add_overlay', 'add_ota_tools'} - v3_reviewed.keys():

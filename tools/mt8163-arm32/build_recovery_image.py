@@ -61,12 +61,12 @@ EVT_PADDED_SIZE = 0x10000
 ZIMAGE_MAGIC = 0x016F2818
 
 STOCK_EVT_SHA256 = "f44630ba28f503dd7503bc7cffa2ee96a319acf2f58f1456bb6f5ff23d57dee1"
-RECOVERY_INIT_SHA256 = "de813146c808eb3cab93977e0ec7e84108c3f60005e28021a873fe3ea20337a4"
+RECOVERY_INIT_SHA256 = "4c8f0e74eae0fe37e757d2329f9d1dc6ac3b5e1920ffab4f52df7a1c4657ed1a"
 BOOT_ENVELOPE_SHA256 = "e83e11b9ef8338cf3262144870790d2b005df16baf4d119849658943e64bbf7a"
 PROVEN_ZIMAGE_SHA256 = "4e144959eb0ffaee91b37d05a0f871863a74f4abb1bad0474c2fec358d5176a6"
 PROVEN_SYSTEM_MAP_SHA256 = "527292112edd28e8facf2998eefe2224b08a05b193efc73634cd998e9113ba95"
 CONNECTIVITY_BUNDLE_ID = "mt8163-v181-stock-v1"
-CONNECTIVITY_IMPORTER_SHA256 = "58b907e1a7840fb9135f9b16e3f95b33424255e5d3d4ecb594c5a74b3de3f907"
+CONNECTIVITY_IMPORTER_SHA256 = "a4c30c740899c889886cfc9aba9d1e8a81164d422d042e5ec85f88aef3ff6b5c"
 WPA_SUPPLICANT_VERSION = "2.10"
 WPA_SOURCE_SHA256 = "20df7ae5154b3830355f8ab4269123a87affdea59fe74fe9292a91d0d7e17b2f"
 WPA_SOURCE_URL = "https://w1.fi/releases/wpa_supplicant-2.10.tar.gz"
@@ -2284,14 +2284,14 @@ def add_ssh_bundle(stage: Path, dropbear: Path, dropbearkey: Path, scp: Path,
 
     manifest["ssh"] = {
         "enabled": True,
-        "activation": "deferred-after-webui-bootstrap",
-        "autostart": True,
+        "activation": "saved-ssh-setting-and-webui-users",
+        "autostart": False,
         "authentication": "webui-users-sha256",
         "account_source": "/data/libreecho/config/users",
         "privilege_policy": "non-root-ephemeral-users",
         "public_key_auth": False,
         "root_login": False,
-        "host_keys": "generated-ephemerally-under-/tmp/dropbear",
+        "host_keys": "persistent-/data/libreecho/config/ssh-host-ed25519-key",
         "files": files,
     }
 
@@ -3108,14 +3108,14 @@ def main() -> None:
         },
         "ssh": {
             "enabled": False,
-            "activation": "deferred-after-webui-bootstrap",
-            "autostart": True,
+            "activation": "saved-ssh-setting-and-webui-users",
+            "autostart": False,
             "authentication": "webui-users-sha256",
             "account_source": "/data/libreecho/config/users",
             "privilege_policy": "non-root-ephemeral-users",
             "public_key_auth": False,
             "root_login": False,
-            "host_keys": "generated-ephemerally-under-/tmp/dropbear",
+            "host_keys": "persistent-/data/libreecho/config/ssh-host-ed25519-key",
             "files": {},
         },
         "ui": {
