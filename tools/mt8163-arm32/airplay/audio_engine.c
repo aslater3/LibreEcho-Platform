@@ -1440,10 +1440,13 @@ static int write_period(struct pcm *pcm, const int16_t *samples,
 			struct le_aec_reference_sender *reference,
 			unsigned int activity_mask)
 {
-	if (pcm_writei(pcm, wide_output ? (const void *)wide_samples :
-				   (const void *)samples,
-		       PERIOD_SIZE) != (int)PERIOD_SIZE)
+	if (wide_output) {
+		/* 24-bit DAC words; the int16 copy still feeds the AEC tap. */
+		if (pcm_writei(pcm, wide_samples, PERIOD_SIZE) != (int)PERIOD_SIZE)
+			return -1;
+	} else if (pcm_writei(pcm, samples, PERIOD_SIZE) != (int)PERIOD_SIZE) {
 		return -1;
+	}
 	/*
 	 * Reference delivery is intentionally lossy.  A missing or slow AEC
 	 * consumer must never delay the sole owner of the speaker PCM.
