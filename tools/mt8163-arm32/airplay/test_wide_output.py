@@ -127,6 +127,9 @@ int main(int argc, char **argv)
     int fails = 0;
 
     mixlog = fopen("/dev/null", "w");
+#ifdef MUSIC_AVL_UP_RATIO
+    avl_enabled = 0; /* music levelling has its own tests */
+#endif
     if (argc > 1 && argv[1][0]) {
         load_audio_profile(argv[1], &speaker_profile);
         if (speaker_profile.biscuit_chain) biscuit_chain = &biscuit_storage;

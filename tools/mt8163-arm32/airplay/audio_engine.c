@@ -36,6 +36,7 @@
 #include "puffin_downmix.h"
 #include "speaker_dsp.h"
 #include "biscuit_speaker_dsp.h"
+#include "music_avl.h"
 
 #define DEFAULT_ROOT "/run/libreecho-audio"
 #define AIRPLAY_ACTIVE_FILE "airplay.active"
@@ -1024,6 +1025,72 @@ static unsigned int ready_activity_mask(const struct source_bus *sources)
 	return mask;
 }
 
+/*
+ * Music AVL state (music_avl.h).  The boost is measured and smoothed once per
+ * period, then ramped across the period's frames and applied to the media
+ * buses only; system, announcement and alarm audio are never levelled.
+ * avl_enabled is a build/test switch; the runtime file
+ * <bus-root>/avl.disabled turns the leveler off live (RAM, for A/B listening).
+ */
+static struct music_avl music_avl_state;
+static int avl_enabled = 1;
+static int avl_runtime_off;
+static int avl_master_percent;
+static char avl_disable_path[256];
+static float avl_gain = 1.0f;
+static int32_t avl_frame_q15 = 32768;
+
+static int media_bus_audible(const struct source_bus *sources, unsigned int source)
+{
+	return source_period_ready(&sources[source]) &&
+	       !(source == SOURCE_AIRPLAY &&
+		 sources[source].airplay_volume_missing);
+}
+
+/* Returns the linear AVL gain for the end of this period. */
+static float music_avl_period_gain(const struct source_bus *sources)
+{
+	double sum = 0.0;
+	unsigned int frames = 0;
+	size_t frame;
+	int off;
+
+	off = !avl_enabled ||
+	      (avl_disable_path[0] && access(avl_disable_path, F_OK) == 0);
+	if (off != avl_runtime_off) {
+		avl_runtime_off = off;
+		fprintf(stderr, "audio-engine: music AVL %s\n", off ? "off" : "on");
+	}
+	if (off) {
+		music_avl_init(&music_avl_state);
+		return 1.0f;
+	}
+	if (!media_bus_audible(sources, SOURCE_MEDIA) &&
+	    !media_bus_audible(sources, SOURCE_AIRPLAY))
+		return powf(10.0f, music_avl_state.gain_db / 20.0f); /* hold */
+	for (frame = 0; frame < PERIOD_SIZE; ++frame) {
+		int64_t mono = 0;
+		unsigned int source;
+
+		for (source = 0; source < SOURCE_COUNT; ++source) {
+			int32_t sample;
+
+			if ((source != SOURCE_MEDIA && source != SOURCE_AIRPLAY) ||
+			    !media_bus_audible(sources, source))
+				continue;
+			sample = ((int32_t)sources[source].samples[frame * INPUT_CHANNELS] +
+				  (int32_t)sources[source].samples[frame * INPUT_CHANNELS + 1]) / 2;
+			mono += ((int64_t)sample * sources[source].gain_q15) >> 15;
+		}
+		sum += (double)mono * (double)mono;
+		++frames;
+	}
+	return music_avl_update(&music_avl_state,
+		music_avl_level_db(sum, frames),
+		music_avl_max_gain_db(avl_master_percent),
+		(float)PERIOD_SIZE / (float)DEFAULT_RATE);
+}
+
 static int32_t mix_sources_frame(const struct source_bus *sources, size_t frame)
 {
 	int higher_priority =
@@ -1048,6 +1115,8 @@ static int32_t mix_sources_frame(const struct source_bus *sources, size_t frame)
 				frame * INPUT_CHANNELS + 1];
 		mono /= 2;
 		gain = sources[source].gain_q15;
+		if (source == SOURCE_MEDIA || source == SOURCE_AIRPLAY)
+			gain = (int32_t)(((int64_t)gain * avl_frame_q15) >> 15);
 		if ((source == SOURCE_MEDIA || source == SOURCE_AIRPLAY) && alarm_active)
 			gain = 0;
 		else if ((source == SOURCE_MEDIA || source == SOURCE_AIRPLAY) &&
@@ -1262,8 +1331,17 @@ static void render_period(struct source_bus *sources, int16_t *output,
 			  int32_t target_master_q15, int32_t *current_master_q15)
 {
 	size_t frame;
+	float avl_start = avl_gain, avl_end = music_avl_period_gain(sources);
+
+	avl_gain = avl_end;
 	for (frame = 0; frame < PERIOD_SIZE; ++frame) {
-		int32_t mixed = mix_sources_frame(sources, frame);
+		int32_t mixed;
+
+		/* Ramp the AVL boost across the period: no per-period steps. */
+		avl_frame_q15 = (int32_t)lrintf(32768.0f *
+			(avl_start + (avl_end - avl_start) *
+			 (float)(frame + 1) / (float)PERIOD_SIZE));
+		mixed = mix_sources_frame(sources, frame);
 		int16_t rendered;
 		*current_master_q15 += (target_master_q15 - *current_master_q15) /
 			(int32_t)(PERIOD_SIZE - frame);
@@ -1411,6 +1489,7 @@ static int prepare_initial_period(struct source_bus *sources, const char *root,
 
 	if (ready <= 0)
 		return ready;
+	avl_master_percent = master_volume;
 	/* The FIFO read may precede the first sender-volume callback.  Decide
 	 * whether to defer before rendering, then refresh the media gain using
 	 * that callback; an already-rendered zero-gain period cannot be fixed
@@ -1566,6 +1645,12 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		"audio-engine: ready (root=%s, input=S16_LE/48000/stereo, "
 		"output=S16_LE/48000/duplicated-stereo, PCM %u,%u)\n",
 		root, card, device);
+	if (snprintf(avl_disable_path, sizeof(avl_disable_path), "%s/avl.disabled",
+		     root) >= (int)sizeof(avl_disable_path))
+		avl_disable_path[0] = '\0';
+	music_avl_init(&music_avl_state);
+	fprintf(stderr, "audio-engine: music AVL available (disable: %s)\n",
+		avl_disable_path[0] ? avl_disable_path : "unavailable");
 
 	while (!stopping) {
 		struct pcm *pcm = NULL;
@@ -1675,6 +1760,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			sync_playback_status(sources, &status);
 			/* Read the atomic logical master each period, not codec readback. */
 			int master = logical_master_volume(root);
+			avl_master_percent = master;
 			speaker_dsp_set_volume(&speaker,
 				speaker_volume_percent(sources, master));
 			if (biscuit_chain)
