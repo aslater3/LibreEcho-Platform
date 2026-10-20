@@ -25,7 +25,9 @@ int main(void)
 	check(music_avl_static_gain_db(-60.0f, 15.0f) < 15.0f, "below the -55 dBFS gate the boost fades", music_avl_static_gain_db(-60.0f, 15.0f), 10.9);
 	check(fabsf(music_avl_static_gain_db(-120.0f, 15.0f)) < 1e-6, "silence is never lifted", music_avl_static_gain_db(-120.0f, 15.0f), 0);
 	check(fabsf(music_avl_max_gain_db(50) - 15.0f) < 1e-6, "maxGain 15 dB at mid volume", music_avl_max_gain_db(50), 15);
-	check(fabsf(music_avl_max_gain_db(80) - 13.0f) < 1e-6, "maxGain 13 dB at volume level 8+", music_avl_max_gain_db(80), 13);
+	check(fabsf(music_avl_max_gain_db(80) - 13.0f) < 1e-6, "maxGain 13 dB at volume level 8", music_avl_max_gain_db(80), 13);
+	check(fabsf(music_avl_max_gain_db(95)) < 1e-6, "no boost at volume levels 9-10", music_avl_max_gain_db(95), 0);
+	check(fabsf(music_avl_max_gain_db(10)) < 1e-6, "no boost at volume level 1", music_avl_max_gain_db(10), 0);
 	check(fabsf(music_avl_max_gain_db(0)) < 1e-6, "no boost when muted", music_avl_max_gain_db(0), 0);
 
 	/* Release (10 s): from 0 dB toward +12 dB on steady -34 dBFS. */

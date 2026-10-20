@@ -1032,6 +1032,7 @@ static unsigned int ready_activity_mask(const struct source_bus *sources)
  * avl_enabled is a build/test switch; the runtime file
  * <bus-root>/avl.disabled turns the leveler off live (RAM, for A/B listening).
  */
+static int logical_master_raw(int percent);
 static struct music_avl music_avl_state;
 static int avl_enabled = 1;
 static int avl_runtime_off;
@@ -1085,10 +1086,23 @@ static float music_avl_period_gain(const struct source_bus *sources)
 		sum += (double)mono * (double)mono;
 		++frames;
 	}
-	return music_avl_update(&music_avl_state,
-		music_avl_level_db(sum, frames),
-		music_avl_max_gain_db(avl_master_percent),
-		(float)PERIOD_SIZE / (float)DEFAULT_RATE);
+	{
+		/* Measure after the master volume, as the stock AVL does; cap the
+		 * boost at the headroom up to the volume-100 level. */
+		float master_db = avl_master_percent > 0 ?
+			((float)logical_master_raw(avl_master_percent) - 127.0f) / 2.0f :
+			MUSIC_AVL_SILENCE_DB;
+		float top_db = ((float)logical_master_raw(100) - 127.0f) / 2.0f;
+		float cap = music_avl_max_gain_db(avl_master_percent);
+
+		if (cap > top_db - master_db)
+			cap = top_db - master_db;
+		if (cap < 0.0f)
+			cap = 0.0f;
+		return music_avl_update(&music_avl_state,
+			music_avl_level_db(sum, frames) + master_db, cap,
+			(float)PERIOD_SIZE / (float)DEFAULT_RATE);
+	}
 }
 
 static int32_t mix_sources_frame(const struct source_bus *sources, size_t frame)

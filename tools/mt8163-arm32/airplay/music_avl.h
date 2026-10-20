@@ -15,11 +15,14 @@
  *   maximum gain          15 dB at volume levels 2-7, 13 dB at level 8
  *   attack / release      0.5 s / 10 s
  *
- * Levels are the RMS of the mono media programme before the master volume,
- * in dBFS.  The result is a smoothed linear gain applied to the media buses
- * only.  Upward compression stops at -10 dBFS, so the boost can raise quiet
- * material to the loudness that loud masters already have but never beyond
- * it; the multiband protection and output limiter still follow.
+ * Levels are the RMS of the mono media programme *after* the master volume,
+ * in dBFS: the stock AVL owns the volume table and lists its maximum gain per
+ * volume level, so at low and middle volume it lifts the programme toward
+ * -10 dBFS (2:1, up to 15 dB) -- stock "smart volume" -- and at the top levels
+ * it does nothing.  The result is a smoothed linear gain applied to the media
+ * buses only; the multiband protection and output limiter still follow.
+ * LibreEcho additionally never lets the boost exceed the headroom up to its
+ * own volume-100 level, so nothing plays louder than it would at full volume.
  */
 
 #include <math.h>
@@ -41,18 +44,20 @@ static inline void music_avl_init(struct music_avl *avl)
 	avl->gain_db = 0.0f;
 }
 
-/* Stock lists maxGain_music for volume levels 2..8 of 10.  Level 1 uses the
- * level-2 value; levels 9 and 10 hold the level-8 value (the stock table does
- * not list them, and the boost is bounded by -10 dBFS anyway). */
+/* Stock maxGain_music lists volume levels 2..8 of 10 (15 dB, 13 dB at 8);
+ * the unlisted levels 0-1 and 9-10 get no boost. */
 static inline float music_avl_max_gain_db(int volume_percent)
 {
-	int level = (volume_percent + 9) / 10;
+	static const float max_gain[11] = {
+		0.0f, 0.0f, 15.0f, 15.0f, 15.0f, 15.0f, 15.0f, 15.0f, 13.0f, 0.0f, 0.0f
+	};
+	int level = (volume_percent + 5) / 10;
 
 	if (volume_percent <= 0)
 		return 0.0f;
-	if (level < 1)
-		level = 1;
-	return level >= 8 ? 13.0f : 15.0f;
+	if (level > 10)
+		level = 10;
+	return max_gain[level];
 }
 
 /* Static gain for a programme level, before smoothing. */

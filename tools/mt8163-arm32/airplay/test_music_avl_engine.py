@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Music AVL through the real engine render path (audio_engine.c compiled in).
 
-A quiet media tone is lifted toward the stock curve (+12 dB static at -34
-dBFS; ~+11 dB after 25 s of the 10 s release), a loud tone and the system bus
-are untouched, the boost ramps within each period (no steps), and the runtime
-kill switch (<root>/avl.disabled) turns it off at the next period.
+Levels are measured after the master volume (stock "smart volume").  At
+volume 50 (-32 dB) a typical -12 dBFS programme is lifted toward +15 dB
+(~+13.6 dB after 25 s of the 10 s release); a -34 dBFS tone sits partly under
+the -55 dBFS gate and gets ~+5 dB; volume 95 (level 10) gets no boost; the
+system bus is untouched; the boost ramps within each period; and the runtime
+kill switch (<root>/avl.disabled) turns it off.
 """
 import subprocess, sys, tempfile
 from pathlib import Path
@@ -27,23 +29,23 @@ static double rms_db(const int16_t *o) { double s = 0; size_t i;
     return 10 * log10(s / PERIOD_SIZE / (32768.0 * 32768.0) + 1e-30); }
 
 /* Render `periods` of a 1 kHz tone at `amp` on `bus`; returns last-period dB. */
-static double run(unsigned int bus, double amp, int periods, int avl, double *max_step)
+static double run(unsigned int bus, double amp, int periods, int avl, int vol, double *max_step)
 {
     static struct source_bus sources[SOURCE_COUNT];
     static int16_t output[PERIOD_SIZE * OUTPUT_CHANNELS];
     struct puffin_dynamics dyn; struct speaker_dsp dsp;
     size_t pb = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t), i; int p; int32_t mg;
     double last = 0, prev = 0; int16_t prev_last = 0;
-    avl_enabled = avl; music_avl_init(&music_avl_state); avl_gain = 1.0f; avl_master_percent = 50;
+    avl_enabled = avl; music_avl_init(&music_avl_state); avl_gain = 1.0f; avl_master_percent = vol;
     for (i = 0; i < SOURCE_COUNT; ++i) { free(sources[i].samples); memset(&sources[i], 0, sizeof(sources[i]));
         sources[i].fd = -1; sources[i].capacity = pb * 2; sources[i].samples = calloc(1, pb * 2); sources[i].gain_q15 = 32768; }
-    puffin_dynamics_init(&dyn); speaker_dsp_init(&dsp, 50); mg = logical_master_gain(50);
+    puffin_dynamics_init(&dyn); speaker_dsp_init(&dsp, vol); mg = logical_master_gain(vol);
     *max_step = 0;
     for (p = 0; p < periods; ++p) {
         sources[bus].received = pb;
         for (i = 0; i < PERIOD_SIZE; ++i) { int16_t v = (int16_t)lrint(amp * sin(2 * M_PI * 1000.0 * (double)(p * PERIOD_SIZE + i) / 48000.0));
             sources[bus].samples[2 * i] = v; sources[bus].samples[2 * i + 1] = v; }
-        render_period(sources, output, &dyn, &dsp, logical_master_gain(50), &mg);
+        render_period(sources, output, &dyn, &dsp, logical_master_gain(vol), &mg);
         last = rms_db(output);
         if (p > 4 && fabs(last - prev) > *max_step) *max_step = fabs(last - prev);
         prev = last; (void)prev_last;
@@ -58,23 +60,28 @@ int main(int argc, char **argv)
     mixlog = fopen("/dev/null", "w");
     wide_supported = 0;
     (void)argc;
-    off = run(SOURCE_MEDIA, 32768 * 0.02818, 590, 0, &step);   /* -34 dBFS RMS mono */
-    on  = run(SOURCE_MEDIA, 32768 * 0.02818, 590, 1, &step);   /* ~25 s */
-    printf("quiet media tone: AVL off %.1f dB, on %.1f dB -> boost %+.1f dB; max period-to-period change %.2f dB\n", off, on, on - off, step);
-    if (!(on - off > 9.5 && on - off < 12.5)) { puts("FAIL: quiet media not lifted toward +12 dB"); ++fails; }
+    off = run(SOURCE_MEDIA, 32768 * 0.2512, 590, 0, 50, &step);   /* -12 dBFS RMS, ~25 s */
+    on  = run(SOURCE_MEDIA, 32768 * 0.2512, 590, 1, 50, &step);
+    printf("typical programme (-12 dBFS) at volume 50: boost %+.1f dB; max period-to-period change %.2f dB\n", on - off, step);
+    if (!(on - off > 12.5 && on - off < 14.8)) { puts("FAIL: programme not lifted toward +15 dB at volume 50"); ++fails; }
     if (!(step < 0.2)) { puts("FAIL: AVL boost changes in steps"); ++fails; }
-    loud_off = run(SOURCE_MEDIA, 32768 * 0.7079, 120, 0, &step); /* -6 dBFS RMS */
-    loud_on  = run(SOURCE_MEDIA, 32768 * 0.7079, 120, 1, &step);
-    printf("loud media tone: boost %+.2f dB\n", loud_on - loud_off);
-    if (!(fabs(loud_on - loud_off) < 0.05)) { puts("FAIL: loud media was levelled"); ++fails; }
-    sys_off = run(SOURCE_SYSTEM, 32768 * 0.02818, 300, 0, &step);
-    sys_on  = run(SOURCE_SYSTEM, 32768 * 0.02818, 300, 1, &step);
-    printf("quiet system tone: boost %+.2f dB\n", sys_on - sys_off);
+    loud_off = run(SOURCE_MEDIA, 32768 * 0.02818, 590, 0, 50, &step); /* -34 dBFS, partly gated */
+    loud_on  = run(SOURCE_MEDIA, 32768 * 0.02818, 590, 1, 50, &step);
+    printf("quiet tone (-34 dBFS) at volume 50: boost %+.1f dB (gate)\n", loud_on - loud_off);
+    if (!(loud_on - loud_off > 4.0 && loud_on - loud_off < 6.5)) { puts("FAIL: gate fade not applied"); ++fails; }
+    off = run(SOURCE_MEDIA, 32768 * 0.2512, 300, 0, 95, &step);
+    on  = run(SOURCE_MEDIA, 32768 * 0.2512, 300, 1, 95, &step);
+    printf("volume 95 (level 10): boost %+.2f dB\n", on - off);
+    if (!(fabs(on - off) < 0.05)) { puts("FAIL: boost at the top volume levels"); ++fails; }
+    sys_off = run(SOURCE_SYSTEM, 32768 * 0.2512, 300, 0, 50, &step);
+    sys_on  = run(SOURCE_SYSTEM, 32768 * 0.2512, 300, 1, 50, &step);
+    printf("system bus: boost %+.2f dB\n", sys_on - sys_off);
     if (!(fabs(sys_on - sys_off) < 0.05)) { puts("FAIL: system bus was levelled"); ++fails; }
+    off = run(SOURCE_MEDIA, 32768 * 0.2512, 590, 0, 50, &step);
     /* Kill switch: the file turns AVL off at the next period. */
     snprintf(avl_disable_path, sizeof(avl_disable_path), "%s/avl.disabled", argv[1]);
     f = fopen(avl_disable_path, "w"); fclose(f);
-    killed = run(SOURCE_MEDIA, 32768 * 0.02818, 590, 1, &step);
+    killed = run(SOURCE_MEDIA, 32768 * 0.2512, 590, 1, 50, &step);
     printf("kill switch present: boost %+.2f dB\n", killed - off);
     if (!(fabs(killed - off) < 0.05)) { puts("FAIL: avl.disabled did not turn AVL off"); ++fails; }
     remove(avl_disable_path);
@@ -95,7 +102,7 @@ def main() -> None:
         subprocess.run(["cc", "-std=c99", "-O2", "-w", "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                         "-I", str(work), "-I", str(AIRPLAY), str(src), "-lm", "-o", str(exe)], check=True, timeout=180)
         subprocess.run([str(exe), str(work)], check=True, timeout=300)
-    print("music_avl_engine: lift, loud/system untouched, smooth, kill switch PASS")
+    print("music_avl_engine: post-volume lift, gate, top-level, system bus, smooth, kill switch PASS")
 
 if __name__ == "__main__":
     main()
