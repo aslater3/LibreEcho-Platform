@@ -2330,7 +2330,15 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		consume_period(sources);
 
 		while (!stopping && sources_active(sources)) {
-			if (poll_sources(sources, 20) < 0 ||
+			/* A live Sendspin generation paces every period itself
+			 * (period_ready() is true), and the blocking PCM write
+			 * is the clock.  Waiting the 20 ms FIFO tick on top of it
+			 * would spend most of a 2048-frame period's headroom; on
+			 * the Radar the first period drained dry behind the
+			 * codec verify + unmute and the S32 ring XRUN'd.  FIFO
+			 * input is still read, just without blocking. */
+			if (poll_sources(sources,
+					 sendspin_live(&g_sendspin) ? 0 : 20) < 0 ||
 			    read_sources(sources, root) < 0) {
 				stopping = 1;
 				break;

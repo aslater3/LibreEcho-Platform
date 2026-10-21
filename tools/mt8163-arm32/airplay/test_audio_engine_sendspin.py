@@ -1205,6 +1205,7 @@ struct engine_log {
     uint32_t magic;
     uint32_t count;
     uint32_t audit_denied;
+    uint32_t rt_underruns;
     struct ev ev[EV_MAX];
 };
 
@@ -1213,6 +1214,8 @@ struct engine_log {
 static struct ev g_ev[EV_MAX];
 static int g_ev_n;
 static int g_audit_denied;
+static uint32_t g_rt_underruns;   /* real-time ring ran dry before a write */
+static int g_slow_unmute_pending; /* SCEN_RTSTART: one hardware-like mixer stall */
 static char g_root[700];
 static int g_ev_fd = -1;
 static int g_ctl_fd = -1;
@@ -1389,6 +1392,8 @@ struct pcm {
     int wide;       /* opened S32_LE: writes carry int32 (24-bit) frames */
     int rejected;   /* S32_LE refused at hw_params: never a usable stream */
     int rt_started;            /* LE_FAKE_PCM_REALTIME drain clock */
+    int rt_any_write;          /* a write has started the drain */
+    int rt_dry_checked;        /* underrun already evaluated for this write */
     struct timespec rt_start;
     uint64_t rt_written;
 };
@@ -1421,6 +1426,7 @@ struct pcm {
  * at no less than the 48 kHz hardware rate. */
 #define SCEN_THROUGHPUT 16
 #define SCEN_IDLEWAKE 17
+#define SCEN_RTSTART 18
 
 static int g_scen;
 static int g_fail_open;
@@ -1536,7 +1542,7 @@ unsigned int pcm_get_buffer_size(const struct pcm *pcm)
 static int fake_realtime(void)
 {
     static int cached = -1;
-    if (g_scen == SCEN_THROUGHPUT)
+    if (g_scen == SCEN_THROUGHPUT || g_scen == SCEN_RTSTART)
         return 1;
     if (cached < 0)
         cached = getenv("LE_FAKE_PCM_REALTIME") != NULL;
@@ -1577,6 +1583,12 @@ static void rt_block_until_room(struct pcm *pcm, unsigned int frames)
             pcm->rt_written = 0u;
         }
         queued = rt_queued(pcm, &now);
+        if (queued == 0u && pcm->rt_dry_checked == 0 && pcm->rt_any_write) {
+            /* The playhead reached the tail before this write: on hardware
+             * an XRUN (EPIPE under PCM_NORESTART). */
+            g_rt_underruns += 1u;
+        }
+        pcm->rt_dry_checked = 1;
         if (queued + frames <= pcm->buffer_frames)
             return;
         ts.tv_sec = 0;
@@ -1636,8 +1648,10 @@ int pcm_writei(struct pcm *pcm, const void *data, unsigned int frame_count)
     if (!samples)
         return -1;
     if (pcm && fake_realtime()) {
+        pcm->rt_dry_checked = 0;
         rt_block_until_room(pcm, accepted);
         pcm->rt_written += accepted;
+        pcm->rt_any_write = 1;
     }
     /* Wide frames are 24-bit MSB-aligned in int32: the top 16 bits are the
      * same programme sample the S16 path would carry. */
@@ -1740,9 +1754,22 @@ int mixer_ctl_get_value(struct mixer_ctl *ctl, unsigned int index)
     return 0;
 }
 
+/* SCEN_RTSTART: on the Radar, codec verify + unmute after the first period
+ * costs ~20-60 ms of mixer ioctls while that period already drains. */
+static void slow_unmute_stall(void)
+{
+    if (g_slow_unmute_pending && g_write_calls > 0u) {
+        struct timespec stall = { 0, 25L * 1000000L };
+
+        g_slow_unmute_pending = 0;
+        nanosleep(&stall, NULL);
+    }
+}
+
 int mixer_ctl_set_value(struct mixer_ctl *ctl, unsigned int index, int value)
 {
     int idx = (int)(intptr_t)ctl - 1;
+    slow_unmute_stall();
     logev(T_MIX_SET, (uint32_t)idx, index, (uint32_t)value, 0);
     return 0;
 }
@@ -1750,6 +1777,7 @@ int mixer_ctl_set_value(struct mixer_ctl *ctl, unsigned int index, int value)
 int mixer_ctl_set_enum_by_string(struct mixer_ctl *ctl, const char *value)
 {
     int idx = (int)(intptr_t)ctl - 1;
+    slow_unmute_stall();
     uint32_t code = 9u;
 
     if (strcmp(value, "On") == 0) code = 1u;
@@ -1776,6 +1804,7 @@ static void dump_log(const char *root, int rc)
     out->magic = LOG_MAGIC;
     out->count = (uint32_t)g_ev_n;
     out->audit_denied = (uint32_t)g_audit_denied;
+    out->rt_underruns = g_rt_underruns;
     memcpy(out->ev, g_ev, sizeof(struct ev) * (size_t)g_ev_n);
     (void)snprintf(path, sizeof(path), "%s/engine.log", root);
     fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0640);
@@ -1820,7 +1849,10 @@ static void child_main(const char *root, int scen, int ev_w, int ctl_r)
     g_written_frames = 0u;
     g_no_timing_buffer = 0;
     g_hts_fail = 0;
-    g_wide_ok = (scen == SCEN_WIDE_FINISH || scen == SCEN_WIDE_EPIPE);
+    g_wide_ok = (scen == SCEN_WIDE_FINISH || scen == SCEN_WIDE_EPIPE ||
+                 scen == SCEN_RTSTART);
+    g_rt_underruns = 0u;
+    g_slow_unmute_pending = (scen == SCEN_RTSTART);
     if (scen == SCEN_MIXFAIL)
         g_mixer_open_fail = 1;
     if (scen == SCEN_PREPFAIL)
@@ -2343,7 +2375,7 @@ static void checkf(const char *tag, const char *message, int cond)
 static const char *const g_scen_names[] = {
     "", "prime", "finish", "legacy", "epipe", "restart", "mixfail",
     "prepfail", "stop", "media", "pcmfail", "notiming", "notiminglegacy",
-    "queryfail", "widefinish", "wideepipe", "throughput", "idlewake"
+    "queryfail", "widefinish", "wideepipe", "throughput", "idlewake", "rtstart"
 };
 
 static void make_root(const char *base, const char *name, char *out,
@@ -3348,6 +3380,58 @@ static void scen_throughput(const char *base)
           "throughput: the loop reached an external /sys /dev /run /data path");
 }
 
+/* Hardware start: a 3072-frame S32 ring, 2048-frame periods, and a mixer
+ * stall (codec verify + unmute) after the first period.  A Sendspin-only
+ * session has no FIFO input, so a loop that still waits the 20 ms FIFO poll
+ * every period lets that first period drain dry: an XRUN on the Radar
+ * ("PCM write failed ... Broken pipe") that ends the generation.  The
+ * producer keeps the sink fed well ahead, as the SDK does. */
+static void scen_rtstart(const char *base)
+{
+    char root[600];
+    char sock[700];
+    pid_t pid;
+    int ev, ctl, fd;
+    uint32_t epoch = 0, status = 0, seq = 0;
+    uint64_t first = 0;
+    const uint32_t chunk = 512u;
+    double start = 0.0;
+
+    make_root(base, g_scen_names[SCEN_RTSTART], root, sizeof(root));
+    (void)snprintf(sock, sizeof(sock), "%s/sendspin.sock", root);
+    if (spawn(root, SCEN_RTSTART, &pid, &ev, &ctl) != 0) {
+        check(0, "rtstart: spawn failed");
+        return;
+    }
+    fd = connect_client(sock, 3000);
+    check(fd >= 0, "rtstart: connect failed");
+    if (fd >= 0) {
+        int ok = 1;
+
+        check(cl_open(fd, 1u, &epoch, &status) == 0 && status == 0u,
+              "rtstart: OPEN failed");
+        start = mono_seconds();
+        while (ok && mono_seconds() - start < 1.0) {
+            ok = cl_data_until_credit(fd, epoch, seq++, first, chunk) == 0;
+            first += chunk;
+        }
+        check(ok, "rtstart: the engine stopped crediting a fed generation (XRUN fence?)");
+        check(cl_finish(fd, epoch, 1u, first, seq - 1u) == 0,
+              "rtstart: FINISH send failed");
+        check(wait_event(ev, 'C', 8000) == 0,
+              "rtstart: completed generation never closed the PCM");
+        close(fd);
+    }
+    (void)finish_child(pid, ev, ctl);
+    check(load_log(root) == 0, "rtstart: engine log missing");
+    if (g_log.rt_underruns)
+        fprintf(stderr, "rtstart: %u underrun(s)\n", (unsigned)g_log.rt_underruns);
+    check(g_log.rt_underruns == 0u,
+          "rtstart: a fed Sendspin session let the S32 ring run dry after start");
+    check(g_log.audit_denied == 0u,
+          "rtstart: the loop reached an external /sys /dev /run /data path");
+}
+
 /* An idle engine must answer the companion promptly: its control ops are
  * bounded at a few tens of ms.  Polling only the source FIFOs leaves a
  * request waiting for the next 20 ms tick; the idle wait must also wake on
@@ -3440,6 +3524,7 @@ static const struct loop_scenario g_loop_scenarios[] = {
     { "wideepipe", scen_wide_epipe },
     { "throughput", scen_throughput },
     { "idlewake", scen_idlewake },
+    { "rtstart", scen_rtstart },
 };
 
 int main(int argc, char **argv)
