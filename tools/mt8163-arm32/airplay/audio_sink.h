@@ -106,6 +106,13 @@ void le_audio_sink_destroy(struct le_audio_sink *sink);
  */
 int le_audio_sink_service(struct le_audio_sink *sink);
 
+/*
+ * The connected peer's socket, for poll(2) readiness only (never read or
+ * write it directly; le_audio_sink_service() owns the I/O).  Returns -1 when
+ * the sink is NULL or no peer is connected.
+ */
+int le_audio_sink_peer_fd(const struct le_audio_sink *sink);
+
 /* The engine epoch, constant for the lifetime of this sink instance. */
 uint32_t le_audio_sink_epoch(const struct le_audio_sink *sink);
 

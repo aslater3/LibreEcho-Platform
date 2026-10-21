@@ -894,6 +894,11 @@ int le_audio_sink_service(struct le_audio_sink *sink)
     return serviced;
 }
 
+int le_audio_sink_peer_fd(const struct le_audio_sink *sink)
+{
+    return sink ? sink->client_fd : -1;
+}
+
 uint32_t le_audio_sink_epoch(const struct le_audio_sink *sink)
 {
     return sink ? sink->epoch : 0u;
