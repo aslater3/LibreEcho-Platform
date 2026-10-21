@@ -1420,6 +1420,7 @@ struct pcm {
  * companion's shape: one DATA, then wait for its CREDIT -- must be credited
  * at no less than the 48 kHz hardware rate. */
 #define SCEN_THROUGHPUT 16
+#define SCEN_IDLEWAKE 17
 
 static int g_scen;
 static int g_fail_open;
@@ -2342,7 +2343,7 @@ static void checkf(const char *tag, const char *message, int cond)
 static const char *const g_scen_names[] = {
     "", "prime", "finish", "legacy", "epipe", "restart", "mixfail",
     "prepfail", "stop", "media", "pcmfail", "notiming", "notiminglegacy",
-    "queryfail", "widefinish", "wideepipe", "throughput"
+    "queryfail", "widefinish", "wideepipe", "throughput", "idlewake"
 };
 
 static void make_root(const char *base, const char *name, char *out,
@@ -2611,9 +2612,15 @@ static void scen_xrun(const char *base, int scen, char ctl_cmd, const char *tag)
             uint8_t p2[64];
             uint32_t p2len = 0;
             if (cl_progress(fd, epoch2, 2u, p2, &p2len) == 0 &&
-                p2len == LE_AUDIO_SINK_PROGRESS_PAYLOAD_BYTES)
+                p2len == LE_AUDIO_SINK_PROGRESS_PAYLOAD_BYTES) {
+                const unsigned long long sub = (unsigned long long)
+                    le_audio_sink_get_u64(p2 + 16);
+                if (sub != PERIOD_SIZE)
+                    fprintf(stderr, "%s: recovery generation submitted %llu frames, want %u\n",
+                            tag, sub, (unsigned)PERIOD_SIZE);
                 checkf(tag, "recovery replayed predecessor frames into the new generation",
-                       le_audio_sink_get_u64(p2 + 16) == PERIOD_SIZE);
+                       sub == PERIOD_SIZE);
+            }
         }
         close(fd);
     }
@@ -3341,6 +3348,65 @@ static void scen_throughput(const char *base)
           "throughput: the loop reached an external /sys /dev /run /data path");
 }
 
+/* An idle engine must answer the companion promptly: its control ops are
+ * bounded at a few tens of ms.  Polling only the source FIFOs leaves a
+ * request waiting for the next 20 ms tick; the idle wait must also wake on
+ * Sendspin socket activity.  PROGRESS_REQ for no generation draws an ERROR
+ * without starting the PCM, so every sample is an idle round trip. */
+static void scen_idlewake(const char *base)
+{
+    char root[600];
+    char sock[700];
+    pid_t pid;
+    int ev, ctl, fd, i;
+    double worst = 0.0, total = 0.0;
+    const int samples = 16;
+
+    make_root(base, g_scen_names[SCEN_IDLEWAKE], root, sizeof(root));
+    (void)snprintf(sock, sizeof(sock), "%s/sendspin.sock", root);
+    if (spawn(root, SCEN_IDLEWAKE, &pid, &ev, &ctl) != 0) {
+        check(0, "idlewake: spawn failed");
+        return;
+    }
+    fd = connect_client(sock, 3000);
+    check(fd >= 0, "idlewake: connect failed");
+    if (fd >= 0) {
+        int ok = 1;
+
+        for (i = 0; ok && i < samples; ++i) {
+            uint8_t p[LE_AUDIO_SINK_PROGRESS_REQ_PAYLOAD_BYTES];
+            uint8_t t = 0;
+            uint8_t r[64];
+            uint32_t rl = 0;
+            double t0, dt;
+
+            /* Spread requests across the engine's 20 ms poll phase. */
+            usleep(7000u + (unsigned)i * 1300u);
+            memset(p, 0, sizeof(p));
+            t0 = mono_seconds();
+            ok = send_datagram(fd, LE_AUDIO_SINK_TYPE_PROGRESS_REQ, p,
+                               sizeof(p)) == 0 &&
+                 recv_datagram(fd, &t, r, &rl) == 0;
+            dt = mono_seconds() - t0;
+            total += dt;
+            if (dt > worst)
+                worst = dt;
+        }
+        check(ok, "idlewake: an idle control request got no reply");
+        if (ok) {
+            fprintf(stderr, "idlewake: idle round trip mean %.2f ms worst %.2f ms\n",
+                    total * 1000.0 / samples, worst * 1000.0);
+            check(worst < 0.008,
+                  "idlewake: idle engine answered the companion on its poll tick, not on socket activity");
+        }
+        close(fd);
+    }
+    (void)finish_child(pid, ev, ctl);
+    check(load_log(root) == 0, "idlewake: engine log missing");
+    check(g_log.audit_denied == 0u,
+          "idlewake: the loop reached an external /sys /dev /run /data path");
+}
+
 static void scen_wide_epipe(const char *base)
 {
     scen_xrun(base, SCEN_WIDE_EPIPE, 'F', "wideepipe");
@@ -3373,6 +3439,7 @@ static const struct loop_scenario g_loop_scenarios[] = {
     { "widefinish", scen_wide_finish },
     { "wideepipe", scen_wide_epipe },
     { "throughput", scen_throughput },
+    { "idlewake", scen_idlewake },
 };
 
 int main(int argc, char **argv)
