@@ -1179,10 +1179,20 @@ static void close_sources(struct source_bus *sources)
 	}
 }
 
-static int poll_sources(struct source_bus *sources, int timeout_ms)
+/*
+ * Wait for source input.  With wake_sink, also wake on Sendspin socket
+ * activity (a new connection or a control/DATA datagram) so an idle engine
+ * answers the companion within milliseconds instead of the next 20 ms poll
+ * tick; the companion's control ops are bounded at a few tens of ms.  Only
+ * the idle wait uses it: inside playback a datagram must not cut the FIFO
+ * wait short, because a missing period there ends the session.
+ */
+static int poll_sources_ex(struct source_bus *sources, int timeout_ms,
+			   int wake_sink)
 {
-	struct pollfd pollfds[SOURCE_COUNT];
+	struct pollfd pollfds[SOURCE_COUNT + 2];
 	unsigned int i;
+	nfds_t count = SOURCE_COUNT;
 	int result;
 
 	for (i = 0; i < SOURCE_COUNT; ++i) {
@@ -1190,10 +1200,29 @@ static int poll_sources(struct source_bus *sources, int timeout_ms)
 		pollfds[i].events = POLLIN;
 		pollfds[i].revents = 0;
 	}
+	if (wake_sink && g_sendspin.sink) {
+		int fds[2];
+
+		fds[0] = le_audio_sink_listen_fd(g_sendspin.sink);
+		fds[1] = le_audio_sink_peer_fd(g_sendspin.sink);
+		for (i = 0; i < 2; ++i) {
+			if (fds[i] < 0)
+				continue;
+			pollfds[count].fd = fds[i];
+			pollfds[count].events = POLLIN;
+			pollfds[count].revents = 0;
+			count += 1;
+		}
+	}
 	do {
-		result = poll(pollfds, SOURCE_COUNT, timeout_ms);
+		result = poll(pollfds, count, timeout_ms);
 	} while (result < 0 && errno == EINTR && !stopping);
 	return result;
+}
+
+static int poll_sources(struct source_bus *sources, int timeout_ms)
+{
+	return poll_sources_ex(sources, timeout_ms, 0);
 }
 
 /* The dedicated AirPlay FIFO is never reclassified as generic media. */
@@ -2180,7 +2209,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		int ready;
 		int poll_timeout = 20; /* service resets even when all buses are idle */
 
-		if (poll_sources(sources, poll_timeout) < 0)
+		if (poll_sources_ex(sources, poll_timeout, 1) < 0)
 			break;
 		if (stopping)
 			break;

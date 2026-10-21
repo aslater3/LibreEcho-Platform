@@ -113,6 +113,9 @@ int le_audio_sink_service(struct le_audio_sink *sink);
  */
 int le_audio_sink_peer_fd(const struct le_audio_sink *sink);
 
+/* The listening socket (-1 when absent), for readiness polling only. */
+int le_audio_sink_listen_fd(const struct le_audio_sink *sink);
+
 /* The engine epoch, constant for the lifetime of this sink instance. */
 uint32_t le_audio_sink_epoch(const struct le_audio_sink *sink);
 
