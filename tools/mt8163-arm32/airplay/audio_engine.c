@@ -111,6 +111,70 @@ static void sendspin_service(struct sendspin_state *sp)
 }
 
 /*
+ * Bound for sendspin_service_until_writable(): each slice either services a
+ * readable peer datagram or waits out the remaining PCM fill time, so this
+ * caps a flooding peer at a fixed amount of work per period.
+ */
+#define SENDSPIN_WAIT_SLICES 64
+
+/*
+ * Keep servicing the Sendspin sink until the PCM has room for one period.
+ *
+ * The companion is stop-and-wait: it sends one DATA and waits for its CREDIT
+ * before the next.  Serviced once per period, the sink therefore admits at
+ * most one SDK write (256-960 frames in practice, never more than one
+ * period) per 2048-frame period -- below real time, so the SDK starves
+ * and drops late chunks.  Servicing while the hardware drains turns each
+ * DATA round trip into socket latency instead of a period.  pcm_writei()
+ * then finds room and does not block; the PCM still paces the loop.
+ * Called between staging and the write: a DATA serviced here only queues
+ * for the next period, and a generation change here is fenced by the
+ * sink's stale-generation commit rejection.
+ *
+ * Only with a timing model: that is what established that the PCM's
+ * hardware pointer is trustworthy.  Without one -- or with no peer, or a
+ * failed query -- pacing is left to pcm_writei() exactly as before.  The
+ * total wait is bounded by one period of wall time regardless of what the
+ * PCM reports, so a ring that never drains cannot stall the loop.
+ */
+static void sendspin_service_until_writable(struct sendspin_state *sp,
+                                            struct pcm *pcm)
+{
+	struct timespec start, now;
+	const long budget_ms = (long)((PERIOD_SIZE * 1000U + DEFAULT_RATE - 1U) /
+				      DEFAULT_RATE);
+	int slice;
+
+	if (!sp->sink || !sp->timing || !pcm ||
+	    clock_gettime(CLOCK_MONOTONIC, &start) != 0)
+		return;
+	for (slice = 0; slice < SENDSPIN_WAIT_SLICES; ++slice) {
+		struct pollfd peer;
+		struct timespec stamp;
+		unsigned int avail = 0;
+		int fd = le_audio_sink_peer_fd(sp->sink);
+		long elapsed_ms, wait_ms;
+
+		if (fd < 0 || pcm_get_htimestamp(pcm, &avail, &stamp) != 0 ||
+		    avail >= PERIOD_SIZE || clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+			return;
+		elapsed_ms = (long)(now.tv_sec - start.tv_sec) * 1000L +
+			     (now.tv_nsec - start.tv_nsec) / 1000000L;
+		if (elapsed_ms >= budget_ms)
+			return;
+		wait_ms = (long)(((PERIOD_SIZE - avail) * 1000U + DEFAULT_RATE - 1U) /
+				 DEFAULT_RATE);
+		if (wait_ms > budget_ms - elapsed_ms)
+			wait_ms = budget_ms - elapsed_ms;
+		peer.fd = fd;
+		peer.events = POLLIN;
+		peer.revents = 0;
+		if (poll(&peer, 1, (int)wait_ms) > 0)
+			sendspin_service(sp);
+	}
+}
+
+/*
  * Refresh the live (epoch, generation) identity from the sink.  A fresh
  * generation (or engine epoch) fences the timing model, so no predecessor
  * progress can be re-attributed and timing stays invalid until re-verified.
@@ -2261,6 +2325,12 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				      g_sendspin.stage_frames, output,
 				      &dynamics, &speaker,
 				      logical_master_gain(master), &master_gain);
+			/* Admit SDK audio for the next period while the
+			 * hardware drains.  After rendering, so render time
+			 * stays hidden behind the queued audio exactly as when
+			 * pcm_writei() blocked; the S32 ring holds only 1024
+			 * frames once a 2048-frame period fits. */
+			sendspin_service_until_writable(&g_sendspin, pcm);
 			if (g_sendspin.have_generation)
 				wrote = sendspin_write_and_account(
 					&g_sendspin, pcm, output, PERIOD_SIZE,

@@ -1388,6 +1388,9 @@ struct pcm {
     int ready;
     int wide;       /* opened S32_LE: writes carry int32 (24-bit) frames */
     int rejected;   /* S32_LE refused at hw_params: never a usable stream */
+    int rt_started;            /* LE_FAKE_PCM_REALTIME drain clock */
+    struct timespec rt_start;
+    uint64_t rt_written;
 };
 
 /* Scenario fault scripts (set in the child before run_engine). */
@@ -1413,6 +1416,10 @@ struct pcm {
  * runs with S32_LE refused, i.e. through the engine's S16 fallback. */
 #define SCEN_WIDE_FINISH 14
 #define SCEN_WIDE_EPIPE 15
+/* Real-time ring (see fake_realtime()): a stop-and-wait producer -- the
+ * companion's shape: one DATA, then wait for its CREDIT -- must be credited
+ * at no less than the 48 kHz hardware rate. */
+#define SCEN_THROUGHPUT 16
 
 static int g_scen;
 static int g_fail_open;
@@ -1518,6 +1525,66 @@ unsigned int pcm_get_buffer_size(const struct pcm *pcm)
     return pcm ? pcm->buffer_frames : 0u;
 }
 
+/*
+ * Opt-in real-time drain (LE_FAKE_PCM_REALTIME): the ring drains at 48 kHz
+ * from the first write and pcm_writei() blocks until the frames fit, as a
+ * real blocking PCM does.  The deterministic scenarios keep the default
+ * instant-drain model; the SDK throughput lane needs hardware pacing, since
+ * an instantly-draining fake hides any per-period sink-service ceiling.
+ */
+static int fake_realtime(void)
+{
+    static int cached = -1;
+    if (g_scen == SCEN_THROUGHPUT)
+        return 1;
+    if (cached < 0)
+        cached = getenv("LE_FAKE_PCM_REALTIME") != NULL;
+    return cached;
+}
+
+static unsigned int rt_queued(struct pcm *pcm, const struct timespec *now)
+{
+    int64_t elapsed_ns, drained;
+    uint64_t written = pcm->rt_written;
+
+    if (!pcm->rt_started)
+        return 0u;
+    elapsed_ns = (int64_t)(now->tv_sec - pcm->rt_start.tv_sec) * 1000000000LL +
+                 (now->tv_nsec - pcm->rt_start.tv_nsec);
+    drained = elapsed_ns > 0 ? elapsed_ns * 48 / 1000000 : 0;
+    if ((uint64_t)drained >= written) {
+        /* Underrun: the playhead stops at the tail; restart the drain clock
+         * there so the next write is not credited with idle time. */
+        pcm->rt_start = *now;
+        pcm->rt_written = 0u;
+        return 0u;
+    }
+    return (unsigned int)(written - (uint64_t)drained);
+}
+
+static void rt_block_until_room(struct pcm *pcm, unsigned int frames)
+{
+    for (;;) {
+        struct timespec now, ts;
+        unsigned int queued;
+
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+            return;
+        if (!pcm->rt_started) {
+            pcm->rt_started = 1;
+            pcm->rt_start = now;
+            pcm->rt_written = 0u;
+        }
+        queued = rt_queued(pcm, &now);
+        if (queued + frames <= pcm->buffer_frames)
+            return;
+        ts.tv_sec = 0;
+        ts.tv_nsec = (long)((queued + frames - pcm->buffer_frames) *
+                            1000000000ULL / 48000ULL) + 100000L;
+        nanosleep(&ts, NULL);
+    }
+}
+
 int pcm_get_htimestamp(struct pcm *pcm, unsigned int *avail,
                        struct timespec *timestamp)
 {
@@ -1528,11 +1595,15 @@ int pcm_get_htimestamp(struct pcm *pcm, unsigned int *avail,
         errno = EIO;             /* persistent query failure: no timestamp */
         return -1;
     }
+    if (clock_gettime(CLOCK_MONOTONIC, timestamp) != 0)
+        return -1;
+    if (pcm && fake_realtime()) {
+        *avail = pcm->buffer_frames - rt_queued(pcm, timestamp);
+        return 0;
+    }
     /* Deterministic fully-drained ring: nothing left in flight, so the
      * physical playhead equals the accepted-frame counter. */
     *avail = pcm ? pcm->buffer_frames : 0u;
-    if (clock_gettime(CLOCK_MONOTONIC, timestamp) != 0)
-        return -1;
     return 0;
 }
 
@@ -1563,6 +1634,10 @@ int pcm_writei(struct pcm *pcm, const void *data, unsigned int frame_count)
 
     if (!samples)
         return -1;
+    if (pcm && fake_realtime()) {
+        rt_block_until_room(pcm, accepted);
+        pcm->rt_written += accepted;
+    }
     /* Wide frames are 24-bit MSB-aligned in int32: the top 16 bits are the
      * same programme sample the S16 path would carry. */
 #define FAKE_SAMPLE(k) (pcm && pcm->wide ? \
@@ -2267,7 +2342,7 @@ static void checkf(const char *tag, const char *message, int cond)
 static const char *const g_scen_names[] = {
     "", "prime", "finish", "legacy", "epipe", "restart", "mixfail",
     "prepfail", "stop", "media", "pcmfail", "notiming", "notiminglegacy",
-    "queryfail", "widefinish", "wideepipe"
+    "queryfail", "widefinish", "wideepipe", "throughput"
 };
 
 static void make_root(const char *base, const char *name, char *out,
@@ -3168,6 +3243,104 @@ static void scen_wide_finish(const char *base)
 /* Scenario 15: an XRUN after a partial 24-bit write accounts only the
  * accepted prefix, fences the generation, and a higher OPEN recovers on a
  * reopened S32_LE PCM with no replay. */
+static double mono_seconds(void)
+{
+    struct timespec t;
+    (void)clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+
+/* One stop-and-wait DATA as the companion sends it: a CAPACITY refusal
+ * accepts nothing and the same sequence is offered again once there is room;
+ * CREDIT is the only acceptance. */
+static int cl_data_until_credit(int fd, uint32_t epoch, uint32_t seq,
+                                uint64_t first, uint32_t frames)
+{
+    int tries;
+
+    for (tries = 0; tries < 5000; ++tries) {
+        uint8_t t;
+        uint8_t tmp[64];
+        uint32_t tl = 0;
+
+        if (cl_data(fd, epoch, 1u, seq, first, frames, 1000, 0) != 0 ||
+            recv_datagram(fd, &t, tmp, &tl) != 0)
+            return -1;
+        if (t == LE_AUDIO_SINK_TYPE_CREDIT)
+            return 0;
+        if (t != LE_AUDIO_SINK_TYPE_ERROR || tl < 4u ||
+            (g_last_error = le_audio_sink_get_u32(tmp + 0)) !=
+                LE_AUDIO_SINK_ERR_CAPACITY)
+            return -1;
+        {
+            struct timespec pause = {0, 1000000L};
+            nanosleep(&pause, NULL);
+        }
+    }
+    return -1;
+}
+
+static void scen_throughput(const char *base)
+{
+    char root[600];
+    char sock[700];
+    pid_t pid;
+    int ev, ctl, fd;
+    uint32_t epoch = 0, status = 0, seq = 0;
+    uint64_t first = 0;
+    const uint32_t chunk = 512u;     /* a typical SDK write, < one period */
+    double start = 0.0, elapsed = 0.0;
+
+    make_root(base, g_scen_names[SCEN_THROUGHPUT], root, sizeof(root));
+    (void)snprintf(sock, sizeof(sock), "%s/sendspin.sock", root);
+    if (spawn(root, SCEN_THROUGHPUT, &pid, &ev, &ctl) != 0) {
+        check(0, "throughput: spawn failed");
+        return;
+    }
+    fd = connect_client(sock, 3000);
+    check(fd >= 0, "throughput: connect failed");
+    if (fd >= 0) {
+        int ok = 1;
+
+        check(cl_open(fd, 1u, &epoch, &status) == 0 && status == 0u,
+              "throughput: OPEN failed");
+        /* Fill the startup ring and queue first; then measure steady state. */
+        while (ok && first < 4u * PERIOD_SIZE) {
+            ok = cl_data_until_credit(fd, epoch, seq++, first, chunk) == 0;
+            first += chunk;
+        }
+        start = mono_seconds();
+        while (ok && (elapsed = mono_seconds() - start) < 1.5) {
+            ok = cl_data_until_credit(fd, epoch, seq++, first, chunk) == 0;
+            first += chunk;
+        }
+        if (!ok)
+            fprintf(stderr, "throughput: DATA seq %u (first %llu) failed, last error %u\n",
+                    (unsigned)(seq - 1u), (unsigned long long)(first - chunk),
+                    (unsigned)g_last_error);
+        check(ok, "throughput: a stop-and-wait DATA was not credited");
+        if (ok) {
+            const double rate = (double)(first - 4u * PERIOD_SIZE) / elapsed;
+            fprintf(stderr, "throughput: stop-and-wait credit rate %.0f frames/s\n",
+                    rate);
+            /* Serviced only once per 2048-frame period, the sink admits one
+             * 512-frame write per period: ~12 kframes/s, which starves the
+             * SDK.  Real time is 48 kframes/s. */
+            check(rate >= 0.9 * DEFAULT_RATE,
+                  "throughput: a stop-and-wait producer was credited below real time");
+        }
+        check(cl_finish(fd, epoch, 1u, first, seq - 1u) == 0,
+              "throughput: FINISH send failed");
+        check(wait_event(ev, 'C', 8000) == 0,
+              "throughput: completed generation never closed the PCM");
+        close(fd);
+    }
+    (void)finish_child(pid, ev, ctl);
+    check(load_log(root) == 0, "throughput: engine log missing");
+    check(g_log.audit_denied == 0u,
+          "throughput: the loop reached an external /sys /dev /run /data path");
+}
+
 static void scen_wide_epipe(const char *base)
 {
     scen_xrun(base, SCEN_WIDE_EPIPE, 'F', "wideepipe");
@@ -3199,6 +3372,7 @@ static const struct loop_scenario g_loop_scenarios[] = {
     { "queryfail", scen_queryfail },
     { "widefinish", scen_wide_finish },
     { "wideepipe", scen_wide_epipe },
+    { "throughput", scen_throughput },
 };
 
 int main(int argc, char **argv)
