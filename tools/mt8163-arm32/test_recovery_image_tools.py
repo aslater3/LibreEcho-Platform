@@ -4300,17 +4300,22 @@ start_feature_service_if_enabled
         self.assertIn(expected, source)
         self.assertIn("RELEASE_MIRROR=https://dl.libreecho.org\n", fetcher)
         self.assertIn(
-            "RELEASE_GITHUB=https://github.com/LibreEcho/LibreEcho/releases\n", fetcher,
+            "RELEASE_GITHUB=https://github.com/aslater3/LibreEcho/releases\n", fetcher,
         )
         self.assertIn(
             'url="$RELEASE_BASE/latest/download/libreecho-$TARGET_SLUG-$channel.ota.tar"',
             fetcher,
         )
         self.assertNotIn("LibreEcho-Platform/releases", source + fetcher)
-        # The transport must not be bound to a personal account: a repository
-        # transfer would otherwise depend on GitHub's redirect forever.
+        # The fallback names the repository releases are published from today.
+        # It used to name the planned organisation home, which 404s until the
+        # repository moves (#259). GitHub redirects release URLs after a
+        # transfer, so this keeps working then, and the generation tool also
+        # accepts the organisation URL so a later fetcher can switch to it.
         generation = (TOOLS_DIR / "initramfs/libreecho-generation").read_text()
-        self.assertNotIn("aslater3", source + fetcher + generation)
+        self.assertNotIn("github.com/LibreEcho/LibreEcho/releases\n", fetcher)
+        self.assertIn("https://github.com/aslater3/LibreEcho/releases|"
+                      "https://github.com/LibreEcho/LibreEcho/releases)", generation)
 
     def test_ota_channel_persistence_selection_and_cleanup_contract(self) -> None:
         fetcher = (TOOLS_DIR / "initramfs/libreecho-update-fetch").read_text()
