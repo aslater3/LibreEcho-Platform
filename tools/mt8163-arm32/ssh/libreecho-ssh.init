@@ -76,20 +76,23 @@ users_file_ready()
     ' "$USERS_FILE"
 }
 
+# SSH is on by default (owner decision, #24). Only a trusted saved configuration
+# (root-owned, 0600, at most 64 KiB) holding exactly one "ssh" key set to false
+# turns it off; a missing, untrusted or ambiguous file keeps the default.
 ssh_config_enabled()
 {
-    [ -f "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ] || return 1
-    [ "$($BB stat -c %u "$CONFIG_FILE" 2>/dev/null)" = 0 ] || return 1
-    [ "$($BB stat -c %a "$CONFIG_FILE" 2>/dev/null)" = 600 ] || return 1
-    size=$($BB stat -c %s "$CONFIG_FILE" 2>/dev/null) || return 1
-    [ "$size" -le 65536 ] || return 1
+    [ -f "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ] || return 0
+    [ "$($BB stat -c %u "$CONFIG_FILE" 2>/dev/null)" = 0 ] || return 0
+    [ "$($BB stat -c %a "$CONFIG_FILE" 2>/dev/null)" = 600 ] || return 0
+    size=$($BB stat -c %s "$CONFIG_FILE" 2>/dev/null) || return 0
+    [ "$size" -le 65536 ] || return 0
     $BB awk '
         { text = text $0 }
         END {
             count = gsub(/"ssh"[[:space:]]*:/, "&", text)
-            if (count != 1) exit 1
-            if (text ~ /"ssh"[[:space:]]*:[[:space:]]*true/) exit 0
-            exit 1
+            if (count != 1) exit 0
+            if (text ~ /"ssh"[[:space:]]*:[[:space:]]*false/) exit 1
+            exit 0
         }
     ' "$CONFIG_FILE"
 }
