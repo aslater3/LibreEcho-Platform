@@ -8,11 +8,14 @@ CURL=${CURL:-/usr/bin/curl}
 CA=${CA:-/etc/ssl/certs/ca-certificates.crt}
 SPACE_RESERVE_BYTES=${SPACE_RESERVE_BYTES:-262144}
 # Feature asset transport chosen by libreecho-update-fetch. Only the two
-# project transports are accepted; anything else falls back to GitHub. Every
+# project transports are accepted (the mirror, the GitHub repository releases
+# are published from, and its planned organisation home); anything else falls
+# back to GitHub. Every
 # asset is still size- and hash-checked against the signed manifest.
 case "${RELEASE_BASE:-}" in
-    https://dl.libreecho.org|https://github.com/LibreEcho/LibreEcho/releases) release_base=$RELEASE_BASE ;;
-    *) release_base=https://github.com/LibreEcho/LibreEcho/releases ;;
+    https://dl.libreecho.org|https://github.com/aslater3/LibreEcho/releases|https://github.com/LibreEcho/LibreEcho/releases)
+        release_base=$RELEASE_BASE ;;
+    *) release_base=https://github.com/aslater3/LibreEcho/releases ;;
 esac
 fail() {
     printf 'ERROR:%s\n' "$1" >&2

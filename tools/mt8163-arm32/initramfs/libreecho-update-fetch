@@ -37,11 +37,13 @@ CURL_HEADERS=/run/libreecho/ota-curl.headers
 CURL_DIAGNOSTIC_MAX=160
 # Release transport. The project-owned download domain is tried first so that a
 # repository or account move never strands installed devices; GitHub Releases
-# is the direct fallback when the domain is unreachable. Both are untrusted
+# is the direct fallback when the domain is unreachable. The fallback names
+# the repository where releases are published today; GitHub redirects it if the
+# repository moves to the LibreEcho organisation. Both are untrusted
 # transport: the control package is signature-checked and every feature asset
 # is size- and hash-pinned by the signed manifest before use.
 RELEASE_MIRROR=https://dl.libreecho.org
-RELEASE_GITHUB=https://github.com/LibreEcho/LibreEcho/releases
+RELEASE_GITHUB=https://github.com/aslater3/LibreEcho/releases
 RELEASE_BASE=$RELEASE_GITHUB
 DATA_ROOT=/data
 PROC_ROOT=/proc
