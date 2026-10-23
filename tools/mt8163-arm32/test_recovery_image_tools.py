@@ -274,6 +274,7 @@ class SourceTests(unittest.TestCase):
         normalized = source.casefold()
         for required in (
             "libreecho-platform",
+            "github.com/aslater3/libreecho-linux)",
             "libreecho-linux-6.1",
             "libreecho-ui",
             "libreecho-build",

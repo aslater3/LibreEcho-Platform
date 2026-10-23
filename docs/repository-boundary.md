@@ -8,7 +8,7 @@ Its historical Linux 3.18 tree remains for compatibility and is not the current
 kernel source of truth.
 
 The current kernel line is maintained separately in
-[`LibreEcho-Linux-6.1`](https://github.com/aslater3/LibreEcho-Linux-6.1). Kernel,
+[`LibreEcho-Linux`](https://github.com/aslater3/LibreEcho-Linux). Kernel,
 device-tree, and driver changes belong there. Public `main` is the clean
 development source line; complete hardware-validated image identities are
 pinned separately by private release provenance. Follow-up fixes remain on
