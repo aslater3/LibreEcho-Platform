@@ -29,7 +29,7 @@ The current ownership map is:
 | Area | Repository | Scope |
 | --- | --- | --- |
 | Platform tooling and ARM32 image contracts | `LibreEcho-Platform` | This repository: initramfs, payload packaging, OTA, recovery tooling |
-| Current kernel and device tree | [`LibreEcho-Linux-6.1`](https://github.com/aslater3/LibreEcho-Linux-6.1) | Linux 6.1 drivers, DT/DTS, kernel configuration, and kernel provenance |
+| Current kernel and device tree | [`LibreEcho-Linux`](https://github.com/aslater3/LibreEcho-Linux) | Linux 6.1 on upstream stable history: drivers, DT/DTS, kernel configuration, and kernel provenance. Replaces the archived [`LibreEcho-Linux-6.1`](https://github.com/aslater3/LibreEcho-Linux-6.1), the kernel source for releases up to 0.14.4 |
 | UI and service daemons | [`LibreEcho-UI`](https://github.com/aslater3/LibreEcho-UI) | Web UI, APIs, product daemons, and UI-side runtime behavior |
 | Product coordination and release documentation | [`LibreEcho`](https://github.com/aslater3/LibreEcho) | Product status, release notes, public issue tracking, and cross-repository policy |
 | Public installation and operator documentation | [`LibreEcho-Docs`](https://github.com/aslater3/LibreEcho-Docs) | Installation, recovery, supported hardware, privacy, and release guidance |
@@ -38,7 +38,7 @@ The current ownership map is:
 The current Linux ownership boundary is **Linux 6.1**. The historical Linux 3.18
 source retained in this repository is compatibility material only; it is not the
 source of truth for current kernel, device-tree, or driver changes. Kernel fixes
-belong in `LibreEcho-Linux-6.1`, while initramfs and product-tooling fixes belong
+belong in `LibreEcho-Linux`, while initramfs and product-tooling fixes belong
 here.
 
 ## Supported target and non-goals
@@ -148,7 +148,7 @@ firmware, private filesystem paths, or unpublished release artifacts.
 
 - Platform tooling, initramfs, OTA, and recovery contracts: file the issue here.
 - Kernel, DT/DTS, driver, and kernel-config behavior: use
-  [`LibreEcho-Linux-6.1`](https://github.com/aslater3/LibreEcho-Linux-6.1).
+  [`LibreEcho-Linux`](https://github.com/aslater3/LibreEcho-Linux).
 - UI, API, and service-daemon behavior: use
   [`LibreEcho-UI`](https://github.com/aslater3/LibreEcho-UI).
 - Product release gates and cross-repository policy: use

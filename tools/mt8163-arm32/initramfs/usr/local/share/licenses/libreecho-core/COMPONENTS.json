@@ -3,7 +3,7 @@
     {
       "id": "linux-6.1",
       "license": "GPL-2.0-only",
-      "source": "https://github.com/aslater3/LibreEcho-Linux-6.1",
+      "source": "https://github.com/aslater3/LibreEcho-Linux",
       "version": "source-commit-in-image-manifest"
     },
     {
