@@ -9,7 +9,7 @@ recorded in `COMPONENTS.json`, the image manifest, and the release SPDX SBOM.
 ## Core operating system
 
 - **Linux 6.1 and MT8163 product drivers** — GPL-2.0-only. Exact corresponding
-  source: https://github.com/aslater3/LibreEcho-Linux-6.1
+  source: https://github.com/aslater3/LibreEcho-Linux
 - **LibreEcho Platform/initramfs tooling** — GPL-2.0-only. Exact corresponding
   source: https://github.com/aslater3/LibreEcho-Platform
 - **LibreEcho UI/services** — MIT. Exact source:
