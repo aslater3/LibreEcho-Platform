@@ -519,7 +519,9 @@ class RadarTreeDiffTests(unittest.TestCase):
                'usr/local/share/licenses/libreecho-core/iw-5.19-COPYING.txt',
                'usr/local/share/licenses/libreecho-core/opus-1.4-COPYING.txt',
                'usr/local/share/licenses/libreecho-core/libogg-1.3.5-COPYING.txt',
-               'usr/local/share/licenses/libreecho-core/opusfile-0.12-COPYING.txt'}
+               'usr/local/share/licenses/libreecho-core/opusfile-0.12-COPYING.txt',
+               # Persistent local services supervisor (#170), new in the core initramfs.
+               'usr/local/sbin/libreecho-local'}
     # Separately reviewed ESPHome satellite change (Platform #212), pinned to
     # its exact reviewed bytes rather than widening the multi-target allowlist.
     ESPHOME_COMMIT = '37de1c11109453194ce6170f360450f887a615d4'
