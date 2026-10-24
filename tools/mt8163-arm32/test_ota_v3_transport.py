@@ -89,12 +89,14 @@ class ControlTransportTests(grammar.SignedFixture):
         self.fetcher.write_text(source)
         self.env.update(SOURCE_PACKAGE=str(self.root / 'package.tar'), CURL_LOG=str(self.root / 'curl.log'))
 
-    def run_case(self, mode, partial=None, slow_reader=False):
+    def run_case(self, mode, partial=None, slow_reader=False, cached=None):
         incoming = self.update / 'incoming'
         shutil.rmtree(incoming, ignore_errors=True)
         incoming.mkdir()
         if partial is not None:
             (incoming / 'github-update.ota.tar.part').write_bytes(partial)
+        if cached is not None:
+            (incoming / 'github-update.ota.tar').write_bytes(cached)
         env = dict(self.env, SCENARIO=mode)
         script = self.fetcher
         if slow_reader:
@@ -109,6 +111,36 @@ class ControlTransportTests(grammar.SignedFixture):
         self.assertEqual(list(self.update.glob('.control-*')), [])
         self.assertFalse((self.update / 'curl.headers').exists())
         self.assertFalse((self.update / 'curl.stderr').exists())
+
+    def quarantined(self):
+        return sorted(p.name for p in self.update.glob('quarantine-*.bad'))
+
+    def test_valid_cached_stable_package_is_superseded_not_quarantined(self):
+        # Issue #274: a check leaves its verified package cached for the
+        # install that follows. A stable refresh must not file those good
+        # bytes as quarantine evidence.
+        result = self.run_case('200-length', cached=self.raw)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual((self.update / 'incoming/github-update.ota.tar').read_bytes(), self.raw)
+        self.assertEqual(self.quarantined(), [])
+        self.assert_clean()
+
+    def test_invalid_cached_package_is_still_quarantined(self):
+        bad = b'not a signed package\n' * 64
+        result = self.run_case('200-length', cached=bad)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        digest = __import__('hashlib').sha256(bad).hexdigest()
+        self.assertEqual(self.quarantined(), ['quarantine-' + digest + '.bad'])
+        self.assertEqual((self.update / 'incoming/github-update.ota.tar').read_bytes(), self.raw)
+
+    def test_check_then_install_cycles_never_fill_quarantine(self):
+        # Eight quarantined files stop every later update (quarantine_capacity),
+        # so routine check/install refreshes must not count towards the cap.
+        for cycle in range(9):
+            with self.subTest(cycle=cycle):
+                result = self.run_case('200-length', cached=self.raw)
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(self.quarantined(), [])
 
     def test_completed_producer_does_not_kill_draining_reader(self):
         result = self.run_case('206', self.raw[:1000], slow_reader=True)
