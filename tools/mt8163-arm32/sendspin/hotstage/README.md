@@ -10,6 +10,7 @@ is packaged or shipped.
 | `build_engine.sh` | Static ARM build of `libreecho-audio-engine` (rootless GCC 15). `ENGINE_CFLAGS=-DLE_ENGINE_LATENCY_TRACE` adds the latency trace; `LATENCY_TOOLS=1` also builds `le-latency-cap`. |
 | `build_sendspind.py` | Stages the pinned SDK from the verified archives and cross-builds the UI repo's `sendspind` statically. |
 | `sendspin-hotstage.sh` | Device side: bind-mounts `/tmp/le-ss/libreecho-audio-engine` over the airplay2 feature engine, restarts it, starts `sendspind --run --dev-allow-unpaired`. `unstage` reverses it. |
+| `ss_probe_serve.py` | Host-side test server (pinned aiosendspin with the `server` extra): connects to players directly, trusts them, groups them and streams a tone and/or a click every second. It ends the stream only after the last chunk's play time, because `stream/end` drops audio the player has not played yet. |
 | `le_latency_cap.c`, `make_clicks.py`, `latency-measure.sh` | Output latency measurement: the trace engine logs when each click passes the ALSA hardware pointer; `le-latency-cap` stamps the mic array (and its electrical reference channels 7/8) on the same CLOCK_MONOTONIC. |
 
 Typical flow (device lease held, `LE_OWNER` set):
@@ -22,6 +23,11 @@ for f in "$OUT"/libreecho-audio-engine "$OUT"/sendspind sendspin-hotstage.sh; do
 done
 # then on the device (le-device sh --script): sh /tmp/le-ss/sendspin-hotstage.sh stage
 ```
+
+`ENGINE_CFLAGS=-DLE_ENGINE_SENDSPIN_TRACE` logs every Sendspin period, the
+generation open and each output-start step to
+`/run/libreecho-audio/sendspin-trace.log`; `le_latency_cap` also prints a
+100 ms peak-level timeline for mic 0 and reference 7.
 
 `--dev-allow-unpaired` lets any host on the LAN stream to the device while it
 runs. Unstage when finished.
