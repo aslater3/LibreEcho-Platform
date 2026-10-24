@@ -41,6 +41,8 @@ int main(int argc, char **argv)
 	long long quiet_until[MAX_CH] = { 0 };
 	unsigned long long total = 0, limit;
 	unsigned int c, i, baseline_frames;
+	double peak[MAX_CH] = { 0 };
+	unsigned int window = 0;
 	long long t_end;
 
 	if (ch == 0 || ch > MAX_CH || seconds <= 0 || seconds > 60)
@@ -84,6 +86,9 @@ int main(int argc, char **argv)
 							((uint32_t)b[2] << 24)) >> 8;
 				double v = fabs((double)raw);
 
+				if (v > peak[c])
+					peak[c] = v;
+
 				if (frame < baseline_frames) {
 					if (v > noise[c])
 						noise[c] = v;
@@ -99,6 +104,14 @@ int main(int argc, char **argv)
 			}
 		}
 		total += PERIOD;
+		/* Peak-level timeline (every 100 ms): mic 0 and reference 7. */
+		window += PERIOD;
+		if (window >= rate / 10) {
+			printf("level t_ms=%llu mic0=%.0f ref7=%.0f\n",
+			       total * 1000ULL / rate, peak[0], ch > 7 ? peak[7] : 0.0);
+			memset(peak, 0, sizeof(peak));
+			window = 0;
+		}
 	}
 	pcm_close(pcm);
 	fflush(stdout);

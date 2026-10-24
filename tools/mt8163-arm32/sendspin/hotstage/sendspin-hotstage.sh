@@ -15,8 +15,12 @@ NAME=${SENDSPIN_NAME:-LibreEcho $(sed -n 's/^target_id=//p' /etc/libreecho/targe
 
 engine_pid() { pidof libreecho-audio-engine | awk '{print $1}'; }
 mounted() { grep -q " $ENGINE " /proc/mounts; }
-restart_engine() {
-    /etc/init.d/libreecho-airplayd.init restart >/dev/null 2>&1
+# The engine runs from the bind target, so the bind can only change while
+# airplayd (and with it the engine) is stopped. le-device stage replaces the
+# file with a new inode, so a restage must re-bind, not just restart.
+airplayd() { /etc/init.d/libreecho-airplayd.init "$1" >/dev/null 2>&1; }
+start_engine() {
+    airplayd start
     i=0
     while [ $i -lt 50 ] && [ -z "$(engine_pid)" ]; do sleep 0.2; i=$((i + 1)); done
 }
@@ -30,19 +34,24 @@ case ${1:-} in
 stage)
     [ -x "$DIR/libreecho-audio-engine" ] && [ -x "$DIR/sendspind" ] || { echo "missing binaries in $DIR"; exit 1; }
     killall sendspind 2>/dev/null
-    mounted || mount --bind "$DIR/libreecho-audio-engine" "$ENGINE" || exit 1
-    restart_engine
+    airplayd stop
+    if mounted; then umount "$ENGINE" || exit 1; fi
+    mount --bind "$DIR/libreecho-audio-engine" "$ENGINE" || { start_engine; exit 1; }
+    start_engine
     i=0
     while [ $i -lt 50 ] && [ ! -S /run/libreecho-audio/sendspin.sock ]; do sleep 0.2; i=$((i + 1)); done
-    "$DIR/sendspind" --run --dev-allow-unpaired --name "$NAME" >"$DIR/sendspind.log" 2>&1 &
+    # Detached: it must outlive the remote session that staged it.
+    setsid "$DIR/sendspind" --run --dev-allow-unpaired --name "$NAME" \
+        </dev/null >"$DIR/sendspind.log" 2>&1 &
     sleep 1
     status
     echo "staged_engine_sha256=$(sha256sum "$DIR/libreecho-audio-engine" | cut -d' ' -f1)"
     ;;
 unstage)
     killall sendspind 2>/dev/null
-    if mounted; then umount "$ENGINE" || exit 1; fi
-    restart_engine
+    airplayd stop
+    if mounted; then umount "$ENGINE" || { start_engine; exit 1; }; fi
+    start_engine
     status
     ;;
 status) status ;;

@@ -174,6 +174,49 @@ static void sendspin_service_until_writable(struct sendspin_state *sp,
 	}
 }
 
+#ifdef LE_ENGINE_SENDSPIN_TRACE
+/* Development-only per-period Sendspin state log (never in release builds). */
+static void sendspin_trace(const struct sendspin_state *sp, const char *where)
+{
+	struct le_audio_sink_progress sink;
+	struct le_audio_timing_progress timing;
+	struct timespec now;
+	FILE *log;
+	int have_sink, have_timing;
+
+	if (!sp->sink)
+		return;
+	size_t nonzero = 0, i;
+
+	for (i = 0; i < sp->stage_frames * OUTPUT_CHANNELS; ++i)
+		nonzero += sp->stage[i] != 0;
+	have_sink = le_audio_sink_get_progress(sp->sink, &sink) == LE_AUDIO_SINK_OK;
+	have_timing = sp->timing &&
+		      le_audio_timing_progress(sp->timing, &timing) == LE_AUDIO_TIMING_OK;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	log = fopen(DEFAULT_ROOT "/sendspin-trace.log", "a");
+	if (!log)
+		return;
+	fprintf(log, "%lld.%06ld %s gen=%u have=%d stage=%zu nz=%zu starve=%u "
+		"active=%d fin=%d done=%d acc=%llu queued=%u tvalid=%d tstat=%d tsrc=%d tfin=%d played=%lld\n",
+		(long long)now.tv_sec, now.tv_nsec / 1000, where, sp->generation,
+		sp->have_generation, sp->stage_frames, nonzero, sp->starve_periods,
+		have_sink ? sink.active : -1, have_sink ? sink.finished : -1,
+		have_sink ? sink.completed : -1,
+		have_sink ? (unsigned long long)sink.accepted_frames : 0ULL,
+		have_sink ? sink.queued_frames : 0u,
+		have_timing ? timing.valid : -1, have_timing ? timing.status : -1, have_timing ? timing.source_valid : -1,
+		have_timing ? timing.source_finish_valid : -1,
+		(long long)sp->played_high_water);
+	fclose(log);
+}
+#define SENDSPIN_TRACE(where) sendspin_trace(&g_sendspin, where)
+#define SENDSPIN_TRACE_SP(sp, where) sendspin_trace(sp, where)
+#else
+#define SENDSPIN_TRACE(where) ((void)0)
+#define SENDSPIN_TRACE_SP(sp, where) ((void)0)
+#endif
+
 /*
  * Refresh the live (epoch, generation) identity from the sink.  A fresh
  * generation (or engine epoch) fences the timing model, so no predecessor
@@ -205,6 +248,7 @@ static void sendspin_sync_identity(struct sendspin_state *sp)
         sp->stage_frames = 0;
         if (sp->timing)
             le_audio_timing_invalidate(sp->timing, LE_AUDIO_TIMING_ERR_OPEN);
+        SENDSPIN_TRACE_SP(sp, "open");
     }
 }
 
@@ -2104,6 +2148,7 @@ static void latency_trace(struct pcm *pcm, const int16_t *samples)
 }
 #endif
 
+
 static int write_period(struct pcm *pcm, const int16_t *samples,
 			struct le_aec_reference_sender *reference,
 			unsigned int activity_mask)
@@ -2285,6 +2330,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			break;
 		if (read_or_retain_sources(sources, root) <= 0)
 			continue;
+		SENDSPIN_TRACE("s-ready");
 		ready = prepare_initial_period(sources, root, output, &dynamics,
 					      &speaker, &first_activity,
 					      logical_master_volume(root), &master_gain);
@@ -2319,12 +2365,14 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				"audio-engine: priority audio continues while AirPlay "
 				"volume is unavailable\n");
 		}
+		SENDSPIN_TRACE("s-prepared");
 		if (arm_output_controls(card) < 0) {
 			fprintf(stderr, "audio-engine: output arm failed\n");
 			clear_source_activity(sources, &announcement_led_active,
 					      &visualizer, &status);
 			continue;
 		}
+		SENDSPIN_TRACE("s-armed");
 		pcm = open_output_pcm(card, device, &config);
 		if (!pcm || !pcm_is_ready(pcm)) {
 			fprintf(stderr, "audio-engine: PCM %u,%u unavailable: %s\n",
@@ -2362,14 +2410,18 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		}
 		/* The codec stays at its safe fixed reference; software owns gain. */
 		int playback_start_failed = 0;
+		SENDSPIN_TRACE("s-opened");
 
 		if (pcm_prepare(pcm) < 0)
 			playback_start_failed = 1;
 		else {
+			SENDSPIN_TRACE("s-prepare");
 			if (verify_codec_reference(card) < 0)
 				playback_start_failed = 1;
+			SENDSPIN_TRACE("s-verified");
 			if (!playback_start_failed && power_output_controls(card) < 0)
 				playback_start_failed = 1;
+			SENDSPIN_TRACE("s-powered");
 			if (!playback_start_failed) {
 				/* Queue the first period only after amp settle.  The PCM starts
 				 * muted, and unmute follows this write. */
@@ -2384,9 +2436,11 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				else
 					started = write_period(pcm, output, &reference,
 							       first_activity);
+				SENDSPIN_TRACE("s-written");
 				if (started < 0 || verify_codec_reference(card) < 0 ||
 				    unmute_output_controls(card) < 0)
 					playback_start_failed = 1;
+				SENDSPIN_TRACE("s-unmuted");
 			}
 		}
 		if (playback_start_failed) {
@@ -2488,9 +2542,11 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 					g_sendspin.starve_periods = 0u;
 				}
 			}
+			SENDSPIN_TRACE("period");
 			process_music_visualizer(&visualizer, sources, output);
 			consume_period(sources);
 		}
+		SENDSPIN_TRACE("close");
 		clear_source_activity(sources, &announcement_led_active,
 				      &visualizer, &status);
 		sendspin_close_timing(&g_sendspin);
