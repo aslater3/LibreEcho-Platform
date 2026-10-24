@@ -124,6 +124,12 @@ class ControlTransportTests(grammar.SignedFixture):
         self.assertEqual((self.update / 'incoming/github-update.ota.tar').read_bytes(), self.raw)
         self.assertEqual(self.quarantined(), [])
         self.assert_clean()
+        log = (self.update / 'ota.log').read_text()
+        self.assertIn('cached-package superseded version=', log)
+        digest = __import__('hashlib').sha256(self.raw).hexdigest()
+        self.assertIn('downloaded version=', log)
+        self.assertIn('size=%d sha256=%s' % (len(self.raw), digest), log)
+        self.assertNotIn('quarantined', log)
 
     def test_invalid_cached_package_is_still_quarantined(self):
         bad = b'not a signed package\n' * 64
@@ -131,6 +137,8 @@ class ControlTransportTests(grammar.SignedFixture):
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         digest = __import__('hashlib').sha256(bad).hexdigest()
         self.assertEqual(self.quarantined(), ['quarantine-' + digest + '.bad'])
+        self.assertIn('quarantined file=github-update.ota.tar sha256=%s size=%d count=1' % (digest, len(bad)),
+                      (self.update / 'ota.log').read_text())
         self.assertEqual((self.update / 'incoming/github-update.ota.tar').read_bytes(), self.raw)
 
     def test_check_then_install_cycles_never_fill_quarantine(self):
