@@ -303,7 +303,7 @@ check_children "$DATA_ROOT/libreecho/update" \
     channel incoming staging state pending installed rolled-back check-status \
     automatic-updates install.lock bootctl.confirm bootctl.confirmed feature-commit committed-manifest committed-manifest.sig restart-record first-install.pending \
     first-install.confirmed boot-health boot-count boot-history \
-    current previous generation.lock asset-cache fetch.lock \
+    current previous generation.lock asset-cache fetch.lock ota.log ota.log.1 \
     config-status features-status transaction-slot \
     ping-last-week ping-last-month ping-last-year ping-next-payload ping-status \
     ping-install-counted \
