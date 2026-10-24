@@ -861,16 +861,39 @@ quarantine_file()
     $BB mv "$source" "$target" || die quarantine_commit
 }
 
-inspect_control_part()
+inspect_control_file()
 {
-    [ -f "$PART" ] && [ ! -L "$PART" ] || return 1
-    size=$($BB stat -c %s "$PART" 2>/dev/null)
+    [ -f "$1" ] && [ ! -L "$1" ] || return 1
+    size=$($BB stat -c %s "$1" 2>/dev/null)
     case "$size" in ''|*[!0-9]*) return 1;; esac
     [ "$size" -gt 0 ] && [ "$size" -le "$MAX_BYTES" ] || return 1
-    inspection=$("$UPDATE" inspect "$PART" 2>/dev/null) || return 1
+    inspection=$("$UPDATE" inspect "$1" 2>/dev/null) || return 1
     version=$(printf '%s\n' "$inspection" | $BB sed -n 's/^UPDATE_VALID version=//p')
     case "$version" in ''|*[!A-Za-z0-9._+~-]*) return 1;; esac
     printf '%s\n' "$version"
+}
+
+inspect_control_part()
+{
+    inspect_control_file "$PART"
+}
+
+# Issue #274: a check leaves its verified package in $PACKAGE for the install
+# that follows. When a later run must refresh it (the stable alias is mutable),
+# bytes that still pass signed inspection are superseded, not suspect: remove
+# them. Quarantine is evidence of bad bytes and is capped at eight entries, so
+# filing good packages there eventually stopped every update with
+# quarantine_capacity. Anything else (not a single-link regular file, oversize,
+# or failing inspection) is still quarantined.
+discard_cached_package()
+{
+    if [ -f "$PACKAGE" ] && [ ! -L "$PACKAGE" ] &&
+        [ "$($BB stat -c %h "$PACKAGE" 2>/dev/null)" = 1 ] &&
+        cached_version=$(inspect_control_file "$PACKAGE"); then
+        $BB rm "$PACKAGE" || die download_commit
+        return 0
+    fi
+    quarantine_file "$PACKAGE"
 }
 
 legacy_download_and_inspect()
@@ -1035,7 +1058,8 @@ download_and_inspect()
     RESET_USED=0
     if [ -e "$PACKAGE" ] || [ -L "$PACKAGE" ]; then
         # Only immutable dev discovery binds a cached package to this check.
-        # Stable must refresh its mutable alias and retain the previous bytes.
+        # Stable must refresh its mutable alias; discard_cached_package removes
+        # the superseded bytes, or quarantines them if they fail inspection.
         if [ "$channel" = dev ] && [ -f "$PACKAGE" ] && [ ! -L "$PACKAGE" ] &&
             [ "$(stat -c %s "$PACKAGE")" -le "$MAX_BYTES" ] &&
             [ "$(sha256sum "$PACKAGE" | $BB awk '{print $1}')" = "$DEV_OTA_SHA256" ]; then
@@ -1045,7 +1069,7 @@ download_and_inspect()
             printf '%s\n' "$version"
             return 0
         fi
-        quarantine_file "$PACKAGE"
+        discard_cached_package
     fi
     if [ -f "$PART" ]; then
         part_size=$($BB stat -c %s "$PART" 2>/dev/null)
