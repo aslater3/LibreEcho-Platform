@@ -7,6 +7,11 @@ group and streams a test signal: a tone with a 5 ms click every second, so
 grouped sync is audible. Run with the pinned aiosendspin.
 
   ss_probe_serve.py ws://HOST:8928/sendspin [...] [--seconds 30] [--level-db -20]
+  ss_probe_serve.py --discover [--pairing-token-file FILE] ...
+
+--discover browses _sendspin._tcp instead of taking URLs. With
+--pairing-token-file the first player is paired with its Pairing PSK token
+(the file is read, never printed) instead of being trusted unpaired.
 """
 import argparse
 import asyncio
@@ -20,7 +25,9 @@ from aiohttp.test_utils import TestServer
 
 from aiosendspin.client import SendspinClient as VirtualClient
 from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
-from aiosendspin.models.types import AudioCodec, Roles
+from aiosendspin.models.types import AudioCodec, PairMethod, Roles
+from aiosendspin.noise.pairing import PairingAttempt
+from aiosendspin.noise.pairing_token import decode_psk_token
 from aiosendspin.noise.keys import Identity, generate_psk, psk_id_for
 from aiosendspin.noise.trust_store import (
     ClientPairingRecord,
@@ -66,6 +73,33 @@ async def start_virtual_players(server, server_store, count):
     return listener, clients, received
 
 
+async def discover(seconds=4.0):
+    """Browse _sendspin._tcp; print and return each player's WebSocket URL."""
+    from zeroconf import ServiceStateChange
+    from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZeroconf
+    found = {}
+    zc = AsyncZeroconf()
+
+    def on_change(zeroconf, service_type, name, state_change):
+        if state_change is ServiceStateChange.Added:
+            found[name] = service_type
+
+    browser = AsyncServiceBrowser(zc.zeroconf, '_sendspin._tcp.local.', handlers=[on_change])
+    await asyncio.sleep(seconds)
+    urls = []
+    for name, service_type in found.items():
+        info = AsyncServiceInfo(service_type, name)
+        if not await info.async_request(zc.zeroconf, 3000):
+            continue
+        txt = {k.decode(): (v or b'').decode() for k, v in info.properties.items()}
+        address = info.parsed_addresses()[0]
+        print(f'discovered {name!r} port={info.port} txt={txt}', flush=True)
+        urls.append(f'ws://{address}:{info.port}{txt.get("path", "/sendspin")}')
+    await browser.async_cancel()
+    await zc.async_close()
+    return urls
+
+
 def player_role(client):
     return next((r for r in client.active_roles if isinstance(r, PlayerV1Role)), None)
 
@@ -103,7 +137,10 @@ def signal(start, frames, tone_hz, level):
 
 async def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('urls', nargs='+')
+    p.add_argument('urls', nargs='*')
+    p.add_argument('--discover', action='store_true',
+                   help='find players by browsing _sendspin._tcp for a few seconds')
+    p.add_argument('--pairing-token-file', help='pair the first player with this token')
     p.add_argument('--seconds', type=float, default=30)
     p.add_argument('--tone', type=float, default=440, help='0 = clicks only')
     p.add_argument('--level-db', type=float, default=-20)
@@ -128,15 +165,28 @@ async def main():
             added.put_nowait(event.client_id)
 
     server.add_event_listener(on_event)
-    for url in a.urls:
-        server.connect_to_client(url, retry_initial_connection=True)
+    urls = list(a.urls)
+    if a.discover:
+        urls += await discover()
+    if not urls:
+        raise SystemExit('no players')
+    attempt = None
+    if a.pairing_token_file:
+        token = decode_psk_token(open(a.pairing_token_file).read().strip())
+        attempt = PairingAttempt(method=PairMethod.PAIRING_PSK, pairing_psk=token.pairing_psk,
+                                 client_id=token.client_id)
+    for index, url in enumerate(urls):
+        server.connect_to_client(url, retry_initial_connection=True,
+                                 pairing_attempt=attempt if index == 0 else None)
+    a.urls = urls
     ids = []
     deadline = time.monotonic() + a.connect_timeout
     while len(ids) < len(a.urls):
         cid = await asyncio.wait_for(added.get(), max(0.1, deadline - time.monotonic()))
-        await server.trust_unpaired(cid)
+        if attempt is None:
+            await server.trust_unpaired(cid)
         ids.append(cid)
-        print('client', cid[:12], 'trusted', flush=True)
+        print('client', cid[:12], 'paired by token' if attempt else 'trusted', flush=True)
     virtual = None
     if a.virtual_players:
         virtual = await start_virtual_players(server, server_store, a.virtual_players)
