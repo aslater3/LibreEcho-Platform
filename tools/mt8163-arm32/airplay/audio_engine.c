@@ -615,6 +615,23 @@ static struct speaker_profile speaker_profile = {
 	.pre_gain = 1.0f, .bass_makeup_db = 0.0f,
 };
 
+/*
+ * Physical output latency past the ALSA hardware pointer, per speaker chain,
+ * for the Sendspin timing model.  Measured with an LE_ENGINE_LATENCY_TRACE
+ * engine against the mic array's electrical reference channels, which share
+ * the CLOCK_MONOTONIC capture stamps (sendspin/hotstage/latency-measure.sh).
+ * Biscuit (Echo Dot): 2.96-3.08 ms over three runs of five clicks.  A chain
+ * without a measurement stays uncalibrated, so Sendspin timing fails closed.
+ */
+#define BISCUIT_OUTPUT_LATENCY_US 3000
+#define UNMEASURED_OUTPUT_LATENCY -1
+
+static int chain_output_latency_us(const struct speaker_profile *profile)
+{
+	return profile->biscuit_chain ? BISCUIT_OUTPUT_LATENCY_US
+				      : UNMEASURED_OUTPUT_LATENCY;
+}
+
 /* Arm the output while keeping the codec muted.  This is used before a
  * stream exists, so enabling the physical amplifier cannot produce a pop. */
 static int arm_output_controls(unsigned int card)
@@ -2037,6 +2054,56 @@ static int prepare_initial_period(struct source_bus *sources, const char *root,
 	return 1;
 }
 
+#ifdef LE_ENGINE_LATENCY_TRACE
+/*
+ * Development-only output latency measurement (never in release builds).
+ * Logs the CLOCK_MONOTONIC time at which the first loud frame after a quiet
+ * stretch passes the ALSA hardware pointer, using the same pointer/stamp pair
+ * as the Sendspin timing model.  A host capture of the same click on the mic,
+ * stamped on the same clock, gives the physical output latency.
+ */
+static void latency_trace(struct pcm *pcm, const int16_t *samples)
+{
+	static unsigned int quiet_frames = DEFAULT_RATE;
+	struct timespec ts;
+	unsigned int avail = 0, i;
+	FILE *log;
+
+	for (i = 0; i < PERIOD_SIZE; ++i) {
+		int v = samples[i * OUTPUT_CHANNELS];
+
+		if (v > 2000 || v < -2000)
+			break;
+	}
+	if (i == PERIOD_SIZE) {
+		quiet_frames += PERIOD_SIZE;
+		return;
+	}
+	if (quiet_frames + i >= DEFAULT_RATE / 5 &&
+	    pcm_get_htimestamp(pcm, &avail, &ts) == 0) {
+		long long queued = (long long)pcm_get_buffer_size(pcm) - avail;
+		long long ahead = queued - (long long)(PERIOD_SIZE - i);
+		long long onset = (long long)ts.tv_sec * 1000000LL +
+				  ts.tv_nsec / 1000 + ahead * 1000000LL / DEFAULT_RATE;
+
+		log = fopen(DEFAULT_ROOT "/latency-trace.log", "a");
+		if (log) {
+			fprintf(log, "onset_mono_us=%lld queued=%lld index=%u\n",
+				onset, queued, i);
+			fclose(log);
+		}
+	}
+	quiet_frames = 0;
+	for (i = PERIOD_SIZE; i-- > 0;) {
+		int v = samples[i * OUTPUT_CHANNELS];
+
+		if (v > 2000 || v < -2000)
+			break;
+		++quiet_frames;
+	}
+}
+#endif
+
 static int write_period(struct pcm *pcm, const int16_t *samples,
 			struct le_aec_reference_sender *reference,
 			unsigned int activity_mask)
@@ -2048,6 +2115,9 @@ static int write_period(struct pcm *pcm, const int16_t *samples,
 	} else if (pcm_writei(pcm, samples, PERIOD_SIZE) != (int)PERIOD_SIZE) {
 		return -1;
 	}
+#ifdef LE_ENGINE_LATENCY_TRACE
+	latency_trace(pcm, samples);
+#endif
 	/*
 	 * Reference delivery is intentionally lossy.  A missing or slow AEC
 	 * consumer must never delay the sole owner of the speaker PCM.
@@ -2269,10 +2339,12 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			continue;
 		}
 		/* The clock domain is declared only because the PCM was opened
-		 * monotonic; the latency constant stays uncalibrated, so finish
-		 * estimates remain invalid (fail closed) until measured. */
+		 * monotonic.  A chain without a measured output latency stays
+		 * uncalibrated, so its finish estimates remain invalid (fail
+		 * closed). */
 		{
 			struct le_audio_timing_config timing_config;
+			int latency_us = chain_output_latency_us(&speaker_profile);
 
 			sendspin_close_timing(&g_sendspin);
 			memset(&timing_config, 0, sizeof(timing_config));
@@ -2280,8 +2352,9 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			timing_config.rate = DEFAULT_RATE;
 			timing_config.buffer_frames = 0;
 			timing_config.clock = LE_AUDIO_TIMING_CLOCK_MONOTONIC;
-			timing_config.output_latency_us = 0;
-			timing_config.latency_calibrated = 0;
+			timing_config.output_latency_us =
+				latency_us > 0 ? (uint32_t)latency_us : 0u;
+			timing_config.latency_calibrated = latency_us >= 0;
 			g_sendspin.timing = le_audio_timing_create(&timing_config);
 			if (!g_sendspin.timing)
 				fprintf(stderr,
