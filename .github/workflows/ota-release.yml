@@ -185,6 +185,7 @@ jobs:
             test_ota_v3_packaging.py \
             test_ota_v3_recovery.py \
             test_ota_v3_transport.py \
+            test_ota_log.py \
             test_ota_v3_web_status.py \
             ota/test_feature_provenance.py \
             ota/test_service_identity.py \
