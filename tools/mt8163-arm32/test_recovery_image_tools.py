@@ -4363,7 +4363,7 @@ start_feature_service_if_enabled
             root.mkdir(parents=True)
             package = root / 'github-update.ota.tar'
             package.write_bytes(b'previous verified candidate')
-            script = 'BB=busybox\ndie() { exit 1; }\n' + function + '\nquarantine_file "$ROOT/github-update.ota.tar"\n'
+            script = 'BB=busybox\ndie() { exit 1; }\nota_log() { :; }\n' + function + '\nquarantine_file "$ROOT/github-update.ota.tar"\n'
             result = subprocess.run(['/bin/sh', '-c', script], env={**os.environ, 'ROOT': str(root)}, capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             retained = list(root.glob('quarantine-*.bad'))
