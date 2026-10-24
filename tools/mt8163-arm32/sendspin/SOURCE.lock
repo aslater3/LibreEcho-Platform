@@ -4,7 +4,7 @@
   "license": "Apache-2.0",
   "description": "Sendspin RC1 encrypted client. This lock mirrors the Product input inventory (docs/architecture/sendspin.md, build/inputs/public-inputs.json); the three must never diverge. Every source is an immutable commit with a SHA-256-verified archive; no moving tags and no unhashed runtime fetch.",
   "target": "arm-linux-gnueabihf-glibc-dynamic",
-  "target_note": "Intended Sendspin companion target: the dynamic glibc ARMHF C++20 pattern used by the AirPlay 2 companion, not a static link. The fixture-verified runtime closure below was observed from a pinned-source cross-build and is enforced by the build; the production daemon closure is explicitly unknown and compile-input provenance is explicitly open.",
+  "target_note": "target describes the dynamic glibc feasibility fixture lane (build_sendspin.sh), whose runtime closure below was observed from a pinned-source cross-build and is enforced by that build. The release player (libreecho-sendspind) is built by build_sendspind.sh fully static with the image's ARMHF cross toolchain: it runs from the mounted airplay2 payload outside the AirPlay sandbox, like the static core daemons. Compile-input provenance stays open.",
   "runtime_requirements": {
     "kind": "audited-loader-library-closure",
     "interpreter": "/lib/ld-linux-armhf.so.3",
@@ -22,13 +22,9 @@
       "status": "observed from the pinned-source cross-build of the LibreEcho adapter fixture and enforced above; 'needed' is the fixture closure, not a claim about any other binary"
     },
     "future_daemon": {
-      "needed": [
-        "libm.so.6",
-        "libc.so.6",
-        "ld-linux-armhf.so.3"
-      ],
-      "note": "The production Sendspin companion daemon has not been built. If it links the C++ runtime dynamically it would add libstdc++.so.6/libgcc_s.so.1, which are outside the reviewed mdns runtime closure unless they are bound statically as the fixture is.",
-      "status": "unknown pending an exact daemon cross-build; no version-validated symbol closure is claimed"
+      "needed": [],
+      "note": "The release player is linked fully static (glibc, libstdc++ and libgcc bound in), so it needs no loader and no shared library from the payload or the core image.",
+      "status": "static; enforced by build_sendspind.sh, which fails closed on a non-ARM or non-EXEC ELF, a PT_INTERP program header or any DT_NEEDED entry"
     },
     "compile_sysroot": {
       "note": "Compilation headers/objects come from the Product archive-backed ARMHF cross-toolchain prefix (build/inputs/armhf-cross-toolchain.lock.json), verified from the locked .deb bytes by build/ci/armhf_toolchain.py `verify` before any target compiler/binutils runs. The consumer derives SYSROOT=<prefix>, CROSS_PREFIX=<prefix>/usr/bin/arm-linux-gnueabihf- and LD_LIBRARY_PATH=<prefix>/usr/lib/x86_64-linux-gnu, and rejects caller SYSROOT/CROSS_PREFIX overrides that conflict with the verified prefix. Compile-input provenance is separate from the runtime symbol closure.",

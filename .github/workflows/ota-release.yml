@@ -141,6 +141,7 @@ jobs:
           python tools/mt8163-arm32/airplay/test_airplay_volume_contract.py
           python tools/mt8163-arm32/airplay/test_audio_period_buffer.py
           python tools/mt8163-arm32/airplay/test_audio_sink.py
+          python tools/mt8163-arm32/sendspin/test_packaging.py
           bash tools/mt8163-arm32/airplay/test_speaker_dsp.sh
           bash tools/mt8163-arm32/airplay/test_speaker_mbcl.sh
           bash tools/mt8163-arm32/airplay/test_biscuit_speaker_dsp.sh
