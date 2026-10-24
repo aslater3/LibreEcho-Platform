@@ -1411,13 +1411,15 @@ class SourceTests(unittest.TestCase):
         source = engine.read_text()
         self.assertIn("#define PERIOD_SIZE 2048U", source)
         self.assertIn(".start_threshold = 1U", source)
-        first_write = source.index(
-            "write_period(pcm, output, &reference, first_activity)"
-        )
+        # The first period is queued after amp power-up and before unmute, on
+        # both the legacy path and the Sendspin-accounted path.
         power_amp = source.index("power_output_controls(card)")
         unmute = source.index("unmute_output_controls(card)")
-        self.assertLess(power_amp, first_write)
-        self.assertLess(first_write, unmute)
+        for first_write_call in ("started = write_period(pcm, output, &reference,",
+                                 "started = sendspin_write_and_account("):
+            first_write = source.index(first_write_call)
+            self.assertLess(power_amp, first_write)
+            self.assertLess(first_write, unmute)
         self.assertIn(
             "ready = prepare_initial_period(sources, root, output, &dynamics,",
             source,
