@@ -2530,6 +2530,24 @@ static void scen_finish(const char *base)
               "finish: physical completion did not stop at the exact source tail");
         check(played == 512u,
               "finish: playhead did not reach the exact FINISH tail");
+        /* The speaker chain's measured output latency calibrates timing:
+         * a measured chain publishes a VALID finish, an unmeasured one
+         * fails closed.  The driver names the expectation per target. */
+        {
+            const char *expect = getenv("LE_EXPECT_SENDSPIN_TIMING");
+            uint32_t flags = le_audio_sink_get_u32(prog + 12);
+            uint64_t finish_us = le_audio_sink_get_u64(prog + 24);
+
+            check(expect != NULL, "finish: driver set no timing expectation");
+            if (expect && strcmp(expect, "valid") == 0)
+                check((flags & LE_AUDIO_SINK_PROGRESS_TIMING_VALID) != 0u &&
+                      finish_us != 0u,
+                      "finish: measured chain did not publish VALID timing");
+            else if (expect)
+                check((flags & LE_AUDIO_SINK_PROGRESS_TIMING_VALID) == 0u &&
+                      finish_us == 0u,
+                      "finish: unmeasured chain published a finish estimate");
+        }
     }
 }
 
@@ -3985,7 +4003,11 @@ def run_loop_for_target(loop_binary: Path, root: Path, target: str,
         platform_targets.audio_profile_bytes(target))
     loop_base = root / "loop" / target
     loop_base.mkdir(parents=True, exist_ok=True)
-    loop_env = dict(env, LE_AUDIO_ENGINE_SENDSPIN_PROFILE_DIR=str(profile_dir))
+    # Only chains with a measured output latency may publish VALID timing.
+    measured = {"biscuit"}
+    loop_env = dict(env, LE_AUDIO_ENGINE_SENDSPIN_PROFILE_DIR=str(profile_dir),
+                    LE_EXPECT_SENDSPIN_TIMING=(
+                        "valid" if audio["speaker_chain"] in measured else "invalid"))
     proc = subprocess.run([str(loop_binary), str(loop_base)], timeout=180,
                           env=loop_env, capture_output=True, text=True)
     sys.stdout.write(proc.stdout)
