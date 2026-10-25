@@ -64,6 +64,7 @@ class ActiveDevicePingTests(unittest.TestCase):
             "LIBREECHO_PING_CURL": str(self.curl),
             "LIBREECHO_PING_CA": str(self.tmp / "ca.pem"),
             "LIBREECHO_PING_NOW": now,
+            "LIBREECHO_PING_CONFIG": str(self.tmp / "web-config.json"),
         }
         return subprocess.run([BUSYBOX, "sh", str(PING), command], env=env,
                               capture_output=True, text=True, timeout=30)
@@ -120,6 +121,49 @@ class ActiveDevicePingTests(unittest.TestCase):
         body, _ = self.sent()
         self.assertEqual((body["wk"], body["mo"], body["w"], body["m"], body["y"]), ("2026-W40", "2026-10", 0, 1, 0))
         self.assertNotIn("i", body)
+
+    def write_config(self, active_ping: str | None) -> None:
+        # The shape the web UI writes: one flat object, one key per line.
+        lines = ['  "hostname": "libreecho"', '  "privacy_telemetry": true']
+        if active_ping is not None:
+            lines.append(f'  "privacy_active_ping": {active_ping}')
+        (self.tmp / "web-config.json").write_text("{\n" + ",\n".join(lines) + "\n}\n")
+
+    def test_owner_switch_off_sends_nothing_and_keeps_markers(self) -> None:
+        self.write_config("false")
+        self.assertEqual(self.run_ping("run").returncode, 0)
+        self.assertFalse(self.curl_log.exists())
+        self.assertEqual(self.state("last-week"), "")
+        self.assertFalse((self.tmp / "state/ping-install-counted").exists())
+        self.assertIn("result=disabled", (self.tmp / "state/ping-status").read_text())
+        # The Privacy page still shows what would be sent.
+        self.assertIn('"hw":"radar"', self.state("next-payload"))
+
+    def test_switching_back_on_resumes_in_the_same_period(self) -> None:
+        self.write_config("false")
+        self.run_ping("run")
+        self.write_config("true")
+        self.assertEqual(self.run_ping("run").returncode, 0)
+        body, _ = self.sent()
+        self.assertEqual((body["w"], body["m"], body["y"], body["i"]), (1, 1, 1, 1))
+        self.assertEqual(self.state("last-week"), "2026-W41")
+
+    def test_missing_or_unreadable_setting_keeps_the_default(self) -> None:
+        for config in (None, "true"):
+            for name in ("last-week", "last-month", "last-year", "install-counted"):
+                (self.tmp / "state" / f"ping-{name}").unlink(missing_ok=True)
+            if config is None:
+                (self.tmp / "web-config.json").unlink(missing_ok=True)
+            else:
+                self.write_config(None)
+            self.assertEqual(self.run_ping("run").returncode, 0, config)
+            self.sent()
+        # A config that names other false values must not switch the ping off.
+        (self.tmp / "web-config.json").write_text('{"privacy_telemetry": false, "privacy_active_ping": true}\n')
+        for name in ("last-week", "last-month", "last-year"):
+            (self.tmp / "state" / f"ping-{name}").unlink(missing_ok=True)
+        self.assertEqual(self.run_ping("run").returncode, 0)
+        self.sent()
 
     def test_failure_does_not_advance_markers(self) -> None:
         for code in ("000", "500", "404", "429"):
