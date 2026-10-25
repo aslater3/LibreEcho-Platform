@@ -1549,6 +1549,24 @@ static int fake_realtime(void)
     return cached;
 }
 
+/*
+ * LE_FAKE_PCM_PPM (|ppm| <= 1000) makes the fake DAC crystal run fast or
+ * slow against CLOCK_MONOTONIC, as a real codec clock drifts from the system
+ * clock: the hardware pointer advances at 48 kHz * (1 + ppm / 1e6).
+ */
+static double rt_rate(void)
+{
+    static double cached = 0.0;
+    if (cached == 0.0) {
+        const char *text = getenv("LE_FAKE_PCM_PPM");
+        double ppm = text ? atof(text) : 0.0;
+        if (ppm < -1000.0 || ppm > 1000.0)
+            ppm = 0.0;
+        cached = 48000.0 * (1.0 + ppm / 1e6);
+    }
+    return cached;
+}
+
 static unsigned int rt_queued(struct pcm *pcm, const struct timespec *now)
 {
     int64_t elapsed_ns, drained;
@@ -1558,7 +1576,7 @@ static unsigned int rt_queued(struct pcm *pcm, const struct timespec *now)
         return 0u;
     elapsed_ns = (int64_t)(now->tv_sec - pcm->rt_start.tv_sec) * 1000000000LL +
                  (now->tv_nsec - pcm->rt_start.tv_nsec);
-    drained = elapsed_ns > 0 ? elapsed_ns * 48 / 1000000 : 0;
+    drained = elapsed_ns > 0 ? (int64_t)((double)elapsed_ns * rt_rate() / 1e9) : 0;
     if ((uint64_t)drained >= written) {
         /* Underrun: the playhead stops at the tail; restart the drain clock
          * there so the next write is not credited with idle time. */
@@ -1592,8 +1610,8 @@ static void rt_block_until_room(struct pcm *pcm, unsigned int frames)
         if (queued + frames <= pcm->buffer_frames)
             return;
         ts.tv_sec = 0;
-        ts.tv_nsec = (long)((queued + frames - pcm->buffer_frames) *
-                            1000000000ULL / 48000ULL) + 100000L;
+        ts.tv_nsec = (long)((double)(queued + frames - pcm->buffer_frames) *
+                            1e9 / rt_rate()) + 100000L;
         nanosleep(&ts, NULL);
     }
 }
@@ -1618,6 +1636,48 @@ int pcm_get_htimestamp(struct pcm *pcm, unsigned int *avail,
      * physical playhead equals the accepted-frame counter. */
     *avail = pcm ? pcm->buffer_frames : 0u;
     return 0;
+}
+
+/*
+ * LE_FAKE_PCM_ONSET_LOG: append the true CLOCK_MONOTONIC time (ns) at which
+ * each click leaves the fake DAC (the first loud frame after >= 200 ms of
+ * quiet), for multi-player synchronization analysis. The frame's play time
+ * follows from the drain model: drain epoch start + its index / rate.
+ */
+static void rt_log_onsets(struct pcm *pcm, const void *data, unsigned int frames)
+{
+    static FILE *log;
+    static int opened;
+    static uint64_t quiet = 48000u;
+    const char *path;
+    unsigned int i;
+
+    if (!opened) {
+        opened = 1;
+        path = getenv("LE_FAKE_PCM_ONSET_LOG");
+        log = path ? fopen(path, "a") : NULL;
+    }
+    if (!log)
+        return;
+    for (i = 0; i < frames; ++i) {
+        int v = pcm->wide ? (int)(((const int32_t *)data)[i * OUTPUT_CHANNELS] / 65536)
+                          : ((const int16_t *)data)[i * OUTPUT_CHANNELS];
+        if (v > 1500 || v < -1500) {
+            if (quiet >= 9600u) {
+                /* LE_FAKE_PCM_EXTRA_LATENCY_US: output delay past the
+                 * pointer that the engine was not calibrated for. */
+                const char *extra = getenv("LE_FAKE_PCM_EXTRA_LATENCY_US");
+                double at = (double)pcm->rt_start.tv_sec * 1e9 + (double)pcm->rt_start.tv_nsec +
+                            (double)(pcm->rt_written + i) * 1e9 / rt_rate() +
+                            (extra ? atof(extra) * 1e3 : 0.0);
+                fprintf(log, "onset_ns=%.0f\n", at);
+                fflush(log);
+            }
+            quiet = 0u;
+        } else {
+            quiet += 1u;
+        }
+    }
 }
 
 int pcm_writei(struct pcm *pcm, const void *data, unsigned int frame_count)
@@ -1650,6 +1710,7 @@ int pcm_writei(struct pcm *pcm, const void *data, unsigned int frame_count)
     if (pcm && fake_realtime()) {
         pcm->rt_dry_checked = 0;
         rt_block_until_room(pcm, accepted);
+        rt_log_onsets(pcm, data, accepted);
         pcm->rt_written += accepted;
         pcm->rt_any_write = 1;
     }
