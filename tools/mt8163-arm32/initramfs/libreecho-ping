@@ -26,6 +26,12 @@
 # (which is then counted again; the published figure is an estimate).  No
 # install date or identifier is stored or sent.
 #
+# The owner can switch the ping off on the Privacy page.  The web UI saves
+# "privacy_active_ping": false in web-config.json; this helper reads it before
+# every attempt, so nothing is sent while it is off and sending resumes at the
+# next daily check after it is switched back on.  A missing or unreadable
+# config keeps the default (on), but only an explicit false turns it off.
+#
 #   libreecho-ping payload   print the body the next attempt would send
 #   libreecho-ping run       one attempt now (exit 0 sent/nothing-due, 1 failed)
 #   libreecho-ping loop      background scheduler started by libreecho-init
@@ -44,6 +50,7 @@ CHANNEL_FILE=${LIBREECHO_PING_CHANNEL_FILE:-/etc/libreecho/update-channel}
 TIME_STATUS=${LIBREECHO_TIME_STATUS:-/run/libreecho/time.status}
 CURL=${LIBREECHO_PING_CURL:-/usr/bin/curl}
 CA=${LIBREECHO_PING_CA:-/etc/ssl/certs/ca-certificates.crt}
+CONFIG=${LIBREECHO_PING_CONFIG:-/data/libreecho/config/web-config.json}
 # Only for host tests: a fixed "now" (any value `date -d` accepts).
 NOW=${LIBREECHO_PING_NOW:-}
 
@@ -118,6 +125,15 @@ build()
     echo "$short"
 }
 
+owner_disabled()
+{
+    # Same key-scan the boot code uses for web-config.json (timezone,
+    # integrations): the UI writes one flat object with one key per line.
+    [ -r "$CONFIG" ] || return 1
+    $BB grep -q '"privacy_active_ping"[[:space:]]*:[[:space:]]*false' \
+        "$CONFIG" 2>/dev/null
+}
+
 clock_synced()
 {
     [ -n "$NOW" ] && return 0
@@ -180,6 +196,13 @@ run_once()
     # Keep the "next payload" preview current for the Privacy page even when
     # nothing is due, so the user always sees the exact bytes.
     [ -n "${PAYLOAD:-}" ] && atomic_write "$STATE/ping-next-payload" "$PAYLOAD"
+    if owner_disabled; then
+        # Markers are left alone, so switching back on resumes counting in
+        # the current period without double-counting an earlier one.
+        record disabled
+        log "skipped: switched off by the owner"
+        return 0
+    fi
     case $rc in
         1) log "skipped: $REASON"; return 1 ;;
         2) return 0 ;;
