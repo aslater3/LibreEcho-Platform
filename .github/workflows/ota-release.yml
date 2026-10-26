@@ -72,7 +72,7 @@ jobs:
             device-tree-compiler espeak-ng-data squashfs-tools nodejs mksh \
             gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf \
             libc6-dev-armhf-cross
-          python -m pip install --disable-pip-version-check PyNaCl==1.5.0
+          python -m pip install --disable-pip-version-check PyNaCl==1.6.2
 
       - name: Build the verified ARM32 Opus prefix
         shell: bash
