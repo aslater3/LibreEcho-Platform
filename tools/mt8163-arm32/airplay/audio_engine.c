@@ -474,6 +474,10 @@ static int32_t wide_samples[PERIOD_SIZE * OUTPUT_CHANNELS];
  * acceptance, -1 on a fatal or XRUN error (the caller tears the PCM down and
  * reopens).
  */
+#ifdef LE_ENGINE_LATENCY_TRACE
+static void latency_trace(struct pcm *pcm);
+#endif
+
 static int sendspin_write_and_account(struct sendspin_state *sp,
                                       struct pcm *pcm, const int16_t *samples,
                                       size_t period_frames,
@@ -543,6 +547,10 @@ static int sendspin_write_and_account(struct sendspin_state *sp,
     /* AEC reference is derived from the final mix, once per accepted period. */
     (void)le_aec_reference_publish(reference, samples, period_frames,
                                    OUTPUT_CHANNELS, activity_mask);
+#ifdef LE_ENGINE_LATENCY_TRACE
+    if (period_frames == PERIOD_SIZE)
+        latency_trace(pcm);
+#endif
 
     if (sendspin_account_range(sp, period_frames, source_frames,
                                first_frame) != 0) {
@@ -660,17 +668,21 @@ static struct speaker_profile speaker_profile = {
 };
 
 /*
- * Physical output latency past the ALSA hardware pointer, per speaker chain,
- * for the Sendspin timing model.  Measured with an LE_ENGINE_LATENCY_TRACE
- * engine against the mic array's electrical reference channels, which share
- * the CLOCK_MONOTONIC capture stamps (sendspin/hotstage/latency-measure.sh).
- * Each chain: three runs of five clicks.  Biscuit (Echo Dot): 2.96-3.08 ms.
- * Radar_puffin (Echo 2nd gen, 0.14.5 kernel): 2.90-2.98 ms.  A new chain must
- * be measured before it gets a value; until then a negative latency keeps
- * Sendspin timing uncalibrated, so it fails closed.
+ * Output latency of a SOURCE frame past the ALSA hardware pointer, per speaker
+ * chain, for the Sendspin timing model: speaker-chain DSP delay (the Dot
+ * limiter's 2 * BISCUIT_LA look-ahead and filter group delay) plus the codec
+ * and amplifier path.  The timing model maps source frames to hardware
+ * frames 1:1, so any DSP delay must be in this constant.  Measured with an
+ * LE_ENGINE_LATENCY_TRACE engine, which stamps the pre-DSP mix at the
+ * pointer, against the mic array's electrical reference channels on the same
+ * CLOCK_MONOTONIC (sendspin/hotstage/latency-measure.sh), two runs of five
+ * clicks each: biscuit (Echo Dot) 5.58-5.66 ms, radar_puffin (Echo 2nd gen,
+ * 0.14.5 kernel) 2.97-3.11 ms.  A new chain must be measured before it gets
+ * a value; until then a negative latency keeps Sendspin timing uncalibrated,
+ * so it fails closed.
  */
-#define BISCUIT_OUTPUT_LATENCY_US 3000
-#define RADAR_PUFFIN_OUTPUT_LATENCY_US 2950
+#define BISCUIT_OUTPUT_LATENCY_US 5620
+#define RADAR_PUFFIN_OUTPUT_LATENCY_US 3040
 
 static int chain_output_latency_us(const struct speaker_profile *profile)
 {
@@ -1880,6 +1892,13 @@ static int wide_output;
 static int wide_supported = -1;
 static int32_t wide_samples[PERIOD_SIZE * OUTPUT_CHANNELS];
 
+#ifdef LE_ENGINE_LATENCY_TRACE
+/* Pre-DSP mix of the period being rendered: the trace times source frames,
+ * so speaker-chain delay (the Dot limiter look-ahead) is part of the
+ * measurement. */
+static int32_t trace_input[PERIOD_SIZE];
+#endif
+
 static int32_t wide_from_s16_units(float y)
 {
 	if (y > 32767.0f)
@@ -1925,6 +1944,9 @@ static void render_period(struct source_bus *sources,
 			 (float)(frame + 1) / (float)PERIOD_SIZE));
 		mixed = mix_sources_frame(sources, sendspin, sendspin_frames,
 						  frame);
+#ifdef LE_ENGINE_LATENCY_TRACE
+		trace_input[frame] = mixed;
+#endif
 		int16_t rendered;
 		*current_master_q15 += (target_master_q15 - *current_master_q15) /
 			(int32_t)(PERIOD_SIZE - frame);
@@ -2103,12 +2125,13 @@ static int prepare_initial_period(struct source_bus *sources, const char *root,
 #ifdef LE_ENGINE_LATENCY_TRACE
 /*
  * Development-only output latency measurement (never in release builds).
- * Logs the CLOCK_MONOTONIC time at which the first loud frame after a quiet
- * stretch passes the ALSA hardware pointer, using the same pointer/stamp pair
- * as the Sendspin timing model.  A host capture of the same click on the mic,
- * stamped on the same clock, gives the physical output latency.
+ * Logs the CLOCK_MONOTONIC time at which the first loud SOURCE frame (the
+ * pre-DSP mix) after a quiet stretch passes the ALSA hardware pointer, using
+ * the same pointer/stamp pair as the Sendspin timing model.  A capture of the
+ * same click on the electrical reference, stamped on the same clock, gives the
+ * source-frame-to-output latency, including any speaker-chain DSP delay.
  */
-static void latency_trace(struct pcm *pcm, const int16_t *samples)
+static void latency_trace(struct pcm *pcm)
 {
 	static unsigned int quiet_frames = DEFAULT_RATE;
 	struct timespec ts;
@@ -2116,7 +2139,7 @@ static void latency_trace(struct pcm *pcm, const int16_t *samples)
 	FILE *log;
 
 	for (i = 0; i < PERIOD_SIZE; ++i) {
-		int v = samples[i * OUTPUT_CHANNELS];
+		int32_t v = trace_input[i];
 
 		if (v > 2000 || v < -2000)
 			break;
@@ -2141,7 +2164,7 @@ static void latency_trace(struct pcm *pcm, const int16_t *samples)
 	}
 	quiet_frames = 0;
 	for (i = PERIOD_SIZE; i-- > 0;) {
-		int v = samples[i * OUTPUT_CHANNELS];
+		int32_t v = trace_input[i];
 
 		if (v > 2000 || v < -2000)
 			break;
@@ -2163,7 +2186,7 @@ static int write_period(struct pcm *pcm, const int16_t *samples,
 		return -1;
 	}
 #ifdef LE_ENGINE_LATENCY_TRACE
-	latency_trace(pcm, samples);
+	latency_trace(pcm);
 #endif
 	/*
 	 * Reference delivery is intentionally lossy.  A missing or slow AEC

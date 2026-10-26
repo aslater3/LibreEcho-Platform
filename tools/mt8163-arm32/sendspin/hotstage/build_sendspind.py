@@ -38,6 +38,9 @@ def main():
     parser.add_argument('--archives', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--cross-prefix', default=os.environ.get('CROSS_PREFIX', str(DEFAULT_PREFIX)))
+    parser.add_argument('--define', action='append', default=[],
+                        help='extra preprocessor define for a development build, e.g. '
+                             'LE_SENDSPIND_CLOCK_TRACE')
     args = parser.parse_args()
     work = Path(tempfile.mkdtemp(prefix='le-sendspind-', dir=os.environ.get('TMPDIR', Path.home() / '.cache')))
     source = load('verify_sendspin_sources', TOOLS / 'verify_sendspin_sources.py')
@@ -59,6 +62,8 @@ set(CMAKE_EXE_LINKER_FLAGS_INIT "-static")
     cmd = ['cmake', '-S', args.ui.resolve() / 'src/adapter/sendspin', '-B', build,
            '-DCMAKE_TOOLCHAIN_FILE=' + str(toolchain), '-DCMAKE_BUILD_TYPE=Release',
            '-DSENDSPIN_SDK_DIR=' + str(stage / lock['identity::sdk']['path'])]
+    if args.define:
+        cmd.append('-DCMAKE_CXX_FLAGS=' + ' '.join('-D' + d for d in args.define))
     for name, variable in [('ArduinoJson', 'ARDUINOJSON'), ('micro-flac', 'MICRO_FLAC'),
                            ('IXWebSocket', 'IXWEBSOCKET'), ('noise-c', 'NOISE_C')]:
         cmd.append(f'-DSENDSPIN_{variable}_DIR=' + str(stage / lock[name]['path']))
