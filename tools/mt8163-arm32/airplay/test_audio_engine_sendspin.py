@@ -522,6 +522,13 @@ int main(int argc, char **argv)
         check(le_audio_sink_submit(sink, (const uint8_t *)src, 100u, 0u, epoch,
                                    1u, 0u) == LE_AUDIO_SINK_OK,
               "source submit rejected");
+        /* Start gate: a fresh, unFINISHed generation renders no source until
+         * a whole period is queued, so start-up padding can never land
+         * between frames the SDK already counts as contiguous. */
+        check(!g_sendspin.source_started && sendspin_stage(&g_sendspin) == 0u,
+              "start gate: a partial first period was staged");
+        /* Partial-period accounting is a mid-stream (post-start) case. */
+        g_sendspin.source_started = 1;
         check(sendspin_stage(&g_sendspin) == 100u,
               "stage did not peek the queued source frames");
         check(g_sendspin.first_frame == 0u, "first frame cursor wrong");
@@ -674,7 +681,10 @@ int main(int argc, char **argv)
 
         check(queue_source(sink, epoch, gen, 0u, 0u, PERIOD_SIZE, 700) ==
               LE_AUDIO_SINK_OK, "EPIPE prefix source submit rejected");
-        check(sendspin_stage(&g_sendspin) == PERIOD_SIZE,
+        /* Start gate: a whole queued period starts a fresh generation. */
+        check(!g_sendspin.source_started &&
+              sendspin_stage(&g_sendspin) == PERIOD_SIZE &&
+              g_sendspin.source_started,
               "EPIPE prefix stage wrong");
         reset_fake_pcm();
         fake_write_mode = 5;
@@ -755,6 +765,9 @@ int main(int argc, char **argv)
          * the source/padding boundary (500 source + 200 engine padding). */
         check(queue_source(sink, epoch, gen, 0u, 0u, 500u, 120) ==
               LE_AUDIO_SINK_OK, "EIO source submit rejected");
+        /* Partial-period accounting is a mid-stream (post-start) case; the
+         * start gate has its own scenario. */
+        g_sendspin.source_started = 1;
         check(sendspin_stage(&g_sendspin) == 500u, "EIO stage wrong");
         reset_fake_pcm();
         fake_write_mode = 5;
@@ -1129,6 +1142,9 @@ int main(int argc, char **argv)
         gen = g_sendspin.generation;
         check(queue_source(sink, epoch, gen, 0u, 0u, 256u, 444) ==
               LE_AUDIO_SINK_OK, "muted source submit rejected");
+        /* Partial-period accounting is a mid-stream (post-start) case; the
+         * start gate has its own scenario. */
+        g_sendspin.source_started = 1;
         (void)sendspin_stage(&g_sendspin);
         reset_fake_pcm();
         check(sendspin_write_and_account(&g_sendspin, pcm, output, PERIOD_SIZE,
@@ -2582,7 +2598,7 @@ static void scen_finish(const char *base)
               g_log.ev[r].a == (PCM_OUT | PCM_MONOTONIC | PCM_NORESTART),
               "finish: 24-bit attempt opened without MONOTONIC|NORESTART");
     }
-    check(count_tag(T_PCM_WRITE) >= 1 && count_tag(T_PCM_WRITE) <= 2,
+    check(count_tag(T_PCM_WRITE) >= 1 && count_tag(T_PCM_WRITE) <= 4,
           "finish: unexpected number of periods after FINISH");
     if (proglen == LE_AUDIO_SINK_PROGRESS_PAYLOAD_BYTES) {
         uint64_t submitted = le_audio_sink_get_u64(prog + 16);
@@ -3342,7 +3358,9 @@ static void scen_wide_finish(const char *base)
     }
     check(count_tag(T_PCM_OPEN) == 1 && count_tag(T_PCM_CLOSE) == 1,
           "widefinish: PCM did not open/close once");
-    check(count_tag(T_PCM_WRITE) >= 1 && count_tag(T_PCM_WRITE) <= 2,
+    /* One period may be silence: the first source frame waits for a whole
+     * period or FINISH (start gate), and DATA arrives before FINISH. */
+    check(count_tag(T_PCM_WRITE) >= 1 && count_tag(T_PCM_WRITE) <= 3,
           "widefinish: unexpected number of periods after FINISH");
     for (i = 0; i < (int)g_log.count; ++i)
         if (g_log.ev[i].tag == T_PCM_WRITE && (g_log.ev[i].c & 0xffffu) != 0u)

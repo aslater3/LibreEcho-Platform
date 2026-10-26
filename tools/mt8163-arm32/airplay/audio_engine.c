@@ -94,6 +94,7 @@ struct sendspin_state {
     uint32_t epoch;
     uint32_t generation;
     int have_generation;
+    int source_started;            /* a source frame of this generation rendered */
     unsigned int starve_periods;   /* bounded priming/underrun silence */
     int64_t played_high_water;     /* last source-relative playhead fed */
     size_t stage_frames;           /* frames peeked for the current period */
@@ -233,6 +234,7 @@ static void sendspin_sync_identity(struct sendspin_state *sp)
     if (!progress.active) {
         if (sp->have_generation) {
             sp->have_generation = 0;
+            sp->source_started = 0;
             sp->starve_periods = 0;
             sp->stage_frames = 0;
         }
@@ -241,6 +243,7 @@ static void sendspin_sync_identity(struct sendspin_state *sp)
     if (!sp->have_generation || progress.generation != sp->generation ||
         progress.epoch != sp->epoch) {
         sp->have_generation = 1;
+        sp->source_started = 0;
         sp->epoch = progress.epoch;
         sp->generation = progress.generation;
         sp->starve_periods = 0;
@@ -277,15 +280,39 @@ static int sendspin_live(struct sendspin_state *sp)
     return 1;
 }
 
-/* Peek the queued source frames for the current period (non-consuming). */
+/*
+ * Peek the queued source frames for the current period (non-consuming).
+ *
+ * A generation's first source frame waits until a whole period is queued (or
+ * the generation is FINISHed).  Otherwise a partial first period is padded to
+ * PERIOD_SIZE with generated silence, and the SDK -- which aligns its stream
+ * to the first played-frame report and then assumes its queued frames play
+ * back to back -- never sees that padding: the start of the stream plays late
+ * by it (60 ms measured on the Dot) until feedback forces a resync.  Padding
+ * before the first source frame is already in that first report, so it is
+ * harmless.  (A two-period cushion was tried: the SDK never queues that much,
+ * so it only delayed the start.)  Once started, a short queue is a real
+ * underrun and is rendered as before.
+ */
 static size_t sendspin_stage(struct sendspin_state *sp)
 {
     if (!sp->sink || !sp->have_generation) {
         sp->stage_frames = 0;
         return 0;
     }
+    if (!sp->source_started) {
+        struct le_audio_sink_progress progress;
+
+        if (le_audio_sink_get_progress(sp->sink, &progress) != LE_AUDIO_SINK_OK ||
+            (!progress.finished && progress.queued_frames < PERIOD_SIZE)) {
+            sp->stage_frames = 0;
+            return 0;
+        }
+    }
     sp->stage_frames = le_audio_sink_render(sp->sink, sp->stage, PERIOD_SIZE,
                                             &sp->first_frame);
+    if (sp->stage_frames)
+        sp->source_started = 1;
     return sp->stage_frames;
 }
 
@@ -429,6 +456,7 @@ static void sendspin_drop_generation(struct sendspin_state *sp)
     if (sp->sink && sp->have_generation)
         (void)le_audio_sink_cancel(sp->sink, epoch, generation);
     sp->have_generation = 0;
+    sp->source_started = 0;
     sp->starve_periods = 0;
     sp->stage_frames = 0;
 }

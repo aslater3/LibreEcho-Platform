@@ -16,6 +16,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef LE_AUDIO_TIMING_TRACE
+#include <stdio.h>
+#endif
+
 struct le_audio_timing_entry {
     uint64_t output_first_frame;
     uint64_t source_first_frame;
@@ -297,6 +301,19 @@ int le_audio_timing_query(struct le_audio_timing *timing,
         return LE_AUDIO_TIMING_OK;
     }
 
+#ifdef LE_AUDIO_TIMING_TRACE
+    /* Development-only (never in release builds): every accepted sample. */
+    {
+        FILE *log = fopen("/run/libreecho-audio/timing-trace.log", "a");
+
+        if (log) {
+            fprintf(log, "now_us=%llu sample_us=%llu playhead=%llu avail=%u physical=%llu\n",
+                    (unsigned long long)now_us, (unsigned long long)sample_us,
+                    (unsigned long long)playhead, avail, (unsigned long long)physical);
+            fclose(log);
+        }
+    }
+#endif
     out->valid = 1;
     out->status = LE_AUDIO_TIMING_OK;
     out->playhead_frames = playhead;
