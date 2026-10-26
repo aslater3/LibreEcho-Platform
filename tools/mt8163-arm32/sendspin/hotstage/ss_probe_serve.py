@@ -215,6 +215,8 @@ async def main():
         last_play = await stream.commit_audio()
         first_play = first_play or last_play
         sent += CHUNK
+    # Server clock time of stream frame 0; click k plays at this + k seconds.
+    print('stream_first_play_us', first_play, flush=True)
     ahead = (last_play - server.clock.now_us()) / 1e6
     print(f'sent_frames {sent} in {time.monotonic() - t0:.2f}s, last chunk plays in {ahead:.2f}s',
           flush=True)
