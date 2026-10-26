@@ -4065,7 +4065,7 @@ def run_loop_for_target(loop_binary: Path, root: Path, target: str,
     loop_base = root / "loop" / target
     loop_base.mkdir(parents=True, exist_ok=True)
     # Only chains with a measured output latency may publish VALID timing.
-    measured = {"biscuit"}
+    measured = {"biscuit", "radar_puffin"}
     loop_env = dict(env, LE_AUDIO_ENGINE_SENDSPIN_PROFILE_DIR=str(profile_dir),
                     LE_EXPECT_SENDSPIN_TIMING=(
                         "valid" if audio["speaker_chain"] in measured else "invalid"))
