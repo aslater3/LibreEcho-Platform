@@ -12,6 +12,7 @@ is packaged or shipped.
 | `sendspin-hotstage.sh` | Device side: bind-mounts `/tmp/le-ss/libreecho-audio-engine` over the airplay2 feature engine, restarts it, starts `sendspind --run --dev-allow-unpaired`. `unstage` reverses it. |
 | `ss_probe_serve.py` | Host-side test server (pinned aiosendspin with the `server` extra): connects to players directly, trusts them, groups them and streams a tone and/or a click every second. It ends the stream only after the last chunk's play time, because `stream/end` drops audio the player has not played yet. |
 | `le_latency_cap.c`, `make_clicks.py`, `latency-measure.sh` | Output latency measurement: the trace engine logs when each click passes the ALSA hardware pointer; `le-latency-cap` stamps the mic array (and its electrical reference channels 7/8) on the same CLOCK_MONOTONIC. |
+| `sync_two_way.py` | Grouped sync: run `le-latency-cap` with `LE_CAP_RAW=FILE` on two players at once while `ss_probe_serve.py --tone 0 --click-ms 0.5 --script '12:mute,20:unmute' --script-player 0` mutes the leading player for part of the run. Each mic hears its own click and the other speaker's; the two-way difference cancels room distance and microphone delay and leaves the acoustic skew. |
 
 Typical flow (device lease held, `LE_OWNER` set):
 

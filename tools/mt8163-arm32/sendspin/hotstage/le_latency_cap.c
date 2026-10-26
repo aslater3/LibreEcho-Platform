@@ -6,6 +6,10 @@
  *
  *   le-latency-cap SECONDS [card device channels rate]
  *   (defaults: 0 24 9 16000, S24_3LE in 640x4 periods like micd's tinycap)
+ *
+ * LE_CAP_RAW=FILE also writes every frame as little-endian
+ * {int64 mono_us, int32 mic0, int32 ref7} for offline analysis (grouped
+ * sync: find the far speaker's click next to the near one).
  */
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -18,6 +22,12 @@
 
 #define MAX_CH 16
 #define PERIOD 640
+
+static int32_t sample24(const uint8_t *b)
+{
+	return (int32_t)(((uint32_t)b[0] << 8) | ((uint32_t)b[1] << 16) |
+			 ((uint32_t)b[2] << 24)) >> 8;
+}
 
 static long long now_us(void)
 {
@@ -44,6 +54,8 @@ int main(int argc, char **argv)
 	double peak[MAX_CH] = { 0 };
 	unsigned int window = 0;
 	long long t_end;
+	const char *raw_path = getenv("LE_CAP_RAW");
+	FILE *raw = NULL;
 
 	if (ch == 0 || ch > MAX_CH || seconds <= 0 || seconds > 60)
 		return 2;
@@ -57,6 +69,14 @@ int main(int argc, char **argv)
 	if (!pcm || !pcm_is_ready(pcm)) {
 		fprintf(stderr, "capture open failed: %s\n", pcm ? pcm_get_error(pcm) : "");
 		return 1;
+	}
+	if (raw_path && *raw_path && ch > 7) {
+		raw = fopen(raw_path, "wb");
+		if (!raw) {
+			fprintf(stderr, "cannot open %s\n", raw_path);
+			pcm_close(pcm);
+			return 1;
+		}
 	}
 	limit = (unsigned long long)(seconds * rate);
 	baseline_frames = rate / 4;
@@ -82,9 +102,7 @@ int main(int argc, char **argv)
 
 			for (c = 0; c < ch; ++c) {
 				const uint8_t *b = &buf[(i * ch + c) * 3];
-				int32_t raw = (int32_t)(((uint32_t)b[0] << 8) | ((uint32_t)b[1] << 16) |
-							((uint32_t)b[2] << 24)) >> 8;
-				double v = fabs((double)raw);
+				double v = fabs((double)sample24(b));
 
 				if (v > peak[c])
 					peak[c] = v;
@@ -103,6 +121,18 @@ int main(int argc, char **argv)
 					quiet_until[c] = frame_us + 150000;
 			}
 		}
+		if (raw) {
+			for (i = 0; i < PERIOD; ++i) {
+				int64_t rec_us = stamp_us -
+					(int64_t)((total + PERIOD + avail - (total + i)) *
+						  1000000ULL / rate);
+				int32_t rec[2] = { sample24(&buf[(i * ch) * 3]),
+						   sample24(&buf[(i * ch + 7) * 3]) };
+
+				fwrite(&rec_us, sizeof(rec_us), 1, raw);
+				fwrite(rec, sizeof(rec), 1, raw);
+			}
+		}
 		total += PERIOD;
 		/* Peak-level timeline (every 100 ms): mic 0 and reference 7. */
 		window += PERIOD;
@@ -114,6 +144,8 @@ int main(int argc, char **argv)
 		}
 	}
 	pcm_close(pcm);
+	if (raw)
+		fclose(raw);
 	fflush(stdout);
 	return 0;
 }

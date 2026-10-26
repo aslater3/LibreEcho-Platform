@@ -123,12 +123,12 @@ async def run_script(client, script):
               f'muted={role.muted}', flush=True)
 
 
-def signal(start, frames, tone_hz, level):
+def signal(start, frames, tone_hz, level, click_frames=RATE // 200):
     out = bytearray()
     amp = 32767 * level
     for n in range(start, start + frames):
         v = 0.6 * math.sin(2 * math.pi * tone_hz * n / RATE) if tone_hz else 0.0
-        if n % RATE < RATE // 200:  # 5 ms click each second
+        if n % RATE < click_frames:  # click each second (5 ms default)
             v = 1.0 if (n // 24) % 2 == 0 else -1.0
         s = int(amp * v)
         out += struct.pack('<hh', s, s)
@@ -144,12 +144,16 @@ async def main():
     p.add_argument('--seconds', type=float, default=30)
     p.add_argument('--tone', type=float, default=440, help='0 = clicks only')
     p.add_argument('--level-db', type=float, default=-20)
+    p.add_argument('--click-ms', type=float, default=5,
+                   help='click length; 0.5 keeps near and far arrivals apart')
     p.add_argument('--connect-timeout', type=float, default=20)
     p.add_argument('--virtual-players', type=int, default=0,
                    help='also group N host-side players without audio output')
     p.add_argument('--script', default='',
                    help="player commands at seconds after stream start, e.g. "
-                        "'3:volume=40,6:mute,9:unmute' (first player only)")
+                        "'3:volume=40,6:mute,9:unmute' (one player, see --script-player)")
+    p.add_argument('--script-player', type=int, default=0,
+                   help='index of the scripted player, in command-line order')
     p.add_argument('--verbose', action='store_true')
     a = p.parse_args()
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
@@ -175,18 +179,18 @@ async def main():
         token = decode_psk_token(open(a.pairing_token_file).read().strip())
         attempt = PairingAttempt(method=PairMethod.PAIRING_PSK, pairing_psk=token.pairing_psk,
                                  client_id=token.client_id)
+    # One at a time, so the client order matches the command line.
+    ids = []
+    deadline = time.monotonic() + a.connect_timeout
     for index, url in enumerate(urls):
         server.connect_to_client(url, retry_initial_connection=True,
                                  pairing_attempt=attempt if index == 0 else None)
-    a.urls = urls
-    ids = []
-    deadline = time.monotonic() + a.connect_timeout
-    while len(ids) < len(a.urls):
         cid = await asyncio.wait_for(added.get(), max(0.1, deadline - time.monotonic()))
-        if attempt is None:
+        if attempt is None or index > 0:
             await server.trust_unpaired(cid)
         ids.append(cid)
-        print('client', cid[:12], 'paired by token' if attempt else 'trusted', flush=True)
+        print('client', index, cid[:12],
+              'paired by token' if attempt and index == 0 else 'trusted', flush=True)
     virtual = None
     if a.virtual_players:
         virtual = await start_virtual_players(server, server_store, a.virtual_players)
@@ -199,7 +203,7 @@ async def main():
         await group.add_client(c)
     print('group members', len(group.clients), flush=True)
     stream = group.start_stream()
-    script_task = asyncio.create_task(run_script(clients[0], a.script)) if a.script else None
+    script_task = asyncio.create_task(run_script(clients[a.script_player], a.script)) if a.script else None
     fmt = AudioFormat(sample_rate=RATE, bit_depth=16, channels=2)
     level = 10 ** (a.level_db / 20)
     sent = 0
@@ -207,7 +211,7 @@ async def main():
     first_play = last_play = None
     t0 = time.monotonic()
     while sent < total:
-        stream.prepare_audio(signal(sent, CHUNK, a.tone, level), fmt)
+        stream.prepare_audio(signal(sent, CHUNK, a.tone, level, max(1, int(a.click_ms * RATE / 1000))), fmt)
         last_play = await stream.commit_audio()
         first_play = first_play or last_play
         sent += CHUNK
