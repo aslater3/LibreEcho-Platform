@@ -664,16 +664,18 @@ static struct speaker_profile speaker_profile = {
  * for the Sendspin timing model.  Measured with an LE_ENGINE_LATENCY_TRACE
  * engine against the mic array's electrical reference channels, which share
  * the CLOCK_MONOTONIC capture stamps (sendspin/hotstage/latency-measure.sh).
- * Biscuit (Echo Dot): 2.96-3.08 ms over three runs of five clicks.  A chain
- * without a measurement stays uncalibrated, so Sendspin timing fails closed.
+ * Each chain: three runs of five clicks.  Biscuit (Echo Dot): 2.96-3.08 ms.
+ * Radar_puffin (Echo 2nd gen, 0.14.5 kernel): 2.90-2.98 ms.  A new chain must
+ * be measured before it gets a value; until then a negative latency keeps
+ * Sendspin timing uncalibrated, so it fails closed.
  */
 #define BISCUIT_OUTPUT_LATENCY_US 3000
-#define UNMEASURED_OUTPUT_LATENCY -1
+#define RADAR_PUFFIN_OUTPUT_LATENCY_US 2950
 
 static int chain_output_latency_us(const struct speaker_profile *profile)
 {
 	return profile->biscuit_chain ? BISCUIT_OUTPUT_LATENCY_US
-				      : UNMEASURED_OUTPUT_LATENCY;
+				      : RADAR_PUFFIN_OUTPUT_LATENCY_US;
 }
 
 /* Arm the output while keeping the codec muted.  This is used before a
