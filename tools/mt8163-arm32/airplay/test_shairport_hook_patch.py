@@ -7,7 +7,7 @@ import tempfile
 from test_airplay_generation_fence import compile_fixture, wait_for
 
 HERE = Path(__file__).resolve().parent
-PATCH = HERE / "shairport-5.1-session-hooks.patch"
+PATCH = HERE / "shairport-5.6.2-session-hooks.patch"
 UPSTREAM = ("common.c", "common.h", "player.c", "player.h")
 
 DRIVER = r'''
@@ -124,7 +124,7 @@ def run():
     assert PATCH.is_file(), "missing pinned Shairport hook patch"
     with tempfile.TemporaryDirectory(prefix="le-shairport-patch-") as directory:
         root = Path(directory)
-        fixture = HERE / "fixtures/shairport-5.1"
+        fixture = HERE / "fixtures/shairport-5.6.2"
         for name in UPSTREAM:
             (root / name).write_bytes((fixture / name).read_bytes())
         subprocess.run(["patch", "--batch", "--fuzz=0", "-p1", "-i", str(PATCH)],
@@ -147,6 +147,14 @@ def run():
                 (full / name).write_bytes((Path(source) / name).read_bytes())
             subprocess.run(["patch", "--batch", "--fuzz=0", "-p1", "-i", str(PATCH)],
                            cwd=full, check=True, timeout=20)
+            # Zero-context insertions have no anchor text, so a clean apply does
+            # not prove placement. Pin both insertions to their intended spot.
+            player = (full / "player.c").read_text()
+            nonce = player.index("/* A new ordered token")
+            assert player.find("\n}\n\nint player_play(", nonce) == player.index("\n}\n", nonce), \
+                "token generator is not the definition immediately before player_play"
+            assert "  int own_airplay_volume_set;\n  char playback_session_token[33];" in \
+                (full / "player.h").read_text(), "session token field is not beside own_airplay_volume_set"
     print("Shairport pinned hook patch / protocol fixture: PASS")
 
 

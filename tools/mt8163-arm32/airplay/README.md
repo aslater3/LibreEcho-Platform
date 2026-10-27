@@ -5,8 +5,8 @@ leaves both processes stopped until the UI integration toggle is enabled.
 
 Pinned upstream source inputs for the ARMHF build are:
 
-- Shairport Sync 5.1, commit `d6ac53bf4c6a1ebc55a03177537765ff42dec919`
-- NQPTP 1.2.8, commit `c925f27c1fd12e4033ac477e5a405969b0b0260b`
+- Shairport Sync 5.6.2, commit `0a34fbda83724cc06266aadcf7c88acc8fef4e7d`
+- NQPTP 1.2.9, commit `ab8fb67483411640fd7f1e193889482f2421c37c`
 
 Shairport Sync must be configured with `--with-airplay-2`, the raw pipe and
 metadata-pipe backends, OpenSSL, FFmpeg, libplist, libsodium, libgcrypt, UUID
@@ -32,7 +32,7 @@ hex digits are a strictly increasing monotonic start tick; the remaining 16
 are random. A bounded runtime high-water mark rejects delayed or repeated
 start hooks even after a newer stop. `--stop <token>`
 removes it and the callback/ack files only when the token matches. The pinned
-Shairport 5.1 patch creates a fresh token for every play and passes it to
+Shairport 5.6.2 patch creates a fresh token for every play and passes it to
 start, stop and `--set-volume <token> <dB>`; pre-start volume is retained for
 the first playback callback. Untagged, malformed and stale start/stop/volume
 hooks fail closed. The bridge discards input while the marker is absent; bytes on
