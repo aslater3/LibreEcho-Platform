@@ -104,12 +104,28 @@ def player_role(client):
     return next((r for r in client.active_roles if isinstance(r, PlayerV1Role)), None)
 
 
-async def run_script(client, script):
-    """Timed volume/mute commands to one player; prints what it reports."""
+async def run_script(client, script, group, ctl, clock):
+    """Timed commands: volume/mute to one player, leave/join of that player,
+    and clear (a seek: pending audio dropped, timing reset).  Each line is
+    stamped with the server clock."""
     start = time.monotonic()
     for step in filter(None, script.split(',')):
         at, _, action = step.partition(':')
         await asyncio.sleep(max(0.0, start + float(at) - time.monotonic()))
+        now = clock.now_us()
+        if action == 'leave':
+            await group.remove_client(client)
+            print(f'script t={at}s leave at_us={now}', flush=True)
+            continue
+        if action == 'join':
+            await group.add_client(client)
+            print(f'script t={at}s join at_us={now}', flush=True)
+            continue
+        if action == 'clear':
+            ctl['stream'].clear()
+            ctl['cleared'] = True
+            print(f'script t={at}s clear at_us={now}', flush=True)
+            continue
         role = player_role(client)
         if role is None:
             print('script: no player role', flush=True)
@@ -154,6 +170,8 @@ async def main():
                         "'3:volume=40,6:mute,9:unmute' (one player, see --script-player)")
     p.add_argument('--script-player', type=int, default=0,
                    help='index of the scripted player, in command-line order')
+    p.add_argument('--lead', type=float, default=0,
+                   help='keep at most this many seconds of audio ahead (0: send all at once)')
     p.add_argument('--verbose', action='store_true')
     a = p.parse_args()
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
@@ -203,7 +221,9 @@ async def main():
         await group.add_client(c)
     print('group members', len(group.clients), flush=True)
     stream = group.start_stream()
-    script_task = asyncio.create_task(run_script(clients[a.script_player], a.script)) if a.script else None
+    ctl = {'stream': stream, 'cleared': False}
+    script_task = asyncio.create_task(run_script(clients[a.script_player], a.script, group, ctl,
+                                                 server.clock)) if a.script else None
     fmt = AudioFormat(sample_rate=RATE, bit_depth=16, channels=2)
     level = 10 ** (a.level_db / 20)
     sent = 0
@@ -212,11 +232,19 @@ async def main():
     t0 = time.monotonic()
     while sent < total:
         stream.prepare_audio(signal(sent, CHUNK, a.tone, level, max(1, int(a.click_ms * RATE / 1000))), fmt)
+        cleared = ctl['cleared']
+        ctl['cleared'] = False
         last_play = await stream.commit_audio()
-        first_play = first_play or last_play
+        if first_play is None:
+            first_play = last_play
+            # Server clock time of stream frame 0; click k plays at this + k seconds.
+            print('stream_first_play_us', first_play, flush=True)
+        if cleared:
+            # Frame `sent` now plays at last_play; clicks stay on n % RATE.
+            print(f'stream_restart_frame {sent} play_us {last_play}', flush=True)
         sent += CHUNK
-    # Server clock time of stream frame 0; click k plays at this + k seconds.
-    print('stream_first_play_us', first_play, flush=True)
+        if a.lead and last_play - server.clock.now_us() > a.lead * 1e6:
+            await asyncio.sleep((last_play - server.clock.now_us()) / 1e6 - a.lead)
     ahead = (last_play - server.clock.now_us()) / 1e6
     print(f'sent_frames {sent} in {time.monotonic() - t0:.2f}s, last chunk plays in {ahead:.2f}s',
           flush=True)
