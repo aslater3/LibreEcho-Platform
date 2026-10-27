@@ -7,7 +7,7 @@
   // here, store the volume for possible use in the future
   config.airplay_volume = airplay_volume;
   conn->own_airplay_volume = airplay_volume;
-  debug_mutex_unlock(&conn->volume_control_mutex, 4);
+  pthread_mutex_unlock(&conn->volume_control_mutex);
 }
 
 void player_volume(double airplay_volume, rtsp_conn_info *conn) {
@@ -18,11 +18,14 @@ void player_volume(double airplay_volume, rtsp_conn_info *conn) {
 void do_flush(uint32_t timestamp, rtsp_conn_info *conn) {
 
   debug(3, "do_flush: flush to %u.", timestamp);
-  debug_mutex_lock(&conn->flush_mutex, 1000, 1);
+  pthread_mutex_lock(&conn->flush_mutex);
   conn->flush_requested = 1;
   conn->flush_rtp_timestamp = timestamp; // flush all packets up to, but not including, this one.
   reset_input_flow_metrics(conn);
-  debug_mutex_unlock(&conn->flush_mutex, 3);
+#ifdef CONFIG_METADATA
+  reset_input_bitrate(conn);
+#endif
+  pthread_mutex_unlock(&conn->flush_mutex);
 }
 
 void player_flush(uint32_t timestamp, rtsp_conn_info *conn) {
@@ -42,8 +45,33 @@ void player_flush(uint32_t timestamp, rtsp_conn_info *conn) {
 #endif
 }
 
+// Export the current session's identity into the environment so that the
+// sessioncontrol hooks (run_this_before_play_begins / run_this_after_play_ends)
+// can tell a brand-new AirPlay stream from an additional room joining an
+// AirPlay 2 group that is already playing. command_start() and command_stop()
+// fork and execv, so the child inherits whatever is set here. One
+// shairport-sync process serves one session at a time, so there is no
+// cross-session race on these variables.
+static void export_session_identity(rtsp_conn_info *conn) {
+  char numbuf[16];
+  if (conn == NULL)
+    return;
+  setenv("SPS_CLIENT_IP", conn->client_ip_string, 1);
+  snprintf(numbuf, sizeof(numbuf), "%u", (unsigned int)conn->connection_number);
+  setenv("SPS_CONNECTION_NUMBER", numbuf, 1);
+#ifdef CONFIG_AIRPLAY_2
+  setenv("SPS_GROUP_ID", conn->airplay_gid ? conn->airplay_gid : "", 1);
+  snprintf(numbuf, sizeof(numbuf), "%u", (unsigned int)conn->groupContainsGroupLeader);
+  setenv("SPS_GROUP_CONTAINS_LEADER", numbuf, 1);
+#else
+  setenv("SPS_GROUP_ID", "", 1);
+  setenv("SPS_GROUP_CONTAINS_LEADER", "0", 1);
+#endif
+}
+
 int player_play(rtsp_conn_info *conn) {
   debug(2, "Connection %d: player_play.", conn->connection_number);
+  export_session_identity(conn);
   command_start(); // before startup, and before the prepare() method runs
   // give the output device as much advance warning as possible to get ready
   // and make sure it's done before launching the player thread
@@ -52,7 +80,7 @@ int player_play(rtsp_conn_info *conn) {
                               // access to the output device (i.e. knowing that it should not be in
                               // use by another program at this time).
 
-  pthread_cleanup_debug_mutex_lock(&conn->player_create_delete_mutex, 5000, 1);
+  pthread_mutex_lock_and_cleanup_push(&conn->player_create_delete_mutex);
   if (conn->player_thread == NULL) {
     pthread_t *pt = malloc(sizeof(pthread_t));
     if (pt == NULL)
@@ -79,7 +107,7 @@ int player_stop(rtsp_conn_info *conn) {
   // note -- this may be called from another connection thread.
   debug(2, "Connection %d: player_stop.", conn->connection_number);
   int response = 0; // okay
-  pthread_cleanup_debug_mutex_lock(&conn->player_create_delete_mutex, 5000, 4);
+  pthread_mutex_lock_and_cleanup_push(&conn->player_create_delete_mutex);
   pthread_t *pt = conn->player_thread;
   if (pt) {
     debug(3, "player_thread cancel...");
@@ -116,6 +144,7 @@ int player_stop(rtsp_conn_info *conn) {
 #ifdef CONFIG_METADATA
     send_ssnc_metadata('pend', NULL, 0, 1); // contains cancellation points
 #endif
+    export_session_identity(conn);
     command_stop();
   }
   return response;
