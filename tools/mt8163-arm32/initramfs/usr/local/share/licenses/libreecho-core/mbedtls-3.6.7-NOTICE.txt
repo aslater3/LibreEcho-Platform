@@ -1,4 +1,4 @@
-Mbed TLS 3.6.4 — third-party runtime notice
+Mbed TLS 3.6.7 — third-party runtime notice
 ===========================================
 
 Mbed TLS is dual-licensed: Apache-2.0 OR GPL-2.0-or-later. LibreEcho uses it
@@ -6,9 +6,9 @@ under the Apache-2.0 option; the full Apache-2.0 text accompanies this bundle
 as Apache-2.0.txt.
 
   upstream: https://github.com/Mbed-TLS/mbedtls
-  source archive: https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.4/mbedtls-3.6.4.tar.bz2
-  source archive SHA-256: ec35b18a6c593cf98c3e30db8b98ff93e8940a8c4e690e66b41dfc011d678110
-  version: 3.6.4
+  source archive: https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.7/mbedtls-3.6.7.tar.bz2
+  source archive SHA-256: a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6
+  version: 3.6.7
 
 The image rebuilds static ARM32 libmbedtls/libmbedx509/libmbedcrypto archives
 from that pinned archive; the source offer records the compiler, the pinned

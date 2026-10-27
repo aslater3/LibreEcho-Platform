@@ -5012,7 +5012,7 @@ class UiTlsPackagingTests(unittest.TestCase):
     def test_mbedtls_dependency_is_pinned_and_provenanced(self) -> None:
         lock = json.loads((TOOLS_DIR / "mbedtls/SOURCE.lock").read_text())
         self.assertEqual(lock["name"], "mbedtls")
-        self.assertEqual(lock["version"], "3.6.4")
+        self.assertEqual(lock["version"], "3.6.7")
         self.assertEqual(lock["license"], "Apache-2.0")
         self.assertRegex(lock["source_sha256"], r"^[0-9a-f]{64}$")
         self.assertTrue(
@@ -5151,7 +5151,7 @@ class UiTlsPackagingTests(unittest.TestCase):
             for header in ("ssl.h", "x509_crt.h", "pk.h", "entropy.h"):
                 (prefix / "include/mbedtls" / header).write_text("/* stub */\n")
             (prefix / "include/mbedtls/build_info.h").write_text(
-                '#define MBEDTLS_VERSION_STRING         "3.6.4"\n'
+                '#define MBEDTLS_VERSION_STRING         "3.6.7"\n'
             )
             for archive in ("libmbedcrypto.a", "libmbedx509.a", "libmbedtls.a"):
                 (prefix / "lib" / archive).write_text("not an archive\n")
@@ -5199,7 +5199,7 @@ class UiTlsPackagingTests(unittest.TestCase):
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             self.assertEqual(accepted.returncode, 0, accepted.stderr)
-            self.assertIn("ui_tls_prefix=ok mbedtls_version=3.6.4", accepted.stdout)
+            self.assertIn("ui_tls_prefix=ok mbedtls_version=3.6.7", accepted.stdout)
 
             for name, payload in consumers.items():
                 binary = tmp / f"libreecho-{name}"
@@ -5604,7 +5604,7 @@ class UiTlsPackagingTests(unittest.TestCase):
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             self.assertEqual(prefix_ok.returncode, 0, prefix_ok.stderr)
-            self.assertIn("ui_tls_prefix=ok mbedtls_version=3.6.4", prefix_ok.stdout)
+            self.assertIn("ui_tls_prefix=ok mbedtls_version=3.6.7", prefix_ok.stdout)
             # A valid prefix must get past every TLS guard: the build then stops
             # on the stand-in UI checkout, not on a TLS refusal.
             reached = self.run_ui_bundle(tmp, str(valid))
@@ -5674,7 +5674,7 @@ class UiTlsPackagingTests(unittest.TestCase):
                 }
                 : > "$objs/leak.o"
                 if [ "${LE_TEST_ARCHIVE_LEAK:-0}" = 1 ]; then
-                  printf -- '-ffile-prefix-map=%s=/usr/src/mbedtls-3.6.4\\n' "$work" \\
+                  printf -- '-ffile-prefix-map=%s=/usr/src/mbedtls-3.6.7\\n' "$work" \\
                     >> "$objs/leak.o"
                   printf '%s\\n' "$work" > "$LE_TEST_FIXTURE_DIR/leaked-build-path.txt"
                 fi

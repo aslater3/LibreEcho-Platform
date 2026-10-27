@@ -120,16 +120,16 @@ tinyalsa_source=$(find "$work" -mindepth 1 -maxdepth 1 -type d -name 'tinyalsa-*
     echo "ERROR: source archive layout is not recognised" >&2
     exit 1
 }
-# Refuse an upstream drift before applying the exact Shairport 5.1 hook patch.
+# Refuse an upstream drift before applying the exact Shairport 5.6.2 hook patch.
 (
     cd "$shairport_source"
     printf '%s\n' \
-        '4561e4b6d7a5c4c24c22f246651bf36626eaeca2ed4b10afcbb090edd171b22a  common.c' \
-        'bb18c3c7c1a6e88569a54a685ddaf3a2c502e2deb864cc1f4f6c8164368f1eb3  common.h' \
-        'ecc08bf0d38554addf882af95e25e4f2f4dd862017487dcc05150efea62151e2  player.c' \
-        '51242bda9351bacfd2dcead44dbb5c1137b678c89d2fe969852b9a9235b6fd5b  player.h' |
+        '7011bff6f49ddada8ce9b34ea36216611c3bfe1847222ca5b72e7798c922667f  common.c' \
+        '66ef34c7bc1a5c4612786b4c8860da6769ae5e1d146800ccb3a5f5537b1eaa3e  common.h' \
+        '18b5ee672237592d80d8b62e5a5d9236ae0d5537a6ecf47097dd6c586c360c33  player.c' \
+        'df449b1074ec67da077631a26cb9d8ca5433474a60efe47d1b47bd4bb8a165a9  player.h' |
         sha256sum -c -
-    patch --batch --fuzz=0 -p1 -i "$SCRIPT_DIR/shairport-5.1-session-hooks.patch"
+    patch --batch --fuzz=0 -p1 -i "$SCRIPT_DIR/shairport-5.6.2-session-hooks.patch"
 )
 reproducible_path_flags="-ffile-prefix-map=$work=/usr/src/libreecho-airplay -fdebug-prefix-map=$work=/usr/src/libreecho-airplay"
 
