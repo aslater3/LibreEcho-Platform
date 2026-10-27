@@ -519,7 +519,11 @@ class RadarTreeDiffTests(unittest.TestCase):
                'usr/local/share/licenses/libreecho-core/iw-5.19-COPYING.txt',
                'usr/local/share/licenses/libreecho-core/opus-1.4-COPYING.txt',
                'usr/local/share/licenses/libreecho-core/libogg-1.3.5-COPYING.txt',
-               'usr/local/share/licenses/libreecho-core/opusfile-0.12-COPYING.txt'}
+               'usr/local/share/licenses/libreecho-core/opusfile-0.12-COPYING.txt',
+               # Mbed TLS 3.6.4 -> 3.6.7 security bump for 0.14.5: the base
+               # tree's notice is replaced by the new version's.
+               'usr/local/share/licenses/libreecho-core/mbedtls-3.6.4-NOTICE.txt',
+               'usr/local/share/licenses/libreecho-core/mbedtls-3.6.7-NOTICE.txt'}
     # Separately reviewed ESPHome satellite change (Platform #212), pinned to
     # its exact reviewed bytes rather than widening the multi-target allowlist.
     ESPHOME_COMMIT = '37de1c11109453194ce6170f360450f887a615d4'
