@@ -269,6 +269,110 @@ print('206' if start else '200', end='')
         self.assertFalse(self.requests.exists())
 
 
+TRANSACTION = TOOLS / 'initramfs/libreecho-generation-transaction'
+STALE_BYTES = 32 * 1024 * 1024
+
+
+class ReclaimSpaceTests(ConvergenceTests):
+    def setUp(self):
+        super().setUp()
+        self.incoming = self.data / 'incoming'
+        self.incoming.mkdir(parents=True)
+        self.env['INCOMING'] = str(self.incoming)
+        self.generations.mkdir(parents=True, exist_ok=True)
+
+    def generation(self, name, size=4096):
+        directory = self.generations / name
+        (directory / 'features').mkdir(parents=True)
+        (directory / 'features/blob').write_bytes(os.urandom(size))
+        return directory
+
+    def pin(self, name):
+        (self.generations / f'{name}.pin').write_text(name + '\n')
+
+    def seed_history(self):
+        self.seed_current()
+        self.generation('earlier')
+        (self.control / 'previous').write_text('earlier\n')
+        self.generation('waiting')
+        self.pin('waiting')
+        (self.control / 'pending').write_text(
+            'schema=3\nslot=b\ntransaction_id=waiting\nmanifest_sha256=' + '0' * 64 + '\n')
+        # An assembly that was never installed, and one that never finished.
+        self.generation('abandoned', STALE_BYTES)
+        self.pin('abandoned')
+        self.generation('interrupted.partial')
+
+    def reserve_needing_reclaim(self):
+        # The reserve exceeds today's free space by half the abandoned tree, so
+        # assembly fits only once that tree is released.
+        stat = os.statvfs(self.generations)
+        return str(stat.f_bavail * stat.f_frsize + STALE_BYTES // 2)
+
+    def test_superseded_candidate_is_released_before_the_space_check(self):
+        self.seed_history()
+        self.env['SPACE_RESERVE_BYTES'] = self.reserve_needing_reclaim()
+        self.assert_target(0)
+        names = sorted(p.name for p in self.generations.iterdir())
+        self.assertNotIn('abandoned', names)
+        self.assertNotIn('abandoned.pin', names)
+        self.assertNotIn('interrupted.partial', names)
+        for kept in ('prior', 'earlier', 'waiting', 'waiting.pin', 'test-target'):
+            self.assertIn(kept, names)
+
+    def test_nothing_is_reclaimed_while_an_install_runs(self):
+        self.seed_history()
+        (self.control / 'install.lock').mkdir()
+        self.env['SPACE_RESERVE_BYTES'] = self.reserve_needing_reclaim()
+        result = self.run_assembly()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('generation-space', result.stderr)
+        for kept in ('abandoned', 'abandoned.pin', 'interrupted.partial', 'waiting.pin'):
+            self.assertTrue((self.generations / kept).exists(), kept)
+
+    def write_incoming(self):
+        orphan = self.incoming / 'orphan.payload.squashfs'
+        orphan.write_bytes(b'collected generation payload')
+        live = self.incoming / 'live.payload.squashfs'
+        target = self.generations / 'prior/features/airplay2/payload.squashfs'
+        os.link(target, live)
+        link = self.incoming / 'symlink.payload.squashfs'
+        link.symlink_to(orphan)
+        return orphan, live, link
+
+    def test_direct_install_uploads_without_a_generation_are_removed(self):
+        self.seed_current()
+        orphan, live, link = self.write_incoming()
+        self.assert_target(0)
+        self.assertFalse(orphan.exists())
+        self.assertTrue(live.exists())
+        self.assertTrue(link.is_symlink())
+
+    def test_uploads_are_kept_until_a_generation_is_committed(self):
+        orphan = self.incoming / 'upload.payload.squashfs'
+        orphan.write_bytes(b'direct install still uploading')
+        self.assert_target(10)
+        self.assertTrue(orphan.exists())
+
+    def test_gc_removes_uploads_left_by_a_collected_generation(self):
+        self.seed_current()
+        orphan, live, link = self.write_incoming()
+        result = subprocess.run(['/bin/busybox', 'sh', str(TRANSACTION), 'gc'],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(orphan.exists())
+        self.assertTrue(live.exists())
+        self.assertTrue(link.is_symlink())
+
+
+# The reclaim scenarios reuse the assembly fixture; the inherited assembly tests
+# already run once through ConvergenceTests.
+for _name in dir(ConvergenceTests):
+    if _name.startswith('test') and _name not in vars(ReclaimSpaceTests):
+        setattr(ReclaimSpaceTests, _name, None)
+del _name
+
+
 if __name__ == '__main__':
     import unittest
     unittest.main()
