@@ -886,11 +886,18 @@ int main(int argc, char **argv)
               LE_AUDIO_SINK_OK, "finish playhead rejected");
         check(le_audio_sink_get_progress(sink, &p4) == LE_AUDIO_SINK_OK &&
               p4.completed == 1, "exact FINISH tail did not complete");
-        /* Completed -> no pacing, no endless silence. */
+        /* Completed -> the generation stops pacing; only the bounded output
+         * hold keeps silence flowing, so a seek or resume reuses the open
+         * PCM, and it ends: no endless silence. */
         check(!sendspin_live(&g_sendspin),
               "completed generation kept pacing silence forever");
-        check(!period_ready(sources),
-              "completed generation still reported a ready period");
+        check(sendspin_held(&g_sendspin) && period_ready(sources),
+              "output hold did not keep the PCM paced after the generation");
+        check(g_sendspin.hold_until_us - sendspin_now_us() <= SENDPIN_OUTPUT_HOLD_US,
+              "output hold is not bounded");
+        g_sendspin.hold_until_us = sendspin_now_us() - 1;
+        check(!sendspin_held(&g_sendspin) && !period_ready(sources),
+              "expired output hold still reported a ready period");
         check(p4.played_frames == total,
               "FINISH tail was not delivered as the exact source end");
     }
@@ -3647,6 +3654,9 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
     audit_selftest(argv[1]);
     g_profile_dir = getenv("LE_AUDIO_ENGINE_SENDSPIN_PROFILE_DIR");
+    /* The loop scenarios bound pacing after a generation ends; the output
+     * hold (unit-tested in engine-sendspin) would add seconds of silence. */
+    g_sendspin_hold_us = 0;
     for (i = 0; i < count; ++i) {
         if (selected >= 0 && (int)i != selected)
             continue;

@@ -87,6 +87,15 @@
 #define SENDPIN_SOCKET_NAME "sendspin.sock"
 #define SENDPIN_WRITE_ZERO_RETRIES 3U
 #define SENDPIN_PRIME_LIMIT 32U
+/*
+ * Keep the output running (silence) this long after a Sendspin generation was
+ * last live.  A seek or pause ends one generation and opens the next; without
+ * the hold the PCM closes after SOURCE_IDLE_PERIODS and the next generation
+ * pays the full output start (~1.4 s on the Dot).  sendspind assumes the same
+ * hold (kEngineOutputHoldMs) when it asks the server for a short lead.
+ */
+#define SENDPIN_OUTPUT_HOLD_US 5000000LL
+static long long g_sendspin_hold_us = SENDPIN_OUTPUT_HOLD_US;
 
 struct sendspin_state {
     struct le_audio_sink *sink;
@@ -100,9 +109,19 @@ struct sendspin_state {
     size_t stage_frames;           /* frames peeked for the current period */
     uint64_t first_frame;          /* cumulative first source frame peeked */
     int16_t stage[PERIOD_SIZE * OUTPUT_CHANNELS];
+    long long hold_until_us;       /* output kept warm until (CLOCK_MONOTONIC) */
 };
 
 static struct sendspin_state g_sendspin;
+
+static long long sendspin_now_us(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return 0;
+    return (long long)now.tv_sec * 1000000LL + now.tv_nsec / 1000;
+}
 
 /* One bounded, non-blocking socket service per poll cycle. */
 static void sendspin_service(struct sendspin_state *sp)
@@ -277,7 +296,15 @@ static int sendspin_live(struct sendspin_state *sp)
     if (!progress.finished && progress.queued_frames == 0u &&
         sp->starve_periods >= SENDPIN_PRIME_LIMIT)
         return 0;
+    sp->hold_until_us = g_sendspin_hold_us > 0 ? sendspin_now_us() + g_sendspin_hold_us : 0;
     return 1;
+}
+
+/* Output still held warm after the last live Sendspin generation. */
+static int sendspin_held(const struct sendspin_state *sp)
+{
+    return sp->sink && sp->hold_until_us != 0 &&
+           sendspin_now_us() < sp->hold_until_us;
 }
 
 /*
@@ -1524,7 +1551,7 @@ static int sources_active(const struct source_bus *sources)
 {
 	unsigned int i;
 
-	if (sendspin_live(&g_sendspin))
+	if (sendspin_live(&g_sendspin) || sendspin_held(&g_sendspin))
 		return 1;
 	for (i = 0; i < SOURCE_COUNT; ++i)
 		if (sources[i].idle_periods > 0 ||
@@ -1545,8 +1572,10 @@ static int period_ready(const struct source_bus *sources)
 	unsigned int i;
 
 	/* A live Sendspin generation paces PCM periods even when no legacy FIFO
-	 * has a complete period, so priming/underrun silence reaches the SDK. */
-	if (sendspin_live(&g_sendspin))
+	 * has a complete period, so priming/underrun silence reaches the SDK;
+	 * the post-generation hold keeps pacing silence so a seek or resume
+	 * reuses the running output. */
+	if (sendspin_live(&g_sendspin) || sendspin_held(&g_sendspin))
 		return 1;
 	for (i = 0; i < SOURCE_COUNT; ++i)
 		if (source_period_ready(&sources[i]))
