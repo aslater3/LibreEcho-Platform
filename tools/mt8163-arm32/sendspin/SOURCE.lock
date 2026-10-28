@@ -54,6 +54,13 @@
         "target": "identity::sdk",
         "pristine_archive_sha256": "2749ee07e4974f3879297af12d651349df33f46125a100cc935bf6966ed8af45",
         "note": "Applied after 0001 (list order), so it diffs the 0001-patched tree. Adds PlayerRoleListener::on_stream_boundary(clear_generation): a synchronous seek boundary fired on the sync task thread inside apply_stream_clear() for both the flag and marker clear paths, once per monotonically tagged boundary. Its return value is the sink frames the consumer discarded at the boundary (the callback outcome), which are removed from sync_task's accepted-minus-played ledger (buffered_frames and new_audio_client_playtime move together) with no notify_audio_played() call, so post-seek audio is not mistaken for late and dropped. Additive default returns 0 and preserves prior behavior. Pinned archive and its sha256 are unchanged."
+      },
+      {
+        "file": "0003-runtime-required-lead.patch",
+        "sha256": "524c658f0c30ef38f50786c245066ef9dca2da5de12061f9569715d1fd81e842",
+        "target": "identity::sdk",
+        "pristine_archive_sha256": "2749ee07e4974f3879297af12d651349df33f46125a100cc935bf6966ed8af45",
+        "note": "Applied after 0002 (list order). Adds PlayerRole::set_required_lead_time_ms(): a runtime override of PlayerRoleConfig::required_lead_time_ms (0 restores the configured value, the pipeline floor still applies) that republishes client/state, so a player whose output is already running can ask for a short lead on the next stream start or seek."
       }
     ],
     "note": "Every applied patch is an immutable, SHA-256-pinned artifact in patches/, applied in list order (0001 then 0002) to the archive-verified staged tree. verify_sendspin_sources.py --patch-dir refuses a missing, extra, corrupt, double-applied, or path-escaping patch; a tree that is not the archive plus exactly this patch list is refused."
@@ -99,7 +106,10 @@
       "archive_url": "https://github.com/machinezone/IXWebSocket/archive/c5a02f1066fb0fde48f80f51178429a27f689a39.tar.gz",
       "archive_sha256": "ef272693e67daef33275daa8d3685f48e8fe4dbe098338750f9dad3013016d96",
       "license": "BSD-3-Clause",
-      "build_flags": ["USE_TLS=OFF", "USE_ZLIB=OFF"]
+      "build_flags": [
+        "USE_TLS=OFF",
+        "USE_ZLIB=OFF"
+      ]
     },
     {
       "name": "micro-flac",
