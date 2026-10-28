@@ -24,6 +24,7 @@ cat > "$STUB/pcm.h" <<'EOF'
 #include <stdint.h>
 #define PCM_OUT 0U
 #define PCM_FORMAT_S16_LE 0
+#define PCM_FORMAT_S32_LE 1
 struct pcm;
 struct pcm_config {
     unsigned int channels;
