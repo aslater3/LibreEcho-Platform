@@ -3,6 +3,7 @@
 BB=/bin/busybox
 ROOT=${ROOT:-/data/libreecho/update}
 GENERATIONS=${GENERATIONS:-/data/libreecho/generations}
+INCOMING=${INCOMING:-/data/libreecho/incoming}
 GENERATION_TOOL=${GENERATION_TOOL:-/usr/local/sbin/libreecho-generation}
 BOOTCTL=${BOOTCTL:-/usr/local/sbin/libreecho-bootctl}
 CMDLINE_FILE=${CMDLINE_FILE:-/proc/cmdline}
@@ -432,6 +433,23 @@ rollback() {
     sync_file
     gc
 }
+# Direct-install uploads are linked into the generation tree in place, so once
+# a generation is committed their incoming names are redundant. An upload whose
+# generation has since been collected (link count 1) is only dead space, and
+# nothing reads incoming after install: a new direct install formats userdata
+# first, so no committed generation exists while it is uploading.
+reclaim_incoming() {
+    local entry
+    [ -e "$ROOT/current" ] || return 0
+    [ -d "$INCOMING" ] && [ ! -L "$INCOMING" ] || return 0
+    safe_path "$INCOMING"
+    for entry in "$INCOMING"/*; do
+        [ -f "$entry" ] && [ ! -L "$entry" ] || continue
+        [ "$($BB stat -c %h "$entry")" = 1 ] || continue
+        $BB rm -f "$entry" || fail reclaim-incoming
+    done
+}
+
 gc() {
     local keep= id directory pin
     # Snapshot pins BEFORE pointers: an installer can clear its pin only after
@@ -462,6 +480,7 @@ gc() {
         $BB find "$directory" -type d -exec $BB chmod 0700 '{}' ';' || fail gc-mode
         $BB rm -rf "$directory" || fail gc-delete
     done
+    reclaim_incoming
     sync_file
 }
 https_client() {
