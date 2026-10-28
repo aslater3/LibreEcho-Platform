@@ -32,7 +32,11 @@ for pair in sys.argv[2:]:
     raw, trace = pair.split(':')
     a = np.fromfile(raw, dtype=dt)
     ref = np.abs(a['ref']).astype(float)
-    thr = ref.max() * 0.3
+    # 30% of the typical click peak: the median of the non-silent per-second
+    # peaks, so a one-off transient outside the stream cannot hide every click.
+    peaks = [ref[i:i + 16000].max() for i in range(0, len(ref), 16000)]
+    peaks = [x for x in peaks if x > 0]
+    thr = (np.median(peaks) if peaks else ref.max()) * 0.3
     idx = np.flatnonzero((ref[1:] > thr) & (ref[:-1] <= thr)) + 1
     on = [idx[0]] + [i for p, i in zip(idx[:-1], idx[1:]) if i - p > 4000]
     tr = []
