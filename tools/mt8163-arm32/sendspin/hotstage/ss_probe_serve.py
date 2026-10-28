@@ -220,6 +220,7 @@ async def main():
     for c in clients[1:]:
         await group.add_client(c)
     print('group members', len(group.clients), flush=True)
+    print('stream_start_us', server.clock.now_us(), flush=True)
     stream = group.start_stream()
     ctl = {'stream': stream, 'cleared': False}
     script_task = asyncio.create_task(run_script(clients[a.script_player], a.script, group, ctl,
