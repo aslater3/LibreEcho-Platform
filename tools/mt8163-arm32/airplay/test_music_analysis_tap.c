@@ -82,8 +82,8 @@ static void analyse_at(int32_t gain, struct music_features *features,
 	for (period = 0; period < TAP_PERIODS; ++period) {
 		click_period(media, period);
 		ready_bus(&sources[SOURCE_MEDIA], media, gain);
-		render_period(sources, output, &dynamics, &speaker, master,
-			      &master);
+		render_period(sources, NULL, 0, output, &dynamics, &speaker,
+			      master, &master);
 		for (i = 0; i < PERIOD_SIZE * OUTPUT_CHANNELS; ++i)
 			if (abs(output[i]) > *output_peak)
 				*output_peak = abs(output[i]);

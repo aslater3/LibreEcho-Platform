@@ -22,7 +22,10 @@ cat > "$STUB/pcm.h" <<'EOF'
 #define LE_TEST_TINYALSA_PCM_H
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 #define PCM_OUT 0U
+#define PCM_NORESTART 0x00000004U
+#define PCM_MONOTONIC 0x00000008U
 #define PCM_FORMAT_S16_LE 0
 #define PCM_FORMAT_S32_LE 1
 struct pcm;
@@ -53,6 +56,11 @@ static inline int pcm_writei(struct pcm *pcm, const void *data,
 { (void)pcm; (void)data; return (int)frames; }
 static inline int pcm_close(struct pcm *pcm)
 { (void)pcm; return 0; }
+static inline unsigned int pcm_get_buffer_size(const struct pcm *pcm)
+{ (void)pcm; return 0; }
+static inline int pcm_get_htimestamp(struct pcm *pcm, unsigned int *avail,
+                                     struct timespec *timestamp)
+{ (void)pcm; (void)avail; (void)timestamp; return -1; }
 #endif
 EOF
 
@@ -88,6 +96,8 @@ CFLAGS="-std=c99 -Wall -Wextra -Wpedantic -Werror \
 
 "$CC" $CFLAGS -I"$WORK/stub/include" \
     "$SCRIPT_DIR/test_music_analysis_tap.c" \
+    "$SCRIPT_DIR/audio_sink.c" \
+    "$SCRIPT_DIR/audio_timing.c" \
     "$SCRIPT_DIR/aec_reference.c" \
     "$SCRIPT_DIR/audio_visualizer.c" \
     "$SCRIPT_DIR/playback_status.c" \
