@@ -364,6 +364,77 @@ class ReclaimSpaceTests(ConvergenceTests):
         self.assertTrue(live.exists())
         self.assertTrue(link.is_symlink())
 
+    def seed_evidence(self):
+        # Five quarantined packages, three quarantined assets and a part no
+        # feature of the target names, oldest first, as weeks of failed checks
+        # leave them; plus a finished part this target can use as it is.
+        cache = self.control / 'asset-cache'
+        cache.mkdir()
+        evidence = {'quarantine': [], 'asset': []}
+        stamp = 1_700_000_000
+        for kind, directory, prefix, count in (('quarantine', self.control, 'quarantine-', 5),
+                                               ('asset', cache, '', 3)):
+            for index in range(count):
+                body = os.urandom(STALE_BYTES // 4)
+                path = directory / f'{prefix}{hashlib.sha256(body).hexdigest()}.bad'
+                path.write_bytes(body)
+                stamp += 86400
+                os.utime(path, (stamp, stamp))
+                evidence[kind].append(path)
+        body = os.urandom(STALE_BYTES // 4)
+        stale = cache / f'{hashlib.sha256(body).hexdigest()}.part'
+        stale.write_bytes(body)
+        usable = cache / f'{hashlib.sha256(self.assets["tts"][0]).hexdigest()}.part'
+        usable.write_bytes(self.assets['tts'][0])
+        return evidence, stale, usable
+
+    def test_old_evidence_and_stale_parts_are_released_only_when_space_is_short(self):
+        evidence, stale, usable = self.seed_evidence()
+        stat = os.statvfs(self.generations)
+        # Fits only once the three oldest quarantined packages, the oldest
+        # quarantined asset and the stale part (5 x 8 MiB) are released.
+        self.env['SPACE_RESERVE_BYTES'] = str(stat.f_bavail * stat.f_frsize + STALE_BYTES // 2)
+        self.assert_target(9)
+        for kind in ('quarantine', 'asset'):
+            self.assertEqual([p.exists() for p in evidence[kind]],
+                             [False] * (len(evidence[kind]) - 2) + [True, True], kind)
+        self.assertFalse(stale.exists())
+        self.assertFalse(usable.exists())  # renamed into the target tree
+
+    def test_evidence_is_kept_while_the_assembly_fits(self):
+        evidence, stale, usable = self.seed_evidence()
+        self.assert_target(9)
+        for path in evidence['quarantine'] + evidence['asset'] + [stale]:
+            self.assertTrue(path.exists(), path.name)
+
+    def test_evidence_is_kept_while_an_install_runs(self):
+        evidence, stale, _ = self.seed_evidence()
+        (self.control / 'install.lock').mkdir()
+        stat = os.statvfs(self.generations)
+        self.env['SPACE_RESERVE_BYTES'] = str(stat.f_bavail * stat.f_frsize + STALE_BYTES // 2)
+        result = self.run_assembly()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('generation-space', result.stderr)
+        for path in evidence['quarantine'] + evidence['asset'] + [stale]:
+            self.assertTrue(path.exists(), path.name)
+
+    def test_complete_parts_are_not_counted_against_free_space(self):
+        # Large enough that counting the seeded parts as new writes would
+        # exceed free space by far more than filesystem noise.
+        self.assets = {f: (os.urandom(STALE_BYTES // 8), self.assets[f][1]) for f in FEATURES}
+        self.text = manifest(self.assets)
+        self.p, self.s = self.signed(self.text)
+        cache = self.control / 'asset-cache'
+        cache.mkdir()
+        for f in FEATURES:
+            for data in self.assets[f]:
+                (cache / f'{hashlib.sha256(data).hexdigest()}.part').write_bytes(data)
+        stat = os.statvfs(self.generations)
+        # Leaves 8 MiB of headroom: enough for the renames, 12 MiB short of
+        # writing the 20 MiB of payloads again.
+        self.env['SPACE_RESERVE_BYTES'] = str(stat.f_bavail * stat.f_frsize - 65536 - STALE_BYTES // 4)
+        self.assert_target(0)
+
 
 # The reclaim scenarios reuse the assembly fixture; the inherited assembly tests
 # already run once through ConvergenceTests.
