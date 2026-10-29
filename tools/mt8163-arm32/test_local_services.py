@@ -165,6 +165,24 @@ class LocalServicesTests(unittest.TestCase):
         self.assertNotIn("service.UPPER", status)
         self.assertNotIn("service.svc16", status)
 
+    def test_absent_root_is_disabled_not_unsafe(self):
+        # A device where local services were never switched on has no
+        # /data/libreecho/local at all: that is "off", not an unsafe path.
+        shutil.rmtree(self.local)
+        status = self.step()
+        self.assertEqual((status["enabled"], status["state"]), ("0", "disabled"))
+        self.background = subprocess.Popen([BUSYBOX, "sh", str(SCRIPT), "run"], env=self.env,
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.status.unlink()
+        self.assertTrue(self.wait_for(lambda: self.read_status().get("state") == "disabled"))
+        time.sleep(0.5)
+        self.assertEqual(self.read_status().get("state"), "disabled")
+
+    def test_dangling_symlink_root_is_refused(self):
+        shutil.rmtree(self.local)
+        os.symlink(self.base / "missing", self.local)
+        self.assertEqual(self.step()["state"], "skipped:path-unsafe")
+
     def test_unsafe_root_is_refused(self):
         real = self.base / "elsewhere"
         shutil.move(str(self.local), str(real))

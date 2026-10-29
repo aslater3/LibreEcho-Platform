@@ -54,6 +54,12 @@ valid_name()
     [ "${#1}" -le 32 ]
 }
 
+# Nothing set up yet (no directory, and not a dangling symlink): simply off.
+root_absent()
+{
+    [ ! -e "$LOCAL_ROOT" ] && [ ! -L "$LOCAL_ROOT" ]
+}
+
 root_safe()
 {
     [ -d "$LOCAL_ROOT" ] && [ ! -L "$LOCAL_ROOT" ] || return 1
@@ -213,6 +219,11 @@ record_exit()
 
 supervise_once()
 {
+    if root_absent; then
+        stop_all
+        write_status disabled
+        return
+    fi
     if ! root_safe; then
         stop_all
         write_status "skipped:path-unsafe"
@@ -300,7 +311,9 @@ run()
     chmod 0700 "$RUN_ROOT" 2>/dev/null
     printf '%s\n' "$$" > "$SUPERVISOR_PIDFILE"
     trap 'stop_all; write_status stopped; rm -f "$SUPERVISOR_PIDFILE"; exit 0' TERM INT
-    if ! root_safe; then
+    if root_absent; then
+        write_status disabled
+    elif ! root_safe; then
         write_status "skipped:path-unsafe"
         log skipped-path-unsafe
     elif enabled && ! boot_guard; then
