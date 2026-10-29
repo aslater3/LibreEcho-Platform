@@ -162,3 +162,43 @@ python3 tools/mt8163-arm32/airplay/test_music_feature_packet.py
 
 `MF_DEBUG=1` on `test-music-features` dumps a per-period CSV trace for
 calibration.
+
+## Offline trace and regression corpus (#46)
+
+`music_trace.c` runs the production producer path (the same
+`audio_visualizer_process_features()`, transport and frame formatter the audio
+engine uses) over a recording and writes the version-2 frames as JSONL. The
+same input always gives a byte-identical trace.
+
+```sh
+cc -O2 -std=c99 audio_visualizer.c music_trace.c -lm -o music-trace
+ffmpeg -i song.flac -ar 48000 -ac 2 -c:a pcm_s16le song.wav   # 48 kHz 16-bit PCM WAV
+./music-trace song.wav song.jsonl
+./music-trace --gain-db -20 song.wav song-quiet.jsonl          # same programme, quieter
+```
+
+`corpus/gen_corpus.py DIR` writes a synthetic corpus (click tracks at 90, 120
+and 150 BPM, a beatless pad, white noise, a sweep, silence and a -20 dB copy)
+with integer synthesis, so every host produces identical files and no audio is
+committed. `test_music_trace.py` checks it in CI: silence is inert, beatless
+material reports no tempo, click tracks get a confident tempo, and level does
+not move tempo or confidence, and 90, 120 and 150 BPM are reported at the
+right metrical level. One known gap is an expected failure until fixed: energy
+and density follow the recording level, so a -20 dB master reads quieter.
+
+The engine analyses a unity-gain tap (#44): the media and AirPlay buses summed
+in stereo before sender volume, master volume, speaker EQ and limiting.  Volume
+changes the speaker output but not the features; a bus at zero gain is left out
+so a muted sender does not animate the LEDs.  `test_music_analysis_tap.sh` runs
+the engine's own tap and analyser and checks that a -20 dB sender gain leaves
+every feature byte-identical.
+
+To evaluate on real music, keep the recordings and a list of them outside the
+repository and run `music-trace` over them; never commit copyrighted audio.
+
+The tempo search correlates a detrended onset envelope (each value minus its
+trailing 8-frame mean), so a smooth or slowly swelling envelope no longer
+produces a confident tempo on beatless material. A periodic onset train also
+correlates at two and three periods, so when the lag a half or a third as long
+scores at least 80% (`MF_METRICAL_RATIO_Q8`) of the best lag, the faster level
+is reported.

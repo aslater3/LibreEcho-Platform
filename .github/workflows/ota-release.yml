@@ -150,7 +150,9 @@ jobs:
           bash tools/mt8163-arm32/airplay/test_music_session_id.sh
           bash tools/mt8163-arm32/airplay/test_music_feature_trace.sh
           bash tools/mt8163-arm32/airplay/test_music_transport_wrap.sh
+          bash tools/mt8163-arm32/airplay/test_music_analysis_tap.sh
           python tools/mt8163-arm32/airplay/test_music_feature_packet.py
+          python tools/mt8163-arm32/airplay/test_music_trace.py
           python -m unittest -q tools/mt8163-arm32/feature_runtime/test_runtime_package.py
           cd tools/mt8163-arm32
           python -m unittest -q \
