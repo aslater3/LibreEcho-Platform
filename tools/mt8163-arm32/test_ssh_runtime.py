@@ -165,6 +165,84 @@ fi
                 subprocess.run(['pkill', '-f', str(root / 'dropbear')], check=False)
                 proc.wait(timeout=5)
 
+    def test_dropbear_start_line_uses_only_options_the_build_keeps(self):
+        # #300: -E was passed to a Dropbear configured with --disable-syslog,
+        # which rejects it, so SSH never started on any image.
+        source = (ROOT / 'ssh/libreecho-ssh.init').read_text()
+        build = (ROOT / 'ssh/build_dropbear.sh').read_text()
+        start = source.index('    $DROPBEAR ')
+        line = source[start:source.index('&\n', start)].replace('\\\n', ' ')
+        options = {word for word in line.split() if word.startswith('-')}
+        self.assertEqual(options, {'-F', '-P', '-r', '-p'})
+        removed_by_configure = {'--disable-syslog': '-E'}
+        for flag, option in removed_by_configure.items():
+            if flag in build:
+                self.assertNotIn(option, options, f'{option} is unavailable with {flag}')
+
+    def _run_supervisor_until(self, root, env, drop_body, predicate, seconds=15):
+        """Run the real supervisor loop against a fake dropbear; return ssh.status text."""
+        drop = Path(env['DROPBEAR'])
+        drop.write_text('#!/bin/sh\n' + drop_body)
+        drop.chmod(0o755)
+        status = root / 'ssh.status'
+        funcs = self._ssh_functions('log', 'log_change', 'write_status', 'ssh_config_enabled',
+                                    'dropbear_running', 'stop_dropbear', 'start_dropbear',
+                                    'dropbear_start_error', 'clear_runtime_accounts',
+                                    'run_supervisor', state=root / 'state')
+        config = root / 'web-config.json'
+        config.write_text('{"ssh":true}')
+        config.chmod(0o600)
+        env = dict(env, CONFIG_FILE=str(config))
+        script = ('STATUS_FILE=' + str(status) + '\n' + funcs +
+                  '\nusers_file_ready() { return 0; }\nsync_accounts() { return 0; }\n'
+                  'write_static_accounts() { return 0; }\nrun_supervisor\n')
+        proc = subprocess.Popen(['sh', '-c', script], env=env, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True)
+        import signal
+        import time
+        try:
+            deadline = time.time() + seconds
+            text = ''
+            while time.time() < deadline:
+                text = status.read_text() if status.exists() else ''
+                if predicate(text):
+                    break
+                time.sleep(0.2)
+            return text
+        finally:
+            os.killpg(proc.pid, signal.SIGKILL)
+            subprocess.run(['pkill', '-f', str(drop)], check=False, timeout=5)
+            proc.wait(timeout=5)
+
+    def test_supervisor_reports_ready_only_when_dropbear_runs(self):
+        # A fake that rejects -E exactly like the shipped --disable-syslog build.
+        like_shipped = ('for a; do [ "$a" = -E ] && { printf "Invalid option -E\\n'
+                        'Dropbear server v2026.93 https://matt.ucc.asn.au/dropbear/dropbear.html\\n'
+                        'Usage: /sbin/dropbear [options]\\n-b bannerfile\tDisplay the contents\\n" >&2; exit 1; }; done\n'
+                        'while [ $# -gt 0 ]; do [ "$1" = -P ] && p=$2; shift; done\n'
+                        'printf "%s\\n" "$$" > "$p"\nexec sleep 60\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env, _ = self._dropbear_env(root)
+            text = self._run_supervisor_until(root, env, like_shipped,
+                                              lambda t: 'account_state=' in t)
+            self.assertIn('account_state=ready\n', text)
+            self.assertNotIn('start_error=', text)
+            self.assertEqual(text.splitlines()[0], 'schema=1')
+
+    def test_supervisor_reports_failed_start_with_sanitized_reason(self):
+        always_fails = ('printf "Invalid option -E <x>;\\033[0m\\nUsage: /sbin/dropbear [options]\\n'
+                        '-b bannerfile\tDisplay the contents\\n" >&2\nexit 1\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env, _ = self._dropbear_env(root)
+            text = self._run_supervisor_until(root, env, always_fails,
+                                              lambda t: 'account_state=' in t)
+            self.assertIn('enabled=1\n', text)
+            self.assertIn('account_state=start-failed\n', text)
+            self.assertNotIn('account_state=ready', text)
+            self.assertIn('start_error=Invalid option -E x0m\n', text)
+
     def test_supervisor_logs_each_state_change_once(self):
         funcs = self._ssh_functions('log_change')
         result = subprocess.run(['sh', '-c', 'log() { printf "%s\\n" "$1"; }\n' + funcs +
