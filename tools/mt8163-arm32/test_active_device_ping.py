@@ -270,7 +270,9 @@ class ActiveDevicePingTests(unittest.TestCase):
         self.assertIn("/usr/local/sbin/libreecho-ping loop", init)
         line = next(l for l in init.splitlines() if "libreecho-ping loop" in l)
         self.assertTrue(line.rstrip().endswith("&"), line)
-        block = init[init.index('if [ "$IMAGE_PROFILE" = ota ]; then\n    ota_health_confirm_worker'):]
+        # The OTA-only block starts the health worker (wrapped since #170 so it
+        # marks OTA health settled for local services) and then the sender.
+        block = init[init.index('if [ "$IMAGE_PROFILE" = ota ]; then\n    ( ota_health_confirm_worker;'):]
         block = block[:block.index("\nfi\n")]
         self.assertIn("libreecho-ping loop", block)
 
