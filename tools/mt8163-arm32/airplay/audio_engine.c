@@ -30,6 +30,8 @@
 
 #include "aec_reference.h"
 #include "audio_period_buffer.h"
+#include "audio_sink.h"
+#include "audio_timing.h"
 #include "audio_visualizer.h"
 #include "music_session_id.h"
 #include "playback_status.h"
@@ -74,6 +76,554 @@
 #define VISUALIZER_FRAME_PERIODS 2U
 #define VISUALIZER_SILENT_PERIODS 24U
 #define VISUALIZER_BRIGHTNESS 70U
+
+/*
+ * Sendspin (LE_AUDIO_SINK/1) integration state.  The engine remains the sole
+ * PCM owner: this only adds a framed, generation-scoped source alongside the
+ * legacy FIFO buses, plus the bounded hardware-timing ledger.  The block is
+ * file-scope so the render/timing step is reachable by the host fixture, but
+ * the engine is single-threaded and single-instance.
+ */
+#define SENDPIN_SOCKET_NAME "sendspin.sock"
+#define SENDPIN_WRITE_ZERO_RETRIES 3U
+#define SENDPIN_PRIME_LIMIT 32U
+/*
+ * Keep the output running (silence) this long after a Sendspin generation was
+ * last live.  A seek or pause ends one generation and opens the next; without
+ * the hold the PCM closes after SOURCE_IDLE_PERIODS and the next generation
+ * pays the full output start (~1.4 s on the Dot).  sendspind assumes the same
+ * hold (kEngineOutputHoldMs) when it asks the server for a short lead.
+ */
+#define SENDPIN_OUTPUT_HOLD_US 5000000LL
+static long long g_sendspin_hold_us = SENDPIN_OUTPUT_HOLD_US;
+
+struct sendspin_state {
+    struct le_audio_sink *sink;
+    struct le_audio_timing *timing;
+    uint32_t epoch;
+    uint32_t generation;
+    int have_generation;
+    int source_started;            /* a source frame of this generation rendered */
+    unsigned int starve_periods;   /* bounded priming/underrun silence */
+    int64_t played_high_water;     /* last source-relative playhead fed */
+    size_t stage_frames;           /* frames peeked for the current period */
+    uint64_t first_frame;          /* cumulative first source frame peeked */
+    int16_t stage[PERIOD_SIZE * OUTPUT_CHANNELS];
+    long long hold_until_us;       /* output kept warm until (CLOCK_MONOTONIC) */
+};
+
+static struct sendspin_state g_sendspin;
+
+static long long sendspin_now_us(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return 0;
+    return (long long)now.tv_sec * 1000000LL + now.tv_nsec / 1000;
+}
+
+/* One bounded, non-blocking socket service per poll cycle. */
+static void sendspin_service(struct sendspin_state *sp)
+{
+    if (sp->sink)
+        (void)le_audio_sink_service(sp->sink);
+}
+
+/*
+ * Bound for sendspin_service_until_writable(): each slice either services a
+ * readable peer datagram or waits out the remaining PCM fill time, so this
+ * caps a flooding peer at a fixed amount of work per period.
+ */
+#define SENDSPIN_WAIT_SLICES 64
+
+/*
+ * Keep servicing the Sendspin sink until the PCM has room for one period.
+ *
+ * The companion is stop-and-wait: it sends one DATA and waits for its CREDIT
+ * before the next.  Serviced once per period, the sink therefore admits at
+ * most one SDK write (256-960 frames in practice, never more than one
+ * period) per 2048-frame period -- below real time, so the SDK starves
+ * and drops late chunks.  Servicing while the hardware drains turns each
+ * DATA round trip into socket latency instead of a period.  pcm_writei()
+ * then finds room and does not block; the PCM still paces the loop.
+ * Called between staging and the write: a DATA serviced here only queues
+ * for the next period, and a generation change here is fenced by the
+ * sink's stale-generation commit rejection.
+ *
+ * Only with a timing model: that is what established that the PCM's
+ * hardware pointer is trustworthy.  Without one -- or with no peer, or a
+ * failed query -- pacing is left to pcm_writei() exactly as before.  The
+ * total wait is bounded by one period of wall time regardless of what the
+ * PCM reports, so a ring that never drains cannot stall the loop.
+ */
+static void sendspin_service_until_writable(struct sendspin_state *sp,
+                                            struct pcm *pcm)
+{
+	struct timespec start, now;
+	const long budget_ms = (long)((PERIOD_SIZE * 1000U + DEFAULT_RATE - 1U) /
+				      DEFAULT_RATE);
+	int slice;
+
+	if (!sp->sink || !sp->timing || !pcm ||
+	    clock_gettime(CLOCK_MONOTONIC, &start) != 0)
+		return;
+	for (slice = 0; slice < SENDSPIN_WAIT_SLICES; ++slice) {
+		struct pollfd peer;
+		struct timespec stamp;
+		unsigned int avail = 0;
+		int fd = le_audio_sink_peer_fd(sp->sink);
+		long elapsed_ms, wait_ms;
+
+		if (fd < 0 || pcm_get_htimestamp(pcm, &avail, &stamp) != 0 ||
+		    avail >= PERIOD_SIZE || clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+			return;
+		elapsed_ms = (long)(now.tv_sec - start.tv_sec) * 1000L +
+			     (now.tv_nsec - start.tv_nsec) / 1000000L;
+		if (elapsed_ms >= budget_ms)
+			return;
+		wait_ms = (long)(((PERIOD_SIZE - avail) * 1000U + DEFAULT_RATE - 1U) /
+				 DEFAULT_RATE);
+		if (wait_ms > budget_ms - elapsed_ms)
+			wait_ms = budget_ms - elapsed_ms;
+		peer.fd = fd;
+		peer.events = POLLIN;
+		peer.revents = 0;
+		if (poll(&peer, 1, (int)wait_ms) > 0)
+			sendspin_service(sp);
+	}
+}
+
+#ifdef LE_ENGINE_SENDSPIN_TRACE
+/* Development-only per-period Sendspin state log (never in release builds). */
+static void sendspin_trace(const struct sendspin_state *sp, const char *where)
+{
+	struct le_audio_sink_progress sink;
+	struct le_audio_timing_progress timing;
+	struct timespec now;
+	FILE *log;
+	int have_sink, have_timing;
+
+	if (!sp->sink)
+		return;
+	size_t nonzero = 0, i;
+
+	for (i = 0; i < sp->stage_frames * OUTPUT_CHANNELS; ++i)
+		nonzero += sp->stage[i] != 0;
+	have_sink = le_audio_sink_get_progress(sp->sink, &sink) == LE_AUDIO_SINK_OK;
+	have_timing = sp->timing &&
+		      le_audio_timing_progress(sp->timing, &timing) == LE_AUDIO_TIMING_OK;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	log = fopen(DEFAULT_ROOT "/sendspin-trace.log", "a");
+	if (!log)
+		return;
+	fprintf(log, "%lld.%06ld %s gen=%u have=%d stage=%zu nz=%zu starve=%u "
+		"active=%d fin=%d done=%d acc=%llu queued=%u tvalid=%d tstat=%d tsrc=%d tfin=%d played=%lld\n",
+		(long long)now.tv_sec, now.tv_nsec / 1000, where, sp->generation,
+		sp->have_generation, sp->stage_frames, nonzero, sp->starve_periods,
+		have_sink ? sink.active : -1, have_sink ? sink.finished : -1,
+		have_sink ? sink.completed : -1,
+		have_sink ? (unsigned long long)sink.accepted_frames : 0ULL,
+		have_sink ? sink.queued_frames : 0u,
+		have_timing ? timing.valid : -1, have_timing ? timing.status : -1, have_timing ? timing.source_valid : -1,
+		have_timing ? timing.source_finish_valid : -1,
+		(long long)sp->played_high_water);
+	fclose(log);
+}
+#define SENDSPIN_TRACE(where) sendspin_trace(&g_sendspin, where)
+#define SENDSPIN_TRACE_SP(sp, where) sendspin_trace(sp, where)
+#else
+#define SENDSPIN_TRACE(where) ((void)0)
+#define SENDSPIN_TRACE_SP(sp, where) ((void)0)
+#endif
+
+/*
+ * Refresh the live (epoch, generation) identity from the sink.  A fresh
+ * generation (or engine epoch) fences the timing model, so no predecessor
+ * progress can be re-attributed and timing stays invalid until re-verified.
+ */
+static void sendspin_sync_identity(struct sendspin_state *sp)
+{
+    struct le_audio_sink_progress progress;
+
+    if (!sp->sink)
+        return;
+    if (le_audio_sink_get_progress(sp->sink, &progress) != LE_AUDIO_SINK_OK)
+        return;
+    if (!progress.active) {
+        if (sp->have_generation) {
+            sp->have_generation = 0;
+            sp->source_started = 0;
+            sp->starve_periods = 0;
+            sp->stage_frames = 0;
+        }
+        return;
+    }
+    if (!sp->have_generation || progress.generation != sp->generation ||
+        progress.epoch != sp->epoch) {
+        sp->have_generation = 1;
+        sp->source_started = 0;
+        sp->epoch = progress.epoch;
+        sp->generation = progress.generation;
+        sp->starve_periods = 0;
+        sp->played_high_water = 0;
+        sp->stage_frames = 0;
+        if (sp->timing)
+            le_audio_timing_invalidate(sp->timing, LE_AUDIO_TIMING_ERR_OPEN);
+        SENDSPIN_TRACE_SP(sp, "open");
+    }
+}
+
+/*
+ * Is a Sendspin generation driving paced hardware periods right now?  A live
+ * session is paced even with no source frames (SDK priming / bounded
+ * underrun), and a FINISHed generation is paced until the physical cursor
+ * passes its exact tail.  Priming is bounded so an idle session cannot spin
+ * forever.
+ */
+static int sendspin_live(struct sendspin_state *sp)
+{
+    struct le_audio_sink_progress progress;
+
+    if (!sp->sink || !sp->have_generation)
+        return 0;
+    if (le_audio_sink_get_progress(sp->sink, &progress) != LE_AUDIO_SINK_OK)
+        return 0;
+    if (!progress.active)
+        return 0;
+    if (progress.finished && progress.completed)
+        return 0;
+    if (!progress.finished && progress.queued_frames == 0u &&
+        sp->starve_periods >= SENDPIN_PRIME_LIMIT)
+        return 0;
+    sp->hold_until_us = g_sendspin_hold_us > 0 ? sendspin_now_us() + g_sendspin_hold_us : 0;
+    return 1;
+}
+
+/* Output still held warm after the last live Sendspin generation. */
+static int sendspin_held(const struct sendspin_state *sp)
+{
+    return sp->sink && sp->hold_until_us != 0 &&
+           sendspin_now_us() < sp->hold_until_us;
+}
+
+/*
+ * Peek the queued source frames for the current period (non-consuming).
+ *
+ * A generation's first source frame waits until a whole period is queued (or
+ * the generation is FINISHed).  Otherwise a partial first period is padded to
+ * PERIOD_SIZE with generated silence, and the SDK -- which aligns its stream
+ * to the first played-frame report and then assumes its queued frames play
+ * back to back -- never sees that padding: the start of the stream plays late
+ * by it (60 ms measured on the Dot) until feedback forces a resync.  Padding
+ * before the first source frame is already in that first report, so it is
+ * harmless.  (A two-period cushion was tried: the SDK never queues that much,
+ * so it only delayed the start.)  Once started, a short queue is a real
+ * underrun and is rendered as before.
+ */
+static size_t sendspin_stage(struct sendspin_state *sp)
+{
+    if (!sp->sink || !sp->have_generation) {
+        sp->stage_frames = 0;
+        return 0;
+    }
+    if (!sp->source_started) {
+        struct le_audio_sink_progress progress;
+
+        if (le_audio_sink_get_progress(sp->sink, &progress) != LE_AUDIO_SINK_OK ||
+            (!progress.finished && progress.queued_frames < PERIOD_SIZE)) {
+            sp->stage_frames = 0;
+            return 0;
+        }
+    }
+    sp->stage_frames = le_audio_sink_render(sp->sink, sp->stage, PERIOD_SIZE,
+                                            &sp->first_frame);
+    if (sp->stage_frames)
+        sp->source_started = 1;
+    return sp->stage_frames;
+}
+
+static void sendspin_close_timing(struct sendspin_state *sp)
+{
+    if (sp->timing) {
+        le_audio_timing_destroy(sp->timing);
+        sp->timing = NULL;
+    }
+}
+
+/*
+ * Reap the verified playhead and publish source-relative progress + the
+ * timing horizon to the sink.  Completed events are drained with a bounded
+ * loop so the event ring cannot overflow.  Only the live generation is fed:
+ * BOTH the sample's epoch and generation must name the live generation before
+ * either the source cursor or the source finish is attributed to it, so a
+ * predecessor tail still draining after a successor OPEN can never be
+ * published as the successor's valid horizon.  A query that cannot be
+ * produced re-asserts explicit INVALID rather than leaving an earlier
+ * calibrated VALID observation standing.
+ */
+static void sendspin_publish_progress(struct sendspin_state *sp)
+{
+    struct le_audio_timing_progress progress;
+    struct le_audio_timing_completed completed;
+    unsigned int guard = 0;
+    int live_identity;
+
+    if (!sp->timing || !sp->have_generation)
+        return;
+    if (le_audio_timing_progress(sp->timing, &progress) != LE_AUDIO_TIMING_OK) {
+        (void)le_audio_sink_note_timing(sp->sink, sp->epoch, sp->generation,
+                                        LE_AUDIO_SINK_PROGRESS_TIMING_INVALID,
+                                        0u);
+        return;
+    }
+
+    live_identity = progress.valid && progress.epoch == sp->epoch &&
+                    progress.generation == sp->generation;
+
+    if (live_identity && progress.source_valid) {
+        if ((int64_t)progress.source_frame > sp->played_high_water)
+            sp->played_high_water = (int64_t)progress.source_frame;
+        (void)le_audio_sink_note_playhead(sp->sink, sp->epoch, sp->generation,
+                                          (uint64_t)sp->played_high_water);
+    }
+
+    if (live_identity && progress.source_finish_valid)
+        (void)le_audio_sink_note_timing(sp->sink, sp->epoch, sp->generation,
+                                        LE_AUDIO_SINK_PROGRESS_TIMING_VALID,
+                                        progress.source_finish_us);
+    else if (progress.status == LE_AUDIO_TIMING_ERR_XRUN ||
+             progress.status == LE_AUDIO_TIMING_ERR_RECONCILE)
+        (void)le_audio_sink_note_timing(sp->sink, sp->epoch, sp->generation,
+                                        LE_AUDIO_SINK_PROGRESS_TIMING_ERROR,
+                                        0u);
+    else
+        (void)le_audio_sink_note_timing(sp->sink, sp->epoch, sp->generation,
+                                        LE_AUDIO_SINK_PROGRESS_TIMING_INVALID,
+                                        0u);
+
+    while (guard++ <= LE_AUDIO_LEDGER_CAPACITY &&
+           le_audio_timing_take_completed(sp->timing, &completed) ==
+               LE_AUDIO_TIMING_OK &&
+           completed.valid) {
+        /* Drained exactly once, oldest first.  The source high-water survives
+         * reaping, so draining a completed event never loses the exact tail;
+         * a predecessor event is dropped without touching the successor. */
+    }
+}
+
+/*
+ * Record a fully- or partially-accepted hardware range: submit the exact
+ * source/generated split of the accepted prefix to the timing ledger, then
+ * consume exactly the accepted source frames from the sink queue.  The
+ * rendered buffer is preserved by the caller, so only the unwritten suffix is
+ * ever retried.  A non-zero return means the accepted frames cannot be
+ * accounted; the caller must contain that as an irreversible discontinuity
+ * rather than leaving an accepted, unaccounted write live.
+ */
+static int sendspin_account_range(struct sendspin_state *sp,
+                                  size_t accepted_frames,
+                                  size_t source_frames,
+                                  uint64_t first_frame)
+{
+    size_t source_accepted = accepted_frames < source_frames
+                                 ? accepted_frames : source_frames;
+    size_t generated_accepted = accepted_frames - source_accepted;
+    int status = LE_AUDIO_TIMING_OK;
+
+    if (sp->timing) {
+        if (source_accepted > 0u) {
+            struct le_audio_timing_submission submission;
+
+            memset(&submission, 0, sizeof(submission));
+            submission.epoch = sp->epoch;
+            submission.generation = sp->generation;
+            submission.source_first_frame = first_frame;
+            submission.frames = (uint32_t)source_accepted;
+            submission.generated = 0;
+            status = le_audio_timing_submit(sp->timing, &submission);
+        }
+        if (status == LE_AUDIO_TIMING_OK && generated_accepted > 0u) {
+            struct le_audio_timing_submission submission;
+
+            memset(&submission, 0, sizeof(submission));
+            submission.epoch = sp->epoch;
+            submission.generation = sp->generation;
+            submission.frames = (uint32_t)generated_accepted;
+            submission.generated = 1;
+            status = le_audio_timing_submit(sp->timing, &submission);
+        }
+    }
+    if (status != LE_AUDIO_TIMING_OK)
+        return -1;
+
+    /* Commit exactly the real source frames the hardware accepted; the queue
+     * head advances so those frames are never rendered a second time. */
+    if (source_accepted > 0u &&
+        le_audio_sink_commit(sp->sink, sp->epoch, sp->generation,
+                             source_accepted) != LE_AUDIO_SINK_OK)
+        return -1;
+    return 0;
+}
+
+/*
+ * Fence and drop the live generation after a write error or an unaccountable
+ * accepted write.  The sink session is CANCELLED so the next poll cannot
+ * re-adopt the same still-active generation and its unread queue is
+ * discarded; because no retransmit-from-cursor exists, the SDK must open a
+ * fresh, strictly higher generation.  The identity is captured first, so a
+ * successor that opened between the failure and this call is never touched
+ * (its own (epoch, generation) does not match the failed pair).
+ */
+static void sendspin_drop_generation(struct sendspin_state *sp)
+{
+    uint32_t epoch = sp->epoch;
+    uint32_t generation = sp->generation;
+
+    if (sp->sink && sp->have_generation)
+        (void)le_audio_sink_cancel(sp->sink, epoch, generation);
+    sp->have_generation = 0;
+    sp->source_started = 0;
+    sp->starve_periods = 0;
+    sp->stage_frames = 0;
+}
+
+/*
+ * Fail closed a FINISHed generation the engine cannot complete because the
+ * timing model is unavailable (le_audio_timing_create() returned NULL after
+ * the PCM started).  Without a DAC timeline there is no physical playhead to
+ * observe, so the exact tail can never be confirmed: rather than fabricate a
+ * completion or guess DAC timing, publish an explicit timing error for the
+ * live (epoch, generation) and CANCEL exactly that generation.  The identity
+ * is captured before the cancel, so a successor that opened in the meantime
+ * is never touched, and recovery requires a fresh, strictly higher OPEN.  Any
+ * uncommitted frames are discarded with the cancelled generation; the ring is
+ * left to drain on the normal teardown.
+ */
+static void sendspin_fail_closed_no_timing(struct sendspin_state *sp)
+{
+    if (!sp->sink || !sp->have_generation)
+        return;
+    (void)le_audio_sink_note_timing(sp->sink, sp->epoch, sp->generation,
+                                    LE_AUDIO_SINK_PROGRESS_TIMING_ERROR, 0u);
+    sendspin_drop_generation(sp);
+}
+
+/*
+ * Wide (S32_LE) output state, defined with the renderer below.  When the PCM
+ * is open wide the hardware takes wide_samples; the int16 period remains the
+ * AEC reference.  Frame accounting is format-independent.
+ */
+static int wide_output;
+static int32_t wide_samples[PERIOD_SIZE * OUTPUT_CHANNELS];
+
+/*
+ * Write one fully-rendered hardware period for a Sendspin-driven generation
+ * and account it.  Handles full, positive-short (retry ONLY the unwritten
+ * suffix -- the rendered buffer is preserved and DSP never advances twice)
+ * and -1/errno==EPIPE/ESTRPIPE outcomes.  A backend that claims to accept
+ * more frames than it was asked for is refused, never trusted.  The exact
+ * source/padding split of whatever the hardware accepted is recorded before
+ * any error tears the session down, so accepted samples are never rewound and
+ * no error leaves an accepted, unaccounted write live.  Returns 0 on full
+ * acceptance, -1 on a fatal or XRUN error (the caller tears the PCM down and
+ * reopens).
+ */
+#ifdef LE_ENGINE_LATENCY_TRACE
+static void latency_trace(struct pcm *pcm);
+#endif
+
+static int sendspin_write_and_account(struct sendspin_state *sp,
+                                      struct pcm *pcm, const int16_t *samples,
+                                      size_t period_frames,
+                                      size_t source_frames,
+                                      uint64_t first_frame,
+                                      struct le_aec_reference_sender *reference,
+                                      unsigned int activity_mask)
+{
+    size_t done = 0;
+    unsigned int zero_retries = 0;
+    int write_errno = 0;
+
+    if (source_frames > period_frames)
+        source_frames = period_frames;
+    while (done < period_frames) {
+        unsigned int remaining = (unsigned int)(period_frames - done);
+        int rc = wide_output ?
+            pcm_writei(pcm, wide_samples + done * OUTPUT_CHANNELS, remaining) :
+            pcm_writei(pcm, samples + done * OUTPUT_CHANNELS, remaining);
+
+        if (rc > 0) {
+            if ((unsigned int)rc > remaining) {
+                /* A backend that accepts more than it was asked for cannot be
+                 * accounted against the rendered buffer: a fatal error. */
+                write_errno = EIO;
+                break;
+            }
+            done += (size_t)rc;
+            zero_retries = 0;
+            continue;
+        }
+        if (rc == 0) {
+            if (++zero_retries > SENDPIN_WRITE_ZERO_RETRIES) {
+                write_errno = EPIPE;   /* bounded zero progress -> fence */
+                break;
+            }
+            continue;
+        }
+        write_errno = errno;           /* rc < 0: errno preserved */
+        break;
+    }
+
+    if (done < period_frames) {
+        /* Not fully accepted.  Account the accepted prefix first (it is in the
+         * ring and will play), then fence: an XRUN explicitly resets the ring
+         * and drops the unplayed backlog, a fatal error quarantines the
+         * timeline.  Either way the affected generation is cancelled so the
+         * next poll cannot re-adopt it. */
+        if (done > 0u)
+            (void)sendspin_account_range(sp, done, source_frames, first_frame);
+        if (sp->timing) {
+            if (write_errno == EPIPE || write_errno == ESTRPIPE) {
+                le_audio_timing_fence(sp->timing, LE_AUDIO_TIMING_ERR_XRUN);
+                (void)le_audio_timing_reset(sp->timing);
+                (void)pcm_prepare(pcm);
+            } else {
+                le_audio_timing_fence(sp->timing, LE_AUDIO_TIMING_ERR_INVALID);
+            }
+        }
+        (void)le_audio_sink_note_timing(sp->sink, sp->epoch, sp->generation,
+                                        LE_AUDIO_SINK_PROGRESS_TIMING_ERROR,
+                                        0u);
+        sendspin_drop_generation(sp);
+        return -1;
+    }
+
+    /* AEC reference is derived from the final mix, once per accepted period. */
+    (void)le_aec_reference_publish(reference, samples, period_frames,
+                                   OUTPUT_CHANNELS, activity_mask);
+#ifdef LE_ENGINE_LATENCY_TRACE
+    if (period_frames == PERIOD_SIZE)
+        latency_trace(pcm);
+#endif
+
+    if (sendspin_account_range(sp, period_frames, source_frames,
+                               first_frame) != 0) {
+        /* An accepted write that cannot be accounted is a fenced
+         * discontinuity, not a silent success: contain it so it is never left
+         * live to be replayed from the cursor. */
+        if (sp->timing)
+            le_audio_timing_fence(sp->timing, LE_AUDIO_TIMING_ERR_RANGE);
+        (void)le_audio_sink_note_timing(sp->sink, sp->epoch, sp->generation,
+                                        LE_AUDIO_SINK_PROGRESS_TIMING_ERROR,
+                                        0u);
+        sendspin_drop_generation(sp);
+        return -1;
+    }
+
+    sendspin_publish_progress(sp);
+    return 0;
+}
 
 enum source_role {
 	SOURCE_MEDIA,
@@ -171,6 +721,29 @@ static struct speaker_profile speaker_profile = {
 	.biscuit_chain = 0, .codec_flat = 0, .hp_driver_gain = 6,
 	.pre_gain = 1.0f, .bass_makeup_db = 0.0f,
 };
+
+/*
+ * Output latency of a SOURCE frame past the ALSA hardware pointer, per speaker
+ * chain, for the Sendspin timing model: speaker-chain DSP delay (the Dot
+ * limiter's 2 * BISCUIT_LA look-ahead and filter group delay) plus the codec
+ * and amplifier path.  The timing model maps source frames to hardware
+ * frames 1:1, so any DSP delay must be in this constant.  Measured with an
+ * LE_ENGINE_LATENCY_TRACE engine, which stamps the pre-DSP mix at the
+ * pointer, against the mic array's electrical reference channels on the same
+ * CLOCK_MONOTONIC (sendspin/hotstage/latency-measure.sh), two runs of five
+ * clicks each: biscuit (Echo Dot) 5.58-5.66 ms, radar_puffin (Echo 2nd gen,
+ * 0.14.5 kernel) 2.97-3.11 ms.  A new chain must be measured before it gets
+ * a value; until then a negative latency keeps Sendspin timing uncalibrated,
+ * so it fails closed.
+ */
+#define BISCUIT_OUTPUT_LATENCY_US 5620
+#define RADAR_PUFFIN_OUTPUT_LATENCY_US 3040
+
+static int chain_output_latency_us(const struct speaker_profile *profile)
+{
+	return profile->biscuit_chain ? BISCUIT_OUTPUT_LATENCY_US
+				      : RADAR_PUFFIN_OUTPUT_LATENCY_US;
+}
 
 /* Arm the output while keeping the codec muted.  This is used before a
  * stream exists, so enabling the physical amplifier cannot produce a pop. */
@@ -736,10 +1309,20 @@ static void close_sources(struct source_bus *sources)
 	}
 }
 
-static int poll_sources(struct source_bus *sources, int timeout_ms)
+/*
+ * Wait for source input.  With wake_sink, also wake on Sendspin socket
+ * activity (a new connection or a control/DATA datagram) so an idle engine
+ * answers the companion within milliseconds instead of the next 20 ms poll
+ * tick; the companion's control ops are bounded at a few tens of ms.  Only
+ * the idle wait uses it: inside playback a datagram must not cut the FIFO
+ * wait short, because a missing period there ends the session.
+ */
+static int poll_sources_ex(struct source_bus *sources, int timeout_ms,
+			   int wake_sink)
 {
-	struct pollfd pollfds[SOURCE_COUNT];
+	struct pollfd pollfds[SOURCE_COUNT + 2];
 	unsigned int i;
+	nfds_t count = SOURCE_COUNT;
 	int result;
 
 	for (i = 0; i < SOURCE_COUNT; ++i) {
@@ -747,10 +1330,29 @@ static int poll_sources(struct source_bus *sources, int timeout_ms)
 		pollfds[i].events = POLLIN;
 		pollfds[i].revents = 0;
 	}
+	if (wake_sink && g_sendspin.sink) {
+		int fds[2];
+
+		fds[0] = le_audio_sink_listen_fd(g_sendspin.sink);
+		fds[1] = le_audio_sink_peer_fd(g_sendspin.sink);
+		for (i = 0; i < 2; ++i) {
+			if (fds[i] < 0)
+				continue;
+			pollfds[count].fd = fds[i];
+			pollfds[count].events = POLLIN;
+			pollfds[count].revents = 0;
+			count += 1;
+		}
+	}
 	do {
-		result = poll(pollfds, SOURCE_COUNT, timeout_ms);
+		result = poll(pollfds, count, timeout_ms);
 	} while (result < 0 && errno == EINTR && !stopping);
 	return result;
+}
+
+static int poll_sources(struct source_bus *sources, int timeout_ms)
+{
+	return poll_sources_ex(sources, timeout_ms, 0);
 }
 
 /* The dedicated AirPlay FIFO is never reclassified as generic media. */
@@ -849,6 +1451,11 @@ static int read_sources(struct source_bus *sources, const char *root)
 	unsigned int i;
 	int received_any = 0;
 
+	/* Bounded cadence: service the non-blocking framed sink and refresh the
+	 * live generation identity before reading the legacy FIFOs. */
+	sendspin_service(&g_sendspin);
+	sendspin_sync_identity(&g_sendspin);
+
 	if (service_airplay_reset(ap, root) < 0)
 		ap->airplay_reset_ready = 0; /* fail only AirPlay, not priority buses */
 	airplay = ap->airplay_reset_ready && airplay_marker_stat(root, &marker);
@@ -944,6 +1551,8 @@ static int sources_active(const struct source_bus *sources)
 {
 	unsigned int i;
 
+	if (sendspin_live(&g_sendspin) || sendspin_held(&g_sendspin))
+		return 1;
 	for (i = 0; i < SOURCE_COUNT; ++i)
 		if (sources[i].idle_periods > 0 ||
 		    sources[i].received >= PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t))
@@ -962,6 +1571,12 @@ static int period_ready(const struct source_bus *sources)
 {
 	unsigned int i;
 
+	/* A live Sendspin generation paces PCM periods even when no legacy FIFO
+	 * has a complete period, so priming/underrun silence reaches the SDK;
+	 * the post-generation hold keeps pacing silence so a seek or resume
+	 * reuses the running output. */
+	if (sendspin_live(&g_sendspin) || sendspin_held(&g_sendspin))
+		return 1;
 	for (i = 0; i < SOURCE_COUNT; ++i)
 		if (source_period_ready(&sources[i]))
 			return 1;
@@ -1105,19 +1720,21 @@ static float music_avl_period_gain(const struct source_bus *sources)
 	}
 }
 
-static int32_t mix_sources_frame(const struct source_bus *sources, size_t frame)
+static int32_t mix_sources_frame(const struct source_bus *sources,
+				 const int16_t *sendspin,
+				 size_t sendspin_frames, size_t frame)
 {
-	int higher_priority =
-		source_period_ready(&sources[SOURCE_SYSTEM]) ||
-		source_period_ready(&sources[SOURCE_ANNOUNCEMENT]) ||
-		source_period_ready(&sources[SOURCE_ALARM]);
-	int alarm_active = source_period_ready(&sources[SOURCE_ALARM]);
-	int32_t mixed = 0;
-	unsigned int source;
+    int higher_priority =
+        source_period_ready(&sources[SOURCE_SYSTEM]) ||
+        source_period_ready(&sources[SOURCE_ANNOUNCEMENT]) ||
+        source_period_ready(&sources[SOURCE_ALARM]);
+    int alarm_active = source_period_ready(&sources[SOURCE_ALARM]);
+    int32_t mixed = 0;
+    unsigned int source;
 
-	for (source = 0; source < SOURCE_COUNT; ++source) {
-		int32_t mono;
-		int32_t gain;
+    for (source = 0; source < SOURCE_COUNT; ++source) {
+        int32_t mono;
+        int32_t gain;
 
 		if (!source_period_ready(&sources[source]) ||
 		    (source == SOURCE_AIRPLAY &&
@@ -1135,6 +1752,24 @@ static int32_t mix_sources_frame(const struct source_bus *sources, size_t frame)
 			gain = 0;
 		else if ((source == SOURCE_MEDIA || source == SOURCE_AIRPLAY) &&
 			 higher_priority)
+			gain = (gain * MEDIA_DUCK_Q15) >> 15;
+		mixed += (int32_t)(((int64_t)mono * gain) >> 15);
+	}
+	/*
+	 * Sendspin is a media-class source: ducked under, and muted for, a
+	 * higher-priority bus, but still consumed.  The SDK owns its own level;
+	 * only the shared master/DSP/duck apply here.  It is deliberately not
+	 * music-AVL levelled or measured: per-device levelling would change the
+	 * relative loudness of grouped rooms that the server keeps in step.
+	 */
+	if (sendspin && frame < sendspin_frames) {
+		int32_t mono = ((int32_t)sendspin[frame * OUTPUT_CHANNELS] +
+				(int32_t)sendspin[frame * OUTPUT_CHANNELS + 1]) / 2;
+		int32_t gain = 32768;
+
+		if (alarm_active)
+			gain = 0;
+		else if (higher_priority)
 			gain = (gain * MEDIA_DUCK_Q15) >> 15;
 		mixed += (int32_t)(((int64_t)mono * gain) >> 15);
 	}
@@ -1314,6 +1949,13 @@ static int wide_output;
 static int wide_supported = -1;
 static int32_t wide_samples[PERIOD_SIZE * OUTPUT_CHANNELS];
 
+#ifdef LE_ENGINE_LATENCY_TRACE
+/* Pre-DSP mix of the period being rendered: the trace times source frames,
+ * so speaker-chain delay (the Dot limiter look-ahead) is part of the
+ * measurement. */
+static int32_t trace_input[PERIOD_SIZE];
+#endif
+
 static int32_t wide_from_s16_units(float y)
 {
 	if (y > 32767.0f)
@@ -1339,7 +1981,9 @@ static int16_t biscuit_render_s16(struct biscuit_dsp *dsp, int32_t mixed)
 	return (int16_t)lrintf(y);
 }
 
-static void render_period(struct source_bus *sources, int16_t *output,
+static void render_period(struct source_bus *sources,
+			  const int16_t *sendspin, size_t sendspin_frames,
+			  int16_t *output,
 			  struct puffin_dynamics *dynamics,
 			  struct speaker_dsp *speaker,
 			  int32_t target_master_q15, int32_t *current_master_q15)
@@ -1355,7 +1999,11 @@ static void render_period(struct source_bus *sources, int16_t *output,
 		avl_frame_q15 = (int32_t)lrintf(32768.0f *
 			(avl_start + (avl_end - avl_start) *
 			 (float)(frame + 1) / (float)PERIOD_SIZE));
-		mixed = mix_sources_frame(sources, frame);
+		mixed = mix_sources_frame(sources, sendspin, sendspin_frames,
+						  frame);
+#ifdef LE_ENGINE_LATENCY_TRACE
+		trace_input[frame] = mixed;
+#endif
 		int16_t rendered;
 		*current_master_q15 += (target_master_q15 - *current_master_q15) /
 			(int32_t)(PERIOD_SIZE - frame);
@@ -1394,9 +2042,9 @@ static void render_period(struct source_bus *sources, int16_t *output,
 			rendered = puffin_render_mono(dynamics, mixed);
 		}
 
-		output[frame * OUTPUT_CHANNELS] = rendered;
-		output[frame * OUTPUT_CHANNELS + 1] = rendered;
-	}
+        output[frame * OUTPUT_CHANNELS] = rendered;
+        output[frame * OUTPUT_CHANNELS + 1] = rendered;
+    }
 }
 
 /* Shared codec-equivalent mapping: logical 1..100 spans -60..-12 dB on a
@@ -1523,11 +2171,65 @@ static int prepare_initial_period(struct source_bus *sources, const char *root,
 		biscuit_dsp_configure(biscuit_chain, speaker_profile.bass_makeup_db);
 	}
 	*master_gain = logical_master_gain(master_volume);
-	render_period(sources, output, dynamics, speaker, *master_gain, master_gain);
+	(void)sendspin_stage(&g_sendspin);
+	render_period(sources, g_sendspin.stage, g_sendspin.stage_frames, output,
+		      dynamics, speaker, *master_gain, master_gain);
 	if (activity_mask)
 		*activity_mask = ready_activity_mask(sources);
 	return 1;
 }
+
+#ifdef LE_ENGINE_LATENCY_TRACE
+/*
+ * Development-only output latency measurement (never in release builds).
+ * Logs the CLOCK_MONOTONIC time at which the first loud SOURCE frame (the
+ * pre-DSP mix) after a quiet stretch passes the ALSA hardware pointer, using
+ * the same pointer/stamp pair as the Sendspin timing model.  A capture of the
+ * same click on the electrical reference, stamped on the same clock, gives the
+ * source-frame-to-output latency, including any speaker-chain DSP delay.
+ */
+static void latency_trace(struct pcm *pcm)
+{
+	static unsigned int quiet_frames = DEFAULT_RATE;
+	struct timespec ts;
+	unsigned int avail = 0, i;
+	FILE *log;
+
+	for (i = 0; i < PERIOD_SIZE; ++i) {
+		int32_t v = trace_input[i];
+
+		if (v > 2000 || v < -2000)
+			break;
+	}
+	if (i == PERIOD_SIZE) {
+		quiet_frames += PERIOD_SIZE;
+		return;
+	}
+	if (quiet_frames + i >= DEFAULT_RATE / 5 &&
+	    pcm_get_htimestamp(pcm, &avail, &ts) == 0) {
+		long long queued = (long long)pcm_get_buffer_size(pcm) - avail;
+		long long ahead = queued - (long long)(PERIOD_SIZE - i);
+		long long onset = (long long)ts.tv_sec * 1000000LL +
+				  ts.tv_nsec / 1000 + ahead * 1000000LL / DEFAULT_RATE;
+
+		log = fopen(DEFAULT_ROOT "/latency-trace.log", "a");
+		if (log) {
+			fprintf(log, "onset_mono_us=%lld queued=%lld index=%u\n",
+				onset, queued, i);
+			fclose(log);
+		}
+	}
+	quiet_frames = 0;
+	for (i = PERIOD_SIZE; i-- > 0;) {
+		int32_t v = trace_input[i];
+
+		if (v > 2000 || v < -2000)
+			break;
+		++quiet_frames;
+	}
+}
+#endif
+
 
 static int write_period(struct pcm *pcm, const int16_t *samples,
 			struct le_aec_reference_sender *reference,
@@ -1540,6 +2242,9 @@ static int write_period(struct pcm *pcm, const int16_t *samples,
 	} else if (pcm_writei(pcm, samples, PERIOD_SIZE) != (int)PERIOD_SIZE) {
 		return -1;
 	}
+#ifdef LE_ENGINE_LATENCY_TRACE
+	latency_trace(pcm);
+#endif
 	/*
 	 * Reference delivery is intentionally lossy.  A missing or slow AEC
 	 * consumer must never delay the sole owner of the speaker PCM.
@@ -1548,6 +2253,14 @@ static int write_period(struct pcm *pcm, const int16_t *samples,
 				       OUTPUT_CHANNELS, activity_mask);
 	return 0;
 }
+
+/*
+ * PCM_MONOTONIC selects the CLOCK_MONOTONIC stamp the Sendspin timing model
+ * requires; PCM_NORESTART makes an underrun surface as pcm_writei()==-1 with
+ * errno==EPIPE instead of a hidden auto-reprepare that discards buffered
+ * frames.  Both apply to the 24-bit attempt and to the S16 fallback.
+ */
+#define OUTPUT_PCM_FLAGS (PCM_OUT | PCM_MONOTONIC | PCM_NORESTART)
 
 /* Prefer 24-bit output; an older kernel rejects S32_LE at hw_params and the
  * engine then stays on the original S16 configuration for this process. */
@@ -1564,7 +2277,7 @@ static struct pcm *open_output_pcm(unsigned int card, unsigned int device,
 		wide.period_count = WIDE_PERIOD_COUNT;
 		wide.stop_threshold = WIDE_PERIOD_SIZE * WIDE_PERIOD_COUNT;
 		wide.silence_threshold = WIDE_PERIOD_SIZE * WIDE_PERIOD_COUNT;
-		pcm = pcm_open(card, device, PCM_OUT, &wide);
+		pcm = pcm_open(card, device, OUTPUT_PCM_FLAGS, &wide);
 		if (pcm && pcm_is_ready(pcm)) {
 			if (wide_supported < 0)
 				fprintf(stderr, "audio-engine: output S32_LE (24-bit)\n");
@@ -1574,7 +2287,7 @@ static struct pcm *open_output_pcm(unsigned int card, unsigned int device,
 		}
 		if (pcm)
 			pcm_close(pcm);
-		pcm = pcm_open(card, device, PCM_OUT, s16);
+		pcm = pcm_open(card, device, OUTPUT_PCM_FLAGS, s16);
 		/* Only a working S16 open proves the format, not the device,
 		 * was refused; a busy or absent PCM retries 24-bit next time. */
 		if (pcm && pcm_is_ready(pcm) && wide_supported < 0) {
@@ -1584,7 +2297,7 @@ static struct pcm *open_output_pcm(unsigned int card, unsigned int device,
 		}
 		return pcm;
 	}
-	return pcm_open(card, device, PCM_OUT, s16);
+	return pcm_open(card, device, OUTPUT_PCM_FLAGS, s16);
 }
 
 static int run_engine(const char *root, unsigned int card, unsigned int device)
@@ -1644,6 +2357,27 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			"audio-engine: AEC reference tap unavailable: %s\n",
 			strerror(errno));
 	sync_playback_status(sources, &status);
+	/* Bind the framed sink now, even while the PCM is idle, so an SDK can
+	 * open a generation and begin priming before any legacy FIFO period. */
+	{
+		char sink_path[256];
+		struct le_audio_sink_config sink_config;
+
+		memset(&g_sendspin, 0, sizeof(g_sendspin));
+		if (snprintf(sink_path, sizeof(sink_path), "%s/%s", root,
+			     SENDPIN_SOCKET_NAME) < (int)sizeof(sink_path)) {
+			memset(&sink_config, 0, sizeof(sink_config));
+			sink_config.socket_path = sink_path;
+			sink_config.capacity_frames = 0;
+			sink_config.allowed_uid = (uid_t)-1;
+			sink_config.allow_root = 0;
+			g_sendspin.sink = le_audio_sink_create(&sink_config);
+			if (!g_sendspin.sink)
+				fprintf(stderr,
+					"audio-engine: framed sink unavailable: %s\n",
+					strerror(errno));
+		}
+	}
 	output = malloc(bytes);
 	if (!output)
 		goto out;
@@ -1672,12 +2406,13 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		int ready;
 		int poll_timeout = 20; /* service resets even when all buses are idle */
 
-		if (poll_sources(sources, poll_timeout) < 0)
+		if (poll_sources_ex(sources, poll_timeout, 1) < 0)
 			break;
 		if (stopping)
 			break;
 		if (read_or_retain_sources(sources, root) <= 0)
 			continue;
+		SENDSPIN_TRACE("s-ready");
 		ready = prepare_initial_period(sources, root, output, &dynamics,
 					      &speaker, &first_activity,
 					      logical_master_volume(root), &master_gain);
@@ -1712,12 +2447,14 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				"audio-engine: priority audio continues while AirPlay "
 				"volume is unavailable\n");
 		}
+		SENDSPIN_TRACE("s-prepared");
 		if (arm_output_controls(card) < 0) {
 			fprintf(stderr, "audio-engine: output arm failed\n");
 			clear_source_activity(sources, &announcement_led_active,
 					      &visualizer, &status);
 			continue;
 		}
+		SENDSPIN_TRACE("s-armed");
 		pcm = open_output_pcm(card, device, &config);
 		if (!pcm || !pcm_is_ready(pcm)) {
 			fprintf(stderr, "audio-engine: PCM %u,%u unavailable: %s\n",
@@ -1731,28 +2468,67 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			usleep(250000);
 			continue;
 		}
+		/* The clock domain is declared only because the PCM was opened
+		 * monotonic.  A chain without a measured output latency stays
+		 * uncalibrated, so its finish estimates remain invalid (fail
+		 * closed). */
+		{
+			struct le_audio_timing_config timing_config;
+			int latency_us = chain_output_latency_us(&speaker_profile);
+
+			sendspin_close_timing(&g_sendspin);
+			memset(&timing_config, 0, sizeof(timing_config));
+			timing_config.pcm = pcm;
+			timing_config.rate = DEFAULT_RATE;
+			timing_config.buffer_frames = 0;
+			timing_config.clock = LE_AUDIO_TIMING_CLOCK_MONOTONIC;
+			timing_config.output_latency_us =
+				latency_us > 0 ? (uint32_t)latency_us : 0u;
+			timing_config.latency_calibrated = latency_us >= 0;
+			g_sendspin.timing = le_audio_timing_create(&timing_config);
+			if (!g_sendspin.timing)
+				fprintf(stderr,
+					"audio-engine: timing model unavailable\n");
+		}
 		/* The codec stays at its safe fixed reference; software owns gain. */
 		int playback_start_failed = 0;
+		SENDSPIN_TRACE("s-opened");
 
 		if (pcm_prepare(pcm) < 0)
 			playback_start_failed = 1;
 		else {
+			SENDSPIN_TRACE("s-prepare");
 			if (verify_codec_reference(card) < 0)
 				playback_start_failed = 1;
+			SENDSPIN_TRACE("s-verified");
 			if (!playback_start_failed && power_output_controls(card) < 0)
 				playback_start_failed = 1;
+			SENDSPIN_TRACE("s-powered");
 			if (!playback_start_failed) {
 				/* Queue the first period only after amp settle.  The PCM starts
 				 * muted, and unmute follows this write. */
-				if (write_period(pcm, output, &reference, first_activity) < 0 ||
-				    verify_codec_reference(card) < 0 ||
+				int started;
+
+				if (g_sendspin.have_generation)
+					started = sendspin_write_and_account(
+						&g_sendspin, pcm, output, PERIOD_SIZE,
+						g_sendspin.stage_frames,
+						g_sendspin.first_frame, &reference,
+						first_activity);
+				else
+					started = write_period(pcm, output, &reference,
+							       first_activity);
+				SENDSPIN_TRACE("s-written");
+				if (started < 0 || verify_codec_reference(card) < 0 ||
 				    unmute_output_controls(card) < 0)
 					playback_start_failed = 1;
+				SENDSPIN_TRACE("s-unmuted");
 			}
 		}
 		if (playback_start_failed) {
 			fprintf(stderr, "audio-engine: playback start failed: %s\n",
 				pcm_get_error(pcm));
+			sendspin_close_timing(&g_sendspin);
 			(void)disable_output_controls(card);
 			pcm_close(pcm);
 			clear_source_activity(sources, &announcement_led_active,
@@ -1763,7 +2539,15 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		consume_period(sources);
 
 		while (!stopping && sources_active(sources)) {
-			if (poll_sources(sources, 20) < 0 ||
+			/* A live Sendspin generation paces every period itself
+			 * (period_ready() is true), and the blocking PCM write
+			 * is the clock.  Waiting the 20 ms FIFO tick on top of it
+			 * would spend most of a 2048-frame period's headroom; on
+			 * the Radar the first period drained dry behind the
+			 * codec verify + unmute and the S32 ring XRUN'd.  FIFO
+			 * input is still read, just without blocking. */
+			if (poll_sources(sources,
+					 sendspin_live(&g_sendspin) ? 0 : 20) < 0 ||
 			    read_sources(sources, root) < 0) {
 				stopping = 1;
 				break;
@@ -1774,26 +2558,80 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			sync_playback_status(sources, &status);
 			/* Read the atomic logical master each period, not codec readback. */
 			int master = logical_master_volume(root);
+			int wrote;
+
 			avl_master_percent = master;
 			speaker_dsp_set_volume(&speaker,
 				speaker_volume_percent(sources, master));
 			if (biscuit_chain)
 				biscuit_dsp_set_volume(biscuit_chain,
 					speaker_volume_percent(sources, master));
-			render_period(sources, output, &dynamics, &speaker,
-				logical_master_gain(master), &master_gain);
-			if (write_period(pcm, output, &reference,
-					 ready_activity_mask(sources)) < 0) {
+			(void)sendspin_stage(&g_sendspin);
+			render_period(sources, g_sendspin.stage,
+				      g_sendspin.stage_frames, output,
+				      &dynamics, &speaker,
+				      logical_master_gain(master), &master_gain);
+			/* Admit SDK audio for the next period while the
+			 * hardware drains.  After rendering, so render time
+			 * stays hidden behind the queued audio exactly as when
+			 * pcm_writei() blocked; the S32 ring holds only 1024
+			 * frames once a 2048-frame period fits. */
+			sendspin_service_until_writable(&g_sendspin, pcm);
+			if (g_sendspin.have_generation)
+				wrote = sendspin_write_and_account(
+					&g_sendspin, pcm, output, PERIOD_SIZE,
+					g_sendspin.stage_frames,
+					g_sendspin.first_frame, &reference,
+					ready_activity_mask(sources));
+			else
+				wrote = write_period(pcm, output, &reference,
+						     ready_activity_mask(sources));
+			if (wrote < 0) {
 				fprintf(stderr,
 					"audio-engine: PCM write failed: %s\n",
 					pcm_get_error(pcm));
 				break;
 			}
+			if (g_sendspin.have_generation) {
+				struct le_audio_sink_progress sink_progress;
+
+				/* Bound priming/underrun: a starved live generation
+				 * paces silence only up to SENDPIN_PRIME_LIMIT periods.
+				 * A FINISHed generation with no timing model can never
+				 * be observed as physically complete, so the same bound
+				 * retires it fail-closed (cancel the exact generation)
+				 * instead of pacing generated silence forever. */
+				if (le_audio_sink_get_progress(
+						g_sendspin.sink,
+						&sink_progress) == LE_AUDIO_SINK_OK &&
+				    sink_progress.active && !sink_progress.completed) {
+					if (sink_progress.finished) {
+						g_sendspin.starve_periods =
+							g_sendspin.timing
+								? 0u
+								: g_sendspin.starve_periods + 1u;
+						if (!g_sendspin.timing &&
+						    g_sendspin.starve_periods >
+							    SENDPIN_PRIME_LIMIT)
+							sendspin_fail_closed_no_timing(
+								&g_sendspin);
+					} else if (g_sendspin.stage_frames == 0u) {
+						g_sendspin.starve_periods += 1u;
+					} else {
+						g_sendspin.starve_periods = 0u;
+					}
+				} else {
+					g_sendspin.starve_periods = 0u;
+				}
+			}
+			SENDSPIN_TRACE("period");
 			process_music_visualizer(&visualizer, sources, output);
 			consume_period(sources);
 		}
+		SENDSPIN_TRACE("close");
 		clear_source_activity(sources, &announcement_led_active,
 				      &visualizer, &status);
+		sendspin_close_timing(&g_sendspin);
 		(void)disable_output_controls(card);
 		pcm_close(pcm);
 	}
@@ -1809,6 +2647,13 @@ out:
 	}
 	le_aec_reference_close(&reference);
 	free(output);
+	/* Cleanup errors must never disturb the legacy engine safety path: the
+	 * sink and timing are released after the amplifier/PCM teardown above. */
+	sendspin_close_timing(&g_sendspin);
+	if (g_sendspin.sink) {
+		le_audio_sink_destroy(g_sendspin.sink);
+		g_sendspin.sink = NULL;
+	}
 	close_sources(sources);
 	return result;
 }

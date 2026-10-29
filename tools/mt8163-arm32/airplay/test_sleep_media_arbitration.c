@@ -224,7 +224,7 @@ int main(int argc, char **argv)
 
             if (mono != 0)
                 ++media_energy;
-            CHECK(mix_sources_frame(sources, frame) == mono);
+            CHECK(mix_sources_frame(sources, NULL, 0, frame) == mono);
         }
         CHECK(media_energy > 0);                 /* the mix is not silence */
     }
@@ -242,7 +242,7 @@ int main(int argc, char **argv)
     puffin_dynamics_init(&dynamics);
     speaker_dsp_init(&speaker, speaker_volume_percent(sources, master));
     current_master = gauge;
-    render_period(sources, output, &dynamics, &speaker, gauge,
+    render_period(sources, NULL, 0, output, &dynamics, &speaker, gauge,
                   &current_master);
     CHECK(peak16(output, PERIOD_SIZE * OUTPUT_CHANNELS) > 0);
     memcpy(media_only, output, PERIOD_BYTES);
@@ -271,7 +271,7 @@ int main(int argc, char **argv)
             int32_t ducked =
                 (int32_t)(((int64_t)media_mono * MEDIA_DUCK_Q15) >> 15);
 
-            CHECK(mix_sources_frame(sources, frame) == ducked + ann_mono);
+            CHECK(mix_sources_frame(sources, NULL, 0, frame) == ducked + ann_mono);
             if (media_mono > 0) {
                 ++media_positive;
                 CHECK(ducked < media_mono);      /* media really was ducked */
@@ -282,7 +282,7 @@ int main(int argc, char **argv)
 
     speaker_dsp_init(&speaker, speaker_volume_percent(sources, master));
     current_master = gauge;
-    render_period(sources, output, &dynamics, &speaker, gauge,
+    render_period(sources, NULL, 0, output, &dynamics, &speaker, gauge,
                   &current_master);
     CHECK(write_period(NULL, output, &reference,
                        ready_activity_mask(sources)) == 0);
@@ -306,7 +306,7 @@ int main(int argc, char **argv)
     ready_frames = (long)(sources[SOURCE_MEDIA].received / SAMPLE_BYTES);
     CHECK(ready_frames > 0);
     for (frame = 0; frame < (unsigned int)ready_frames; ++frame)
-        CHECK(mix_sources_frame(sources, frame) ==
+        CHECK(mix_sources_frame(sources, NULL, 0, frame) ==
               mono_at(&sources[SOURCE_MEDIA], frame));
 
     result = failures ? 1 : 0;
