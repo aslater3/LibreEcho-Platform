@@ -1868,6 +1868,25 @@ class VendorAssetContractTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0, name)
 
+    def test_data_contract_knows_the_news_cache(self) -> None:
+        """#121: the web UI's news cache files are known, not merely tolerated."""
+        cleanup = TOOLS_DIR / "initramfs/libreecho-data-cleanup"
+        with tempfile.TemporaryDirectory() as temporary:
+            data_root = Path(temporary) / "data"
+            update = data_root / "libreecho/update"
+            update.mkdir(parents=True)
+            names = ("news-cache.json", "news-cache.json.tmp", "news-cache.json.bak", "news-status",
+                     "news-status.tmp", "news-status.bak", "news-download.tmp")
+            for name in names:
+                (update / name).write_text("x")
+            result = subprocess.run(["/bin/sh", str(cleanup)],
+                                    env={**os.environ, "LIBREECHO_DATA_TEST_MODE": "1", "DATA_ROOT": str(data_root)},
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("DATA_CLEANUP_TOLERATED", result.stderr)
+            for name in names:
+                self.assertTrue((update / name).exists(), name)
+
     def test_ui_startup_services_are_built_packaged_and_verified(self) -> None:
         bundle = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
         builder = (TOOLS_DIR / "build_recovery_image.py").read_text()

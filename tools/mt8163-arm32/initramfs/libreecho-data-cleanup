@@ -307,6 +307,7 @@ check_children "$DATA_ROOT/libreecho/update" \
     config-status features-status transaction-slot \
     ping-last-week ping-last-month ping-last-year ping-next-payload ping-status \
     ping-install-counted \
+    news-cache.json news-cache.json.tmp news-cache.json.bak news-status news-status.tmp news-status.bak news-download.tmp \
     ping-last-week.tmp ping-last-month.tmp ping-last-year.tmp ping-next-payload.tmp ping-status.tmp \
     ping-install-counted.tmp
 
