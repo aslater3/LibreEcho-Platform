@@ -34,6 +34,7 @@ write_status()
         printf 'privilege_policy=non-root-ephemeral-users\n'
         printf 'account_state=%s\n' "$state"
         printf 'host_keys=persistent:%s\n' "$HOSTKEY_FILE"
+        if [ "$state" = start-failed ]; then printf 'start_error=%s\n' "${2:-unknown}"; fi
     } > "$tmp" || return 1
     $BB chmod 0644 "$tmp" || return 1
     $BB mv -f "$tmp" "$STATUS_FILE"
@@ -216,6 +217,7 @@ stop_dropbear()
 
 start_dropbear()
 {
+    dropbear_launched=0
     [ -x "$DROPBEAR" ] && [ -x "$DROPBEARKEY" ] || return 1
     key_dir=${HOSTKEY_FILE%/*}
     [ -d "$key_dir" ] && [ ! -L "$key_dir" ] || return 1
@@ -246,11 +248,31 @@ start_dropbear()
     [ -s "$HOSTKEY_FILE" ] || return 1
     [ "$($BB stat -c %u "$HOSTKEY_FILE" 2>/dev/null)" = 0 ] || return 1
     [ "$($BB stat -c %a "$HOSTKEY_FILE" 2>/dev/null)" = 600 ] || return 1
-    $DROPBEAR -F -E -P "$DROPBEAR_PIDFILE" \
+    # The shipped Dropbear is built with --disable-syslog, which also removes
+    # -E; stderr already goes to the log below (#300).
+    dropbear_launched=1
+    $DROPBEAR -F -P "$DROPBEAR_PIDFILE" \
         -r "$HOSTKEY_FILE" -p 0.0.0.0:22 \
         >/run/libreecho-ssh/dropbear.log 2>&1 &
     $BB sleep 1
     dropbear_running
+}
+
+# One short, printable reason for a failed start. Dropbear follows a bad
+# option with its usage text, so prefer the last error-looking line.
+dropbear_start_error()
+{
+    if [ "${dropbear_launched:-0}" != 1 ]; then
+        printf 'preflight-failed\n'
+        return 0
+    fi
+    reason=$($BB awk '
+        { gsub(/[^A-Za-z0-9 ._:\/,()-]/, "") }
+        $0 ~ /[^ ]/ { last = $0 }
+        /[Ii]nvalid|[Ee]rror|[Ee]xit|[Ff]ail/ { error = $0 }
+        END { print substr(error != "" ? error : last, 1, 160) }
+    ' /run/libreecho-ssh/dropbear.log 2>/dev/null)
+    printf '%s\n' "${reason:-exited}"
 }
 
 clear_runtime_accounts()
@@ -278,16 +300,13 @@ run_supervisor()
             log_change disabled
             write_status disabled || true
         elif users_file_ready && sync_accounts; then
-            if ! dropbear_running; then
-                if start_dropbear; then
-                    log_change started
-                else
-                    log_change start-failed
-                fi
-            else
+            if dropbear_running || start_dropbear; then
                 log_change started
+                write_status ready || true
+            else
+                log_change start-failed
+                write_status start-failed "$(dropbear_start_error)" || true
             fi
-            write_status ready || true
         else
             if dropbear_running; then
                 log_change users-invalid-stopping
