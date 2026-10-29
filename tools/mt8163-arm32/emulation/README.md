@@ -45,3 +45,9 @@ bootstrap mode (`user_count:0`); create the admin via
 - **Not emulated:** real audio/mic/LED/Bluetooth hardware. The `linux` backend
   reports those adapters unavailable unless their daemons run; the `mock` backend
   fills them in. OTA slot/flash flows need a full-system VM, not this container.
+
+## Simulated hardware
+
+`hwsim/le-hwsim` serves simulated audio, LED, network and Bluetooth daemons on
+their real socket names, so `libreecho-web --backend linux` and other clients
+run unchanged against scripted hardware state. See [hwsim/README.md](hwsim/README.md).

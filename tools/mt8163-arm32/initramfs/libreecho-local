@@ -1,0 +1,337 @@
+#!/bin/sh
+# Persistent local services supervisor (#170).
+#
+# The owner's own services live in /data/libreecho/local, which survives A/B
+# OTA updates. LibreEcho is an open platform: nothing here is signed or
+# allowlisted. This supervisor only keeps them from hurting the device:
+#
+#   enabled                  opt-in marker; absent => nothing runs
+#   services/<name>/run      executable, runs in the foreground, restarted
+#   services/<name>/down     optional; present => this service is not run
+#   services/<name>/once     optional; run once per boot (a startup.sh)
+#   .boot-guard              written here: consecutive boots that did not
+#                            survive BOOT_GUARD_RESET_SECONDS of services
+#
+# Each service runs in its own session at low CPU and I/O priority and is the
+# OOM killer's first choice, so it cannot starve the core daemons. A crashing
+# service backs off (1, 2, 4 ... 60 s) and is given up after 10 failures in 10
+# minutes. Removing "enabled" stops everything within one poll. Logs are in
+# tmpfs and capped. The status file names services and states only.
+#
+# usage: libreecho-local run|status|stop
+
+LOCAL_ROOT=${LOCAL_ROOT:-/data/libreecho/local}
+STATUS_FILE=${LOCAL_STATUS:-/run/libreecho/local.status}
+RUN_ROOT=${LOCAL_RUN_ROOT:-/run/libreecho-local}
+LOG_ROOT=${LOCAL_LOG_ROOT:-/var/log/libreecho/local}
+POLL_SECONDS=${LOCAL_POLL_SECONDS:-5}
+LOG_MAX_BYTES=${LOCAL_LOG_MAX_BYTES:-262144}
+MAX_SERVICES=16
+MAX_FAILURES=${LOCAL_MAX_FAILURES:-10}
+FAILURE_WINDOW_SECONDS=${LOCAL_FAILURE_WINDOW_SECONDS:-600}
+BACKOFF_MAX_SECONDS=${LOCAL_BACKOFF_MAX_SECONDS:-60}
+ONCE_TIMEOUT_SECONDS=${LOCAL_ONCE_TIMEOUT_SECONDS:-300}
+BOOT_GUARD_LIMIT=3
+BOOT_GUARD_RESET_SECONDS=${LOCAL_BOOT_GUARD_RESET_SECONDS:-180}
+STOP_GRACE_SECONDS=${LOCAL_STOP_GRACE_SECONDS:-5}
+SUPERVISOR_PIDFILE=$RUN_ROOT/supervisor.pid
+
+log()
+{
+    printf 'libreecho-local:%s\n' "$*" > /dev/console 2>/dev/null || true
+}
+
+now()
+{
+    date +%s
+}
+
+valid_name()
+{
+    case "$1" in
+        ''|*[!a-z0-9._-]*) return 1 ;;
+    esac
+    [ "${#1}" -le 32 ]
+}
+
+root_safe()
+{
+    [ -d "$LOCAL_ROOT" ] && [ ! -L "$LOCAL_ROOT" ] || return 1
+    [ ! -e "$LOCAL_ROOT/services" ] && return 0
+    [ -d "$LOCAL_ROOT/services" ] && [ ! -L "$LOCAL_ROOT/services" ]
+}
+
+enabled()
+{
+    root_safe && [ -f "$LOCAL_ROOT/enabled" ]
+}
+
+# The services to consider, in name order, at most MAX_SERVICES valid ones.
+service_names()
+{
+    [ -d "$LOCAL_ROOT/services" ] || return 0
+    count=0
+    for dir in "$LOCAL_ROOT"/services/*; do
+        [ -d "$dir" ] || continue
+        name=${dir##*/}
+        if ! valid_name "$name"; then
+            log "skipped-invalid-name"
+            continue
+        fi
+        count=$((count + 1))
+        if [ "$count" -gt "$MAX_SERVICES" ]; then
+            log "skipped-over-limit:$name"
+            continue
+        fi
+        printf '%s\n' "$name"
+    done
+}
+
+state_get()
+{
+    cat "$RUN_ROOT/$1/$2" 2>/dev/null
+}
+
+state_set()
+{
+    mkdir -p "$RUN_ROOT/$1" && printf '%s\n' "$3" > "$RUN_ROOT/$1/$2"
+}
+
+service_pid()
+{
+    pid=$(state_get "$1" pid)
+    case "$pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    kill -0 "$pid" 2>/dev/null && printf '%s\n' "$pid"
+}
+
+stop_service()
+{
+    pid=$(service_pid "$1") || { rm -f "$RUN_ROOT/$1/pid"; return 0; }
+    kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+    waited=0
+    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$STOP_GRACE_SECONDS" ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
+    rm -f "$RUN_ROOT/$1/pid"
+}
+
+stop_all()
+{
+    for state_dir in "$RUN_ROOT"/*/; do
+        [ -d "$state_dir" ] || continue
+        name=${state_dir%/}
+        name=${name##*/}
+        stop_service "$name"
+        [ "$(state_get "$name" state)" = running ] && state_set "$name" state stopped
+    done
+}
+
+cap_log()
+{
+    file=$LOG_ROOT/$1.log
+    [ -f "$file" ] || return 0
+    size=$(wc -c < "$file" 2>/dev/null || echo 0)
+    [ "$size" -gt "$LOG_MAX_BYTES" ] || return 0
+    # The service appends, so copy-and-truncate keeps its file descriptor valid.
+    cp "$file" "$file.1" 2>/dev/null && : > "$file"
+}
+
+start_service()
+{
+    name=$1
+    dir=$LOCAL_ROOT/services/$name
+    rc_file=$RUN_ROOT/$name/rc
+    mkdir -p "$RUN_ROOT/$name" "$LOG_ROOT" || return 1
+    rm -f "$rc_file"
+    cap_log "$name"
+    if [ -f "$dir/once" ]; then
+        limit="timeout -k 5 $ONCE_TIMEOUT_SECONDS"
+    else
+        limit=
+    fi
+    # setsid makes the service its own process group so stop reaches every
+    # child it forks; the wrapper records the exit status for the next poll.
+    ( cd "$dir" || exit 1
+      echo 800 > /proc/self/oom_score_adj 2>/dev/null
+      command -v ionice >/dev/null 2>&1 && ionice -c 3 -p $$ >/dev/null 2>&1
+      exec setsid sh -c 'nice -n 10 $1 ./run; echo $? > "$2"' sh "$limit" "$rc_file" \
+          >> "$LOG_ROOT/$name.log" 2>&1 < /dev/null ) &
+    state_set "$name" pid "$!"
+    state_set "$name" started "$(now)"
+    state_set "$name" state running
+}
+
+record_exit()
+{
+    name=$1
+    rc=$(state_get "$name" rc)
+    [ -n "$rc" ] || rc=unknown
+    rm -f "$RUN_ROOT/$name/pid"
+    if [ -f "$LOCAL_ROOT/services/$name/once" ]; then
+        state_set "$name" state "exited:$rc"
+        return
+    fi
+    t=$(now)
+    started=$(state_get "$name" started)
+    [ -n "$started" ] || started=$t
+    window_start=$(state_get "$name" window_start)
+    failures=$(state_get "$name" failures)
+    [ -n "$failures" ] || failures=0
+    [ -n "$window_start" ] || window_start=$t
+    if [ $((t - window_start)) -ge "$FAILURE_WINDOW_SECONDS" ]; then
+        window_start=$t
+        failures=0
+    fi
+    failures=$((failures + 1))
+    state_set "$name" failures "$failures"
+    state_set "$name" window_start "$window_start"
+    if [ "$failures" -ge "$MAX_FAILURES" ]; then
+        state_set "$name" state failed
+        log "service-failed:$name"
+        return
+    fi
+    # Backoff 1, 2, 4 ... BACKOFF_MAX_SECONDS; a run that lasted longer than
+    # the backoff ceiling starts the sequence again.
+    if [ $((t - started)) -ge "$BACKOFF_MAX_SECONDS" ]; then
+        delay=1
+    else
+        delay=1
+        i=1
+        while [ "$i" -lt "$failures" ] && [ "$delay" -lt "$BACKOFF_MAX_SECONDS" ]; do
+            delay=$((delay * 2))
+            i=$((i + 1))
+        done
+        [ "$delay" -gt "$BACKOFF_MAX_SECONDS" ] && delay=$BACKOFF_MAX_SECONDS
+    fi
+    state_set "$name" next_start $((t + delay))
+    state_set "$name" state "exited:$rc"
+}
+
+supervise_once()
+{
+    if ! root_safe; then
+        stop_all
+        write_status "skipped:path-unsafe"
+        return
+    fi
+    if ! enabled; then
+        stop_all
+        write_status disabled
+        return
+    fi
+    names=$(service_names)
+    # Stop services whose directory went away.
+    for state_dir in "$RUN_ROOT"/*/; do
+        [ -d "$state_dir" ] || continue
+        name=${state_dir%/}
+        name=${name##*/}
+        case "
+$names
+" in
+            *"
+$name
+"*) ;;
+            *) stop_service "$name"; rm -rf "$RUN_ROOT/$name" ;;
+        esac
+    done
+    for name in $names; do
+        dir=$LOCAL_ROOT/services/$name
+        if [ -e "$dir/down" ]; then
+            stop_service "$name"
+            state_set "$name" state down
+            continue
+        fi
+        if [ ! -f "$dir/run" ] || [ ! -x "$dir/run" ]; then
+            stop_service "$name"
+            state_set "$name" state no-run
+            continue
+        fi
+        if service_pid "$name" >/dev/null; then
+            cap_log "$name"
+            continue
+        fi
+        state=$(state_get "$name" state)
+        [ "$state" = running ] && { record_exit "$name"; state=$(state_get "$name" state); }
+        [ "$state" = failed ] && continue
+        if [ -f "$dir/once" ]; then
+            case "$state" in exited:*) continue ;; esac
+        fi
+        next=$(state_get "$name" next_start)
+        [ -n "$next" ] && [ "$(now)" -lt "$next" ] && continue
+        start_service "$name" || state_set "$name" state start-failed
+    done
+    write_status running
+}
+
+write_status()
+{
+    tmp=$STATUS_FILE.tmp
+    mkdir -p "${STATUS_FILE%/*}" || return 1
+    {
+        printf 'schema=1\n'
+        if enabled; then printf 'enabled=1\n'; else printf 'enabled=0\n'; fi
+        printf 'state=%s\n' "$1"
+        if [ "$1" = running ]; then
+            for name in $(service_names); do
+                printf 'service.%s=%s\n' "$name" "$(state_get "$name" state)"
+            done
+        fi
+    } > "$tmp" && chmod 0644 "$tmp" && mv -f "$tmp" "$STATUS_FILE"
+}
+
+boot_guard()
+{
+    guard=$LOCAL_ROOT/.boot-guard
+    count=$(cat "$guard" 2>/dev/null)
+    case "$count" in ''|*[!0-9]*) count=0 ;; esac
+    if [ "$count" -ge "$BOOT_GUARD_LIMIT" ]; then
+        return 1
+    fi
+    printf '%s\n' $((count + 1)) > "$guard"
+}
+
+run()
+{
+    mkdir -p "$RUN_ROOT" || exit 1
+    chmod 0700 "$RUN_ROOT" 2>/dev/null
+    printf '%s\n' "$$" > "$SUPERVISOR_PIDFILE"
+    trap 'stop_all; write_status stopped; rm -f "$SUPERVISOR_PIDFILE"; exit 0' TERM INT
+    if ! root_safe; then
+        write_status "skipped:path-unsafe"
+        log skipped-path-unsafe
+    elif enabled && ! boot_guard; then
+        write_status "skipped:boot-loop-guard"
+        log skipped-boot-loop-guard
+        rm -f "$SUPERVISOR_PIDFILE"
+        exit 0
+    fi
+    guard_reset_at=$(( $(now) + BOOT_GUARD_RESET_SECONDS ))
+    while :; do
+        supervise_once
+        if [ -n "$guard_reset_at" ] && [ "$(now)" -ge "$guard_reset_at" ]; then
+            enabled && printf '0\n' > "$LOCAL_ROOT/.boot-guard"
+            guard_reset_at=
+        fi
+        sleep "$POLL_SECONDS" &
+        wait $!
+    done
+}
+
+case "${1:-}" in
+    run) run ;;
+    once) mkdir -p "$RUN_ROOT" && supervise_once ;;
+    status) [ -r "$STATUS_FILE" ] && cat "$STATUS_FILE" ;;
+    stop)
+        pid=$(cat "$SUPERVISOR_PIDFILE" 2>/dev/null)
+        case "$pid" in ''|*[!0-9]*) ;; *) kill -TERM "$pid" 2>/dev/null ;; esac
+        stop_all
+        ;;
+    *)
+        printf 'Usage: %s {run|status|stop}\n' "$0" >&2
+        exit 2
+        ;;
+esac

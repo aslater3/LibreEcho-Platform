@@ -274,6 +274,7 @@ class SourceTests(unittest.TestCase):
         normalized = source.casefold()
         for required in (
             "libreecho-platform",
+            "github.com/aslater3/libreecho-linux)",
             "libreecho-linux-6.1",
             "libreecho-ui",
             "libreecho-build",
@@ -1411,13 +1412,15 @@ class SourceTests(unittest.TestCase):
         source = engine.read_text()
         self.assertIn("#define PERIOD_SIZE 2048U", source)
         self.assertIn(".start_threshold = 1U", source)
-        first_write = source.index(
-            "write_period(pcm, output, &reference, first_activity)"
-        )
+        # The first period is queued after amp power-up and before unmute, on
+        # both the legacy path and the Sendspin-accounted path.
         power_amp = source.index("power_output_controls(card)")
         unmute = source.index("unmute_output_controls(card)")
-        self.assertLess(power_amp, first_write)
-        self.assertLess(first_write, unmute)
+        for first_write_call in ("started = write_period(pcm, output, &reference,",
+                                 "started = sendspin_write_and_account("):
+            first_write = source.index(first_write_call)
+            self.assertLess(power_amp, first_write)
+            self.assertLess(first_write, unmute)
         self.assertIn(
             "ready = prepare_initial_period(sources, root, output, &dynamics,",
             source,
@@ -1864,6 +1867,85 @@ class VendorAssetContractTests(unittest.TestCase):
                     text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 )
                 self.assertEqual(result.returncode, 0, name)
+
+    def test_data_contract_knows_the_news_cache(self) -> None:
+        """#121: the web UI's news cache files are known, not merely tolerated."""
+        cleanup = TOOLS_DIR / "initramfs/libreecho-data-cleanup"
+        with tempfile.TemporaryDirectory() as temporary:
+            data_root = Path(temporary) / "data"
+            update = data_root / "libreecho/update"
+            update.mkdir(parents=True)
+            names = ("news-cache.json", "news-cache.json.tmp", "news-cache.json.bak", "news-status",
+                     "news-status.tmp", "news-status.bak", "news-download.tmp")
+            for name in names:
+                (update / name).write_text("x")
+            result = subprocess.run(["/bin/sh", str(cleanup)],
+                                    env={**os.environ, "LIBREECHO_DATA_TEST_MODE": "1", "DATA_ROOT": str(data_root)},
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("DATA_CLEANUP_TOLERATED", result.stderr)
+            for name in names:
+                self.assertTrue((update / name).exists(), name)
+
+    def test_data_contract_keeps_owner_local_services(self) -> None:
+        """#170: /data/libreecho/local is the owner's; never cleaned or fatal."""
+        cleanup = TOOLS_DIR / "initramfs/libreecho-data-cleanup"
+        with tempfile.TemporaryDirectory() as temporary:
+            data_root = Path(temporary) / "data"
+            local = data_root / "libreecho/local"
+            (local / "services/dropbear").mkdir(parents=True)
+            (local / "bin").mkdir()
+            (local / "enabled").write_text("")
+            run = local / "services/dropbear/run"
+            run.write_text("#!/bin/sh\nexec /data/libreecho/local/bin/dropbear -F\n")
+            run.chmod(0o755)
+            (local / "bin/dropbear").write_bytes(b"\x7fELF-fake")
+            (local / "etc").mkdir()
+            os.symlink("../bin/dropbear", local / "etc/dropbear-link")
+            (local / ".boot-guard").write_text("1\n")
+            environment = {**os.environ, "LIBREECHO_DATA_TEST_MODE": "1", "DATA_ROOT": str(data_root)}
+
+            def snapshot(root: Path) -> dict[str, bytes]:
+                out = {}
+                for path in sorted(root.rglob("*")):
+                    key = str(path.relative_to(root))
+                    out[key] = (b"link:" + os.readlink(path).encode()) if path.is_symlink() else (
+                        path.read_bytes() if path.is_file() else b"dir")
+                return out
+
+            before = snapshot(local)
+            result = subprocess.run(["/bin/sh", str(cleanup)], env=environment,
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("DATA_CLEANUP_UNKNOWN", result.stderr)
+            self.assertEqual(snapshot(local), before, "local/ contents must be untouched")
+
+            # A mistaken shape is reported but must not fail the contract.
+            shutil.rmtree(local)
+            os.symlink("/tmp", local)
+            result = subprocess.run(["/bin/sh", str(cleanup)], env=environment,
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("DATA_CLEANUP_TOLERATED=libreecho/local", result.stderr)
+            local.unlink()
+            local.write_text("not a directory")
+            result = subprocess.run(["/bin/sh", str(cleanup)], env=environment,
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("DATA_CLEANUP_TOLERATED=libreecho/local", result.stderr)
+
+            # The cleanup never creates local/; an unknown sibling directory is
+            # reported and preserved like any other unrecognised userdata.
+            local.unlink()
+            result = subprocess.run(["/bin/sh", str(cleanup)], env=environment,
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(local.exists())
+            (data_root / "libreecho/localx").mkdir()
+            result = subprocess.run(["/bin/sh", str(cleanup)], env=environment,
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("DATA_CLEANUP_TOLERATED=libreecho/localx", result.stderr)
 
     def test_ui_startup_services_are_built_packaged_and_verified(self) -> None:
         bundle = (TOOLS_DIR / "ui/build_ui_bundle.sh").read_text()
@@ -3289,7 +3371,9 @@ start_feature_service_if_enabled
 
     def test_production_ota_health_worker_checks_full_service_graph(self) -> None:
         source = (TOOLS_DIR / "initramfs/libreecho-init").read_text()
-        self.assertIn('ota_health_confirm_worker &', source)
+        # The worker is launched in the background and, unless it reboots,
+        # publishes ota-health-settled for the local services gate (#170).
+        self.assertIn('( ota_health_confirm_worker; : > "$OTA_HEALTH_SETTLED" ) &', source)
         self.assertIn('[ "$SERVICE_PROFILE" = production ]', source)
         for socket_path in (
             "/run/libreecho/network.sock",
@@ -3749,11 +3833,11 @@ start_feature_service_if_enabled
         # Every boot is counted and recorded before the worker is launched.
         self.assertLess(
             init.index("bh_boot_count=$(bh_bump_count)"),
-            init.index("ota_health_confirm_worker &"),
+            init.index("( ota_health_confirm_worker;"),
         )
         self.assertLess(
             init.index("boot-diagnostics-unavailable"),
-            init.index("ota_health_confirm_worker &"),
+            init.index("( ota_health_confirm_worker;"),
         )
         # The record is only taken once the userdata cleanup contract passed.
         self.assertLess(

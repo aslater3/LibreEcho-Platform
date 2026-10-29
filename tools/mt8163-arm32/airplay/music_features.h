@@ -235,6 +235,12 @@ static inline void music_features_state_init(struct music_features_state *state)
 #define MF_BEAT_ATTACK 1U
 #define MF_BEAT_DECAY 5U
 #define MF_BEAT_MIN_SCORE 48U
+/* Detrending window for the tempo search, and the minimum mean squared
+   detrended onset level (per frame) for any tempo to be considered. */
+#define MF_DETREND_FRAMES 8U
+#define MF_BEAT_MIN_VARIANCE 16U
+/* A faster metrical level is chosen when it scores at least this fraction (Q8) of the best lag. */
+#define MF_METRICAL_RATIO_Q8 205U
 #define MF_BEAT_CONFIDENCE_LEVEL 32U
 #define MF_BEAT_PHASE_LEVEL 64U
 #define MF_BEAT_COHERENT_LEVEL 48U
@@ -500,37 +506,69 @@ static inline void music_features_update(struct music_features_state *state,
 	if (state->hist_filled < MUSIC_FEATURES_ONSET_HISTORY)
 		++state->hist_filled;
 
-	for (i = 0; i < MUSIC_FEATURES_ONSET_HISTORY; ++i)
-		den += (uint32_t)state->onset_hist[i] *
-			state->onset_hist[i];
+	/*
+	 * Detrend before correlating: each envelope value minus its trailing
+	 * MF_DETREND_FRAMES local mean, oldest first.  Raw autocorrelation of a
+	 * smooth or slowly swelling envelope (a pad, a crescendo) is high at every
+	 * lag, which reported a confident tempo on beatless material (#45/#46).
+	 * Only onsets that stand out from their surroundings now correlate, and an
+	 * envelope with almost no variation produces no score at all.
+	 */
+	if (state->hist_filled >= MUSIC_FEATURES_ONSET_HISTORY) {
+		int16_t detrended[MUSIC_FEATURES_ONSET_HISTORY];
+		unsigned int lag, k;
+		uint32_t window = 0;
 
-	if (state->hist_filled >= MUSIC_FEATURES_ONSET_HISTORY &&
-	    den != 0) {
-		unsigned int lag;
+		for (k = 0; k < MUSIC_FEATURES_ONSET_HISTORY; ++k) {
+			unsigned int idx = (state->hist_index + k) %
+				MUSIC_FEATURES_ONSET_HISTORY;
+			unsigned int count = k + 1U < MF_DETREND_FRAMES
+				? k + 1U : MF_DETREND_FRAMES;
 
-		for (lag = MUSIC_FEATURES_MIN_LAG;
-		     lag <= MUSIC_FEATURES_MAX_LAG; ++lag) {
-			uint32_t num = 0;
-			int32_t score;
-			unsigned int k;
+			window += state->onset_hist[idx];
+			if (k >= MF_DETREND_FRAMES)
+				window -= state->onset_hist[
+					(state->hist_index + k - MF_DETREND_FRAMES) %
+					MUSIC_FEATURES_ONSET_HISTORY];
+			detrended[k] = (int16_t)((int)state->onset_hist[idx] -
+						 (int)(window / count));
+			den += (uint32_t)((int32_t)detrended[k] * detrended[k]);
+		}
+		if (den >= MF_BEAT_MIN_VARIANCE * MUSIC_FEATURES_ONSET_HISTORY) {
+			int32_t scores[MUSIC_FEATURES_MAX_LAG + 1U];
+			unsigned int divisor;
 
-			for (k = 0; k < MUSIC_FEATURES_ONSET_HISTORY; ++k) {
-				unsigned int a = (state->hist_index +
-						  MUSIC_FEATURES_ONSET_HISTORY -
-						  1U - k) %
-					MUSIC_FEATURES_ONSET_HISTORY;
-				unsigned int b = (state->hist_index +
-						  MUSIC_FEATURES_ONSET_HISTORY -
-						  1U - k - lag) %
-					MUSIC_FEATURES_ONSET_HISTORY;
+			for (lag = MUSIC_FEATURES_MIN_LAG;
+			     lag <= MUSIC_FEATURES_MAX_LAG; ++lag) {
+				int32_t num = 0;
+				int32_t score;
 
-				num += (uint32_t)state->onset_hist[a] *
-					state->onset_hist[b];
+				for (k = lag; k < MUSIC_FEATURES_ONSET_HISTORY; ++k)
+					num += (int32_t)detrended[k] *
+						detrended[k - lag];
+				score = num > 0 ? (int32_t)((int64_t)num * 256 /
+							      (int64_t)den) : 0;
+				scores[lag] = score;
+				if (score > best_score) {
+					best_score = score;
+					best_lag = lag;
+				}
 			}
-			score = (int32_t)(num * 256U / den);
-			if (score > best_score) {
-				best_score = score;
-				best_lag = lag;
+			/*
+			 * Metrical level: a periodic onset train also correlates at two
+			 * and three periods, and the longer lag can win by a hair.  If
+			 * the lag a half or a third as long scores nearly as well, the
+			 * beat is the faster one (#45).
+			 */
+			for (divisor = 3U; divisor >= 2U; --divisor) {
+				unsigned int fast = (unsigned int)(best_lag + divisor / 2U) / divisor;
+
+				if (best_score > 0 && fast >= MUSIC_FEATURES_MIN_LAG &&
+				    scores[fast] * 256 >= best_score * (int32_t)MF_METRICAL_RATIO_Q8) {
+					best_lag = fast;
+					best_score = scores[fast];
+					break;
+				}
 			}
 		}
 	}

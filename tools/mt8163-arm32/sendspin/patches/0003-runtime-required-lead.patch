@@ -1,0 +1,60 @@
+diff -ruN a/include/sendspin/player_role.h b/include/sendspin/player_role.h
+--- a/include/sendspin/player_role.h
++++ b/include/sendspin/player_role.h
+@@ -262,6 +262,15 @@
+     /// @param adjustable true if the delay can be adjusted at runtime
+     void set_output_delay_adjustable(bool adjustable);
+ 
++    /// @brief Changes the startup lead reported as `required_lead_time_ms`. Main loop only.
++    ///
++    /// Overrides PlayerRoleConfig::required_lead_time_ms at runtime (0 restores the configured
++    /// value) and republishes client/state, so the server schedules the next stream start or
++    /// post-clear chunk with it. The pipeline floor still applies. For outputs whose startup
++    /// cost depends on state, e.g. a short lead while the output is already running.
++    /// @param lead_ms the lead in milliseconds, or 0 for the configured value
++    void set_required_lead_time_ms(uint16_t lead_ms);
++
+     // ========================================
+     // Queries
+     // ========================================
+diff -ruN a/src/player_role.cpp b/src/player_role.cpp
+--- a/src/player_role.cpp
++++ b/src/player_role.cpp
+@@ -185,6 +185,14 @@
+     this->impl_->update_output_delay(delay_ms);
+ }
+ 
++void PlayerRole::set_required_lead_time_ms(uint16_t lead_ms) {
++    if (this->impl_->required_lead_override_ms.exchange(lead_ms, std::memory_order_relaxed) ==
++        lead_ms) {
++        return;
++    }
++    this->impl_->client->publish_state();
++}
++
+ void PlayerRole::set_output_delay_adjustable(bool adjustable) {
+     this->impl_->output_delay_adjustable.store(adjustable, std::memory_order_relaxed);
+     this->impl_->client->publish_state();
+@@ -308,8 +316,9 @@
+     // Never below what the pipeline itself spends: the server extends lead only toward the
+     // reported number, so a configured value under that floor would truncate the stream start
+     // (roles/player/v1.md "Server Audio Send Constraints").
++    const uint16_t lead_override = this->required_lead_override_ms.load(std::memory_order_relaxed);
+     player_state.required_lead_time_ms =
+-        std::max(this->config.required_lead_time_ms.value_or(0),
++        std::max(lead_override != 0 ? lead_override : this->config.required_lead_time_ms.value_or(0),
+                  PlayerRoleConfig::pipeline_lead_time_ms(this->config.extra_startup_silence_ms));
+     player_state.min_buffer_ms = this->config.min_buffer_ms;
+     // roles/player/v1.md "client/state player object": the commands the server may send.
+diff -ruN a/src/player_role_impl.h b/src/player_role_impl.h
+--- a/src/player_role_impl.h
++++ b/src/player_role_impl.h
+@@ -242,6 +242,8 @@
+     // on_stream_end() from firing without a matching on_stream_start()
+     bool stream_active{false};
+     std::atomic<bool> output_delay_adjustable{false};
++    // Runtime override of config.required_lead_time_ms; 0 = use the configured value.
++    std::atomic<uint16_t> required_lead_override_ms{0};
+     // Set by the client while it is unavailable; read by handle_binary() on the network thread.
+     std::atomic<bool> discard_audio{false};
+     uint8_t volume{0};
