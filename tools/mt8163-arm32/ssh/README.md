@@ -36,4 +36,6 @@ permits root login. The persisted host key is device-specific and must never be
 included in an image or shared backup.
 
 The supervisor status file is `/run/libreecho/ssh.status` and exposes only
-non-secret mode, source, privilege, account-state, and host-key policy fields.
+non-secret mode, source, privilege, account-state, and host-key policy fields. When Dropbear
+cannot be started, `account_state=start-failed` is reported with a
+`start_error=` field holding one sanitized line from the Dropbear log.
