@@ -100,7 +100,7 @@ static double render_tone(int wide, double *max_s16_diff)
             sources[SOURCE_MEDIA].samples[2 * i] = v;
             sources[SOURCE_MEDIA].samples[2 * i + 1] = v;
         }
-        render_period(sources, output, &dynamics, &speaker,
+        render_period(sources, NULL, 0, output, &dynamics, &speaker,
                       logical_master_gain(50), &master_gain);
         if (p < 4)
             continue; /* let the EQ and dynamics settle */

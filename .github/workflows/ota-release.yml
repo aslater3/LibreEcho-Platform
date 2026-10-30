@@ -140,6 +140,9 @@ jobs:
           python tools/mt8163-arm32/airplay/test_audio_engine_contract.py
           python tools/mt8163-arm32/airplay/test_airplay_volume_contract.py
           python tools/mt8163-arm32/airplay/test_audio_period_buffer.py
+          python tools/mt8163-arm32/airplay/test_audio_sink.py
+          python tools/mt8163-arm32/airplay/test_audio_engine_sendspin.py
+          python tools/mt8163-arm32/sendspin/test_packaging.py
           bash tools/mt8163-arm32/airplay/test_speaker_dsp.sh
           bash tools/mt8163-arm32/airplay/test_speaker_mbcl.sh
           bash tools/mt8163-arm32/airplay/test_biscuit_speaker_dsp.sh
@@ -148,7 +151,10 @@ jobs:
           bash tools/mt8163-arm32/airplay/test_music_session_id.sh
           bash tools/mt8163-arm32/airplay/test_music_feature_trace.sh
           bash tools/mt8163-arm32/airplay/test_music_transport_wrap.sh
+          bash tools/mt8163-arm32/airplay/test_music_analysis_tap.sh
           python tools/mt8163-arm32/airplay/test_music_feature_packet.py
+          python tools/mt8163-arm32/airplay/test_music_trace.py
+          python tools/mt8163-arm32/emulation/hwsim/test_hwsim.py
           python -m unittest -q tools/mt8163-arm32/feature_runtime/test_runtime_package.py
           cd tools/mt8163-arm32
           python -m unittest -q \
@@ -165,6 +171,7 @@ jobs:
             mdns/test_runtime.py \
             test_qualification.py \
             test_ssh_runtime.py \
+            test_local_services.py \
             test_vm_profile.py \
             test_vendor_import_compat.py \
             test_source_offer_tools.py \
@@ -185,6 +192,7 @@ jobs:
             test_ota_v3_packaging.py \
             test_ota_v3_recovery.py \
             test_ota_v3_transport.py \
+            test_ota_log.py \
             test_ota_v3_web_status.py \
             ota/test_feature_provenance.py \
             ota/test_service_identity.py \
@@ -251,6 +259,7 @@ jobs:
           done < <(git ls-files -z 'tools/mt8163-arm32/*.sh' 'tools/mt8163-arm32/**/*.sh')
           bash tools/mt8163-arm32/tts/test_package_feature_contract.sh
           /bin/busybox sh -n tools/mt8163-arm32/initramfs/libreecho-init
+          /bin/busybox sh -n tools/mt8163-arm32/initramfs/libreecho-local
           /bin/busybox sh -n tools/mt8163-arm32/initramfs/libreecho-feature-transaction
           /bin/busybox sh -n tools/mt8163-arm32/initramfs/libreecho-update
           /bin/busybox sh -n tools/mt8163-arm32/initramfs/libreecho-update-fetch

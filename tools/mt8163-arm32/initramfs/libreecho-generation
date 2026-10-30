@@ -3,16 +3,22 @@
 BB=/bin/busybox
 ROOT=${ROOT:-/data/libreecho/update}
 GENERATIONS=${GENERATIONS:-/data/libreecho/generations}
+INCOMING=${INCOMING:-/data/libreecho/incoming}
 TARGET_MANIFEST=${TARGET_MANIFEST:-/usr/local/sbin/libreecho-target-manifest}
 CURL=${CURL:-/usr/bin/curl}
 CA=${CA:-/etc/ssl/certs/ca-certificates.crt}
 SPACE_RESERVE_BYTES=${SPACE_RESERVE_BYTES:-262144}
+# Newest quarantined files of each kind kept as evidence under space pressure.
+EVIDENCE_KEEP=2
 # Feature asset transport chosen by libreecho-update-fetch. Only the two
-# project transports are accepted; anything else falls back to GitHub. Every
+# project transports are accepted (the mirror, the GitHub repository releases
+# are published from, and its planned organisation home); anything else falls
+# back to GitHub. Every
 # asset is still size- and hash-checked against the signed manifest.
 case "${RELEASE_BASE:-}" in
-    https://dl.libreecho.org|https://github.com/LibreEcho/LibreEcho/releases) release_base=$RELEASE_BASE ;;
-    *) release_base=https://github.com/LibreEcho/LibreEcho/releases ;;
+    https://dl.libreecho.org|https://github.com/aslater3/LibreEcho/releases|https://github.com/LibreEcho/LibreEcho/releases)
+        release_base=$RELEASE_BASE ;;
+    *) release_base=https://github.com/aslater3/LibreEcho/releases ;;
 esac
 fail() {
     printf 'ERROR:%s\n' "$1" >&2
@@ -187,8 +193,109 @@ features/$feature/payload.squashfs"
     [ "$actual" = "$(printf '%s\n' "$expected" | $BB sort)" ] || fail generation-file-set
 }
 
+# Direct-install uploads are linked into the generation tree in place, so once
+# a generation is committed their incoming names are redundant. An upload whose
+# generation has since been collected (link count 1) is only dead space, and
+# nothing reads incoming after install: a new direct install formats userdata
+# first, so no committed generation exists while it is uploading.
+reclaim_incoming() {
+    local entry
+    [ -e "$ROOT/current" ] || return 0
+    [ -d "$INCOMING" ] && [ ! -L "$INCOMING" ] || return 0
+    safe_path "$INCOMING"
+    for entry in "$INCOMING"/*; do
+        [ -f "$entry" ] && [ ! -L "$entry" ] || continue
+        [ "$($BB stat -c %h "$entry")" = 1 ] || continue
+        $BB rm -f "$entry" || fail reclaim-incoming
+    done
+}
+
+# A pin keeps an assembled candidate until its install publishes pending. A new
+# assembly supersedes every candidate that never got that far, so their pins,
+# trees and partial trees are released before the space check. Current,
+# previous and pending are never touched, and nothing is while an install runs.
+reclaim() {
+    local keep=" $1 " id entry
+    [ ! -e "$ROOT/install.lock" ] && [ ! -L "$ROOT/install.lock" ] || return 0
+    for id in current previous; do
+        if [ -e "$ROOT/$id" ]; then
+            regular "$ROOT/$id" "$id"; id=$($BB cat "$ROOT/$id"); valid_id "$id"; keep="$keep$id "
+        fi
+    done
+    if [ -e "$ROOT/pending" ]; then
+        regular "$ROOT/pending" pending
+        id=$(value transaction_id "$ROOT/pending"); valid_id "$id"; keep="$keep$id "
+    fi
+    for entry in "$GENERATIONS"/*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        id=${entry##*/}; id=${id%.pin}; id=${id%.partial}
+        case "$keep" in *" $id "*) continue;; esac
+        case "$entry" in
+            *.pin)
+                [ -f "$entry" ] && [ ! -L "$entry" ] || continue
+                valid_id "$id"; safe_path "$entry"
+                $BB rm -f "$entry" || fail reclaim-pin;;
+            *)
+                [ -d "$entry" ] && [ ! -L "$entry" ] || continue
+                valid_id "$id"; safe_path "$entry"
+                [ -z "$($BB find "$entry" -type l)" ] || fail reclaim-type
+                $BB find "$entry" -type d -exec $BB chmod 0700 '{}' ';' || fail reclaim-mode
+                $BB rm -rf "$entry" || fail reclaim-delete;;
+        esac
+    done
+    reclaim_incoming
+    sync_file
+}
+
+# Remove all but the newest EVIDENCE_KEEP regular files matching a glob whose
+# basename (without its .bad suffix and $2 prefix) is a content hash.
+trim_evidence() {
+    local pattern=$1 prefix=$2 entry name kept=0
+    for entry in $($BB ls -1t $pattern 2>/dev/null); do
+        [ -f "$entry" ] && [ ! -L "$entry" ] || continue
+        name=${entry##*/}; name=${name#"$prefix"}; name=${name%.bad}
+        valid_hash "$name" || continue
+        kept=$((kept + 1))
+        [ "$kept" -gt "$EVIDENCE_KEEP" ] || continue
+        safe_path "$entry"
+        $BB rm -f "$entry" || fail reclaim-evidence
+        printf 'reclaimed=%s\n' "${entry##*/}" >&2
+    done
+}
+
+# Quarantined packages and feature assets are inert failure evidence, and a
+# part no feature of this manifest names belongs to a superseded assembly.
+# Nothing depends on either, but evidence is worth keeping while it costs
+# nothing: this runs only when the space check would otherwise fail, keeps
+# the newest EVIDENCE_KEEP of each kind, and, like reclaim, does nothing
+# while an install runs. The generation lock excludes other assemblers.
+reclaim_space() {
+    local manifest=$1 wanted=' ' feature entry name
+    [ ! -e "$ROOT/install.lock" ] && [ ! -L "$ROOT/install.lock" ] || return 0
+    for feature in airplay2 tts wakeword stt assistant; do
+        wanted="$wanted$(value "feature_${feature}_sha256" "$manifest") $(value "feature_${feature}_manifest_sha256" "$manifest") "
+    done
+    for entry in "$ROOT/asset-cache"/*.part; do
+        [ -f "$entry" ] && [ ! -L "$entry" ] || continue
+        name=${entry##*/}; name=${name%.part}
+        valid_hash "$name" || continue
+        case "$wanted" in *" $name "*) continue;; esac
+        safe_path "$entry"
+        $BB rm -f "$entry" || fail reclaim-part
+        printf 'reclaimed=%s\n' "asset-cache/${entry##*/}" >&2
+    done
+    trim_evidence "$ROOT/quarantine-*.bad" quarantine-
+    trim_evidence "$ROOT/asset-cache/*.bad" ''
+    sync_file
+}
+
+probe_space() {
+    available=$($BB df -Pk "$GENERATIONS" | $BB awk 'NR==2 {print $4}')
+    case "$available" in ''|*[!0-9]*) fail space-probe;; esac
+}
+
 assemble() {
-    local manifest=$1 signature=$2 tx partial dest current= source feature kind file asset size digest part http rc needed=0 bytes available
+    local manifest=$1 signature=$2 tx partial dest current= source feature kind file asset size digest part http rc needed=0 bytes available hash credited=' '
     "$TARGET_MANIFEST" check "$manifest" "$signature" || fail target-invalid
     tx=$(value transaction_id "$manifest"); valid_id "$tx"
     safe_path "$ROOT"; safe_path "$GENERATIONS"
@@ -216,6 +323,7 @@ assemble() {
         current=$($BB cat "$ROOT/current"); valid_id "$current"
         safe_path "$GENERATIONS/$current"
     fi
+    reclaim "$tx"
     # Discard only this transaction's unpublished assembly, never a generation.
     if [ -e "$partial" ]; then
         [ -d "$partial" ] && [ -z "$($BB find "$partial" -type l)" ] || fail partial-type
@@ -228,7 +336,16 @@ assemble() {
             if [ "$kind" = payload ]; then file=payload.squashfs; size=size; digest=sha256
             else file=manifest.json; size=manifest_size; digest=manifest_sha256; fi
             bytes=$(value "feature_${feature}_${size}" "$manifest")
-            if [ -n "$current" ] && matches "$GENERATIONS/$current/features/$feature/$file" "$bytes" "$(value "feature_${feature}_${digest}" "$manifest")"; then continue; fi
+            hash=$(value "feature_${feature}_${digest}" "$manifest")
+            if [ -n "$current" ] && matches "$GENERATIONS/$current/features/$feature/$file" "$bytes" "$hash"; then continue; fi
+            # A complete, verified part (a finished or seeded download) is
+            # renamed into the tree below, not written again. Credit it once.
+            case "$credited" in
+                *" $hash "*) ;;
+                *) if matches "$ROOT/asset-cache/$hash.part" "$bytes" "$hash"; then
+                       credited="$credited$hash "; continue
+                   fi;;
+            esac
             # Block-round allocations and reject arithmetic overflow before write.
             [ "$bytes" -le 9223372036854767615 ] || fail space-overflow
             bytes=$(((bytes + 4095) / 4096 * 4096))
@@ -240,8 +357,11 @@ assemble() {
     [ "$needed" -le 9223372036854710271 ] || fail space-overflow
     [ "$SPACE_RESERVE_BYTES" -le "$((9223372036854710271 - needed))" ] || fail space-overflow
     needed=$((needed + SPACE_RESERVE_BYTES + 65536))
-    available=$($BB df -Pk "$GENERATIONS" | $BB awk 'NR==2 {print $4}')
-    case "$available" in ''|*[!0-9]*) fail space-probe;; esac
+    probe_space
+    if [ "$available" -lt "$(((needed + 1023) / 1024))" ]; then
+        reclaim_space "$manifest"
+        probe_space
+    fi
     [ "$available" -ge "$(((needed + 1023) / 1024))" ] || fail generation-space
     $BB mkdir -p "$partial/features" || fail partial-create
     atomic_copy "$manifest" "$partial/target.manifest"

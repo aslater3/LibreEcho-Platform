@@ -1,0 +1,9 @@
+{
+  "description": "Wi-Fi drops to a weak, gateway-unreachable state and recovers.",
+  "steps": [
+    {"at": 0, "set": {"network": {"signal": 72, "connectivity": "healthy", "gateway_reachable": true}}},
+    {"at": 1, "set": {"network": {"signal": 8, "connectivity": "degraded", "gateway_reachable": false}}},
+    {"at": 2, "set": {"network": {"signal": 72, "connectivity": "healthy", "gateway_reachable": true}}}
+  ],
+  "expect": []
+}

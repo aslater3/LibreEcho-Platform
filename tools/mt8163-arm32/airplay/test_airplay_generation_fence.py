@@ -76,6 +76,8 @@ def compile_fixture(root, fixed_nonce=False, pause_before_marker=False):
     cc = os.getenv("CC", "cc")
     subprocess.run([cc, "-std=c99", "-Wall", "-Wextra", "-Werror", "-ffunction-sections",
                     "-fdata-sections", "-I", str(root), "-I", str(HERE),
+                    str(HERE / "audio_sink.c"),
+                    str(HERE / "audio_timing.c"),
                     str(root / "engine.c"), "-Wl,--gc-sections", "-lm", "-o", str(root / "engine")],
                    check=True, timeout=60)
     subprocess.run([cc, "-std=c99", "-Wall", "-Wextra", "-Werror", str(root / "bridge.c"),

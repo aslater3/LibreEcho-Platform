@@ -65,6 +65,12 @@ STAGING=$UPDATE_ROOT/staging
 STATE=$UPDATE_ROOT/state
 PENDING=$UPDATE_ROOT/pending
 LOCK=$UPDATE_ROOT/install.lock
+OTA_LOG=$UPDATE_ROOT/ota.log
+OTA_LOG_MAX_BYTES=65536
+OTA_LOG_SOURCE=update
+# Only install and confirm log: inspect also runs on partial downloads, where
+# failing is expected and would only bury the real errors.
+OTA_LOG_ACTIVE=0
 VERIFY=/usr/local/libexec/libreecho-update-verify
 BOOTCTL=/usr/local/sbin/libreecho-bootctl
 PUBLIC_KEY=/etc/libreecho/ota-public-key.hex
@@ -134,8 +140,33 @@ cleanup_refused_install_artifacts()
     return 0
 }
 
+# --- ota_log (keep identical in libreecho-update and libreecho-update-fetch) ---
+# Persistent OTA event log. One line per decision or failure, kept on /data so
+# it survives the reboot an update needs and the next check that overwrites
+# check-status, and mirrored to syslog (logread, tag libreecho-ota). At most two
+# files, ota.log and ota.log.1, each rotated at OTA_LOG_MAX_BYTES. Best effort:
+# a logging failure never changes an update result.
+ota_log()
+{
+    ota_log_line=$(printf '%s %s[%s] %s' \
+        "$($BB date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" "$OTA_LOG_SOURCE" "$$" "$*" |
+        $BB tr '\r\n' '  ' | $BB cut -c 1-512)
+    $BB logger -t libreecho-ota "${ota_log_line#* }" 2>/dev/null || :
+    [ -d "${OTA_LOG%/*}" ] && [ ! -L "${OTA_LOG%/*}" ] || return 0
+    [ ! -L "$OTA_LOG" ] && [ ! -L "$OTA_LOG.1" ] || return 0
+    ota_log_size=$($BB stat -c %s "$OTA_LOG" 2>/dev/null) || ota_log_size=0
+    case "$ota_log_size" in ''|*[!0-9]*) ota_log_size=0 ;; esac
+    if [ "$ota_log_size" -ge "$OTA_LOG_MAX_BYTES" ]; then
+        $BB mv -f "$OTA_LOG" "$OTA_LOG.1" 2>/dev/null || :
+    fi
+    (umask 077; printf '%s\n' "$ota_log_line" >> "$OTA_LOG") 2>/dev/null || :
+    return 0
+}
+# --- end ota_log ---
+
 die()
 {
+    [ "$OTA_LOG_ACTIVE" != 1 ] || ota_log "install-error reason=$1 state=${state_name:-none}"
     echo "ERROR:$1" >&2
     # An aborted install used to leave $STATE at whatever step it reached
     # (typically "verifying" / 5), which makes the update subsystem report a
@@ -235,6 +266,7 @@ state_write()
     state_name=$1
     progress=$2
     detail=$3
+    [ "$OTA_LOG_ACTIVE" != 1 ] || ota_log "install-state state=$state_name progress=$progress detail=$detail"
     {
         echo schema=1
         echo "state=$state_name"
@@ -626,6 +658,7 @@ case "${1:-}" in
         [ "$ALLOW_UNSIGNED" = 0 ] || die unsigned_target_unsupported
         [ "$#" = 0 ] || die usage
         INSTALL_CLEANUP=1
+        OTA_LOG_ACTIVE=1
         install_package "$package"
         ;;
     inspect)
@@ -634,6 +667,7 @@ case "${1:-}" in
         ;;
     confirm)
         [ "$#" -eq 1 ] || die usage
+        OTA_LOG_ACTIVE=1
         confirm_pending
         ;;
     capabilities)

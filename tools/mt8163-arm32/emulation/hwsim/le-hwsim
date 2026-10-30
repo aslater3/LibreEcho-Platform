@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""le-hwsim: serve simulated LibreEcho adapters (audio, LED, network, Bluetooth) on a socket directory.
+
+  le-hwsim serve --run-dir /run/libreecho [--log events.jsonl] [--timeout SECONDS]
+  le-hwsim run SCENARIO.json --run-dir DIR [--log events.jsonl] [--timeout 120]
+
+`serve` runs until the timeout (default 1 hour) or SIGTERM. `run` plays a
+scenario timeline and exits 0 when every expectation was met, 1 otherwise.
+The real daemons' clients (libreecho-web --backend linux, agentd ...) talk to
+these sockets unchanged; bind-mount the directory onto /run/libreecho.
+"""
+import argparse
+import json
+import signal
+import sys
+import threading
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from le_hwsim.simulator import Simulator, run_scenario  # noqa: E402
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="le-hwsim")
+    sub = p.add_subparsers(dest="command", required=True)
+    for name in ("serve", "run"):
+        x = sub.add_parser(name)
+        if name == "run":
+            x.add_argument("scenario")
+        x.add_argument("--run-dir", required=True)
+        x.add_argument("--log")
+        x.add_argument("--timeout", type=float, default=3600.0 if name == "serve" else 120.0)
+    a = p.parse_args()
+    sim = Simulator(Path(a.run_dir), Path(a.log) if a.log else None)
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    try:
+        print("le-hwsim: ready", flush=True)
+        if a.command == "serve":
+            stop.wait(a.timeout)
+            return 0
+        failures = run_scenario(sim, json.loads(Path(a.scenario).read_text()), timeout=a.timeout)
+        for failure in failures:
+            print("FAIL " + failure, file=sys.stderr)
+        print("le-hwsim: scenario " + ("passed" if not failures else "failed"))
+        return 1 if failures else 0
+    finally:
+        sim.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

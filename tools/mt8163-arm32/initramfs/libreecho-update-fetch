@@ -37,16 +37,21 @@ CURL_HEADERS=/run/libreecho/ota-curl.headers
 CURL_DIAGNOSTIC_MAX=160
 # Release transport. The project-owned download domain is tried first so that a
 # repository or account move never strands installed devices; GitHub Releases
-# is the direct fallback when the domain is unreachable. Both are untrusted
+# is the direct fallback when the domain is unreachable. The fallback names
+# the repository where releases are published today; GitHub redirects it if the
+# repository moves to the LibreEcho organisation. Both are untrusted
 # transport: the control package is signature-checked and every feature asset
 # is size- and hash-pinned by the signed manifest before use.
 RELEASE_MIRROR=https://dl.libreecho.org
-RELEASE_GITHUB=https://github.com/LibreEcho/LibreEcho/releases
+RELEASE_GITHUB=https://github.com/aslater3/LibreEcho/releases
 RELEASE_BASE=$RELEASE_GITHUB
 DATA_ROOT=/data
 PROC_ROOT=/proc
 RUN_ROOT=/run
 FEATURE_ROOT=$DATA_ROOT/libreecho/features
+OTA_LOG=$ROOT/ota.log
+OTA_LOG_MAX_BYTES=65536
+OTA_LOG_SOURCE=update-fetch
 
 sanitize_status_value()
 {
@@ -153,6 +158,30 @@ check_status_write()
         $BB mv "$CHECK_STATUS.tmp" "$CHECK_STATUS"
 }
 
+# --- ota_log (keep identical in libreecho-update and libreecho-update-fetch) ---
+# Persistent OTA event log. One line per decision or failure, kept on /data so
+# it survives the reboot an update needs and the next check that overwrites
+# check-status, and mirrored to syslog (logread, tag libreecho-ota). At most two
+# files, ota.log and ota.log.1, each rotated at OTA_LOG_MAX_BYTES. Best effort:
+# a logging failure never changes an update result.
+ota_log()
+{
+    ota_log_line=$(printf '%s %s[%s] %s' \
+        "$($BB date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" "$OTA_LOG_SOURCE" "$$" "$*" |
+        $BB tr '\r\n' '  ' | $BB cut -c 1-512)
+    $BB logger -t libreecho-ota "${ota_log_line#* }" 2>/dev/null || :
+    [ -d "${OTA_LOG%/*}" ] && [ ! -L "${OTA_LOG%/*}" ] || return 0
+    [ ! -L "$OTA_LOG" ] && [ ! -L "$OTA_LOG.1" ] || return 0
+    ota_log_size=$($BB stat -c %s "$OTA_LOG" 2>/dev/null) || ota_log_size=0
+    case "$ota_log_size" in ''|*[!0-9]*) ota_log_size=0 ;; esac
+    if [ "$ota_log_size" -ge "$OTA_LOG_MAX_BYTES" ]; then
+        $BB mv -f "$OTA_LOG" "$OTA_LOG.1" 2>/dev/null || :
+    fi
+    (umask 077; printf '%s\n' "$ota_log_line" >> "$OTA_LOG") 2>/dev/null || :
+    return 0
+}
+# --- end ota_log ---
+
 automatic_updates_enabled()
 {
     [ "$(check_value_from_file "$AUTOMATIC" enabled)" = 1 ]
@@ -194,6 +223,7 @@ die()
     error_exit=${3:-}
     error_detail=${4:-}
     http_status=${5:-}
+    ota_log "error reason=$reason reachable=$reachable curl_exit=$error_exit http=$http_status detail=$(sanitize_status_value "$error_detail")"
     if ! check_status_write error "" "$reason" "$reachable" \
         "$error_exit" "$error_detail" "$http_status"; then
         [ -n "$error_detail" ] && echo "ERROR_DETAIL:$error_detail" >&2
@@ -258,8 +288,12 @@ select_release_source()
     RELEASE_BASE=$RELEASE_GITHUB
     probe=$ROOT/.control-range-probe.$$
     bounded_curl "$probe" "$CURL_HEADERS" 64 20 "$RELEASE_MIRROR/healthz" || STREAM_CURL_RC=1
+    RELEASE_SOURCE_NOTE="github mirror_probe_exit=$STREAM_CURL_RC"
     if [ "$STREAM_CURL_RC" -eq 0 ] && [ "$($BB head -n 1 "$probe" 2>/dev/null)" = "libreecho-dl ok" ]; then
         RELEASE_BASE=$RELEASE_MIRROR
+        RELEASE_SOURCE_NOTE=mirror
+    elif [ "$STREAM_CURL_RC" -eq 0 ]; then
+        RELEASE_SOURCE_NOTE="github mirror_probe=unexpected-body"
     fi
     $BB rm -f "$probe" "$CURL_HEADERS" "$CURL_STDERR"
     url="$RELEASE_BASE/latest/download/libreecho-$TARGET_SLUG-$channel.ota.tar"
@@ -846,6 +880,7 @@ quarantine_file()
         [ "$($BB stat -c %s "$target")" = "$size" ] || die quarantine_identity
         [ "$($BB sha256sum "$target" | $BB awk '{print $1}')" = "$digest" ] || die quarantine_identity
         $BB rm "$source" || die quarantine_commit
+        ota_log "quarantined file=${source##*/} sha256=$digest size=$size duplicate=1"
         return 0
     fi
     count=0
@@ -854,21 +889,54 @@ quarantine_file()
         count=$((count + 1))
     done
     # Preserve history and stop explicitly rather than silently evicting it.
-    [ "$count" -lt 8 ] || die quarantine_capacity
+    [ "$count" -lt 8 ] || {
+        ota_log "quarantine-full count=$count file=${source##*/} sha256=$digest"
+        die quarantine_capacity
+    }
     $BB chmod 600 "$source" || die quarantine_mode
     $BB mv "$source" "$target" || die quarantine_commit
+    ota_log "quarantined file=${source##*/} sha256=$digest size=$size count=$((count + 1))"
+}
+
+inspect_control_file()
+{
+    [ -f "$1" ] && [ ! -L "$1" ] || return 1
+    size=$($BB stat -c %s "$1" 2>/dev/null)
+    case "$size" in ''|*[!0-9]*) return 1;; esac
+    [ "$size" -gt 0 ] && [ "$size" -le "$MAX_BYTES" ] || return 1
+    inspection=$("$UPDATE" inspect "$1" 2>/dev/null) || return 1
+    version=$(printf '%s\n' "$inspection" | $BB sed -n 's/^UPDATE_VALID version=//p')
+    case "$version" in ''|*[!A-Za-z0-9._+~-]*) return 1;; esac
+    printf '%s\n' "$version"
 }
 
 inspect_control_part()
 {
-    [ -f "$PART" ] && [ ! -L "$PART" ] || return 1
-    size=$($BB stat -c %s "$PART" 2>/dev/null)
-    case "$size" in ''|*[!0-9]*) return 1;; esac
-    [ "$size" -gt 0 ] && [ "$size" -le "$MAX_BYTES" ] || return 1
-    inspection=$("$UPDATE" inspect "$PART" 2>/dev/null) || return 1
-    version=$(printf '%s\n' "$inspection" | $BB sed -n 's/^UPDATE_VALID version=//p')
-    case "$version" in ''|*[!A-Za-z0-9._+~-]*) return 1;; esac
-    printf '%s\n' "$version"
+    inspect_control_file "$PART"
+}
+
+log_downloaded_package()
+{
+    ota_log "downloaded version=$1 size=$($BB stat -c %s "$PACKAGE" 2>/dev/null) sha256=$($BB sha256sum "$PACKAGE" 2>/dev/null | $BB awk '{print $1}')"
+}
+
+# Issue #274: a check leaves its verified package in $PACKAGE for the install
+# that follows. When a later run must refresh it (the stable alias is mutable),
+# bytes that still pass signed inspection are superseded, not suspect: remove
+# them. Quarantine is evidence of bad bytes and is capped at eight entries, so
+# filing good packages there eventually stopped every update with
+# quarantine_capacity. Anything else (not a single-link regular file, oversize,
+# or failing inspection) is still quarantined.
+discard_cached_package()
+{
+    if [ -f "$PACKAGE" ] && [ ! -L "$PACKAGE" ] &&
+        [ "$($BB stat -c %h "$PACKAGE" 2>/dev/null)" = 1 ] &&
+        cached_version=$(inspect_control_file "$PACKAGE"); then
+        $BB rm "$PACKAGE" || die download_commit
+        ota_log "cached-package superseded version=$cached_version action=removed"
+        return 0
+    fi
+    quarantine_file "$PACKAGE"
 }
 
 legacy_download_and_inspect()
@@ -983,6 +1051,7 @@ promote_control_part()
     version=$(printf '%s\n' "$inspection" | $BB sed -n 's/^UPDATE_VALID version=//p')
     case "$version" in ''|*[!A-Za-z0-9._+~-]*) die downloaded_version;; esac
     $BB mv "$PART" "$PACKAGE" || die download_commit
+    log_downloaded_package "$version"
     printf '%s\n' "$version"
 }
 
@@ -1004,6 +1073,7 @@ fresh_control_download()
     $BB rm -f "$CURL_HEADERS" "$CURL_STDERR"
     version=$(printf '%s\n' "$inspection" | $BB sed -n 's/^UPDATE_VALID version=//p')
     case "$version" in ''|*[!A-Za-z0-9._+~-]*) die downloaded_version;; esac
+    log_downloaded_package "$version"
     printf '%s\n' "$version"
 }
 
@@ -1011,6 +1081,7 @@ reset_and_fresh_control()
 {
     [ "${RESET_USED:-0}" -eq 0 ] || die download_reset_limit
     RESET_USED=1
+    ota_log "partial-download discarded size=${part_size:-} remote_size=${remote_size:-} http=${RESPONSE_HTTP_CODE:-}"
     fresh_control_download
 }
 
@@ -1033,17 +1104,20 @@ download_and_inspect()
     RESET_USED=0
     if [ -e "$PACKAGE" ] || [ -L "$PACKAGE" ]; then
         # Only immutable dev discovery binds a cached package to this check.
-        # Stable must refresh its mutable alias and retain the previous bytes.
+        # Stable must refresh its mutable alias; discard_cached_package removes
+        # the superseded bytes (their version goes to ota.log) or quarantines
+        # them if they fail inspection.
         if [ "$channel" = dev ] && [ -f "$PACKAGE" ] && [ ! -L "$PACKAGE" ] &&
             [ "$(stat -c %s "$PACKAGE")" -le "$MAX_BYTES" ] &&
             [ "$(sha256sum "$PACKAGE" | $BB awk '{print $1}')" = "$DEV_OTA_SHA256" ]; then
             inspection=$("$UPDATE" inspect "$PACKAGE") || die downloaded_package_invalid true
             version=$(printf '%s\n' "$inspection" | $BB sed -n 's/^UPDATE_VALID version=//p')
             case "$version" in ''|*[!A-Za-z0-9._+~-]*) die downloaded_version;; esac
+            ota_log "cached-package reused version=$version"
             printf '%s\n' "$version"
             return 0
         fi
-        quarantine_file "$PACKAGE"
+        discard_cached_package
     fi
     if [ -f "$PART" ]; then
         part_size=$($BB stat -c %s "$PART" 2>/dev/null)
@@ -1075,6 +1149,7 @@ download_and_inspect()
                     esac
                     resume=$ROOT/.control-resume.$$
                     tail_limit=$((MAX_BYTES - part_size + 1))
+                    ota_log "partial-download resume from=$part_size remote_size=$remote_size"
                     bounded_curl "$resume" "$CURL_HEADERS" "$tail_limit" 1800 --range "$part_size-" "$url"
                     curl_detail=$(downloader_stderr)
                     parse_response_headers "$CURL_HEADERS" || curl_failure "$STREAM_CURL_RC" "$curl_detail" ""
@@ -1188,6 +1263,12 @@ check_or_install()
     select_release_source
     resolve_dev_release || return 1
     install_unlock
+    if [ "$channel" = dev ]; then
+        ota_log_dev=" dev_tag=${DEV_RELEASE_TAG:-} dev_sha256=${DEV_OTA_SHA256:-}"
+    else
+        ota_log_dev=
+    fi
+    ota_log "start action=$requested_action channel=$channel target=$TARGET_SLUG source=${RELEASE_SOURCE_NOTE:-github} installed=$($BB sed -n 's/^version=//p' "$ROOT/installed" 2>/dev/null)$ota_log_dev"
     version=$(download_and_inspect) || return 1
     if [ "$channel" = dev ]; then
         [ "$(sha256sum "$PACKAGE" | $BB awk '{print $1}')" = "$DEV_OTA_SHA256" ] || { quarantine_file "$PACKAGE"; die dev_control_identity; }
@@ -1197,6 +1278,7 @@ check_or_install()
         replay_status=$(automatic_replay_status)
         if [ -n "$replay_status" ]; then
             check_status_write_candidate "$replay_status" "$version"
+            ota_log "result status=$replay_status version=$version"
             echo "UPDATE_HELD version=$version"
             return 0
         fi
@@ -1205,21 +1287,26 @@ check_or_install()
     installed_channel=$(record_channel "$ROOT/installed")
     if [ "$requested_action" != install ] && [ "$version" = "$installed" ] && [ "$channel" = "$installed_channel" ] && candidate_matches_record "$ROOT/installed"; then
         check_status_write_candidate up-to-date "$version"
+        ota_log "result status=up-to-date version=$version"
         echo "UPDATE_CURRENT version=$version"
         return 0
     fi
     download_feature_assets
     if [ "$requested_action" = check ]; then
         check_status_write_candidate update-available "$version"
+        ota_log "result status=update-available version=$version"
         echo "UPDATE_AVAILABLE version=$version"
         return 0
     fi
     "$UPDATE" install "$PACKAGE" || {
+        install_exit=$?
+        ota_log "result status=install-failed version=$version installer_exit=$install_exit"
         cleanup_refused_install_artifacts || true
         check_status_write error "$version" install_failed true
         return 1
     }
     check_status_write_candidate reboot-pending "$version"
+    ota_log "result status=reboot-pending version=$version"
 }
 
 watch_updates()
