@@ -1300,6 +1300,74 @@ static int32_t read_media_gain(const char *root)
 	return db_to_q15(db);
 }
 
+/*
+ * Separate reply volume (LibreEcho-UI #409).  audiod publishes the owner's
+ * assistant-reply level beside master.volume as reply.volume, in the same
+ * logical 0..100 form; the file is absent while replies follow the master.
+ * When present, the system bus (Home Assistant and live-voice replies,
+ * chimes) and the announcement bus (local speech) are mixed apart from the
+ * master-scaled buses and take the logical gain of the reply level instead,
+ * on the same taper, so a reply at level R sounds as loud as everything does
+ * at master R.  Both sums then meet the shared speaker chain.  The reply gain
+ * ramps across a period like the master does, so moving either level never
+ * steps.  Media, AirPlay, Sendspin and the alarm bus keep the master level;
+ * a master of zero (mute) still silences everything.
+ */
+#define REPLY_VOLUME_FILE "reply.volume"
+static int reply_volume_percent = -1;   /* -1: replies follow the master */
+static int32_t reply_target_q15 = -1;
+static int32_t reply_current_q15 = -1;
+static int32_t logical_master_gain(int percent);
+static int logical_master_volume(const char *root);
+
+static int read_reply_volume(const char *root)
+{
+	char path[256], text[16], *end;
+	struct stat st;
+	int fd, n;
+	long value;
+
+	n = snprintf(path, sizeof(path), "%s/%s", root, REPLY_VOLUME_FILE);
+	if (n < 0 || n >= (int)sizeof(path))
+		return -1;
+	fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0)
+		return -1;
+	if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) ||
+	    st.st_size <= 0 || st.st_size >= (off_t)sizeof(text)) {
+		close(fd);
+		return -1;
+	}
+	n = (int)read(fd, text, (size_t)st.st_size);
+	close(fd);
+	if (n != st.st_size)
+		return -1;
+	text[n] = '\0';
+	errno = 0;
+	value = strtol(text, &end, 10);
+	if (errno || end == text || (*end != '\n' && *end != '\0') ||
+	    (*end == '\n' && end[1] != '\0') || value < 0 || value > 100)
+		return -1;
+	return (int)value;
+}
+
+/* Refresh the reply level once per period, beside the master read. */
+static void apply_reply_volume(const char *root)
+{
+	reply_volume_percent = read_reply_volume(root);
+	if (reply_volume_percent < 0)
+		reply_target_q15 = -1;
+	else if (logical_master_volume(root) <= 0)
+		reply_target_q15 = 0;
+	else
+		reply_target_q15 = logical_master_gain(reply_volume_percent);
+}
+
+static int reply_bus(unsigned int source)
+{
+	return source == SOURCE_SYSTEM || source == SOURCE_ANNOUNCEMENT;
+}
+
 static int setup_sources(struct source_bus *sources, const char *root)
 {
 	static const char *const names[SOURCE_COUNT] = {
@@ -1581,6 +1649,7 @@ static int read_sources(struct source_bus *sources, const char *root)
 	ap->airplay_volume_missing = airplay && !ap->airplay_admitted;
 	ap->gain_q15 = ap->airplay_last_gain;
 	sources[SOURCE_MEDIA].gain_q15 = read_media_gain(root);
+	apply_reply_volume(root);
 	return received_any;
 }
 
@@ -1775,7 +1844,8 @@ static int32_t mix_sources_frame(const struct source_bus *sources,
 
 		if (!source_period_ready(&sources[source]) ||
 		    (source == SOURCE_AIRPLAY &&
-		     sources[source].airplay_volume_missing))
+		     sources[source].airplay_volume_missing) ||
+		    (reply_target_q15 >= 0 && reply_bus(source)))
 			continue;
 		mono = (int32_t)sources[source].samples[
 			frame * INPUT_CHANNELS] +
@@ -1809,6 +1879,24 @@ static int32_t mix_sources_frame(const struct source_bus *sources,
 		else if (higher_priority)
 			gain = (gain * MEDIA_DUCK_Q15) >> 15;
 		mixed += (int32_t)(((int64_t)mono * gain) >> 15);
+	}
+	return mixed;
+}
+
+/* The reply buses alone, at unity, while a separate reply level is set. */
+static int32_t mix_reply_frame(const struct source_bus *sources, size_t frame)
+{
+	int32_t mixed = 0;
+	unsigned int source;
+
+	for (source = 0; source < SOURCE_COUNT; ++source) {
+		int32_t mono;
+
+		if (!reply_bus(source) || !source_period_ready(&sources[source]))
+			continue;
+		mono = ((int32_t)sources[source].samples[frame * INPUT_CHANNELS] +
+			(int32_t)sources[source].samples[frame * INPUT_CHANNELS + 1]) / 2;
+		mixed += (int32_t)(((int64_t)mono * sources[source].gain_q15) >> 15);
 	}
 	return mixed;
 }
@@ -2027,10 +2115,16 @@ static void render_period(struct source_bus *sources,
 {
 	size_t frame;
 	float avl_start = avl_gain, avl_end = music_avl_period_gain(sources);
+	int reply_separate = reply_target_q15 >= 0;
 
 	avl_gain = avl_end;
+	/* A newly separate reply level starts from the master it replaces. */
+	if (!reply_separate)
+		reply_current_q15 = -1;
+	else if (reply_current_q15 < 0)
+		reply_current_q15 = *current_master_q15;
 	for (frame = 0; frame < PERIOD_SIZE; ++frame) {
-		int32_t mixed;
+		int32_t mixed, reply = 0;
 
 		/* Ramp the AVL boost across the period: no per-period steps. */
 		avl_frame_q15 = (int32_t)lrintf(32768.0f *
@@ -2038,8 +2132,13 @@ static void render_period(struct source_bus *sources,
 			 (float)(frame + 1) / (float)PERIOD_SIZE));
 		mixed = mix_sources_frame(sources, sendspin, sendspin_frames,
 						  frame);
+		if (reply_separate) {
+			reply = mix_reply_frame(sources, frame);
+			reply_current_q15 += (reply_target_q15 - reply_current_q15) /
+				(int32_t)(PERIOD_SIZE - frame);
+		}
 #ifdef LE_ENGINE_LATENCY_TRACE
-		trace_input[frame] = mixed;
+		trace_input[frame] = mixed + reply;
 #endif
 		int16_t rendered;
 		*current_master_q15 += (target_master_q15 - *current_master_q15) /
@@ -2050,6 +2149,10 @@ static void render_period(struct source_bus *sources,
 			float wide = (float)mixed *
 				((float)*current_master_q15 / 32768.0f);
 			float y;
+
+			if (reply_separate)
+				wide += (float)reply *
+					((float)reply_current_q15 / 32768.0f);
 
 			if (biscuit_chain)
 				y = biscuit_dsp_process(biscuit_chain,
@@ -2070,6 +2173,8 @@ static void render_period(struct source_bus *sources,
 			continue;
 		}
 		mixed = (int32_t)(((int64_t)mixed * *current_master_q15) >> 15);
+		if (reply_separate)
+			mixed += (int32_t)(((int64_t)reply * reply_current_q15) >> 15);
 		/* All producer buses meet here: mono EQ, then multiband
 		 * protection, then the +3 dB trim and final PCM safety limiter. */
 		if (biscuit_chain) {
@@ -2173,6 +2278,13 @@ static int speaker_volume_percent(const struct source_bus *sources, int master)
 		gain = sources[SOURCE_MEDIA].gain_q15;
 	if (airplay_ready && sources[SOURCE_AIRPLAY].gain_q15 > gain)
 		gain = sources[SOURCE_AIRPLAY].gain_q15;
+	/* A reply at its own level is what is audible over ducked media, so it
+	 * picks the loudness preset; an alarm keeps the master's. */
+	if (reply_target_q15 >= 0 && master > 0 &&
+	    !source_period_ready(&sources[SOURCE_ALARM]) &&
+	    (source_period_ready(&sources[SOURCE_SYSTEM]) ||
+	     source_period_ready(&sources[SOURCE_ANNOUNCEMENT])))
+		master = reply_volume_percent;
 	return speaker_volume_percent_for_mix(master, gain,
 		media_ready || airplay_ready, higher_priority_active(sources));
 }
