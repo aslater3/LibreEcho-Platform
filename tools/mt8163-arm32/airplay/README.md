@@ -115,6 +115,13 @@ gain values, not acoustic sound-pressure limits; high-level speaker distortion
 has not been ruled out. The physical PCM codec control
 remains fixed at index `127` (0 dB) after prepare. Non-muted AirPlay is unity
 source gain, sender mute is zero, and generic media alone uses `media.volume`.
+An optional `/run/libreecho-audio/reply.volume`, in the same validated
+`0..100` form, gives assistant replies their own level: while it exists the
+system and announcement buses take the logical gain of that level instead of
+the master (smoothed the same way), media, AirPlay, Sendspin and the alarm
+bus keep the master, a master of `0` still mutes everything, and the loudness
+preset follows the reply level while a reply plays. Absent or malformed means
+replies follow the master.
 The first AirPlay period waits for matching marker/callback/ack identity;
 replacement callbacks retain the last valid gain temporarily without
 re-holding audio, then fail closed on prolonged ack loss. Generic media and
