@@ -36,9 +36,12 @@
 /* M_PI is a POSIX extension and is not exposed under strict -std=c99. */
 #define SPEAKER_DSP_TWO_PI 6.28318530717958647692f
 
-/* five loudness sections, then two parametric-EQ sections */
-#define SPEAKER_DSP_SECTIONS 7
+/* five loudness sections, two parametric-EQ sections, then the owner bass and
+ * treble shelves (flat unless speaker_dsp_set_tone() applies a setting) */
+#define SPEAKER_DSP_SECTIONS 9
 #define SPEAKER_DSP_LOUDNESS_SECTIONS 5
+#define SPEAKER_DSP_PARAMETRIC_SECTIONS 2
+#define SPEAKER_DSP_TONE_SECTION 7
 #define SPEAKER_DSP_VOLUME_RAMP_FRAMES 4800
 
 /* Volume steps the loudness ladder is anchored on (stock "Volume Boundary"). */
@@ -68,6 +71,7 @@ struct speaker_dsp {
 	struct speaker_mbcl mbcl;
 	int active;
 	int next_active;
+	int tone_on; /* owner bass/treble shelves applied on the bus */
 	int volume_percent;
 	int queued_volume_percent;
 	int volume_ramp_remaining;
@@ -162,6 +166,24 @@ static inline void speaker_biquad_design(struct speaker_dsp_biquad *bq,
 	bq->z2 = 0.0f;
 }
 
+/* Owner tone shelves, applied after the stock-derived EQ and before MBCL.
+ * Fixed corners, +/-6 dB at most.  Flat settings are not run at all, so the
+ * default chain is the stock chain bit for bit. */
+#define SPEAKER_DSP_BASS_FC_HZ 120.0f
+#define SPEAKER_DSP_TREBLE_FC_HZ 6000.0f
+
+static inline void speaker_dsp_tone_design(struct speaker_dsp_biquad *out,
+					   float bass_db, float treble_db)
+{
+	struct speaker_dsp_section bass = { SPEAKER_SHAPE_LOWSHELF,
+		SPEAKER_DSP_BASS_FC_HZ, 0.707f, bass_db };
+	struct speaker_dsp_section treble = { SPEAKER_SHAPE_HIGHSHELF,
+		SPEAKER_DSP_TREBLE_FC_HZ, 0.707f, treble_db };
+
+	speaker_biquad_design(&out[0], &bass);
+	speaker_biquad_design(&out[1], &treble);
+}
+
 /* Select the first configured upper boundary, without interpolating presets. */
 static inline void speaker_dsp_loudness_gains(float volume, float *gains)
 {
@@ -191,6 +213,7 @@ static inline void speaker_dsp_init(struct speaker_dsp *dsp, int volume_percent)
 	}
 	dsp->active = 0;
 	dsp->next_active = 0;
+	dsp->tone_on = 0;
 	dsp->volume_percent = volume_percent;
 	dsp->queued_volume_percent = -2; /* -1 is a valid unknown level. */
 	dsp->volume_ramp_remaining = 0;
@@ -214,6 +237,30 @@ static inline void speaker_dsp_init(struct speaker_dsp *dsp, int volume_percent)
 	dsp->active = 1;
 }
 
+/* Apply the owner bass/treble settings (dB, within +/-6).  Safe to call while
+ * a volume transition is blending: both cascades receive the same shelves. */
+static inline void speaker_dsp_set_tone(struct speaker_dsp *dsp,
+					float bass_db, float treble_db)
+{
+	struct speaker_dsp_biquad tone[2];
+	int i;
+
+	dsp->tone_on = bass_db != 0.0f || treble_db != 0.0f;
+	speaker_dsp_tone_design(tone, bass_db, treble_db);
+	/* Coefficients only: the filter history carries over, so a change
+	 * during playback does not restart the shelves from silence. */
+	for (i = 0; i < 2; ++i) {
+		struct speaker_dsp_biquad *cur = &dsp->sections[SPEAKER_DSP_TONE_SECTION + i];
+		struct speaker_dsp_biquad *nxt = &dsp->next_sections[SPEAKER_DSP_TONE_SECTION + i];
+
+		cur->b0 = nxt->b0 = tone[i].b0;
+		cur->b1 = nxt->b1 = tone[i].b1;
+		cur->b2 = nxt->b2 = tone[i].b2;
+		cur->a1 = nxt->a1 = tone[i].a1;
+		cur->a2 = nxt->a2 = tone[i].a2;
+	}
+}
+
 /* Run both stable cascades during a volume change.  Blending their outputs
  * leaves the filter history intact and avoids resetting the shared dynamics
  * while AirPlay updates its phone volume in a single open PCM stream. */
@@ -233,6 +280,11 @@ static inline void speaker_dsp_set_volume(struct speaker_dsp *dsp,
 	if (dsp->volume_percent == volume_percent)
 		return;
 	speaker_dsp_init(&next, volume_percent);
+	/* The owner tone is not part of the volume ladder: carry it across. */
+	next.tone_on = dsp->tone_on;
+	for (i = 0; i < 2; ++i)
+		next.sections[SPEAKER_DSP_TONE_SECTION + i] =
+			dsp->sections[SPEAKER_DSP_TONE_SECTION + i];
 	for (i = 0; i < SPEAKER_DSP_SECTIONS; ++i)
 		dsp->next_sections[i] = next.sections[i];
 	dsp->next_active = next.active;
@@ -257,16 +309,25 @@ static inline float speaker_dsp_equalize_f(struct speaker_dsp *dsp, float sample
 	int i;
 
 	if (dsp->active)
-		for (i = 0; i < SPEAKER_DSP_SECTIONS; ++i)
+		for (i = 0; i < SPEAKER_DSP_LOUDNESS_SECTIONS +
+				SPEAKER_DSP_PARAMETRIC_SECTIONS; ++i)
 			x = speaker_dsp_step(&dsp->sections[i], x);
+	if (dsp->tone_on)
+		for (i = 0; i < 2; ++i)
+			x = speaker_dsp_step(&dsp->sections[SPEAKER_DSP_TONE_SECTION + i], x);
 	if (dsp->volume_ramp_remaining > 0) {
 		float next = sample;
 		float fraction = 1.0f - (float)dsp->volume_ramp_remaining /
 			(float)SPEAKER_DSP_VOLUME_RAMP_FRAMES;
 
 		if (dsp->next_active)
-			for (i = 0; i < SPEAKER_DSP_SECTIONS; ++i)
+			for (i = 0; i < SPEAKER_DSP_LOUDNESS_SECTIONS +
+					SPEAKER_DSP_PARAMETRIC_SECTIONS; ++i)
 				next = speaker_dsp_step(&dsp->next_sections[i], next);
+		if (dsp->tone_on)
+			for (i = 0; i < 2; ++i)
+				next = speaker_dsp_step(
+					&dsp->next_sections[SPEAKER_DSP_TONE_SECTION + i], next);
 		x += (next - x) * fraction;
 		if (--dsp->volume_ramp_remaining == 0) {
 			int queued = dsp->queued_volume_percent;

@@ -16,6 +16,7 @@
 #include <assert.h>
 
 #include "speaker_dsp.h"
+#include "speaker_tone.h"
 #include "puffin_downmix.h"
 
 /* M_PI is a POSIX extension, not exposed under strict -std=c99. */
@@ -225,7 +226,8 @@ static double parametric_gain_db(double f)
 	double g = 0.0;
 
 	speaker_dsp_init(&dsp, 70);
-	for (i = SPEAKER_DSP_LOUDNESS_SECTIONS; i < SPEAKER_DSP_SECTIONS; ++i)
+	for (i = SPEAKER_DSP_LOUDNESS_SECTIONS;
+	     i < SPEAKER_DSP_LOUDNESS_SECTIONS + SPEAKER_DSP_PARAMETRIC_SECTIONS; ++i)
 		g += biquad_gain_db(&dsp.sections[i], f);
 	return g;
 }
@@ -414,6 +416,165 @@ static void test_loudness_keeps_stock_presence_lift(void)
 	}
 }
 
+/* Steady-state gain of a chain object, measured from its current state. */
+static double dsp_gain_db(struct speaker_dsp *dsp, double f)
+{
+	double w = TEST_TWO_PI * f / RATE, acc = 0.0;
+	long n, settle = (long)(RATE * 0.25), measure = (long)(RATE * 0.25);
+
+	for (n = 0; n < settle + measure; ++n) {
+		float y = speaker_dsp_equalize(dsp, (int32_t)lrint(AMPL * sin(w * (double)n)));
+		if (n >= settle)
+			acc += (double)y * (double)y;
+	}
+	return 20.0 * log10(sqrt(acc / (double)measure) / (AMPL / sqrt(2.0)));
+}
+
+static void test_owner_tone_flat_is_bit_transparent(void)
+{
+	struct speaker_dsp stock, flat;
+	long n, differs = 0;
+
+	printf("owner tone flat is the stock chain\n");
+	speaker_dsp_init(&stock, 70);
+	speaker_dsp_init(&flat, 70);
+	speaker_dsp_set_tone(&flat, 0.0f, 0.0f);
+	for (n = 0; n < RATE / 2; ++n) {
+		int32_t x = (int32_t)lrint(9000.0 * sin(TEST_TWO_PI * 85.0 * (double)n / RATE)
+			+ 3000.0 * sin(TEST_TWO_PI * 7000.0 * (double)n / RATE));
+		if (speaker_dsp_process_f(&stock, (float)x) != speaker_dsp_process_f(&flat, (float)x))
+			differs++;
+	}
+	check(differs == 0, "flat tone output equals stock output sample for sample",
+	      (double)differs, 0.0, 0.0);
+}
+
+static void test_owner_tone_shapes_bass_and_treble(void)
+{
+	struct speaker_dsp flat, bass, treble;
+	double f_flat, f_bass, f_treble;
+
+	printf("owner bass and treble shelves\n");
+	speaker_dsp_init(&flat, 70);
+	speaker_dsp_init(&bass, 70);
+	speaker_dsp_init(&treble, 70);
+	speaker_dsp_set_tone(&bass, 6.0f, 0.0f);
+	speaker_dsp_set_tone(&treble, 0.0f, 6.0f);
+
+	f_flat = dsp_gain_db(&flat, 60.0);
+	f_bass = dsp_gain_db(&bass, 60.0);
+	check(fabs((f_bass - f_flat) - 6.0) < 1.0, "bass +6 lifts 60 Hz by about 6 dB",
+	      f_bass - f_flat, 6.0, 1.0);
+
+	f_flat = dsp_gain_db(&flat, 9000.0);
+	f_treble = dsp_gain_db(&treble, 9000.0);
+	check(fabs((f_treble - f_flat) - 6.0) < 1.0, "treble +6 lifts 9 kHz by about 6 dB",
+	      f_treble - f_flat, 6.0, 1.0);
+
+	f_bass = dsp_gain_db(&bass, 9000.0) - dsp_gain_db(&flat, 9000.0);
+	check(fabs(f_bass) < 0.5, "bass shelf leaves 9 kHz alone", f_bass, 0.0, 0.5);
+	f_treble = dsp_gain_db(&treble, 60.0) - dsp_gain_db(&flat, 60.0);
+	check(fabs(f_treble) < 0.5, "treble shelf leaves 60 Hz alone", f_treble, 0.0, 0.5);
+}
+
+static void test_owner_tone_survives_volume_change(void)
+{
+	struct speaker_dsp moved, reference;
+	double got, want;
+
+	printf("owner tone survives a live volume change\n");
+	speaker_dsp_init(&moved, 50);
+	speaker_dsp_set_tone(&moved, 4.0f, -3.0f);
+	speaker_dsp_set_volume(&moved, 100);
+	speaker_dsp_init(&reference, 100);
+	speaker_dsp_set_tone(&reference, 4.0f, -3.0f);
+	got = dsp_gain_db(&moved, 60.0);
+	want = dsp_gain_db(&reference, 60.0);
+	check(fabs(got - want) < 0.2, "bass setting kept after volume 50 to 100",
+	      got - want, 0.0, 0.2);
+	got = dsp_gain_db(&moved, 9000.0);
+	want = dsp_gain_db(&reference, 9000.0);
+	check(fabs(got - want) < 0.2, "treble setting kept after volume 50 to 100",
+	      got - want, 0.0, 0.2);
+}
+
+/* Full-volume bass and treble boost must still be held by MBCL: the protected
+ * output peak stays at the level the stock chain reaches, and MBCL works. */
+static void test_owner_tone_max_boost_still_limited_by_mbcl(void)
+{
+	struct speaker_dsp flat, boosted;
+	double peak_flat = 0.0, peak_boost = 0.0, peak_pre = 0.0;
+	long n;
+
+	printf("max owner boost stays under MBCL at full volume\n");
+	speaker_dsp_init(&flat, 100);
+	speaker_dsp_init(&boosted, 100);
+	speaker_dsp_set_tone(&boosted, 6.0f, 6.0f);
+	for (n = 0; n < (long)RATE; ++n) {
+		double t = (double)n / RATE;
+		int32_t x = (int32_t)lrint(30000.0 * sin(TEST_TWO_PI * 60.0 * t)
+			+ 8000.0 * sin(TEST_TWO_PI * 9000.0 * t));
+		int32_t y_flat = speaker_dsp_process(&flat, x);
+		int32_t y_boost = speaker_dsp_process(&boosted, x);
+		float pre = speaker_dsp_equalize(&boosted, x);
+
+		if (n < RATE / 4)
+			continue;
+		if (fabs((double)y_flat) > peak_flat)
+			peak_flat = fabs((double)y_flat);
+		if (fabs((double)y_boost) > peak_boost)
+			peak_boost = fabs((double)y_boost);
+		if (fabs((double)pre) > peak_pre)
+			peak_pre = fabs((double)pre);
+	}
+	printf("  peaks: flat protected=%.0f boosted pre-MBCL=%.0f boosted protected=%.0f\n",
+	       peak_flat, peak_pre, peak_boost);
+	check(peak_boost < peak_pre * 0.9,
+	      "MBCL reduces the boosted bus (limiting engaged)",
+	      peak_boost - peak_pre, 0.0, peak_pre * 0.1);
+	check(fabs(peak_boost - peak_flat) < peak_flat * 0.25,
+	      "boosted output stays near the stock protected ceiling",
+	      peak_boost - peak_flat, 0.0, peak_flat * 0.25);
+}
+
+static void test_owner_tone_file_parsing(void)
+{
+	struct speaker_tone t;
+	char buf[128];
+	int ok;
+
+	printf("tone.conf parsing (whole file accepted or flat)\n");
+	strcpy(buf, "schema=1\nbass_db=6\ntreble_db=-2.5\n");
+	ok = speaker_tone_parse(buf, &t);
+	check(ok && t.bass_db == 6.0f && t.treble_db == -2.5f, "valid file parses",
+	      t.treble_db, -2.5, 0.0);
+	strcpy(buf, "treble_db=0\nschema=1\nbass_db=-6\n");
+	ok = speaker_tone_parse(buf, &t);
+	check(ok && t.bass_db == -6.0f, "keys in any order, limits inclusive", t.bass_db, -6.0, 0.0);
+	strcpy(buf, "schema=1\nbass_db=6.5\ntreble_db=0\n");
+	ok = speaker_tone_parse(buf, &t);
+	check(!ok && t.bass_db == 0.0f && t.treble_db == 0.0f, "out of range is rejected flat",
+	      t.bass_db, 0.0, 0.0);
+	strcpy(buf, "schema=1\nbass_db=3\n");
+	ok = speaker_tone_parse(buf, &t);
+	check(!ok, "missing key is rejected whole", ok, 0.0, 0.0);
+	strcpy(buf, "schema=1\nbass_db=3\nbass_db=4\ntreble_db=0\n");
+	ok = speaker_tone_parse(buf, &t);
+	check(!ok, "duplicate key is rejected", ok, 0.0, 0.0);
+	strcpy(buf, "schema=2\nbass_db=3\ntreble_db=0\n");
+	ok = speaker_tone_parse(buf, &t);
+	check(!ok, "unknown schema is rejected", ok, 0.0, 0.0);
+	strcpy(buf, "schema=1\nbass_db=nan\ntreble_db=0\n");
+	ok = speaker_tone_parse(buf, &t);
+	check(!ok, "non-finite value is rejected", ok, 0.0, 0.0);
+	strcpy(buf, "schema=1\nbass_db=3x\ntreble_db=0\n");
+	ok = speaker_tone_parse(buf, &t);
+	check(!ok, "trailing junk is rejected", ok, 0.0, 0.0);
+	strcpy(buf, "schema=1\nbass_db=1\ntreble_db=1\nextra=1\n");
+	ok = speaker_tone_parse(buf, &t);
+	check(!ok, "unknown key is rejected", ok, 0.0, 0.0);
+}
+
 int main(void)
 {
 	test_biquad_shapes();
@@ -429,6 +590,11 @@ int main(void)
 	test_live_volume_change_updates_loudness_without_stream_restart();
 	test_mid_ramp_volume_retarget_is_continuous();
 	test_loudness_keeps_stock_presence_lift();
+	test_owner_tone_flat_is_bit_transparent();
+	test_owner_tone_shapes_bass_and_treble();
+	test_owner_tone_survives_volume_change();
+	test_owner_tone_max_boost_still_limited_by_mbcl();
+	test_owner_tone_file_parsing();
 
 	if (failures) {
 		printf("\nspeaker_dsp: %d check(s) FAILED\n", failures);
