@@ -17,6 +17,7 @@
 
 #include "speaker_dsp.h"
 #include "speaker_tone.h"
+#include "speaker_boost.h"
 #include "puffin_downmix.h"
 
 /* M_PI is a POSIX extension, not exposed under strict -std=c99. */
@@ -575,6 +576,151 @@ static void test_owner_tone_file_parsing(void)
 	check(!ok, "unknown key is rejected", ok, 0.0, 0.0);
 }
 
+/* RMS level of the protected chain output at a steady sine, dBFS (full-scale
+ * sine = 0 dB).  Settles first, then measures; the boost is set by the caller. */
+static double dsp_out_level_dbfs(struct speaker_dsp *dsp, double f, double amp)
+{
+	double w = TEST_TWO_PI * f / RATE, acc = 0.0;
+	long n, settle = (long)(RATE * 0.5), measure = (long)(RATE * 0.25);
+
+	for (n = 0; n < settle + measure; ++n) {
+		float y = speaker_dsp_process_f(dsp, (float)(amp * sin(w * (double)n)));
+		if (n >= settle)
+			acc += (double)y * (double)y;
+	}
+	return 20.0 * log10(sqrt(acc / (double)measure) / (SPEAKER_MBCL_PCM / sqrt(2.0)));
+}
+
+static void test_owner_boost_default_is_stock(void)
+{
+	struct speaker_dsp stock, off;
+	long n, differs = 0;
+
+	printf("owner boost off is the stock chain\n");
+	speaker_dsp_init(&stock, 70);
+	speaker_dsp_init(&off, 70);
+	speaker_dsp_set_boost(&off, 0.0f);
+	for (n = 0; n < RATE / 2; ++n) {
+		float x = (float)(9000.0 * sin(TEST_TWO_PI * 85.0 * (double)n / RATE)
+			+ 3000.0 * sin(TEST_TWO_PI * 7000.0 * (double)n / RATE));
+		if (speaker_dsp_process_f(&stock, x) != speaker_dsp_process_f(&off, x))
+			differs++;
+	}
+	check(differs == 0, "boost 0 dB output equals stock output sample for sample",
+	      (double)differs, 0.0, 0.0);
+}
+
+static void test_owner_boost_lifts_level_before_mbcl(void)
+{
+	struct speaker_dsp stock, plus3, plus6;
+	double base, b3, b6;
+
+	printf("owner boost lifts the level ahead of MBCL\n");
+	speaker_dsp_init(&stock, 70);
+	speaker_dsp_init(&plus3, 70);
+	speaker_dsp_set_boost(&plus3, 3.0f);
+	speaker_dsp_init(&plus6, 70);
+	speaker_dsp_set_boost(&plus6, 6.0f);
+	base = dsp_out_level_dbfs(&stock, 1000.0, 1000.0);
+	b3 = dsp_out_level_dbfs(&plus3, 1000.0, 1000.0);
+	b6 = dsp_out_level_dbfs(&plus6, 1000.0, 1000.0);
+	check(fabs((b3 - base) - 3.0) < 0.5, "+3 dB boost raises a quiet 1 kHz tone by about 3 dB",
+	      b3 - base, 3.0, 0.5);
+	check(fabs((b6 - base) - 6.0) < 0.5, "+6 dB boost raises a quiet 1 kHz tone by about 6 dB",
+	      b6 - base, 6.0, 0.5);
+
+	/* Loud material is where MBCL takes most of the makeup back: the boost
+	 * still raises it, but by less than the full step.  Measured: +2.1 dB at
+	 * -12 dBFS, volume 70.  Pinned so the release note cannot overclaim. */
+	speaker_dsp_init(&stock, 70);
+	speaker_dsp_init(&plus6, 70);
+	speaker_dsp_set_boost(&plus6, 6.0f);
+	base = dsp_out_level_dbfs(&stock, 1000.0, 32768.0 * pow(10.0, -12.0 / 20.0));
+	b6 = dsp_out_level_dbfs(&plus6, 1000.0, 32768.0 * pow(10.0, -12.0 / 20.0));
+	check(b6 - base > 1.5 && b6 - base < 3.0,
+	      "+6 dB boost at -12 dBFS is partly taken back by MBCL",
+	      b6 - base, 2.1, 0.6);
+}
+
+static void test_owner_boost_respects_mbcl_ceiling(void)
+{
+	struct speaker_dsp boosted;
+	double peak = 0.0, ceiling = SPEAKER_MBCL_CEILING;
+	long n;
+
+	printf("owner boost cannot pass the MBCL ceiling\n");
+	speaker_dsp_init(&boosted, 100);
+	speaker_dsp_set_boost(&boosted, 6.0f);
+	for (n = 0; n < (long)RATE * 2; ++n) {
+		double t = (double)n / RATE;
+		float x = (float)(30000.0 * sin(TEST_TWO_PI * 60.0 * t) +
+				  30000.0 * sin(TEST_TWO_PI * 1000.0 * t));
+		float y = speaker_dsp_process_f(&boosted, x);
+		if (fabs((double)y) > peak)
+			peak = fabs((double)y);
+	}
+	check(peak <= ceiling * (1.0 + 1e-6), "+6 dB boost at full scale held at the MBCL ceiling",
+	      peak, ceiling, ceiling * 1e-6);
+}
+
+static void test_owner_boost_survives_volume_change(void)
+{
+	struct speaker_dsp moved;
+
+	printf("owner boost survives a live volume change\n");
+	speaker_dsp_init(&moved, 50);
+	speaker_dsp_set_boost(&moved, 6.0f);
+	speaker_dsp_set_volume(&moved, 100);
+	check(fabs(moved.boost_gain - speaker_boost_gain(6.0f)) < 1e-6f,
+	      "boost gain kept after volume 50 to 100", moved.boost_gain,
+	      speaker_boost_gain(6.0f), 1e-6);
+}
+
+static void test_boost_file_parsing(void)
+{
+	float db;
+	char buf[128];
+	int ok;
+
+	printf("boost.conf parsing (whole file accepted or 0 dB)\n");
+	strcpy(buf, "schema=1\nboost_db=3\n");
+	ok = speaker_boost_parse(buf, &db);
+	check(ok && db == 3.0f, "valid file parses", db, 3.0, 0.0);
+	strcpy(buf, "boost_db=6\nschema=1\n");
+	ok = speaker_boost_parse(buf, &db);
+	check(ok && db == 6.0f, "keys in any order", db, 6.0, 0.0);
+	strcpy(buf, "schema=1\nboost_db=0\n");
+	ok = speaker_boost_parse(buf, &db);
+	check(ok && db == 0.0f, "explicit 0 dB parses", db, 0.0, 0.0);
+	strcpy(buf, "schema=1\nboost_db=4.5\n");
+	ok = speaker_boost_parse(buf, &db);
+	check(!ok && db == 0.0f, "off-step value is rejected flat", db, 0.0, 0.0);
+	strcpy(buf, "schema=1\nboost_db=12\n");
+	ok = speaker_boost_parse(buf, &db);
+	check(!ok && db == 0.0f, "value above the 6 dB step is rejected", db, 0.0, 0.0);
+	strcpy(buf, "schema=1\nboost_db=-3\n");
+	ok = speaker_boost_parse(buf, &db);
+	check(!ok && db == 0.0f, "negative boost is rejected", db, 0.0, 0.0);
+	strcpy(buf, "boost_db=3\n");
+	ok = speaker_boost_parse(buf, &db);
+	check(!ok && db == 0.0f, "missing schema is rejected whole", db, 0.0, 0.0);
+	strcpy(buf, "schema=1\n");
+	ok = speaker_boost_parse(buf, &db);
+	check(!ok, "missing boost_db is rejected whole", ok, 0.0, 0.0);
+	strcpy(buf, "schema=1\nboost_db=3\nboost_db=6\n");
+	ok = speaker_boost_parse(buf, &db);
+	check(!ok && db == 0.0f, "duplicate key is rejected", db, 0.0, 0.0);
+	strcpy(buf, "schema=1\nboost_db=3x\n");
+	ok = speaker_boost_parse(buf, &db);
+	check(!ok && db == 0.0f, "trailing junk is rejected", db, 0.0, 0.0);
+	strcpy(buf, "schema=1\nboost_db=nan\n");
+	ok = speaker_boost_parse(buf, &db);
+	check(!ok && db == 0.0f, "non-finite value is rejected", db, 0.0, 0.0);
+	strcpy(buf, "schema=1\nboost_db=3\nextra=1\n");
+	ok = speaker_boost_parse(buf, &db);
+	check(!ok && db == 0.0f, "unknown key is rejected", db, 0.0, 0.0);
+}
+
 int main(void)
 {
 	test_biquad_shapes();
@@ -595,6 +741,11 @@ int main(void)
 	test_owner_tone_survives_volume_change();
 	test_owner_tone_max_boost_still_limited_by_mbcl();
 	test_owner_tone_file_parsing();
+	test_owner_boost_default_is_stock();
+	test_owner_boost_lifts_level_before_mbcl();
+	test_owner_boost_respects_mbcl_ceiling();
+	test_owner_boost_survives_volume_change();
+	test_boost_file_parsing();
 
 	if (failures) {
 		printf("\nspeaker_dsp: %d check(s) FAILED\n", failures);

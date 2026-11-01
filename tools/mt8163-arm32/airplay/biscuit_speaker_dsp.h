@@ -124,6 +124,9 @@ struct biscuit_dsp {
 	 * compressors and limiters; flat (tone_on == 0) is the stock chain. */
 	struct biscuit_biquad tone[2];
 	int tone_on;
+	/* Owner makeup (linear) before the compressors and limiters; 1.0 is
+	 * stock.  The limiters still bound the output after the boost. */
+	double boost;
 	double eq_gain, next_eq_gain;
 	/* Post-compressor makeup on the bass bands (<115 Hz, 115-500 Hz), set
 	 * from the per-target audio profile; 0 dB (the zero state) is stock. */
@@ -282,6 +285,7 @@ static inline void biscuit_dsp_init_params(struct biscuit_dsp *d, int volume,
 {
 	int i;
 	memset(d, 0, sizeof(*d));
+	d->boost = 1.0;
 	for (i = 0; i < BISCUIT_EQ_SECTIONS; ++i)
 		biscuit_design(&d->eq[i], biscuit_eq[i].shape, biscuit_eq[i].fc,
 			       biscuit_eq[i].q, biscuit_eq[i].gain_db);
@@ -346,6 +350,13 @@ static inline void biscuit_dsp_set_tone(struct biscuit_dsp *d, float bass_db, fl
 	}
 }
 
+/* Owner makeup (dB, 0, +3 or +6; see speaker_boost.h).  A plain gain ahead of
+ * the Dot's compressors and limiters: protection is not bypassed. */
+static inline void biscuit_dsp_set_boost(struct biscuit_dsp *d, float boost_db)
+{
+	d->boost = boost_db == 0.0f ? 1.0 : pow(10.0, (double)boost_db / 20.0);
+}
+
 /* Volume changes only move a broadband gain; ramp it to avoid zipper noise. */
 static inline void biscuit_dsp_set_volume(struct biscuit_dsp *d, int volume)
 {
@@ -357,12 +368,14 @@ static inline void biscuit_dsp_set_volume(struct biscuit_dsp *d, int volume)
 		float bass_makeup_db = d->bass_makeup_db;
 		struct biscuit_biquad tone[2];
 		int tone_on = d->tone_on;
+		double boost = d->boost;
 
 		memcpy(tone, d->tone, sizeof(tone));
 		biscuit_dsp_init(d, volume);
 		biscuit_dsp_configure(d, bass_makeup_db);
 		memcpy(d->tone, tone, sizeof(tone));
 		d->tone_on = tone_on;
+		d->boost = boost;
 		return;
 	}
 	d->volume = volume;
@@ -392,6 +405,8 @@ static inline float biscuit_dsp_process(struct biscuit_dsp *d, float sample)
 		--d->ramp;
 	}
 	x *= d->eq_gain;
+	if (d->boost != 1.0)
+		x *= d->boost;
 
 	biscuit_lr4_step(&d->split[0], x, &lo0, &hi0);
 	biscuit_lr4_step(&d->split[1], hi0, &lo1, &hi1);

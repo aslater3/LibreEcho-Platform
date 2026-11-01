@@ -39,6 +39,7 @@
 #include "speaker_dsp.h"
 #include "biscuit_speaker_dsp.h"
 #include "speaker_tone.h"
+#include "speaker_boost.h"
 #include "music_avl.h"
 
 #define DEFAULT_ROOT "/run/libreecho-audio"
@@ -49,6 +50,7 @@
 #define AIRPLAY_RESET_ACK_FILE "airplay.reset-ack"
 #define MASTER_VOLUME_FILE "master.volume"
 #define TONE_SETTINGS_FILE "tone.conf"
+#define BOOST_SETTINGS_FILE "boost.conf"
 #define IMAGE_TARGET_FILE "/etc/libreecho/target"
 /* airplayd chroots the engine into the feature root, which does not carry
  * the image identity; the host /proc is mounted there, so PID 1's root is. */
@@ -2002,6 +2004,29 @@ static void load_owner_tone(const char *root, struct speaker_tone *out)
 }
 
 /*
+ * Owner gain boost from <root>/boost.conf, read once per playback start.  A
+ * missing or rejected file is 0 dB, which is the stock sound.  The makeup is
+ * applied ahead of the chain's protection, so it cannot bypass it.
+ */
+static void load_owner_boost(const char *root, float *out_db)
+{
+	char path[256], text[128];
+	int n, rc;
+
+	*out_db = 0.0f;
+	n = snprintf(path, sizeof(path), "%s/%s", root, BOOST_SETTINGS_FILE);
+	if (n < 0 || n >= (int)sizeof(path))
+		return;
+	rc = read_small_file(path, text, sizeof(text));
+	if (rc < 0)
+		return;
+	if (rc == 0 || !speaker_boost_parse(text, out_db)) {
+		fprintf(stderr, "audio-engine: boost settings rejected; using 0 dB\n");
+		*out_db = 0.0f;
+	}
+}
+
+/*
  * Wide output state.  With a 24-bit-capable kernel the PCM is S32_LE and the
  * chain stays in float from the master gain to the DAC: 16-bit volume
  * arithmetic otherwise drops one bit per 6 dB of attenuation.  The int16
@@ -2213,6 +2238,7 @@ static int prepare_initial_period(struct source_bus *sources, const char *root,
 {
 	int ready = wait_for_period(sources, root);
 	struct speaker_tone tone;
+	float boost_db;
 
 	if (ready <= 0)
 		return ready;
@@ -2230,17 +2256,22 @@ static int prepare_initial_period(struct source_bus *sources, const char *root,
 	}
 	puffin_dynamics_init(dynamics);
 	load_owner_tone(root, &tone);
+	load_owner_boost(root, &boost_db);
 	speaker_dsp_init(speaker, speaker_volume_percent(sources, master_volume));
 	speaker_dsp_set_tone(speaker, tone.bass_db, tone.treble_db);
+	speaker_dsp_set_boost(speaker, boost_db);
 	if (biscuit_chain) {
 		biscuit_dsp_init(biscuit_chain,
 			speaker_volume_percent(sources, master_volume));
 		biscuit_dsp_configure(biscuit_chain, speaker_profile.bass_makeup_db);
 		biscuit_dsp_set_tone(biscuit_chain, tone.bass_db, tone.treble_db);
+		biscuit_dsp_set_boost(biscuit_chain, boost_db);
 	}
 	if (tone.bass_db != 0.0f || tone.treble_db != 0.0f)
 		fprintf(stderr, "audio-engine: owner tone bass %+.1f dB treble %+.1f dB\n",
 			(double)tone.bass_db, (double)tone.treble_db);
+	if (boost_db != 0.0f)
+		fprintf(stderr, "audio-engine: owner boost %+.1f dB\n", (double)boost_db);
 	*master_gain = logical_master_gain(master_volume);
 	(void)sendspin_stage(&g_sendspin);
 	render_period(sources, g_sendspin.stage, g_sendspin.stage_frames, output,

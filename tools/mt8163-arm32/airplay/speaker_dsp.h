@@ -32,6 +32,7 @@
 #include <math.h>
 #include <stdint.h>
 #include "speaker_mbcl.h"
+#include "speaker_boost.h"
 
 /* M_PI is a POSIX extension and is not exposed under strict -std=c99. */
 #define SPEAKER_DSP_TWO_PI 6.28318530717958647692f
@@ -72,6 +73,7 @@ struct speaker_dsp {
 	int active;
 	int next_active;
 	int tone_on; /* owner bass/treble shelves applied on the bus */
+	float boost_gain; /* owner makeup before MBCL; 1.0f is stock */
 	int volume_percent;
 	int queued_volume_percent;
 	int volume_ramp_remaining;
@@ -214,6 +216,7 @@ static inline void speaker_dsp_init(struct speaker_dsp *dsp, int volume_percent)
 	dsp->active = 0;
 	dsp->next_active = 0;
 	dsp->tone_on = 0;
+	dsp->boost_gain = 1.0f;
 	dsp->volume_percent = volume_percent;
 	dsp->queued_volume_percent = -2; /* -1 is a valid unknown level. */
 	dsp->volume_ramp_remaining = 0;
@@ -259,6 +262,14 @@ static inline void speaker_dsp_set_tone(struct speaker_dsp *dsp,
 		cur->a1 = nxt->a1 = tone[i].a1;
 		cur->a2 = nxt->a2 = tone[i].a2;
 	}
+}
+
+/* Owner makeup gain (0, +3 or +6 dB, see speaker_boost.h) ahead of MBCL.  It
+ * is a plain gain: MBCL and its ceiling still act on the boosted bus, and a
+ * volume change does not reset it because it is not part of the ladder. */
+static inline void speaker_dsp_set_boost(struct speaker_dsp *dsp, float boost_db)
+{
+	dsp->boost_gain = speaker_boost_gain(boost_db);
 }
 
 /* Run both stable cascades during a volume change.  Blending their outputs
@@ -354,6 +365,8 @@ static inline float speaker_dsp_process_f(struct speaker_dsp *dsp, float sample)
 {
 	float x = speaker_dsp_equalize_f(dsp, sample);
 
+	if (dsp->boost_gain != 1.0f)
+		x *= dsp->boost_gain;
 	x = speaker_mbcl_process(&dsp->mbcl, x);
 	/* This guard is for pathological filter state, never normal EQ overshoot. */
 	if (x > (float)(INT32_MAX / 4))
