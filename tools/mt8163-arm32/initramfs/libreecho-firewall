@@ -1,0 +1,131 @@
+#!/bin/busybox sh
+# shellcheck shell=dash
+# LibreEcho default inbound firewall (nftables), applied at boot.
+#
+# Default-deny inbound on an inet table. The ruleset text here must stay
+# byte-identical to firewall/libreecho_firewall_ruleset.py render_ruleset();
+# firewall/test_libreecho_firewall_ruleset.py checks that for every feature
+# combination through --render.
+#
+# Non-blocking by design: a missing nft binary, a failed load or a failed
+# render is logged and boot continues. An owner disable switch file on userdata
+# turns the firewall off and removes the table.
+#
+# Usage: libreecho-firewall [--render] [--esphome] [--airplay] [--ptp]
+#                           [--ssh] [--adb-tcp] [--recovery-ap]
+#   --render   print the ruleset to stdout and touch nothing else.
+# The caller (boot) passes feature flags; this script does not read feature
+# state itself.
+
+BB=${LIBREECHO_FW_BB:-/bin/busybox}
+NFT=${LIBREECHO_FW_NFT:-/usr/local/sbin/nft}
+DISABLE_SWITCH=${LIBREECHO_FW_DISABLE:-/data/libreecho/config/firewall-disable}
+RUN_DIR=${LIBREECHO_FW_RUN:-/run/libreecho}
+TABLE=libreecho_fw
+
+render=0
+f_esphome=0
+f_airplay=0
+f_ptp=0
+f_ssh=0
+f_adb=0
+f_recovery=0
+for arg in "$@"; do
+	case "$arg" in
+		--render) render=1 ;;
+		--esphome) f_esphome=1 ;;
+		--airplay) f_airplay=1 ;;
+		--ptp) f_ptp=1 ;;
+		--ssh) f_ssh=1 ;;
+		--adb-tcp) f_adb=1 ;;
+		--recovery-ap) f_recovery=1 ;;
+		*) echo "libreecho-firewall: unknown option: $arg" >&2; exit 2 ;;
+	esac
+done
+
+log()
+{
+	printf '%s\n' "libreecho-firewall: $*"
+}
+
+# Print "{ a, b }" or "a" for the sorted unique ports given as arguments.
+port_set()
+{
+	ps_list=$(for ps_p in "$@"; do printf '%s\n' "$ps_p"; done | $BB sort -n -u)
+	ps_count=$(printf '%s\n' "$ps_list" | $BB wc -l | $BB tr -d ' ')
+	if [ "$ps_count" -eq 1 ]; then
+		printf '%s\n' "$ps_list"
+		return 0
+	fi
+	printf '{ %s }\n' "$(printf '%s\n' "$ps_list" | $BB tr '\n' ' ' | $BB sed 's/ $//; s/ /, /g')"
+}
+
+render_ruleset()
+{
+	tcp_ports="8080"
+	udp_ports="5353"
+	[ "$f_esphome" -eq 1 ] && tcp_ports="$tcp_ports 6053"
+	[ "$f_airplay" -eq 1 ] && tcp_ports="$tcp_ports 7000"
+	[ "$f_ptp" -eq 1 ] && udp_ports="$udp_ports 319 320"
+	[ "$f_ssh" -eq 1 ] && tcp_ports="$tcp_ports 22"
+	[ "$f_adb" -eq 1 ] && tcp_ports="$tcp_ports 5555"
+	if [ "$f_recovery" -eq 1 ]; then
+		tcp_ports="$tcp_ports 53"
+		udp_ports="$udp_ports 53 67"
+	fi
+	# shellcheck disable=SC2086
+	tcp_set=$(port_set $tcp_ports)
+	# shellcheck disable=SC2086
+	udp_set=$(port_set $udp_ports)
+	printf '%s\n' \
+		"# LibreEcho default inbound firewall. Generated at boot; do not edit." \
+		"add table inet $TABLE" \
+		"delete table inet $TABLE" \
+		"table inet $TABLE {" \
+		"  chain input {" \
+		"    type filter hook input priority 0; policy drop;" \
+		'    iifname "lo" accept' \
+		"    ct state established,related accept" \
+		"    ct state invalid drop" \
+		"    meta l4proto ipv6-icmp accept" \
+		"    meta l4proto icmp icmp type echo-request accept" \
+		"    tcp dport $tcp_set accept" \
+		"    udp dport $udp_set accept" \
+		"  }" \
+		"}"
+}
+
+if [ "$render" -eq 1 ]; then
+	render_ruleset
+	exit 0
+fi
+
+table_remove()
+{
+	[ -x "$NFT" ] && "$NFT" delete table inet "$TABLE" >/dev/null 2>&1
+	return 0
+}
+
+if [ -e "$DISABLE_SWITCH" ]; then
+	table_remove
+	log "disabled by owner switch $DISABLE_SWITCH"
+	exit 0
+fi
+if [ ! -x "$NFT" ]; then
+	log "nft unavailable; inbound firewall not applied"
+	exit 0
+fi
+$BB mkdir -p "$RUN_DIR" || { log "cannot create $RUN_DIR; not applied"; exit 0; }
+rules="$RUN_DIR/firewall.nft"
+if ! render_ruleset > "$rules.tmp"; then
+	log "render failed; not applied"
+	exit 0
+fi
+$BB mv "$rules.tmp" "$rules"
+if "$NFT" -f "$rules"; then
+	log "applied"
+else
+	table_remove
+	log "load failed; table removed, device is not firewalled"
+fi
+exit 0
