@@ -12,10 +12,10 @@ permissions:
 
 jobs:
   button-image-contracts:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install device-tree and Python test tools
         run: |
           sudo apt-get update
@@ -36,10 +36,10 @@ jobs:
 
   recovery-ap-build:
     name: Build pinned recovery-AP binaries
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install ARM cross toolchain and build tools
         run: |
           sudo apt-get update
