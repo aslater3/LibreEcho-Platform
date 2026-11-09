@@ -881,6 +881,24 @@ class SupervisorLifecycleTests(unittest.TestCase):
                              "supervisor survived a successful stop")
         self.assertIn("mdns-supervisor-stop-timeout:", self.log.read_text())
 
+    def test_stop_ends_a_supervisor_whose_binary_was_replaced(self) -> None:
+        # Hot-staging or restoring the supervisor binary while it runs leaves
+        # /proc/<pid>/exe as "<path> (deleted)". stop must still find it, or
+        # it reports success while the old supervisor keeps running.
+        supervisor = self._spawn(self.supervisor)
+        time.sleep(0.2)
+        replacement = self.work / "libreecho-mdnsd.new"
+        shutil.copy(self.supervisor, replacement)
+        self.supervisor.unlink()
+        replacement.rename(self.supervisor)
+        self.assertTrue(os.readlink(f"/proc/{supervisor.pid}/exe").endswith(" (deleted)"))
+        self._spawn(self.dbus)
+        self._spawn(self.avahi)
+        self._bus()
+        self.assertIn(str(supervisor.pid), self._run("supervisor_pids"))
+        self.assertIn("rc=0", self._run("stop"))
+        supervisor.wait(timeout=5)
+
     def test_record_runtime_pair_writes_the_identity_pair(self) -> None:
         self._spawn(self.supervisor)
         dbus = self._spawn(self.dbus)
