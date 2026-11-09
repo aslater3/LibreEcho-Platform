@@ -120,6 +120,10 @@ struct biscuit_band {
 
 struct biscuit_dsp {
 	struct biscuit_biquad eq[BISCUIT_EQ_SECTIONS];
+	/* Owner bass and treble shelves, after the loudness EQ and before the
+	 * compressors and limiters; flat (tone_on == 0) is the stock chain. */
+	struct biscuit_biquad tone[2];
+	int tone_on;
 	double eq_gain, next_eq_gain;
 	/* Post-compressor makeup on the bass bands (<115 Hz, 115-500 Hz), set
 	 * from the per-target audio profile; 0 dB (the zero state) is stock. */
@@ -324,6 +328,24 @@ static inline void biscuit_dsp_configure(struct biscuit_dsp *d, float bass_makeu
 	d->makeup[0] = d->makeup[1] = powf(10.0f, bass_makeup_db / 20.0f);
 }
 
+/* Owner bass/treble shelves (dB, within +/-6).  Coefficients only: the filter
+ * history carries over, so a change during playback does not click. */
+#define BISCUIT_BASS_FC_HZ 120.0
+#define BISCUIT_TREBLE_FC_HZ 6000.0
+static inline void biscuit_dsp_set_tone(struct biscuit_dsp *d, float bass_db, float treble_db)
+{
+	struct biscuit_biquad t[2];
+	int i;
+
+	d->tone_on = bass_db != 0.0f || treble_db != 0.0f;
+	biscuit_design(&t[0], BISCUIT_LOWSHELF, BISCUIT_BASS_FC_HZ, 0.707, bass_db);
+	biscuit_design(&t[1], BISCUIT_HIGHSHELF, BISCUIT_TREBLE_FC_HZ, 0.707, treble_db);
+	for (i = 0; i < 2; ++i) {
+		d->tone[i].b0 = t[i].b0; d->tone[i].b1 = t[i].b1; d->tone[i].b2 = t[i].b2;
+		d->tone[i].a1 = t[i].a1; d->tone[i].a2 = t[i].a2;
+	}
+}
+
 /* Volume changes only move a broadband gain; ramp it to avoid zipper noise. */
 static inline void biscuit_dsp_set_volume(struct biscuit_dsp *d, int volume)
 {
@@ -333,9 +355,14 @@ static inline void biscuit_dsp_set_volume(struct biscuit_dsp *d, int volume)
 	 * whether it runs, and that is rare enough to switch directly. */
 	if ((volume >= 0) != d->eq_active) {
 		float bass_makeup_db = d->bass_makeup_db;
+		struct biscuit_biquad tone[2];
+		int tone_on = d->tone_on;
 
+		memcpy(tone, d->tone, sizeof(tone));
 		biscuit_dsp_init(d, volume);
 		biscuit_dsp_configure(d, bass_makeup_db);
+		memcpy(d->tone, tone, sizeof(tone));
+		d->tone_on = tone_on;
 		return;
 	}
 	d->volume = volume;
@@ -357,6 +384,9 @@ static inline float biscuit_dsp_process(struct biscuit_dsp *d, float sample)
 	if (d->eq_active)
 		for (i = 0; i < BISCUIT_EQ_SECTIONS; ++i)
 			x = biscuit_step(&d->eq[i], x);
+	if (d->tone_on)
+		for (i = 0; i < 2; ++i)
+			x = biscuit_step(&d->tone[i], x);
 	if (d->ramp > 0) {
 		d->eq_gain += (d->next_eq_gain - d->eq_gain) / d->ramp;
 		--d->ramp;
