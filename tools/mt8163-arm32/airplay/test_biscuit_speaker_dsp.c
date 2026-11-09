@@ -193,6 +193,73 @@ static void test_owner_tone(void)
 	}
 }
 
+/* Steady-state RMS of the full Dot chain output for a sine, dBFS. */
+static double boost_out_level_dbfs(struct biscuit_dsp *d, double f, double in_dbfs)
+{
+	double amp = 32768.0 * pow(10.0, in_dbfs / 20.0), w = TEST_TWO_PI * f / RATE, acc = 0.0;
+	long n, settle = (long)(RATE * 0.5), meas = (long)(RATE * 0.25);
+
+	for (n = 0; n < settle + meas; ++n) {
+		float y = biscuit_dsp_process(d, (float)(amp * sin(w * (double)n)));
+		if (n >= settle)
+			acc += (double)y * (double)y;
+	}
+	return 20.0 * log10(sqrt(acc / (double)meas) / (32768.0 / sqrt(2.0)));
+}
+
+static void test_owner_boost(void)
+{
+	static struct biscuit_dsp stock, off, plus6, moved, ref;
+	double base, b6, peak = 0.0, ceiling = 32768.0 * pow(10.0, -0.1 / 20.0);
+	long n, differs = 0;
+	float x;
+
+	printf("biscuit_speaker_dsp: owner boost\n");
+	biscuit_dsp_init(&stock, 50);
+	biscuit_dsp_init(&off, 50);
+	biscuit_dsp_set_boost(&off, 0.0f);
+	for (n = 0; n < (long)RATE / 2; ++n) {
+		x = (float)(9000.0 * sin(TEST_TWO_PI * 80.0 * (double)n / RATE) +
+			    3000.0 * sin(TEST_TWO_PI * 7000.0 * (double)n / RATE));
+		if (biscuit_dsp_process(&stock, x) != biscuit_dsp_process(&off, x))
+			differs++;
+	}
+	check(differs == 0, "boost 0 dB equals the stock Dot chain sample for sample",
+	      (double)differs, 0.0, 0.0);
+
+	biscuit_dsp_init(&stock, 50);
+	biscuit_dsp_init(&plus6, 50);
+	biscuit_dsp_set_boost(&plus6, 6.0f);
+	base = boost_out_level_dbfs(&stock, 1000.0, -40.0);
+	b6 = boost_out_level_dbfs(&plus6, 1000.0, -40.0);
+	check_near("+6 dB boost raises a quiet 1 kHz tone by about 6 dB", b6 - base, 6.0, 0.5);
+
+	/* Full scale at max boost and volume: the Dot limiters still hold the ceiling. */
+	biscuit_dsp_init(&plus6, 100);
+	biscuit_dsp_set_boost(&plus6, 6.0f);
+	for (n = 0; n < (long)RATE * 2; ++n) {
+		double t = (double)n / RATE;
+		float y;
+
+		x = (float)(30000.0 * sin(TEST_TWO_PI * 80.0 * t) +
+			    30000.0 * sin(TEST_TWO_PI * 1000.0 * t));
+		y = biscuit_dsp_process(&plus6, x);
+		if (n >= (long)RATE && fabs(y) > peak)
+			peak = fabs(y);
+	}
+	check(peak <= ceiling + 1.0, "+6 dB boost at full scale held at the Dot ceiling",
+	      peak, ceiling, 1.0);
+
+	biscuit_dsp_init(&moved, 50);
+	biscuit_dsp_set_boost(&moved, 6.0f);
+	biscuit_dsp_set_volume(&moved, -1);
+	biscuit_dsp_set_volume(&moved, 60);
+	biscuit_dsp_init(&ref, 60);
+	biscuit_dsp_set_boost(&ref, 6.0f);
+	check(fabs(moved.boost - ref.boost) < 1e-12,
+	      "boost survives unknown-volume re-init", moved.boost, ref.boost, 1e-12);
+}
+
 int main(void)
 {
 	double peak, lo, hi;
@@ -274,6 +341,7 @@ int main(void)
 	check(biscuit_dsp_process(&d, NAN) == 0.0f, "NaN input is dropped", 0.0, 0.0, 0.0);
 
 	test_owner_tone();
+	test_owner_boost();
 
 	if (failures) {
 		printf("biscuit_speaker_dsp: %d FAILED\n", failures);
