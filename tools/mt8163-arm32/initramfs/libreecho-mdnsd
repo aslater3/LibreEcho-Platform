@@ -231,7 +231,17 @@ prepare_runtime() {
 }
 
 start_supervisor() {
-    "$SUPERVISOR" >>"$LOG" 2>&1 &
+    # A plain background job stays in the session and process group of the
+    # shell that ran restart. When that shell exits the supervisor takes the
+    # hangup with it, and dbus/avahi follow via PDEATHSIG. setsid moves it into
+    # its own session; stdin is /dev/null so it holds nothing from the caller.
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$SUPERVISOR" </dev/null >>"$LOG" 2>&1 &
+    else
+        # No setsid applet on this image: at least ignore SIGHUP. This does
+        # not leave the session, so it only helps when the hangup is the cause.
+        $BB sh -c 'trap "" HUP; exec "$@"' sh "$SUPERVISOR" </dev/null >>"$LOG" 2>&1 &
+    fi
     supervisor_pid=$!
     count=0
     while [ "$count" -lt "$START_TIMEOUT" ]; do
