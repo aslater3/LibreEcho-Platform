@@ -111,7 +111,10 @@ runtime_present() {
 supervisor_pids() {
     # Every live process running the UI supervisor executable. Matched on
     # /proc/<pid>/exe, never argv or a pidfile, so an unrelated process cannot
-    # be selected.
+    # be selected. A supervisor whose binary was replaced on disk while it
+    # runs (a hot-staged or restored file) reads as "<path> (deleted)"; it is
+    # still the supervisor, and missing it let stop report success while it
+    # kept running and respawning its pair.
     [ -n "$SUPERVISOR" ] || return 0
     want=$($BB readlink -f "$SUPERVISOR" 2>/dev/null) || return 0
     [ -n "$want" ] || return 0
@@ -119,7 +122,10 @@ supervisor_pids() {
         [ -d "$entry" ] || continue
         pid=${entry##*/}
         [ "$pid" = "$$" ] && continue
-        [ "$(process_exe "$pid")" = "$want" ] && printf '%s\n' "$pid"
+        exe=$(process_exe "$pid")
+        if [ "$exe" = "$want" ] || [ "$exe" = "$want (deleted)" ]; then
+            printf '%s\n' "$pid"
+        fi
     done
 }
 
