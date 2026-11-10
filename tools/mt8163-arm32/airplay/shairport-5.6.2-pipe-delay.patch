@@ -11,16 +11,37 @@
  static int fd = -1;
  static int warned = 0;
  static unsigned int bytes_per_frame = 0;
-@@ -48,6 +52,8 @@
+@@ -48,6 +52,19 @@
  char *pipename = NULL;
  char *default_pipe_name = "/tmp/shairport-sync-audio";
  
 +static struct le_ad_client le_delay;
 +
++// Sync-correction totals kept by player.c (also patched by LibreEcho).
++extern uint32_t le_ad_ctr_resyncs, le_ad_ctr_late_drops, le_ad_ctr_frames_inserted,
++    le_ad_ctr_frames_dropped;
++
++static void le_sync_counters(void) {
++  le_ad_client_set_sync(&le_delay, __atomic_load_n(&le_ad_ctr_resyncs, __ATOMIC_RELAXED),
++                        __atomic_load_n(&le_ad_ctr_late_drops, __ATOMIC_RELAXED),
++                        __atomic_load_n(&le_ad_ctr_frames_inserted, __ATOMIC_RELAXED),
++                        __atomic_load_n(&le_ad_ctr_frames_dropped, __ATOMIC_RELAXED));
++}
++
  static int prepare() {
    int result = 0;
    // this will leave fd as -1 if a reader hasn't been attached to the pipe
-@@ -94,6 +100,14 @@
+@@ -84,7 +101,8 @@
+     // int rc = non_blocking_write(fd, buf, samples * 4);
+     if (bytes_per_frame == 0)
+       debug(1, "pipe: bytes per frame not initialised before play()!");
+-    int rc = write(fd, buf, samples * bytes_per_frame);
++    // Bounded chunks under one mutex shared with flush(), see airplay_delay.h.
++    int rc = le_ad_client_write(&le_delay, fd, buf, samples * bytes_per_frame, bytes_per_frame);
+     if ((rc < 0) && (errno != EPIPE) && (warned == 0)) {
+       strerror_r(errno, (char *)errorstring, 1024);
+       debug(1, "error %d writing to the pipe named \"%s\": \"%s\".", errno, pipename, errorstring);
+@@ -94,6 +112,25 @@
    return 0;
  }
  
@@ -29,13 +50,24 @@
 +// bridge's figure is missing or stale, so Shairport falls back to running
 +// without a delay() rather than trusting a wrong number.
 +static int delay(long *the_delay) {
++  le_sync_counters();
 +  return le_ad_client_delay(&le_delay, fd, bytes_per_frame, the_delay);
++}
++
++// Everything written to the pipe so far is stale (skip, seek, pause). Called from
++// the player thread with flush_mutex held and, in AirPlay 2, from the buffered
++// audio thread on pause, so it must not wait for long and must not race play():
++// both take one mutex. It asks the bridge to discard what is queued past this
++// pipe and waits a bounded time for the answer (see airplay_delay.h).
++static void flush(void) {
++  le_sync_counters();
++  le_ad_client_flush(&le_delay);
 +}
 +
  static void stop(void) {
    // Don't close the pipe just because a play session has stopped.
  }
-@@ -106,7 +120,12 @@
+@@ -106,7 +143,12 @@
  
    // set up default values first
  
@@ -49,7 +81,7 @@
    config.audio_backend_latency_offset = 0;
  
    // get settings from settings file, passing in defaults for format_set, rate_set and channel_set
-@@ -138,6 +157,8 @@
+@@ -138,6 +180,8 @@
    if (pipename == NULL)
      pipename = default_pipe_name; // if none specified
  
@@ -58,12 +90,53 @@
    // here, create the pipe
    mode_t oldumask = umask(000);
    if (mkfifo(pipename, 0666) && errno != EEXIST)
-@@ -185,7 +206,7 @@
+@@ -184,8 +228,8 @@
+                            .configure = &configure,
                             .stop = &stop,
                             .is_running = NULL,
-                            .flush = NULL,
+-                           .flush = NULL,
 -                           .delay = NULL,
++                           .flush = &flush,
 +                           .delay = &delay,
                             .stats = NULL,
                             .play = &play,
                             .volume = NULL,
+--- a/player.c
++++ b/player.c
+@@ -2105,6 +2105,12 @@
+   // debug_mutex_unlock(&conn->ab_mutex, 0);
+ }
+ 
++/* LibreEcho: sync-correction counters, RAM only. The pipe backend publishes them
++ * (see audio_pipe.c and airplay_delay.h); Shairport itself only logs these events
++ * at debug level 2. */
++uint32_t le_ad_ctr_resyncs, le_ad_ctr_late_drops, le_ad_ctr_frames_inserted,
++    le_ad_ctr_frames_dropped;
++
+ // get the next frame, when available. return 0 if underrun/stream reset.
+ static abuf_t *buffer_get_frame(rtsp_conn_info *conn, int resync_requested) {
+   // int16_t buf_fill;
+@@ -4738,8 +4744,10 @@
+ 
+                 if (centered_sync_error_time < 0) {
+                   request_resync = 1; // ask for a resync
++                  __atomic_fetch_add(&le_ad_ctr_resyncs, 1, __ATOMIC_RELAXED);
+                 } else {
+                   int16_t occ = conn->ab_write - conn->ab_read;
++                  __atomic_fetch_add(&le_ad_ctr_late_drops, 1, __ATOMIC_RELAXED);
+                   debug(2,
+                         "drop late packet, timestamp: %u,  late by: %.3f ms, packets remaining in "
+                         "the buffer: %u.",
+@@ -5137,6 +5145,12 @@
+             // number of additions+subtractions
+             tsum_of_sync_errors = tsum_of_sync_errors + sync_error;
+             tsum_of_corrections = tsum_of_corrections + amount_to_stuff;
++            if (amount_to_stuff > 0)
++              __atomic_fetch_add(&le_ad_ctr_frames_inserted, (uint32_t)amount_to_stuff,
++                                 __ATOMIC_RELAXED);
++            else if (amount_to_stuff < 0)
++              __atomic_fetch_add(&le_ad_ctr_frames_dropped, (uint32_t)(-amount_to_stuff),
++                                 __ATOMIC_RELAXED);
+             tsum_of_insertions_and_deletions =
+                 tsum_of_insertions_and_deletions + abs(amount_to_stuff);
+           }

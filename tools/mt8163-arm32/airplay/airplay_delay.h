@@ -18,6 +18,11 @@
  *   <airplay.pcm>.delay-read            written by Shairport's pipe backend
  *       the delay() value it last read plus a fallback counter, for the
  *       bridge's status file and event lines.
+ *   <airplay.pcm>.counters              written by Shairport's pipe backend
+ *       the flush request counter the bridge acts on (the bridge answers in
+ *       its own page's flush_done) and RAM-only counters of Shairport's
+ *       resyncs, late-packet drops, sync-correction frames and flushes, which
+ *       the bridge copies into airplay.status.
  *
  * Shairport's delay() then returns
  *     frames in airplay.pcm (FIONREAD, read at call time) + downstream
@@ -32,6 +37,8 @@
  */
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -44,6 +51,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef PIPE_BUF
+#define PIPE_BUF 4096
+#endif
+
 #define LE_AD_RATE 48000ULL
 /* A snapshot older than this is not trusted.  The engine publishes at least
  * every ~45 ms while playing and every 20 ms while idle. */
@@ -52,6 +63,13 @@
 #define LE_AD_MAGIC_ENGINE 0x3145454cu /* "LEE1" */
 #define LE_AD_MAGIC_BRIDGE 0x3142454cu /* "LEB1" */
 #define LE_AD_MAGIC_READ 0x3152454cu   /* "LER1" */
+#define LE_AD_MAGIC_COUNTERS 0x3143454cu /* "LEC1" */
+/* How long flush() waits for the bridge to discard what is queued behind
+ * Shairport.  The bridge ignores a request older than this: Shairport has
+ * already given up and may be writing the new audio. */
+#define LE_AD_FLUSH_WAIT_NS 300000000ULL
+/* While Shairport waits for pipe space it lets go of the I/O mutex this often. */
+#define LE_AD_WRITE_POLL_MS 10
 /* A recomputed FIFO occupancy further than this from the live FIONREAD is
  * treated as a stale offset and re-based (64 KiB FIFO plus a safe margin). */
 #define LE_AD_REBASE_BYTES 262144
@@ -102,6 +120,9 @@ struct le_ad_bridge {
 	uint32_t fifo_frames;       /* diagnostics: airplay-media FIFO */
 	uint32_t queue_frames;      /* diagnostics: engine queue */
 	uint32_t alsa_frames;       /* diagnostics: ALSA queue */
+	uint32_t flush_done;        /* last flush request the bridge has answered */
+	uint32_t flush_expired;     /* requests answered without a discard (too old) */
+	uint32_t flush_failed;      /* flushes where the engine could not be reset */
 };
 
 struct le_ad_read {
@@ -115,8 +136,26 @@ struct le_ad_read {
 	uint32_t pad;
 };
 
+/* Shairport's side of the flush handshake and its sync diagnostics.  Every
+ * field has a single writer (Shairport's pipe backend, under its client
+ * lock); the bridge only reads it. */
+struct le_ad_counters {
+	uint32_t magic;
+	uint32_t seq;
+	uint64_t mono_ns;        /* when flush_req last changed */
+	uint32_t flush_req;      /* flush requests issued; the bridge acts on a change */
+	uint32_t flush_calls;    /* flush() calls, including ones with nobody to tell */
+	uint32_t flush_timeouts; /* flushes the bridge did not answer in time */
+	uint32_t resyncs;        /* resyncs Shairport requested (sync error too big) */
+	uint32_t late_drops;     /* late packets Shairport dropped */
+	uint32_t frames_inserted;/* frames added by Shairport's sync correction */
+	uint32_t frames_dropped; /* frames removed by Shairport's sync correction */
+	uint32_t pad;
+};
+
 typedef char le_ad_engine_fits[sizeof(struct le_ad_engine) <= LE_AD_PAGE_SIZE ? 1 : -1];
 typedef char le_ad_bridge_fits[sizeof(struct le_ad_bridge) <= LE_AD_PAGE_SIZE ? 1 : -1];
+typedef char le_ad_counters_fits[sizeof(struct le_ad_counters) <= LE_AD_PAGE_SIZE ? 1 : -1];
 typedef char le_ad_read_fits[sizeof(struct le_ad_read) <= LE_AD_PAGE_SIZE ? 1 : -1];
 
 static inline uint64_t le_ad_now_ns(void)
@@ -318,6 +357,9 @@ struct le_ad_bridge_ctx {
 	uint64_t epoch;
 	int64_t offset;
 	int have_epoch;
+	uint32_t flush_done;
+	uint32_t flush_expired;
+	uint32_t flush_failed;
 	char engine_path[256];
 };
 
@@ -417,7 +459,22 @@ static inline void le_ad_bridge_publish(struct le_ad_bridge_ctx *ctx, uint64_t n
 	page->fifo_frames = parts->fifo_frames;
 	page->queue_frames = parts->queue_frames;
 	page->alsa_frames = parts->alsa_frames;
+	page->flush_done = ctx->flush_done;
+	page->flush_expired = ctx->flush_expired;
+	page->flush_failed = ctx->flush_failed;
 	le_ad_write_end(page);
+}
+
+/* The engine page's sequence, or UINT32_MAX when there is no readable engine.
+ * The sequence moves on every publish, so a flush can tell that the engine
+ * has published again since it drained its queue. */
+static inline uint32_t le_ad_bridge_engine_seq(struct le_ad_bridge_ctx *ctx)
+{
+	const void *map = le_ad_reader_get(&ctx->engine, ctx->engine_path, 0);
+
+	if (!map)
+		return UINT32_MAX;
+	return le_ad_seq_load(map) & ~1u;
 }
 
 /* One bridge tick: read the engine page, combine, publish.  Returns the
@@ -479,26 +536,243 @@ static inline unsigned int le_ad_delay_from_snapshot(const struct le_ad_bridge *
 }
 
 struct le_ad_client {
+	/* lock guards the two RAM pages and the counters below; io_lock makes
+	 * play() and flush() mutually exclusive (see le_ad_client_write). */
 	pthread_mutex_t lock;
+	pthread_mutex_t io_lock;
 	struct le_ad_reader bridge;
 	struct le_ad_read *record;
+	struct le_ad_counters *counters;
 	char bridge_path[320];
 	char record_path[320];
+	char counters_path[320];
 	int ready;
 	uint32_t reads;
 	uint32_t fallbacks;
+	uint32_t flush_epoch; /* bumped by every flush, guarded by io_lock */
+	uint32_t flush_req;
+	uint32_t flush_calls;
+	uint32_t flush_timeouts;
+	uint32_t resyncs;
+	uint32_t late_drops;
+	uint32_t frames_inserted;
+	uint32_t frames_dropped;
+	uint32_t published_resyncs;
+	uint32_t published_late_drops;
+	uint32_t published_inserted;
+	uint32_t published_dropped;
 };
 
 static inline void le_ad_client_init(struct le_ad_client *client, const char *pipe_path)
 {
 	memset(client, 0, sizeof(*client));
 	pthread_mutex_init(&client->lock, NULL);
+	pthread_mutex_init(&client->io_lock, NULL);
 	if (snprintf(client->bridge_path, sizeof(client->bridge_path), "%s.delay",
 		     pipe_path) >= (int)sizeof(client->bridge_path) ||
 	    snprintf(client->record_path, sizeof(client->record_path), "%s.delay-read",
-		     pipe_path) >= (int)sizeof(client->record_path))
+		     pipe_path) >= (int)sizeof(client->record_path) ||
+	    snprintf(client->counters_path, sizeof(client->counters_path), "%s.counters",
+		     pipe_path) >= (int)sizeof(client->counters_path))
 		return;
 	client->ready = 1;
+}
+
+/* The totals Shairport's player keeps; the backend hands them over before it
+ * publishes.  Plain monotonic counters, so a stale value is merely older. */
+static inline void le_ad_client_set_sync(struct le_ad_client *client, uint32_t resyncs,
+					 uint32_t late_drops, uint32_t inserted,
+					 uint32_t dropped)
+{
+	pthread_mutex_lock(&client->lock);
+	client->resyncs = resyncs;
+	client->late_drops = late_drops;
+	client->frames_inserted = inserted;
+	client->frames_dropped = dropped;
+	pthread_mutex_unlock(&client->lock);
+}
+
+/* Map the counters page (once).  A restarted Shairport continues the request
+ * counter it finds there, so the bridge never mistakes a fresh page for an old
+ * request.  Called with client->lock held. */
+static inline struct le_ad_counters *le_ad_client_counters_page(struct le_ad_client *client)
+{
+	if (!client->counters) {
+		client->counters = (struct le_ad_counters *)le_ad_map_writer(
+			client->counters_path, LE_AD_MAGIC_COUNTERS);
+		if (client->counters && client->flush_req == 0)
+			client->flush_req = client->counters->flush_req;
+	}
+	return client->counters;
+}
+
+/* Write the counters page.  Called with client->lock held.  Without `force`
+ * it only writes when a sync counter changed, so it costs nothing on the hot
+ * path; `stamp` also records when (a new flush request). */
+static inline void le_ad_client_publish_counters(struct le_ad_client *client,
+						 uint64_t now_ns, int force, int stamp)
+{
+	struct le_ad_counters *page;
+
+	if (!force && client->published_resyncs == client->resyncs &&
+	    client->published_late_drops == client->late_drops &&
+	    client->published_inserted == client->frames_inserted &&
+	    client->published_dropped == client->frames_dropped)
+		return;
+	page = le_ad_client_counters_page(client);
+	if (!page)
+		return;
+	le_ad_write_begin(page);
+	if (stamp)
+		page->mono_ns = now_ns;
+	page->flush_req = client->flush_req;
+	page->flush_calls = client->flush_calls;
+	page->flush_timeouts = client->flush_timeouts;
+	page->resyncs = client->resyncs;
+	page->late_drops = client->late_drops;
+	page->frames_inserted = client->frames_inserted;
+	page->frames_dropped = client->frames_dropped;
+	le_ad_write_end(page);
+	client->published_resyncs = client->resyncs;
+	client->published_late_drops = client->late_drops;
+	client->published_inserted = client->frames_inserted;
+	client->published_dropped = client->frames_dropped;
+}
+
+/* Is the bridge's answer to flush request `req` in?  *alive is cleared when
+ * the bridge page is missing or has stopped ticking (nobody will answer); a
+ * page caught mid-update counts as alive. */
+static inline int le_ad_client_flush_answered(struct le_ad_client *client, uint32_t req,
+					      int revalidate, int *alive)
+{
+	struct le_ad_bridge snapshot;
+	const void *map = le_ad_reader_get(&client->bridge, client->bridge_path, revalidate);
+	uint64_t now = le_ad_now_ns();
+
+	*alive = 0;
+	if (!map)
+		return 0;
+	if (le_ad_read_page(map, &snapshot, sizeof(snapshot), LE_AD_MAGIC_BRIDGE) != 0) {
+		*alive = 1; /* mid-update (or unreadable): keep waiting, the deadline bounds it */
+		return 0;
+	}
+	*alive = snapshot.mono_ns != 0 && now > snapshot.mono_ns &&
+		 now - snapshot.mono_ns <= LE_AD_STALE_NS;
+	return (int32_t)(snapshot.flush_done - req) >= 0;
+}
+
+/* Shairport's flush(): everything written so far is stale.  Holds io_lock, so
+ * it can neither interleave with a play() chunk nor let one write after it,
+ * asks the bridge to discard what is queued past the pipe (drain the pipe,
+ * drop the bridge remainder, reset the engine's AirPlay queue and media FIFO;
+ * the session marker and the volume file are left alone) and waits at most
+ * LE_AD_FLUSH_WAIT_NS for the answer.  A missing or dead bridge ends the wait
+ * at once.  Never fails: Shairport has no way to handle an error here. */
+static inline void le_ad_client_flush(struct le_ad_client *client)
+{
+	uint64_t start = le_ad_now_ns(), deadline;
+	uint32_t req;
+	unsigned int spins = 0;
+	int cancel_state, alive = 1, answered = 0;
+
+	(void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+	pthread_mutex_lock(&client->io_lock);
+	++client->flush_epoch;
+	pthread_mutex_lock(&client->lock);
+	++client->flush_calls;
+	if (!client->ready) {
+		pthread_mutex_unlock(&client->lock);
+		goto out;
+	}
+	(void)le_ad_client_counters_page(client);
+	req = ++client->flush_req;
+	le_ad_client_publish_counters(client, start, 1, 1);
+	pthread_mutex_unlock(&client->lock);
+	deadline = start + LE_AD_FLUSH_WAIT_NS;
+	for (;;) {
+		answered = le_ad_client_flush_answered(client, req, (spins++ & 63u) == 0, &alive);
+		if (answered || !alive || le_ad_now_ns() >= deadline)
+			break;
+		usleep(500);
+	}
+	if (!answered && alive) {
+		pthread_mutex_lock(&client->lock);
+		++client->flush_timeouts;
+		le_ad_client_publish_counters(client, le_ad_now_ns(), 1, 0);
+		pthread_mutex_unlock(&client->lock);
+	}
+out:
+	pthread_mutex_unlock(&client->io_lock);
+	(void)pthread_setcancelstate(cancel_state, NULL);
+}
+
+/* Shairport's play(): write `length` bytes (whole frames) to the pipe in
+ * all-or-nothing PIPE_BUF chunks.  The mutex is held only for one chunk; while
+ * the pipe is full the writer waits in poll() WITHOUT it, so a flush can
+ * always get in.  If a flush happened since this call started, the rest of the
+ * buffer belongs to audio that has just been discarded and is dropped.
+ * Returns the bytes accepted, or -1 with errno (EPIPE: no reader). */
+static inline ssize_t le_ad_client_write(struct le_ad_client *client, int fd,
+					 const void *buffer, size_t length,
+					 unsigned int bytes_per_frame)
+{
+	const unsigned char *bytes = (const unsigned char *)buffer;
+	size_t chunk_limit, done = 0;
+	uint32_t epoch = 0;
+	int first = 1;
+
+	if (bytes_per_frame == 0)
+		bytes_per_frame = 4;
+	chunk_limit = PIPE_BUF - PIPE_BUF % bytes_per_frame;
+	while (done < length) {
+		struct pollfd wait;
+		int cancel_state, full = 0, flushed = 0, error = 0;
+		ssize_t n = 0;
+
+		(void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+		pthread_mutex_lock(&client->io_lock);
+		if (first) {
+			epoch = client->flush_epoch;
+			first = 0;
+		}
+		if (client->flush_epoch != epoch) {
+			flushed = 1;
+		} else {
+			size_t step = length - done < chunk_limit ? length - done : chunk_limit;
+
+			/* Shairport opens the pipe blocking; a blocked write() under the
+			 * mutex would hold flush() off. Checked per chunk because the
+			 * descriptor may have been closed and reopened. */
+			int flags = fcntl(fd, F_GETFL);
+
+			if (flags >= 0 && (flags & O_NONBLOCK) == 0)
+				(void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+			n = write(fd, bytes + done, step);
+			if (n < 0 && errno == EINTR)
+				n = 0;
+			else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+				full = 1;
+			else if (n < 0)
+				error = errno;
+		}
+		pthread_mutex_unlock(&client->io_lock);
+		(void)pthread_setcancelstate(cancel_state, NULL);
+		if (flushed)
+			return (ssize_t)length;
+		if (error) {
+			errno = error;
+			return -1;
+		}
+		if (n > 0)
+			done += (size_t)n;
+		if (full) {
+			wait.fd = fd;
+			wait.events = POLLOUT;
+			wait.revents = 0;
+			(void)poll(&wait, 1, LE_AD_WRITE_POLL_MS);
+		}
+	}
+	return (ssize_t)length;
 }
 
 static inline void le_ad_client_record(struct le_ad_client *client, uint64_t now_ns,
@@ -525,6 +799,7 @@ static inline void le_ad_client_record(struct le_ad_client *client, uint64_t now
 	page->reads = client->reads;
 	page->fallbacks = client->fallbacks;
 	le_ad_write_end(page);
+	le_ad_client_publish_counters(client, now_ns, 0, 0);
 }
 
 /* Shairport's delay(): frames written to the pipe but not yet played.

@@ -149,3 +149,51 @@ int player_stop(rtsp_conn_info *conn) {
   }
   return response;
 }
+
+void buffer_get_frame_cleanup_handler(__attribute__((unused)) void *arg) {
+  // rtsp_conn_info *conn = (rtsp_conn_info *)arg;
+  // debug_mutex_unlock(&conn->ab_mutex, 0);
+}
+
+// get the next frame, when available. return 0 if underrun/stream reset.
+static abuf_t *buffer_get_frame(rtsp_conn_info *conn, int resync_requested) {
+  // int16_t buf_fill;
+  // struct timespec tn;
+
+  /*
+  {
+
+                      inframe->timestamp, sync_error_out_of_bounds, centered_sync_error_time * 1000,
+                      conn->sync_samples_count, sync_samples_highest_error,
+                      sync_samples_lowest_error);
+
+                if (centered_sync_error_time < 0) {
+                  request_resync = 1; // ask for a resync
+                } else {
+                  int16_t occ = conn->ab_write - conn->ab_read;
+                  debug(2,
+                        "drop late packet, timestamp: %u,  late by: %.3f ms, packets remaining in "
+                        "the buffer: %u.",
+                        inframe->timestamp, centered_sync_error_time * 1000, occ);
+                  unsigned int s;
+                  for (s = 0; s < conn->sync_samples_count; s++) {
+                    debug(4, "sample: %u, value: %.3f ms", s, sync_samples[s] * 0.000001);
+                  }
+                  debug(4, "sync_history_length: %u, samples_count: %u, sample_index: %u",
+                        SYNC_HISTORY_LENGTH, conn->sync_samples_count, last_sample_index);
+
+            number_of_statistics++;
+            frames_since_last_stats_logged += frames_played;
+            // stats accumulation. We want an average of sync error, drift, adjustment,
+            // number of additions+subtractions
+            tsum_of_sync_errors = tsum_of_sync_errors + sync_error;
+            tsum_of_corrections = tsum_of_corrections + amount_to_stuff;
+            tsum_of_insertions_and_deletions =
+                tsum_of_insertions_and_deletions + abs(amount_to_stuff);
+          }
+        }
+        // free buffers and mark the frame as finished
+#ifdef CONFIG_FFMPEG
+        if (inframe->avframe != NULL) {
+          av_frame_free(&inframe->avframe);
+          inframe->avframe = NULL;

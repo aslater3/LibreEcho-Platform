@@ -13,6 +13,14 @@ numbered frame stream into airplay.pcm.  Proves:
 * a vanished engine reader is waited out, not turned into loss;
 * event lines are rate limited and coalesced, and the status file is a fixed
   size file overwritten in place;
+* a flush request from Shairport (skip/seek/pause) drops the unsent remainder
+  and the airplay.pcm tail, is answered through the bridge page, leaves the
+  session marker and the volume state untouched and does not drop the audio of
+  the new track; a request Shairport has already given up on is answered
+  without discarding anything;
+* Shairport's resync / late-drop / sync-correction counters are copied into the
+  status file (still fixed size, overwritten in place) and reported once per
+  rate-limit window;
 * nothing is written under /data.
 """
 import errno
@@ -33,7 +41,8 @@ from test_airplay_session_dsp import HERE
 A = "a" * 32
 B = "b" * 32
 FRAME = 4
-STATUS_SIZE = 768
+STATUS_SIZE = 1024
+MAGIC_COUNTERS = 0x3143454C
 
 
 def frames(start, count, base=0):
@@ -347,7 +356,11 @@ def scenario_status_file_is_fixed_size(directory):
             seen.add(fields["mono_ms"])
             for key in ("pipe_fill_frames", "bridge_remainder_frames", "media_fifo_frames",
                         "engine_queue_frames", "alsa_delay_frames", "downstream_frames",
-                        "shairport_delay_frames", "delay_fallbacks", "discards", "reopens"):
+                        "shairport_delay_frames", "delay_fallbacks", "discards", "reopens",
+                        "flushes", "flush_discarded_bytes", "flush_expired", "flush_engine_failed",
+                        "shairport_flush_calls", "shairport_flush_timeouts", "shairport_resyncs",
+                        "shairport_late_drops", "shairport_frames_inserted",
+                        "shairport_frames_dropped"):
                 assert key in fields, key
             time.sleep(0.05)
         assert len(seen) >= 4, "status was not refreshed every interval"
@@ -361,6 +374,166 @@ def scenario_status_file_is_fixed_size(directory):
         assert read_status(status)[1]["mono_ms"] == stamp
         assert status.stat().st_size == STATUS_SIZE and status.stat().st_ino == inode
     finally:
+        rig.close()
+
+
+class CountersPage:
+    """Shairport's <airplay.pcm>.counters page, written the way its backend does."""
+
+    def __init__(self, path):
+        self.path = path
+        self.fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        os.ftruncate(self.fd, 64)
+        self.seq = 0
+        self.values = dict(mono_ns=0, flush_req=0, flush_calls=0, flush_timeouts=0, resyncs=0,
+                           late_drops=0, frames_inserted=0, frames_dropped=0)
+
+    def publish(self, **changes):
+        self.values.update(changes)
+        v = self.values
+        body = struct.pack("<Q8I", v["mono_ns"], v["flush_req"], v["flush_calls"],
+                           v["flush_timeouts"], v["resyncs"], v["late_drops"],
+                           v["frames_inserted"], v["frames_dropped"], 0)
+        self.seq += 2
+        os.pwrite(self.fd, struct.pack("<I", self.seq - 1), 4)
+        os.pwrite(self.fd, body, 8)
+        os.pwrite(self.fd, struct.pack("<I", MAGIC_COUNTERS), 0)
+        os.pwrite(self.fd, struct.pack("<I", self.seq), 4)
+
+    def request_flush(self, age_ns=0):
+        self.publish(flush_req=self.values["flush_req"] + 1,
+                     flush_calls=self.values["flush_calls"] + 1,
+                     mono_ns=time.monotonic_ns() - age_ns)
+        return self.values["flush_req"]
+
+    def close(self):
+        os.close(self.fd)
+
+
+def bridge_page_fields(root):
+    """flush_done, flush_expired, flush_failed from the bridge's delay page."""
+    path = root / "input.pcm.delay"
+    for _ in range(100):
+        raw = path.read_bytes()
+        if len(raw) == 64 and struct.unpack("<I", raw[4:8])[0] % 2 == 0:
+            return struct.unpack("<III", raw[48:60])
+        time.sleep(0.002)
+    raise AssertionError("bridge page unreadable")
+
+
+def file_identity(path):
+    st = path.stat()
+    return (st.st_dev, st.st_ino, st.st_ctime_ns, st.st_mtime_ns, path.read_bytes())
+
+
+def scenario_flush_discards_tail_keeps_session(directory):
+    rig = Rig(directory, "flush", "-DEVENT_INTERVAL_MS=100ULL")
+    shairport = CountersPage(rig.root / "input.pcm.counters")
+    try:
+        set_marker(rig.root, A)
+        (rig.root / "airplay.volume").write_text("-12.000000\n")
+        wait_for(lambda: "session-start" in rig.log())
+        marker = file_identity(rig.root / "airplay.active")
+        volume = file_identity(rig.root / "airplay.volume")
+        # The engine is blocked: the stream backs up into the media FIFO, the
+        # bridge's remainder and airplay.pcm.
+        total = 20000  # 80 KB: fits the FIFO, remainder and airplay.pcm (~45 KB each)
+        thread = rig.feed(total, chunk=352)
+        thread.join(timeout=10)
+        assert not thread.is_alive(), "the pipes should hold 80 KB"
+        wait_for(lambda: fionread(rig.reader) >= 40000, 5)
+        tail = fionread(rig.writer)
+        assert tail > 8192, f"airplay.pcm should hold a backlog, has {tail}"  # stale tail to discard
+        # Shairport flushes: the bridge discards remainder + pipe tail and answers.
+        request = shairport.request_flush()
+        wait_for(lambda: bridge_page_fields(rig.root)[0] == request, 5, "flush was never answered")
+        assert fionread(rig.writer) == 0, "airplay.pcm still holds stale audio after the flush"
+        assert bridge_page_fields(rig.root)[1:] == (0, 0)
+        text = rig.log()
+        wait_for(lambda: "flush x1" in rig.log(), 3)
+        assert re.search(r"flush x1 \(\d+ bytes dropped \(\d+ bridge, \d+ pipe\)", rig.log()), rig.log()
+        assert "discard x" not in text, "a flush is not a session discard"
+        # Session state is exactly as before: same marker, same volume file.
+        assert file_identity(rig.root / "airplay.active") == marker
+        assert file_identity(rig.root / "airplay.volume") == volume
+        assert "session-end" not in rig.log() and log_count(rig.log(), "session-start") == 1
+        # The new track: its frames follow whatever the media FIFO already held,
+        # in order, with none of the discarded tail in between.
+        rig.drain()
+        old = bytes(rig.received)
+        assert len(old) < total * FRAME, "the discarded tail must not reach the engine"
+        check_sequence(old)
+        rig.received.clear()
+        base_b = 0x50000000
+        rig.sent_frames = 0
+        rig.feed(5000, base=base_b).join(timeout=5)
+        wait_for(lambda: (rig.drain(), len(rig.received) >= 5000 * FRAME)[1], 10)
+        assert check_sequence(bytes(rig.received), base=base_b) == 5000
+        # Flushes and the discarded bytes are in the status file.
+        wait_for(lambda: int(read_status(rig.root / "airplay.status")[1].get("flushes", "0")) == 1, 12,
+                 "flush missing from airplay.status")
+    finally:
+        shairport.close()
+        rig.close()
+
+
+def scenario_stale_flush_request_discards_nothing(directory):
+    rig = Rig(directory, "flush-late", "-DEVENT_INTERVAL_MS=100ULL")
+    shairport = CountersPage(rig.root / "input.pcm.counters")
+    try:
+        set_marker(rig.root, A)
+        wait_for(lambda: "session-start" in rig.log())
+        rig.feed(20000, chunk=352).join(timeout=10)
+        # Shairport gave up on this request 1 s ago and has been writing since.
+        request = shairport.request_flush(age_ns=1_000_000_000)
+        wait_for(lambda: bridge_page_fields(rig.root)[0] == request, 5)
+        assert bridge_page_fields(rig.root)[1] == 1, "expired request not counted"
+        wait_for(lambda: (rig.drain(), len(rig.received) >= 20000 * FRAME)[1], 10)
+        assert check_sequence(bytes(rig.received)) == 20000, "an expired flush must not drop audio"
+        assert "too late" in rig.log() and "discard x" not in rig.log()
+    finally:
+        shairport.close()
+        rig.close()
+
+
+def scenario_sync_counters_reach_status(directory):
+    rig = Rig(directory, "counters", "-DSTATUS_INTERVAL_MS=200ULL -DEVENT_INTERVAL_MS=1000ULL")
+    status = rig.root / "airplay.status"
+    shairport = CountersPage(rig.root / "input.pcm.counters")
+    try:
+        set_marker(rig.root, A)
+        wait_for(status.exists, 5)
+        inode = status.stat().st_ino
+        raw, fields = read_status(status)
+        assert fields["shairport_resyncs"] == "0" and fields["flushes"] == "0"
+        # Counts that predate nothing: Shairport reports a resync and late drops.
+        shairport.publish(resyncs=1, late_drops=4, frames_inserted=30, frames_dropped=12,
+                          flush_calls=2, flush_timeouts=1)
+        wait_for(lambda: read_status(status)[1]["shairport_resyncs"] == "1", 5)
+        raw, fields = read_status(status)
+        assert status.stat().st_ino == inode and len(raw) == STATUS_SIZE
+        assert (fields["shairport_late_drops"], fields["shairport_frames_inserted"],
+                fields["shairport_frames_dropped"], fields["shairport_flush_calls"],
+                fields["shairport_flush_timeouts"]) == ("4", "30", "12", "2", "1")
+        wait_for(lambda: "resync x5" in rig.log(), 3)
+        assert "+1 resyncs, +4 late packets dropped" in rig.log()
+        # A burst inside the window is one coalesced line, not one per event.
+        for count in range(2, 12):
+            shairport.publish(resyncs=count)
+            time.sleep(0.02)
+        wait_for(lambda: read_status(status)[1]["shairport_resyncs"] == "11", 5)
+        time.sleep(1.2)
+        lines = [line for line in rig.log().splitlines() if "resync x" in line]
+        assert 2 <= len(lines) <= 3, lines
+        assert sum(int(m) for m in re.findall(r"resync x(\d+)", rig.log())) == 15, rig.log()
+        # A restarted Shairport counts from zero again: no wrapped-around burst.
+        shairport.publish(resyncs=0, late_drops=0, frames_inserted=0, frames_dropped=0)
+        wait_for(lambda: read_status(status)[1]["shairport_resyncs"] == "0", 5)
+        time.sleep(1.2)
+        assert sum(int(m) for m in re.findall(r"resync x(\d+)", rig.log())) == 15, rig.log()
+        assert status.stat().st_size == STATUS_SIZE and status.stat().st_ino == inode
+    finally:
+        shairport.close()
         rig.close()
 
 
@@ -390,6 +563,12 @@ def run():
         print("bridge: event lines rate limited and coalesced")
         scenario_status_file_is_fixed_size(directory)
         print("bridge: status file fixed size, overwritten in place")
+        scenario_flush_discards_tail_keeps_session(directory)
+        print("bridge: flush drops the stale tail, keeps marker and volume, new track intact")
+        scenario_stale_flush_request_discards_nothing(directory)
+        print("bridge: a flush request Shairport gave up on discards nothing")
+        scenario_sync_counters_reach_status(directory)
+        print("bridge: Shairport sync counters in the fixed-size status, events rate limited")
     print("AirPlay bridge never drops audio on a full pipe: PASS")
 
 

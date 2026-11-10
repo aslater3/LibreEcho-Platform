@@ -43,7 +43,7 @@
 #define FRAME_BYTES 4U
 /* PIPE_BUF: a non-blocking FIFO write of this size is all-or-nothing. */
 #define WRITE_CHUNK 4096U
-#define STATUS_SIZE 768U
+#define STATUS_SIZE 1024U
 /* Diagnostics are RAM only: events go to stderr (the RAM-resident
  * libreecho-airplayd log) at most once per kind per interval, and the status
  * file is overwritten in place at the same cadence while a session is live. */
@@ -290,23 +290,34 @@ static int set_active(const char *path, const char *token)
 
 /* The bridge may not yet have read the predecessor's input bytes. Its read
  * is serialized by the hook lock, so empty this FIFO before engine reset. */
-static int drain_input(void)
+static int drain_fd(int fd, size_t *drained)
 {
 	unsigned char buffer[4096];
 	size_t total = 0;
-	int fd = open(DEFAULT_INPUT_FIFO, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
-	if (fd < 0) return errno == ENOENT ? 0 : 1;
 	for (;;) {
 		ssize_t n = read(fd, buffer, sizeof(buffer));
 		if (n > 0) {
 			total += (size_t)n;
-			if (total > 262144) { close(fd); return 1; }
+			if (total > 262144) return 1;
 			continue;
 		}
 		if (n < 0 && errno == EINTR) continue;
-		if (n == 0 || (n < 0 && errno == EAGAIN)) { close(fd); return 0; }
-		close(fd); return 1;
+		if (n == 0 || (n < 0 && errno == EAGAIN)) {
+			if (drained) *drained = total;
+			return 0;
+		}
+		return 1;
 	}
+}
+
+static int drain_input(void)
+{
+	int result;
+	int fd = open(DEFAULT_INPUT_FIFO, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0) return errno == ENOENT ? 0 : 1;
+	result = drain_fd(fd, NULL);
+	close(fd);
+	return result;
 }
 
 /* Called under the shared forwarding/hook lock. A unique request is published
@@ -370,11 +381,14 @@ enum event_kind {
 	EV_SESSION_START,
 	EV_SESSION_END,
 	EV_DELAY_FALLBACK,
+	EV_RESYNC,
+	EV_FLUSH,
 	EV_COUNT
 };
 
 static const char *const event_names[EV_COUNT] = {
-	"discard", "reopen", "session-start", "session-end", "delay-fallback"
+	"discard", "reopen", "session-start", "session-end", "delay-fallback",
+	"resync", "flush"
 };
 
 struct forwarder {
@@ -408,6 +422,13 @@ struct forwarder {
 	struct le_ad_parts parts;
 	unsigned int delay_reason;
 	struct le_ad_reader shairport;
+	/* Shairport's flush requests and sync counters (<airplay.pcm>.counters). */
+	struct le_ad_reader counters_reader;
+	struct le_ad_counters counters;
+	int have_counters, flush_seeded;
+	uint32_t flush_handled;
+	uint32_t seen_resyncs, seen_late_drops;
+	uint64_t flushes, flush_discarded_bytes;
 	uint64_t ev_pending[EV_COUNT];
 	uint64_t ev_last_ms[EV_COUNT];
 	char ev_detail[EV_COUNT][96];
@@ -528,7 +549,17 @@ static void write_status(struct forwarder *f, int active)
 		     "delay_last_fallback=%s\n"
 		     "discards=%llu\n"
 		     "discarded_bytes=%llu\n"
-		     "reopens=%llu\n",
+		     "reopens=%llu\n"
+		     "flushes=%llu\n"
+		     "flush_discarded_bytes=%llu\n"
+		     "flush_expired=%u\n"
+		     "flush_engine_failed=%u\n"
+		     "shairport_flush_calls=%u\n"
+		     "shairport_flush_timeouts=%u\n"
+		     "shairport_resyncs=%u\n"
+		     "shairport_late_drops=%u\n"
+		     "shairport_frames_inserted=%u\n"
+		     "shairport_frames_dropped=%u\n",
 		     (unsigned long long)now, active, (unsigned long long)f->session_frames,
 		     (int)(fifo_bytes(f->input) / (int)FRAME_BYTES),
 		     f->pending_len / FRAME_BYTES,
@@ -537,7 +568,16 @@ static void write_status(struct forwarder *f, int active)
 		     f->parts.downstream_frames, le_ad_reason_name(f->delay_reason),
 		     shairport_delay, age_ms, fallbacks, le_ad_reason_name(last_reason),
 		     (unsigned long long)f->discards, (unsigned long long)f->discarded_bytes,
-		     (unsigned long long)f->reopens);
+		     (unsigned long long)f->reopens,
+		     (unsigned long long)f->flushes,
+		     (unsigned long long)f->flush_discarded_bytes,
+		     f->delay.flush_expired, f->delay.flush_failed,
+		     f->have_counters ? f->counters.flush_calls : 0u,
+		     f->have_counters ? f->counters.flush_timeouts : 0u,
+		     f->have_counters ? f->counters.resyncs : 0u,
+		     f->have_counters ? f->counters.late_drops : 0u,
+		     f->have_counters ? f->counters.frames_inserted : 0u,
+		     f->have_counters ? f->counters.frames_dropped : 0u);
 	if (n < 0)
 		return;
 	/* Fixed size, rewritten in place: pad with spaces, end with a newline. */
@@ -596,13 +636,72 @@ static void sync_session(struct forwarder *f, const struct stat *marker, int pre
 	}
 }
 
+/* Shairport's page of flush requests and sync counters. Missing until its
+ * pipe backend first has something to say. */
+static int read_counters(struct forwarder *f, struct le_ad_counters *c)
+{
+	char path[320];
+	const void *map;
+
+	if (snprintf(path, sizeof(path), "%s.counters", f->input_path) >= (int)sizeof(path))
+		return -1;
+	map = le_ad_reader_get(&f->counters_reader, path, 0);
+	return map ? le_ad_read_page(map, c, sizeof(*c), LE_AD_MAGIC_COUNTERS) : -1;
+}
+
+/* Called once at start: a request or a count that predates this process
+ * belongs to nobody. A page that does not exist yet starts from zero, so the
+ * very first flush is seen. */
+static void seed_counters(struct forwarder *f)
+{
+	struct le_ad_counters c;
+
+	f->flush_handled = f->seen_resyncs = f->seen_late_drops = 0;
+	if (read_counters(f, &c) == 0) {
+		f->flush_handled = c.flush_req;
+		f->seen_resyncs = c.resyncs;
+		f->seen_late_drops = c.late_drops;
+		f->counters = c;
+		f->have_counters = 1;
+	}
+}
+
+/* Copy Shairport's counters for the status file and report new resyncs and
+ * late-packet drops through the same rate limiter as every other event. */
+static void refresh_counters(struct forwarder *f)
+{
+	struct le_ad_counters c;
+	uint32_t resyncs, late;
+
+	if (read_counters(f, &c) != 0)
+		return;
+	/* A restarted Shairport counts from zero again. */
+	if ((int32_t)(c.resyncs - f->seen_resyncs) < 0)
+		f->seen_resyncs = c.resyncs;
+	if ((int32_t)(c.late_drops - f->seen_late_drops) < 0)
+		f->seen_late_drops = c.late_drops;
+	resyncs = c.resyncs - f->seen_resyncs;
+	late = c.late_drops - f->seen_late_drops;
+	if (resyncs || late)
+		event_note(f, EV_RESYNC, (uint64_t)resyncs + late,
+			   "Shairport +%u resyncs, +%u late packets dropped; totals %u/%u, sync correction +%u/-%u frames",
+			   resyncs, late, c.resyncs, c.late_drops, c.frames_inserted,
+			   c.frames_dropped);
+	f->seen_resyncs = c.resyncs;
+	f->seen_late_drops = c.late_drops;
+	f->counters = c;
+	f->have_counters = 1;
+}
+
 /* Session events and the status cadence. No lock: this only observes. */
 static void track_session(struct forwarder *f)
 {
 	struct stat marker;
 	uint64_t now = now_ms();
-	int present = marker_present(&marker);
+	int present;
 
+	refresh_counters(f);
+	present = marker_present(&marker);
 	sync_session(f, &marker, present);
 	if (f->session_active && now - f->last_status_ms >= STATUS_INTERVAL_MS)
 		write_status(f, 1);
@@ -639,6 +738,84 @@ static void publish_delay(struct forwarder *f)
 	if (f->delay_reason != LE_AD_OK && before == LE_AD_OK && f->session_active)
 		event_note(f, EV_DELAY_FALLBACK, 1, "bridge cannot publish delay: %s",
 			   le_ad_reason_name(f->delay_reason));
+}
+
+/* Shairport asked for a flush (skip, seek or pause): everything queued past
+ * its pipe is stale. This is the DISCARD half of the session fence and
+ * nothing else: the airplay.pcm input is drained, the unsent remainder dropped
+ * and the engine told to empty its AirPlay queue and media FIFO. Only the ALSA
+ * ring plays out. The session marker and the volume state are NOT touched
+ * (clear_session_state would delete the volume file, and the engine's master
+ * acknowledgement is tied to the marker's identity, so a fresh marker would
+ * leave AirPlay muted until the sender sends another volume). Shairport is
+ * waiting for flush_done, published together with the new delay figures. */
+static void service_flush(struct forwarder *f)
+{
+	uint32_t req, engine_seq;
+	uint64_t age, held, drained = 0;
+	size_t drained_bytes = 0;
+	int lock_fd, i, engine_reset = 0;
+
+	if (!f->have_counters || f->counters.flush_req == f->flush_handled)
+		return;
+	req = f->counters.flush_req;
+	age = le_ad_now_ns() - f->counters.mono_ns;
+	if (f->counters.mono_ns == 0 || age > LE_AD_FLUSH_WAIT_NS) {
+		/* Shairport stopped waiting and has probably written the new audio. */
+		f->flush_handled = req;
+		f->delay.flush_expired++;
+		f->delay.flush_done = req;
+		event_note(f, EV_FLUSH, 1, "request answered too late (%llu ms), nothing discarded",
+			   (unsigned long long)(age / 1000000ULL));
+		publish_delay(f);
+		return;
+	}
+	lock_fd = lock_session_mode(1);
+	if (lock_fd < 0)
+		return; /* retried on the next tick while the request is still fresh */
+	le_ad_bridge_begin(&f->delay);
+	age = le_ad_now_ns() - f->counters.mono_ns;
+	if (age > LE_AD_FLUSH_WAIT_NS) {
+		f->flush_handled = req;
+		f->delay.flush_expired++;
+		f->delay.flush_done = req;
+		event_note(f, EV_FLUSH, 1, "request answered too late (%llu ms), nothing discarded",
+			   (unsigned long long)(age / 1000000ULL));
+		publish_delay(f);
+		close(lock_fd);
+		return;
+	}
+	held = f->pending_len + f->carry_len;
+	f->pending_off = f->pending_len = f->carry_len = 0;
+	if (drain_fd(f->input, &drained_bytes) != 0)
+		drained_bytes = 0;
+	drained = drained_bytes;
+	f->flushes++;
+	f->flush_discarded_bytes += held + drained;
+	if (f->session_active && f->delay_reason != LE_AD_NO_ENGINE &&
+	    f->delay_reason != LE_AD_ENGINE_STALE) {
+		if (reset_engine() == 0) {
+			engine_reset = 1;
+			/* delay() must see the emptied queue: wait (bounded) until the
+			 * engine has published again after the reset. */
+			engine_seq = le_ad_bridge_engine_seq(&f->delay);
+			for (i = 0; i < 25 && engine_seq != UINT32_MAX &&
+			     le_ad_bridge_engine_seq(&f->delay) == engine_seq; ++i)
+				usleep(2000);
+		} else {
+			f->delay.flush_failed++;
+		}
+	}
+	f->flush_handled = req;
+	f->delay.flush_done = req;
+	publish_delay(f);
+	event_note(f, EV_FLUSH, 1,
+		   "%llu bytes dropped (%llu bridge, %llu pipe)%s; %llu flushes total",
+		   (unsigned long long)(held + drained), (unsigned long long)held,
+		   (unsigned long long)drained,
+		   engine_reset ? ", engine queue reset" : ", engine NOT reset",
+		   (unsigned long long)f->flushes);
+	close(lock_fd);
 }
 
 /* Open the engine FIFO without blocking.  Never closes the input pipe. */
@@ -733,6 +910,7 @@ static int forward_stream(struct forwarder *f)
 		ssize_t n;
 
 		track_session(f);
+		service_flush(f);
 		if (f->output < 0 && open_output(f, 1) < 0) {
 			/* No reader (engine restarting): wait, keep the remainder and
 			 * keep Shairport's pipe intact. */
@@ -893,6 +1071,7 @@ int main(int argc, char **argv)
 		    (int)sizeof(delay_path))
 			le_ad_bridge_open(&f.delay, delay_path,
 					  DEFAULT_AIRPLAY_ENGINE_DELAY_FILE);
+		seed_counters(&f);
 		while (!stopping) {
 			if (forward_stream(&f) < 0 && !stopping) {
 				/* Only a hard input error gets here (the pipe could not be
@@ -905,6 +1084,8 @@ int main(int argc, char **argv)
 				usleep(250000);
 			}
 		}
+		le_ad_reader_close(&f.counters_reader);
+		le_ad_reader_close(&f.shairport);
 		le_ad_bridge_close(&f.delay);
 	}
 	return 0;

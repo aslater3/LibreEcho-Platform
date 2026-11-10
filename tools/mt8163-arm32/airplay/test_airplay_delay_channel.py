@@ -7,7 +7,14 @@
 * the real bridge + a real engine read loop + the patched Shairport backend:
   with the engine held, every frame written is accounted for exactly once
   across pipe + bridge + media FIFO + engine queue, and a stalled engine makes
-  delay() fail instead of reporting a stale number.
+  delay() fail instead of reporting a stale number;
+* flush() (skip/seek/pause): with the same real bridge and engine, a flush
+  empties everything queued past Shairport (pipe, bridge, media FIFO, engine
+  AirPlay queue) so delay() drops to the new queue, the volume file and the
+  session marker stay untouched, the engine keeps playing AirPlay (the next
+  audio is the new track's, not the old tail), a flush racing play() from a
+  second thread (the AirPlay 2 pause path) does not hang, and the counters
+  appear in the fixed-size airplay.status.
 """
 import os
 import struct
@@ -391,11 +398,143 @@ def end_to_end(directory):
             engine.kill()
 
 
+def identity(path):
+    st = path.stat()
+    return (st.st_dev, st.st_ino, st.st_ctime_ns, st.st_mtime_ns, path.read_bytes())
+
+
+def status_fields(path):
+    raw = path.read_bytes()
+    assert len(raw) == 1024 and raw.endswith(b"\n"), len(raw)
+    return dict(line.split("=", 1) for line in raw.decode().splitlines() if "=" in line)
+
+
+def end_to_end_flush(directory):
+    """Real bridge + engine read loop + patched Shairport: skip/seek/pause flush."""
+    fence.ENGINE_DRIVER, saved = ENGINE_LOOP, fence.ENGINE_DRIVER
+    os.environ["LE_TEST_BRIDGE_CFLAGS"] = "-DEVENT_INTERVAL_MS=200ULL -DSTATUS_INTERVAL_MS=200ULL"
+    try:
+        root = directory / "e2e-flush"
+        root.mkdir()
+        fence.compile_fixture(root)
+    finally:
+        fence.ENGINE_DRIVER = saved
+        os.environ.pop("LE_TEST_BRIDGE_CFLAGS", None)
+    shairport = patchtest.build_driver(directory / "shairport-flush")
+    log = root / "observed"
+    (root / "hold").write_text("")  # the engine reads into its queue but plays nothing
+    engine = subprocess.Popen([str(root / "engine"), str(root), str(log)], cwd=root)
+    bridge = None
+    driver = None
+    try:
+        wait_for((root / "airplay-media.pcm").exists)
+        os.mkfifo(root / "input.pcm")
+        bridge = subprocess.Popen([str(root / "bridge")], stderr=open(root / "bridge.log", "w"))
+        page = root / "input.pcm.delay"
+        wait_for(page.exists)
+        pipe_fd = os.open(root / "input.pcm", os.O_RDWR | os.O_NONBLOCK)
+        assert fence.hook(root, "--start") == 0
+        fence.admit(root)
+        driver = patchtest.Driver(shairport, root / "input.pcm")
+        assert driver.ask("prepare") == "prepare rc=0"
+        marker = identity(root / "airplay.active")
+        volume = identity(root / "airplay.volume")
+        master = identity(root / "airplay.master")
+
+        # Old track: 20000 frames queued across pipe + bridge + FIFO + engine.
+        old = 20000
+        sent = 0
+        while sent < old:
+            step = min(1408 // 4, old - sent)
+            assert driver.ask(f"play {step} {sent}") == "play rc=0"
+            sent += step
+            time.sleep(0.0005)
+        wait_for(lambda: driver.delay() == (0, old), 6.0, "old audio never fully queued")
+        queued = read_bridge_page(page)
+        assert queued["queue"] > 0 and queued["fifo"] > 0, queued
+
+        # Skip: flush() returns promptly, everything past Shairport is gone and
+        # delay() reports the new, empty queue.
+        started = time.monotonic()
+        assert driver.ask("flush").startswith("flush ms=")
+        assert time.monotonic() - started < 0.3, "flush() was not answered by the bridge"
+        wait_for(lambda: driver.delay() == (0, 0), 3.0, "delay() did not drop to the emptied queue")
+        emptied = read_bridge_page(page)
+        assert (emptied["pend"], emptied["fifo"], emptied["queue"]) == (0, 0, 0), emptied
+        assert emptied["valid"] == 1
+        # Session state untouched: marker, volume file and the engine's master ack.
+        assert identity(root / "airplay.active") == marker
+        assert identity(root / "airplay.volume") == volume
+        assert identity(root / "airplay.master") == master
+        wait_for(lambda: "flush x" in (root / "bridge.log").read_text(), 3)
+        text = (root / "bridge.log").read_text()
+        assert "engine queue reset" in text and "engine NOT reset" not in text, text
+        assert "session-end" not in text and "discard x" not in text, text
+
+        # New track: exactly its own frames are queued, and once the engine plays
+        # again its first period is the new track's first frame, not the old tail.
+        new_base = 40000
+        sent = 0
+        while sent < 6000:
+            step = min(1408 // 4, 6000 - sent)
+            assert driver.ask(f"play {step} {new_base + sent}") == "play rc=0"
+            sent += step
+            time.sleep(0.0005)
+        wait_for(lambda: driver.delay() == (0, 6000), 6.0, "new audio not accounted exactly")
+        (root / "hold").unlink()
+        first = wait_for(lambda: [w for w in log.read_text().split()
+                                  if not w.startswith("partial:")] or None, 6.0,
+                         "engine never played the new track (AirPlay left unadmitted?)")[0]
+        expected = new_base & 0xFFFF
+        expected = expected - 65536 if expected >= 32768 else expected
+        assert int(first) == expected, f"first played period {first}, want the new track's {expected}"
+        wait_for(lambda: driver.delay() == (0, 0), 6.0)
+
+        # Pause path: AirPlay 2 flushes from its buffered-audio thread while the
+        # player thread is writing. No hang, bounded, bridge answered the last one.
+        counters = Path(str(root / "input.pcm") + ".counters")
+        before = patchtest.read_counters(counters)
+        text = driver.ask("race 100", timeout=30)
+        assert int(text.split("ms=")[1]) < 25000, text
+        after = patchtest.read_counters(counters)
+        assert after["flush_calls"] == before["flush_calls"] + 100, (before, after)
+        wait_for(lambda: struct.unpack("<I", (root / "input.pcm.delay").read_bytes()[48:52])[0]
+                 == after["flush_req"], 3.0, "last flush request never answered")
+        wait_for(lambda: driver.delay()[0] == 0, 3.0)
+
+        # The counters reach the fixed-size status file.
+        driver.ask("setctr 2 3 40 10")
+        driver.delay()
+        wait_for(lambda: status_fields(root / "airplay.status").get("shairport_resyncs") == "2",
+                 3.0, "Shairport's counters never reached airplay.status")
+        fields = status_fields(root / "airplay.status")
+        assert (fields["shairport_late_drops"], fields["shairport_frames_inserted"],
+                fields["shairport_frames_dropped"]) == ("3", "40", "10"), fields
+        assert int(fields["flushes"]) >= 1 and int(fields["shairport_flush_calls"]) >= 101, fields
+        assert fields["flush_engine_failed"] == "0" and fields["flush_expired"] == "0", fields
+        os.close(pipe_fd)
+    finally:
+        if driver:
+            driver.close()
+        if bridge:
+            bridge.terminate()
+            try:
+                bridge.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                bridge.kill()
+        engine.terminate()
+        try:
+            engine.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            engine.kill()
+
+
 def run():
     with tempfile.TemporaryDirectory(prefix="le-delay-channel-") as temp:
         directory = Path(temp)
         unit_tests(directory)
         end_to_end(directory)
+        end_to_end_flush(directory)
     print("AirPlay output-delay channel (math, engine publisher, bridge, Shairport): PASS")
 
 
