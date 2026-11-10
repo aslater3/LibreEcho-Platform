@@ -75,11 +75,38 @@ default desired buffer to 0.35 s so the queue stays inside the FIFOs.
 Diagnostics are RAM only (nothing is written under `/data`). The bridge
 logs to stderr, which lands in the RAM-resident `libreecho-airplayd.log`: one
 line at most per 10 s for each of `discard`, `reopen`, `session-start`,
-`session-end` and `delay-fallback`, with coalesced counts. While a session is
-active `/run/libreecho-audio/airplay.status` (a fixed 768 byte text file,
-overwritten in place every 10 s) shows the FIFO fills, remainder, engine queue,
-ALSA delay, the `delay()` value Shairport last read and the running discard,
-reopen and fallback counts.
+`session-end`, `delay-fallback`, `resync` and `flush`, with coalesced counts.
+While a session is active `/run/libreecho-audio/airplay.status` (a fixed 1024
+byte text file, overwritten in place every 10 s) shows the FIFO fills,
+remainder, engine queue, ALSA delay, the `delay()` value Shairport last read,
+the running discard, reopen and fallback counts, the flush counts and
+Shairport's own resync / late-packet / sync-correction counts.
+
+Skips, seeks and AirPlay 2 pauses take effect at once. The pipe backend gets a
+`flush()` in the same patch: Shairport's player thread calls it (with
+`flush_mutex` held) before the next frame after a skip or seek, and AirPlay 2's
+buffered-audio thread calls it on pause. One mutex covers `flush()` and each
+`play()` chunk (a `play()` that finds the pipe full waits in `poll()` without
+it, and drops the remainder of its buffer if a flush happened meanwhile), so
+they never race and neither waits unboundedly under the lock. `flush()` bumps
+a request counter in the Shairport-written `<airplay.pcm>.counters` page and
+waits at most 300 ms for the bridge to answer in `flush_done` of its
+`<airplay.pcm>.delay` page. The bridge, under the hook lock, drains
+`airplay.pcm`, drops its unsent remainder and has the engine empty its AirPlay
+queue and the media FIFO (`reset_engine()`, the discard half of the session
+fence), waits up to 150 ms for an engine snapshot that postdates the reset
+(different epoch/seq) and republishes the delay before answering (if none
+arrives it still answers, counts `flush_engine_late` and publishes the delay as
+unavailable, so `delay()` fails with `-ENODEV`, until the engine's next
+snapshot), so `delay()` then reports the new, near-empty queue and only the
+ALSA ring (about 64 ms) plays out. It does not call `clear_session_state()` and
+does not replace the session marker: the volume file stays, and the engine's
+master acknowledgement is tied to the marker's identity, so a fresh marker
+would leave AirPlay muted until the sender sent another volume. A request older
+than the 300 ms wait is answered without discarding (Shairport has moved on
+and may already be writing the new track). The same counters page carries
+Shairport's resync requests, late-packet drops and frames added or removed by
+sync correction, which Shairport itself only logs at debug level 2.
 `libreecho-audio-engine` is the sole playback PCM and amplifier owner;
 `audiod` alone writes the PCM Playback Volume control. The engine reads back
 both codec indices after prepare and again before unmute, refusing to play if
