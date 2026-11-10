@@ -29,6 +29,7 @@
 #include <tinyalsa/pcm.h>
 
 #include "aec_reference.h"
+#include "airplay_delay.h"
 #include "audio_period_buffer.h"
 #include "audio_sink.h"
 #include "audio_timing.h"
@@ -46,6 +47,7 @@
 #define AIRPLAY_MASTER_FILE "airplay.master"
 #define AIRPLAY_RESET_FILE "airplay.reset"
 #define AIRPLAY_RESET_ACK_FILE "airplay.reset-ack"
+#define AIRPLAY_ENGINE_DELAY_FILE "airplay.engine-delay"
 #define MASTER_VOLUME_FILE "master.volume"
 #define IMAGE_TARGET_FILE "/etc/libreecho/target"
 /* airplayd chroots the engine into the feature root, which does not carry
@@ -1392,6 +1394,54 @@ static int poll_sources(struct source_bus *sources, int timeout_ms)
 	return poll_sources_ex(sources, timeout_ms, 0);
 }
 
+/*
+ * Output-delay channel for Shairport (see airplay_delay.h).  The engine is the
+ * only place that knows how much AirPlay audio is queued past the media FIFO
+ * and how deep the ALSA ring is, so it publishes that, with a monotonic
+ * timestamp and a cumulative count of the bytes it has read from the FIFO, in
+ * a fixed-size seqlock page under the RAM bus root.  The bridge adds its own
+ * part and Shairport's delay() reads the total.  Single-threaded: published
+ * after every read_sources() batch and every period write, so a snapshot is
+ * never older than one 20 ms poll tick (idle) or one 2048-frame period.
+ */
+static uint64_t g_airplay_media_read_bytes;
+static struct le_ad_engine_pub g_airplay_delay;
+
+static void airplay_delay_publish(struct pcm *pcm,
+				  const struct source_bus *sources)
+{
+	const struct source_bus *ap = &sources[SOURCE_AIRPLAY];
+	unsigned int avail = 0;
+	struct timespec stamp;
+	uint64_t now = le_ad_now_ns();
+	uint64_t at = now;
+	uint32_t alsa = 0;
+	int alsa_valid = 1;
+	int playing = pcm != NULL && !ap->airplay_volume_missing;
+
+	if (!g_airplay_delay.page)
+		return;
+	if (pcm) {
+		unsigned int buffer = pcm_get_buffer_size(pcm);
+
+		if (pcm_get_htimestamp(pcm, &avail, &stamp) == 0 &&
+		    buffer >= avail) {
+			uint64_t ts = (uint64_t)stamp.tv_sec * 1000000000ULL +
+				      (uint64_t)stamp.tv_nsec;
+
+			alsa = buffer - avail;
+			/* The ALSA timestamp is the moment the level was true. */
+			if (ts != 0 && ts <= now)
+				at = ts;
+		} else {
+			alsa_valid = 0;
+		}
+	}
+	le_ad_engine_publish(&g_airplay_delay, at, g_airplay_media_read_bytes,
+			     (uint32_t)(ap->received / (INPUT_CHANNELS * sizeof(int16_t))),
+			     alsa, alsa_valid, playing);
+}
+
 /* The dedicated AirPlay FIFO is never reclassified as generic media. */
 static int discard_disconnected_media(struct source_bus *media)
 {
@@ -1404,6 +1454,7 @@ static int discard_disconnected_media(struct source_bus *media)
 		ssize_t n = read(media->fd, input, sizeof(input));
 		if (n > 0) {
 			drained += (size_t)n;
+			g_airplay_media_read_bytes += (uint64_t)n;
 			if (drained > media->capacity * 4)
 				return -1; /* fail closed if a producer never quiesces */
 			continue;
@@ -1548,6 +1599,8 @@ static int read_sources(struct source_bus *sources, const char *root)
 			n = read(sources[i].fd, input, read_bytes);
 
 			if (n > 0) {
+				if (i == SOURCE_AIRPLAY)
+					g_airplay_media_read_bytes += (uint64_t)n;
 				appended = le_audio_period_buffer_append(
 					cursor, &sources[i].received, sources[i].capacity,
 					input, (size_t)n);
@@ -2394,6 +2447,18 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			"audio-engine: AEC reference tap unavailable: %s\n",
 			strerror(errno));
 	sync_playback_status(sources, &status);
+	{
+		char delay_path[256];
+
+		memset(&g_airplay_delay, 0, sizeof(g_airplay_delay));
+		g_airplay_media_read_bytes = 0;
+		if (snprintf(delay_path, sizeof(delay_path), "%s/%s", root,
+			     AIRPLAY_ENGINE_DELAY_FILE) >= (int)sizeof(delay_path) ||
+		    le_ad_engine_open(&g_airplay_delay, delay_path) < 0)
+			fprintf(stderr,
+				"audio-engine: AirPlay delay channel unavailable: %s\n",
+				strerror(errno));
+	}
 	/* Bind the framed sink now, even while the PCM is idle, so an SDK can
 	 * open a generation and begin priming before any legacy FIFO period. */
 	{
@@ -2443,6 +2508,9 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		int ready;
 		int poll_timeout = 20; /* service resets even when all buses are idle */
 
+		/* Idle snapshot, taken before the wait: its FIFO counter and queue
+		 * are a consistent pair, and the poll bounds its age to one tick. */
+		airplay_delay_publish(NULL, sources);
 		if (poll_sources_ex(sources, poll_timeout, 1) < 0)
 			break;
 		if (stopping)
@@ -2574,6 +2642,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		}
 		process_music_visualizer(&visualizer, sources);
 		consume_period(sources);
+		airplay_delay_publish(pcm, sources);
 
 		while (!stopping && sources_active(sources)) {
 			/* A live Sendspin generation paces every period itself
@@ -2664,7 +2733,9 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			SENDSPIN_TRACE("period");
 			process_music_visualizer(&visualizer, sources);
 			consume_period(sources);
+			airplay_delay_publish(pcm, sources);
 		}
+		airplay_delay_publish(NULL, sources);
 		SENDSPIN_TRACE("close");
 		clear_source_activity(sources, &announcement_led_active,
 				      &visualizer, &status);
@@ -2691,6 +2762,7 @@ out:
 		le_audio_sink_destroy(g_sendspin.sink);
 		g_sendspin.sink = NULL;
 	}
+	le_ad_engine_close(&g_airplay_delay);
 	close_sources(sources);
 	return result;
 }

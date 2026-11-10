@@ -1,0 +1,69 @@
+--- a/audio_pipe.c
++++ b/audio_pipe.c
+@@ -41,6 +41,10 @@
+ 
+ #include "utilities/network_utilities.h"
+ 
++/* LibreEcho: the pipe's reader is libreecho-airplay-audio, which publishes how
++ * much audio is still queued behind this pipe (see airplay_delay.h). */
++#include "airplay_delay.h"
++
+ static int fd = -1;
+ static int warned = 0;
+ static unsigned int bytes_per_frame = 0;
+@@ -48,6 +52,8 @@
+ char *pipename = NULL;
+ char *default_pipe_name = "/tmp/shairport-sync-audio";
+ 
++static struct le_ad_client le_delay;
++
+ static int prepare() {
+   int result = 0;
+   // this will leave fd as -1 if a reader hasn't been attached to the pipe
+@@ -94,6 +100,14 @@
+   return 0;
+ }
+ 
++// Frames written to the pipe but not yet played: what is in the pipe now plus
++// what the bridge and the audio engine still hold. Fails (-ENODEV) when the
++// bridge's figure is missing or stale, so Shairport falls back to running
++// without a delay() rather than trusting a wrong number.
++static int delay(long *the_delay) {
++  return le_ad_client_delay(&le_delay, fd, bytes_per_frame, the_delay);
++}
++
+ static void stop(void) {
+   // Don't close the pipe just because a play session has stopped.
+ }
+@@ -106,7 +120,12 @@
+ 
+   // set up default values first
+ 
+-  config.audio_backend_buffer_desired_length = 1.0;
++  // With a real delay() Shairport keeps this much audio queued behind the
++  // pipe. It must stay well inside the airplay.pcm + engine FIFO capacity
++  // (about 0.68 s) so Shairport's own blocking write never becomes the limiter;
++  // 0.35 s leaves room for scheduling jitter. A config file value still wins
++  // (parse_audio_options below).
++  config.audio_backend_buffer_desired_length = 0.35;
+   config.audio_backend_latency_offset = 0;
+ 
+   // get settings from settings file, passing in defaults for format_set, rate_set and channel_set
+@@ -138,6 +157,8 @@
+   if (pipename == NULL)
+     pipename = default_pipe_name; // if none specified
+ 
++  le_ad_client_init(&le_delay, pipename);
++
+   // here, create the pipe
+   mode_t oldumask = umask(000);
+   if (mkfifo(pipename, 0666) && errno != EEXIST)
+@@ -185,7 +206,7 @@
+                            .stop = &stop,
+                            .is_running = NULL,
+                            .flush = NULL,
+-                           .delay = NULL,
++                           .delay = &delay,
+                            .stats = NULL,
+                            .play = &play,
+                            .volume = NULL,

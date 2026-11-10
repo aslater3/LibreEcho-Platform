@@ -72,7 +72,7 @@ def compile_fixture(root, fixed_nonce=False, pause_before_marker=False):
         bridge_source = bridge_source.replace(before,
             'if (!result && !strcmp(argv[1], "--start")) raise(SIGSTOP);\n\t\t' + before)
     (root / "bridge.c").write_text(bridge_source)
-    assert "input = open(input_path, O_RDWR | O_NONBLOCK | O_CLOEXEC);" in (root / "bridge.c").read_text()
+    assert "input = open(f->input_path, O_RDWR | O_NONBLOCK | O_CLOEXEC);" in (root / "bridge.c").read_text()
     cc = os.getenv("CC", "cc")
     subprocess.run([cc, "-std=c99", "-Wall", "-Wextra", "-Werror", "-ffunction-sections",
                     "-fdata-sections", "-I", str(root), "-I", str(HERE),
@@ -80,8 +80,10 @@ def compile_fixture(root, fixed_nonce=False, pause_before_marker=False):
                     str(HERE / "audio_timing.c"),
                     str(root / "engine.c"), "-Wl,--gc-sections", "-lm", "-o", str(root / "engine")],
                    check=True, timeout=60)
-    subprocess.run([cc, "-std=c99", "-Wall", "-Wextra", "-Werror", str(root / "bridge.c"),
-                    "-lm", "-o", str(root / "bridge")], check=True, timeout=60)
+    # LE_TEST_BRIDGE_CFLAGS lets a test shorten the bridge's 10 s diagnostics cadence.
+    subprocess.run([cc, "-std=c99", "-Wall", "-Wextra", "-Werror", "-I", str(HERE),
+                    *os.getenv("LE_TEST_BRIDGE_CFLAGS", "").split(),
+                    str(root / "bridge.c"), "-lm", "-o", str(root / "bridge")], check=True, timeout=60)
 
 
 def hook(root, arg, token=A, timeout=3):
