@@ -94,8 +94,11 @@ waits at most 300 ms for the bridge to answer in `flush_done` of its
 `<airplay.pcm>.delay` page. The bridge, under the hook lock, drains
 `airplay.pcm`, drops its unsent remainder and has the engine empty its AirPlay
 queue and the media FIFO (`reset_engine()`, the discard half of the session
-fence), waits for the engine's next snapshot and republishes the delay before
-answering, so `delay()` then reports the new, near-empty queue and only the
+fence), waits up to 150 ms for an engine snapshot that postdates the reset
+(different epoch/seq) and republishes the delay before answering (if none
+arrives it still answers, counts `flush_engine_late` and publishes the delay as
+unavailable, so `delay()` fails with `-ENODEV`, until the engine's next
+snapshot), so `delay()` then reports the new, near-empty queue and only the
 ALSA ring (about 64 ms) plays out. It does not call `clear_session_state()` and
 does not replace the session marker: the volume file stays, and the engine's
 master acknowledgement is tied to the marker's identity, so a fresh marker

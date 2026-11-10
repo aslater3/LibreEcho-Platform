@@ -54,6 +54,9 @@
 #define STATUS_INTERVAL_MS 10000ULL
 #endif
 #define OUTPUT_REOPEN_MS 100ULL
+/* How long a flush waits for the engine's post-reset snapshot (Shairport waits
+ * LE_AD_FLUSH_WAIT_NS = 300 ms; a reset itself can take ~10 ms to notice). */
+#define FLUSH_ENGINE_WAIT_NS 150000000ULL
 #define SESSION_TOKEN_LENGTH 32
 
 static volatile sig_atomic_t stopping;
@@ -554,6 +557,7 @@ static void write_status(struct forwarder *f, int active)
 		     "flush_discarded_bytes=%llu\n"
 		     "flush_expired=%u\n"
 		     "flush_engine_failed=%u\n"
+		     "flush_engine_late=%u\n"
 		     "shairport_flush_calls=%u\n"
 		     "shairport_flush_timeouts=%u\n"
 		     "shairport_resyncs=%u\n"
@@ -571,7 +575,7 @@ static void write_status(struct forwarder *f, int active)
 		     (unsigned long long)f->reopens,
 		     (unsigned long long)f->flushes,
 		     (unsigned long long)f->flush_discarded_bytes,
-		     f->delay.flush_expired, f->delay.flush_failed,
+		     f->delay.flush_expired, f->delay.flush_failed, f->delay.flush_late,
 		     f->have_counters ? f->counters.flush_calls : 0u,
 		     f->have_counters ? f->counters.flush_timeouts : 0u,
 		     f->have_counters ? f->counters.resyncs : 0u,
@@ -751,10 +755,10 @@ static void publish_delay(struct forwarder *f)
  * waiting for flush_done, published together with the new delay figures. */
 static void service_flush(struct forwarder *f)
 {
-	uint32_t req, engine_seq;
-	uint64_t age, held, drained = 0;
+	uint32_t req, mark_seq = 0;
+	uint64_t age, held, drained = 0, mark_epoch = 0, deadline;
 	size_t drained_bytes = 0;
-	int lock_fd, i, engine_reset = 0;
+	int lock_fd, engine_reset = 0, late = 0;
 
 	if (!f->have_counters || f->counters.flush_req == f->flush_handled)
 		return;
@@ -796,12 +800,28 @@ static void service_flush(struct forwarder *f)
 	    f->delay_reason != LE_AD_ENGINE_STALE) {
 		if (reset_engine() == 0) {
 			engine_reset = 1;
-			/* delay() must see the emptied queue: wait (bounded) until the
-			 * engine has published again after the reset. */
-			engine_seq = le_ad_bridge_engine_seq(&f->delay);
-			for (i = 0; i < 25 && engine_seq != UINT32_MAX &&
-			     le_ad_bridge_engine_seq(&f->delay) == engine_seq; ++i)
-				usleep(2000);
+			/* delay() must see the emptied queue. The reset is acknowledged
+			 * inside one engine iteration and the engine publishes at its end,
+			 * so a snapshot with a different (epoch, seq) than the one seen
+			 * now is post-reset. Wait for it, well inside Shairport's
+			 * LE_AD_FLUSH_WAIT_NS. */
+			if (le_ad_bridge_engine_mark(&f->delay, &mark_seq, &mark_epoch) == 0) {
+				deadline = le_ad_now_ns() + FLUSH_ENGINE_WAIT_NS;
+				while (!le_ad_bridge_engine_advanced(&f->delay, mark_seq, mark_epoch)) {
+					if (le_ad_now_ns() >= deadline) {
+						/* Answer anyway, but publish no figure until the
+						 * engine's next snapshot: a brief -ENODEV beats
+						 * the old queue counted as full. */
+						late = 1;
+						f->delay.flush_late++;
+						f->delay.await_active = 1;
+						f->delay.await_seq = mark_seq;
+						f->delay.await_epoch = mark_epoch;
+						break;
+					}
+					usleep(2000);
+				}
+			}
 		} else {
 			f->delay.flush_failed++;
 		}
@@ -813,6 +833,7 @@ static void service_flush(struct forwarder *f)
 		   "%llu bytes dropped (%llu bridge, %llu pipe)%s; %llu flushes total",
 		   (unsigned long long)(held + drained), (unsigned long long)held,
 		   (unsigned long long)drained,
+		   late ? ", engine queue reset, snapshot LATE (delay unavailable until it arrives)" :
 		   engine_reset ? ", engine queue reset" : ", engine NOT reset",
 		   (unsigned long long)f->flushes);
 	close(lock_fd);

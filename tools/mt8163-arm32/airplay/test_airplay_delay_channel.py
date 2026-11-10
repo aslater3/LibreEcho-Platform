@@ -252,7 +252,8 @@ ENGINE_LOOP = fence.ENGINE_DRIVER.replace(
     '    }',
 ).replace(
     'assert(poll_sources(buses, 20) >= 0);',
-    'airplay_delay_publish(NULL, buses);\n        assert(poll_sources(buses, 20) >= 0);',
+    'if (access("nopub", F_OK) != 0) airplay_delay_publish(NULL, buses);\n'
+    '        assert(poll_sources(buses, 20) >= 0);',
 ).replace(
     'if (source_period_ready(&buses[SOURCE_AIRPLAY])) {',
     'if (source_period_ready(&buses[SOURCE_AIRPLAY]) && access("hold", F_OK) != 0) {',
@@ -440,6 +441,7 @@ def end_to_end_flush(directory):
         marker = identity(root / "airplay.active")
         volume = identity(root / "airplay.volume")
         master = identity(root / "airplay.master")
+        counters_path = Path(str(root / "input.pcm") + ".counters")
 
         # Old track: 20000 frames queued across pipe + bridge + FIFO + engine.
         old = 20000
@@ -490,9 +492,48 @@ def end_to_end_flush(directory):
         assert int(first) == expected, f"first played period {first}, want the new track's {expected}"
         wait_for(lambda: driver.delay() == (0, 0), 6.0)
 
+        # Slow engine: it acknowledges the reset but does not publish again for
+        # a while. The bridge must answer within Shairport's wait, publish NO
+        # figure (delay() -> -ENODEV, never the pre-reset queue) and recover
+        # with the exact post-flush value as soon as the engine publishes.
+        (root / "hold").write_text("")
+        sent = 0
+        while sent < 6000:
+            step = min(1408 // 4, 6000 - sent)
+            assert driver.ask(f"play {step} {sent}") == "play rc=0"
+            sent += step
+            time.sleep(0.0005)
+        wait_for(lambda: driver.delay() == (0, 6000), 6.0, "6000 frames not queued")
+        timeouts = patchtest.read_counters(counters_path)["flush_timeouts"]
+        (root / "nopub").write_text("")
+        time.sleep(0.15)  # the engine's last publish is now older than the flush
+        started = time.monotonic()
+        driver.ask("flush")
+        took = time.monotonic() - started
+        assert 0.1 <= took < 0.3, f"late-snapshot flush took {took:.3f}s"
+        assert patchtest.read_counters(counters_path)["flush_timeouts"] == timeouts, \
+            "the bridge must still answer within Shairport's wait"
+        for _ in range(10):
+            page_now = read_bridge_page(page)
+            assert page_now["valid"] == 0 and page_now["reason"] == 9, page_now
+            rc, _ = driver.delay()
+            assert rc != 0, "delay() used pre-reset engine figures after a flush"
+            time.sleep(0.01)
+        (root / "nopub").unlink()
+        wait_for(lambda: driver.delay() == (0, 0), 3.0,
+                 "delay() did not recover to the exact post-flush value")
+        assert read_bridge_page(page)["valid"] == 1
+        assert driver.ask("play 1000 5") == "play rc=0"
+        wait_for(lambda: driver.delay() == (0, 1000), 3.0)
+        wait_for(lambda: status_fields(root / "airplay.status")["flush_engine_late"] == "1", 3.0,
+                 "flush_engine_late missing from airplay.status")
+        wait_for(lambda: "snapshot LATE" in (root / "bridge.log").read_text(), 3.0)
+        (root / "hold").unlink()
+        wait_for(lambda: driver.delay() == (0, 0), 6.0)
+
         # Pause path: AirPlay 2 flushes from its buffered-audio thread while the
         # player thread is writing. No hang, bounded, bridge answered the last one.
-        counters = Path(str(root / "input.pcm") + ".counters")
+        counters = counters_path
         before = patchtest.read_counters(counters)
         text = driver.ask("race 100", timeout=30)
         assert int(text.split("ms=")[1]) < 25000, text
@@ -512,6 +553,7 @@ def end_to_end_flush(directory):
                 fields["shairport_frames_dropped"]) == ("3", "40", "10"), fields
         assert int(fields["flushes"]) >= 1 and int(fields["shairport_flush_calls"]) >= 101, fields
         assert fields["flush_engine_failed"] == "0" and fields["flush_expired"] == "0", fields
+        assert fields["flush_engine_late"] == "1", fields
         os.close(pipe_fd)
     finally:
         if driver:

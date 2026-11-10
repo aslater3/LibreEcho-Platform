@@ -84,14 +84,15 @@ enum le_ad_reason {
 	LE_AD_NO_PIPE = 6,       /* Shairport has no open pipe */
 	LE_AD_RACE = 7,          /* page kept changing under the reader */
 	LE_AD_FIONREAD_FAILED = 8,
-	LE_AD_REASON_COUNT = 9
+	LE_AD_FLUSH_PENDING = 9, /* flushed; engine has not published since */
+	LE_AD_REASON_COUNT = 10
 };
 
 static inline const char *le_ad_reason_name(unsigned int reason)
 {
 	static const char *const names[LE_AD_REASON_COUNT] = {
 		"ok", "no-page", "stale", "no-engine", "engine-stale",
-		"alsa-unknown", "no-pipe", "race", "fionread-failed"
+		"alsa-unknown", "no-pipe", "race", "fionread-failed", "flush-pending"
 	};
 	return reason < LE_AD_REASON_COUNT ? names[reason] : "unknown";
 }
@@ -123,6 +124,7 @@ struct le_ad_bridge {
 	uint32_t flush_done;        /* last flush request the bridge has answered */
 	uint32_t flush_expired;     /* requests answered without a discard (too old) */
 	uint32_t flush_failed;      /* flushes where the engine could not be reset */
+	uint32_t flush_late;        /* flushes answered before the engine's post-reset snapshot */
 };
 
 struct le_ad_read {
@@ -360,6 +362,13 @@ struct le_ad_bridge_ctx {
 	uint32_t flush_done;
 	uint32_t flush_expired;
 	uint32_t flush_failed;
+	uint32_t flush_late;
+	/* After a flush whose post-reset engine snapshot has not arrived: the
+	 * engine page identity (epoch, seq) the pre-reset figures carry. Nothing
+	 * is published as valid until the engine page changes. */
+	int await_active;
+	uint32_t await_seq;
+	uint64_t await_epoch;
 	char engine_path[256];
 };
 
@@ -462,19 +471,36 @@ static inline void le_ad_bridge_publish(struct le_ad_bridge_ctx *ctx, uint64_t n
 	page->flush_done = ctx->flush_done;
 	page->flush_expired = ctx->flush_expired;
 	page->flush_failed = ctx->flush_failed;
+	page->flush_late = ctx->flush_late;
 	le_ad_write_end(page);
 }
 
-/* The engine page's sequence, or UINT32_MAX when there is no readable engine.
- * The sequence moves on every publish, so a flush can tell that the engine
- * has published again since it drained its queue. */
-static inline uint32_t le_ad_bridge_engine_seq(struct le_ad_bridge_ctx *ctx)
+/* Identity of the engine's current snapshot: (epoch, seq).  The sequence moves
+ * on every publish and the epoch on every engine start, so a snapshot with a
+ * different identity was published after this one.  Returns 0, or -1 when
+ * there is no readable engine page. */
+static inline int le_ad_bridge_engine_mark(struct le_ad_bridge_ctx *ctx, uint32_t *seq,
+					   uint64_t *epoch)
 {
+	struct le_ad_engine e;
 	const void *map = le_ad_reader_get(&ctx->engine, ctx->engine_path, 0);
 
-	if (!map)
-		return UINT32_MAX;
-	return le_ad_seq_load(map) & ~1u;
+	if (!map || le_ad_read_page(map, &e, sizeof(e), LE_AD_MAGIC_ENGINE) != 0)
+		return -1;
+	*seq = e.seq & ~1u;
+	*epoch = e.epoch;
+	return 0;
+}
+
+/* Has the engine published since `mark`?  (An unreadable page is "no".) */
+static inline int le_ad_bridge_engine_advanced(struct le_ad_bridge_ctx *ctx, uint32_t seq,
+					       uint64_t epoch)
+{
+	uint32_t now_seq;
+	uint64_t now_epoch;
+
+	return le_ad_bridge_engine_mark(ctx, &now_seq, &now_epoch) == 0 &&
+	       (now_seq != seq || now_epoch != epoch);
 }
 
 /* One bridge tick: read the engine page, combine, publish.  Returns the
@@ -494,7 +520,12 @@ static inline unsigned int le_ad_bridge_update(struct le_ad_bridge_ctx *ctx,
 	if (!map || le_ad_read_page(map, &e, sizeof(e), LE_AD_MAGIC_ENGINE) != 0) {
 		(void)le_ad_reader_get(&ctx->engine, ctx->engine_path, 1);
 		reason = LE_AD_NO_ENGINE;
+	} else if (ctx->await_active && (e.seq & ~1u) == ctx->await_seq &&
+		   e.epoch == ctx->await_epoch) {
+		/* Still the engine's pre-flush figures: never publish them. */
+		reason = LE_AD_FLUSH_PENDING;
 	} else {
+		ctx->await_active = 0;
 		reason = le_ad_downstream(ctx, &e, now_ns, written_bytes,
 					  media_fifo_bytes, pend_frames, parts);
 		if (reason == LE_AD_ENGINE_STALE)
