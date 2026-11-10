@@ -35,6 +35,9 @@ python3 "$SCRIPT_DIR/test_airplay_generation_fence.py"
 python3 "$SCRIPT_DIR/test_airplay_hook_identity.py"
 python3 "$SCRIPT_DIR/test_airplay_hook_lock_priority.py"
 python3 "$SCRIPT_DIR/test_shairport_hook_patch.py"
+python3 "$SCRIPT_DIR/test_shairport_pipe_delay_patch.py"
+python3 "$SCRIPT_DIR/test_airplay_bridge_no_drop.py"
+python3 "$SCRIPT_DIR/test_airplay_delay_channel.py"
 "$SCRIPT_DIR/test_speaker_dsp.sh"
 "$SCRIPT_DIR/test_speaker_mbcl.sh"
 "$SCRIPT_DIR/test_biscuit_speaker_dsp.sh"
@@ -142,9 +145,15 @@ tinyalsa_source=$(find "$work" -mindepth 1 -maxdepth 1 -type d -name 'tinyalsa-*
         '7011bff6f49ddada8ce9b34ea36216611c3bfe1847222ca5b72e7798c922667f  common.c' \
         '66ef34c7bc1a5c4612786b4c8860da6769ae5e1d146800ccb3a5f5537b1eaa3e  common.h' \
         '18b5ee672237592d80d8b62e5a5d9236ae0d5537a6ecf47097dd6c586c360c33  player.c' \
-        'df449b1074ec67da077631a26cb9d8ca5433474a60efe47d1b47bd4bb8a165a9  player.h' |
+        'df449b1074ec67da077631a26cb9d8ca5433474a60efe47d1b47bd4bb8a165a9  player.h' \
+        '27d5ce1a40923c559b2dcc058b5fc74c24b56d25c1babb0b2644c9c461ad4fa1  audio_pipe.c' |
         sha256sum -c -
     patch --batch --fuzz=0 -p1 -i "$SCRIPT_DIR/shairport-5.6.2-session-hooks.patch"
+    # Real delay() for the pipe backend (issue #356). The patched audio_pipe.c
+    # includes airplay_delay.h, the one definition shared with the bridge and
+    # the engine, so it is installed beside it rather than duplicated.
+    patch --batch --fuzz=0 -p1 -i "$SCRIPT_DIR/shairport-5.6.2-pipe-delay.patch"
+    install -m 0644 "$SCRIPT_DIR/airplay_delay.h" airplay_delay.h
 )
 reproducible_path_flags="-ffile-prefix-map=$work=/usr/src/libreecho-airplay -fdebug-prefix-map=$work=/usr/src/libreecho-airplay"
 
@@ -265,7 +274,7 @@ build_tinyalsa() {
 build_audio_components() {
     local bridge_cflags="--sysroot=$SYSROOT -O2 -std=c99 -Wall -Wextra -Wpedantic $reproducible_path_flags"
     local objects="$work/libreecho-objects"
-    bridge_cflags+=" -I$tinyalsa_source/include"
+    bridge_cflags+=" -I$SCRIPT_DIR -I$tinyalsa_source/include"
     if [[ -n "$KERNEL_HEADERS" ]]; then
         bridge_cflags+=" -I$KERNEL_HEADERS/include/uapi -I$KERNEL_HEADERS/include"
     fi

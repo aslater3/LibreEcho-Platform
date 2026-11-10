@@ -51,6 +51,35 @@ without a reset is refused. Engine restart begins with AirPlay unarmed rather
 than trusting a surviving marker. Host fixtures cover late A callbacks after
 B starts; real-device callback ordering and audio remain a release gate.
 Pre-reset PCM already handed to ALSA cannot be retroactively unplayed.
+
+A full `airplay-media.pcm` never costs audio (issue #356). The bridge keeps the
+unsent remainder (whole 4-byte frames; a trailing partial frame is carried to
+the next read), waits for FIFO space outside the shared lock, re-checks the
+session marker under the lock before each write, and never closes
+`airplay.pcm` or the media FIFO for a transient stall. Held audio is discarded
+only when the marker is gone or replaced; an engine that vanishes is waited
+out and the media FIFO reopened every 100 ms. Shairport's pipe backend gets a
+real `delay()` (`shairport-5.6.2-pipe-delay.patch`), so it does its own drift
+correction against the sender timeline and keeps AirPlay group sync. The
+number it returns is frames in `airplay.pcm` (read with `FIONREAD`) plus
+`downstream_frames` published by the bridge: bridge remainder, media FIFO
+(bridge bytes written minus the engine's cumulative bytes read), the engine's
+AirPlay queue and the ALSA ring, each fixed-size seqlock page being defined in
+`airplay_delay.h` (`<bus root>/airplay.engine-delay` from the engine,
+`<airplay.pcm>.delay` from the bridge, `<airplay.pcm>.delay-read` from
+Shairport). A snapshot older than 250 ms, a missing or torn page or an
+unknown ALSA level makes `delay()` return `-ENODEV`, which is Shairport's
+previous no-`delay()` behaviour. The patch also lowers the pipe backend's
+default desired buffer to 0.35 s so the queue stays inside the FIFOs.
+
+Diagnostics are RAM only (nothing is written under `/data`). The bridge
+logs to stderr, which lands in the RAM-resident `libreecho-airplayd.log`: one
+line at most per 10 s for each of `discard`, `reopen`, `session-start`,
+`session-end` and `delay-fallback`, with coalesced counts. While a session is
+active `/run/libreecho-audio/airplay.status` (a fixed 768 byte text file,
+overwritten in place every 10 s) shows the FIFO fills, remainder, engine queue,
+ALSA delay, the `delay()` value Shairport last read and the running discard,
+reopen and fallback counts.
 `libreecho-audio-engine` is the sole playback PCM and amplifier owner;
 `audiod` alone writes the PCM Playback Volume control. The engine reads back
 both codec indices after prepare and again before unmute, refusing to play if
