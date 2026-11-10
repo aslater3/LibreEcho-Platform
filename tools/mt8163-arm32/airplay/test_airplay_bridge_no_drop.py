@@ -228,7 +228,7 @@ def scenario_discard_only_when_session_over(directory):
     try:
         set_marker(rig.root, A)
         wait_for(lambda: "session-start" in rig.log())
-        rig.feed(60000, base=0)
+        feeder_a = rig.feed(60000, base=0)
         time.sleep(1.0)  # engine blocked, bridge holding a remainder
         assert "discard" not in rig.log(), rig.log()
         # Session A ends (marker gone): the held remainder is dropped, once.
@@ -236,7 +236,12 @@ def scenario_discard_only_when_session_over(directory):
         wait_for(lambda: "discard" in rig.log(), 5, "held audio was not discarded at session end")
         assert "session ended" in rig.log()
         assert "session-end" in rig.log()
-        # The tail still in airplay.pcm is a dead session's, and is consumed.
+        # The tail still in airplay.pcm is a dead session's, and is consumed. A's
+        # writer must also be finished: until then it could still put A frames
+        # into the pipe after B's marker exists (those would be a test artefact,
+        # not a leak: the bridge cannot tell who wrote them).
+        feeder_a.join(timeout=15)
+        assert not feeder_a.is_alive(), "A's writer never finished: its tail was not consumed"
         wait_for(lambda: fionread(rig.writer) == 0, 10, "bridge left the dead session's bytes")
         # Whatever the engine did receive for A is an exact prefix: no gap, no loss.
         wait_for(lambda: (rig.drain(), True)[1], 1)
@@ -262,10 +267,15 @@ def scenario_discard_only_when_session_over(directory):
         set_marker(rig.root, "c" * 32, replace=True)
         wait_for(lambda: "session replaced" in rig.log(), 5, "replacement did not drop B's tail")
         wait_for(lambda: log_count(rig.log(), "session-start") >= 3, 5)
-        time.sleep(0.3)
-        rig.drain()
+        # The engine has been blocked all along, so the media FIFO holds exactly
+        # what B got through before the replacement. Take that snapshot in one
+        # read: draining further would make room for B's still-writing producer,
+        # whose later frames are C's by definition.
+        held = fionread(rig.reader)
+        assert held > 0
+        snapshot = os.read(rig.reader, held)
         # Everything delivered for B is again an exact prefix of B.
-        check_sequence(bytes(rig.received), base=base_b)
+        check_sequence(snapshot, base=base_b)
     finally:
         rig.close()
 
