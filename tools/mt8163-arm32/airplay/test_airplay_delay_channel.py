@@ -34,6 +34,7 @@ MATH_TEST = r'''
 #define _GNU_SOURCE
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "airplay_delay.h"
 
 static struct le_ad_engine engine(uint64_t at, uint64_t read, uint32_t q, uint32_t a,
@@ -138,6 +139,52 @@ int main(void)
         le_ad_write_end(page);
         assert(!le_ad_write_in_progress(page));
         assert(le_ad_read_page(page, &copy, sizeof(copy), LE_AD_MAGIC_ENGINE) == 0);
+    }
+
+    /* A page caught mid-update is BUSY, not absent; the retries back off
+     * (bounded, a few ms at most) instead of spinning back to back. */
+    {
+        uint32_t page[16] = {0};
+        struct le_ad_engine copy;
+        uint64_t t;
+        page[0] = LE_AD_MAGIC_ENGINE;
+        le_ad_write_begin(page);
+        t = le_ad_now_ns();
+        assert(le_ad_read_page(page, &copy, sizeof(copy), LE_AD_MAGIC_ENGINE) == LE_AD_READ_BUSY);
+        t = le_ad_now_ns() - t;
+        assert(t >= 500000ULL && t < 50 * ms);
+        le_ad_write_end(page);
+        /* Wrong magic on a stable page is ABSENT: the page is not ours. */
+        assert(le_ad_read_page(page, &copy, sizeof(copy), LE_AD_MAGIC_BRIDGE) == LE_AD_READ_ABSENT);
+    }
+    /* The bridge tick distinguishes the two: busy engine, absent engine. */
+    {
+        char path[] = "/tmp/le-ad-busy-XXXXXX";
+        struct le_ad_bridge_ctx bridge;
+        struct le_ad_engine_pub pub;
+        struct le_ad_parts parts;
+        int fd = mkstemp(path);
+        assert(fd >= 0); close(fd);
+        memset(&pub, 0, sizeof(pub));
+        assert(le_ad_engine_open(&pub, path) == 0);
+        le_ad_engine_publish(&pub, le_ad_now_ns(), 0, 0, 0, 1, 0);
+        le_ad_bridge_open(&bridge, "/tmp/le-ad-busy-bridge-page", path);
+        assert(le_ad_bridge_update(&bridge, le_ad_now_ns(), 0, 0, 0, &parts) == LE_AD_OK);
+        le_ad_write_begin(pub.page);  /* the engine "is publishing" for good */
+        assert(le_ad_bridge_update(&bridge, le_ad_now_ns(), 0, 0, 0, &parts) == LE_AD_ENGINE_BUSY);
+        assert(strcmp(le_ad_reason_name(LE_AD_ENGINE_BUSY), "engine-busy") == 0);
+        le_ad_write_end(pub.page);
+        assert(le_ad_bridge_update(&bridge, le_ad_now_ns(), 0, 0, 0, &parts) == LE_AD_OK);
+        le_ad_bridge_close(&bridge);
+        le_ad_engine_close(&pub);
+        unlink(path);
+        unlink("/tmp/le-ad-busy-bridge-page");
+        bridge.page = NULL;
+        memset(&bridge, 0, sizeof(bridge));
+        le_ad_bridge_open(&bridge, "/tmp/le-ad-busy-bridge-page", "/nonexistent/engine-page");
+        assert(le_ad_bridge_update(&bridge, le_ad_now_ns(), 0, 0, 0, &parts) == LE_AD_NO_ENGINE);
+        le_ad_bridge_close(&bridge);
+        unlink("/tmp/le-ad-busy-bridge-page");
     }
     puts("math ok");
     return 0;

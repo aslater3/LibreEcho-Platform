@@ -368,6 +368,7 @@ def scenario_status_file_is_fixed_size(directory):
                         "engine_queue_frames", "alsa_delay_frames", "downstream_frames",
                         "shairport_delay_frames", "delay_fallbacks", "discards", "reopens",
                         "flushes", "flush_discarded_bytes", "flush_expired", "flush_engine_failed",
+                        "flush_engine_unreset",
                         "shairport_flush_calls", "shairport_flush_timeouts", "shairport_resyncs",
                         "shairport_late_drops", "shairport_frames_inserted",
                         "shairport_frames_dropped"):
@@ -547,6 +548,91 @@ def scenario_sync_counters_reach_status(directory):
         rig.close()
 
 
+def write_engine_page(root, busy):
+    """A minimal airplay.engine-delay page: valid magic, odd seq while 'busy'."""
+    path = root / "airplay.engine-delay"
+    body = struct.pack("<IIQQQIIII", 0x3145454C, 1 if busy else 2, 1,
+                       time.monotonic_ns(), 0, 0, 0, 0, 1)
+    path.write_bytes(body + bytes(64 - len(body)))
+    return path
+
+
+class FakeEngineReset(threading.Thread):
+    """Answers the bridge's reset request like the engine does (token echoed)."""
+
+    def __init__(self, root):
+        super().__init__(daemon=True)
+        self.root = root
+        self.stop = threading.Event()
+        self.answered = 0
+
+    def run(self):
+        request = self.root / "airplay.reset"
+        ack = self.root / "airplay.reset-ack"
+        last = None
+        while not self.stop.is_set():
+            try:
+                token = request.read_bytes()
+            except OSError:
+                token = None
+            if token and token != last and len(token) == 33:
+                ack.write_bytes(token)
+                last = token
+                self.answered += 1
+            time.sleep(0.003)
+
+
+def flush_status(rig):
+    return read_status(rig.root / "airplay.status")[1]
+
+
+def scenario_busy_engine_page_still_resets_engine(directory):
+    """A page caught mid-update is an engine that is there: flush must reset it."""
+    rig = Rig(directory, "flush-busy", "-DEVENT_INTERVAL_MS=100ULL -DSTATUS_INTERVAL_MS=100ULL")
+    shairport = CountersPage(rig.root / "input.pcm.counters")
+    engine = FakeEngineReset(rig.root)
+    try:
+        write_engine_page(rig.root, busy=True)  # seq odd for good: every read is BUSY
+        set_marker(rig.root, A)
+        wait_for(lambda: "session-start" in rig.log())
+        wait_for(lambda: flush_status(rig).get("delay_state") == "engine-busy", 5,
+                 "a busy engine page was not reported as engine-busy")
+        assert flush_status(rig)["delay_state"] != "no-engine"
+        engine.start()
+        request = shairport.request_flush()
+        wait_for(lambda: bridge_page_fields(rig.root)[0] == request, 8, "flush never answered")
+        assert engine.answered == 1, "the flush skipped reset_engine() on a busy page"
+        wait_for(lambda: "flush x1" in rig.log(), 3)
+        assert "engine queue reset" in rig.log() and "engine NOT reset" not in rig.log(), rig.log()
+        wait_for(lambda: flush_status(rig).get("flushes") == "1", 3)
+        assert flush_status(rig)["flush_engine_unreset"] == "0", flush_status(rig)
+    finally:
+        engine.stop.set()
+        shairport.close()
+        rig.close()
+
+
+def scenario_absent_engine_counts_unreset_flush(directory):
+    """No engine page at all: the flush cannot reset anything, and it is counted."""
+    rig = Rig(directory, "flush-noengine", "-DEVENT_INTERVAL_MS=100ULL -DSTATUS_INTERVAL_MS=100ULL")
+    shairport = CountersPage(rig.root / "input.pcm.counters")
+    try:
+        set_marker(rig.root, A)
+        wait_for(lambda: "session-start" in rig.log())
+        wait_for(lambda: flush_status(rig).get("delay_state") == "no-engine", 5,
+                 "a missing engine page was not reported as no-engine")
+        request = shairport.request_flush()
+        wait_for(lambda: bridge_page_fields(rig.root)[0] == request, 8, "flush never answered")
+        wait_for(lambda: "engine NOT reset" in rig.log(), 3)
+        wait_for(lambda: flush_status(rig).get("flush_engine_unreset") == "1", 3,
+                 "flush_engine_unreset not counted in airplay.status")
+        raw = (rig.root / "airplay.status").read_bytes()
+        assert len(raw) == STATUS_SIZE and raw.endswith(b"\n")
+    finally:
+        shairport.close()
+        rig.close()
+
+
 def scenario_nothing_touches_data():
     for name in ("airplay_audio.c", "airplay_delay.h", "shairport-5.6.2-pipe-delay.patch"):
         source = (HERE / name).read_text()
@@ -579,6 +665,10 @@ def run():
         print("bridge: a flush request Shairport gave up on discards nothing")
         scenario_sync_counters_reach_status(directory)
         print("bridge: Shairport sync counters in the fixed-size status, events rate limited")
+        scenario_busy_engine_page_still_resets_engine(directory)
+        print("bridge: a busy engine page is engine-busy and a flush still resets the engine")
+        scenario_absent_engine_counts_unreset_flush(directory)
+        print("bridge: a flush that cannot reset the engine is counted in airplay.status")
     print("AirPlay bridge never drops audio on a full pipe: PASS")
 
 

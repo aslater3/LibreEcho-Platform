@@ -59,6 +59,7 @@ int pcm_is_ready(struct pcm *p) { (void)p; return 0; }
 const char *pcm_get_error(struct pcm *p) { (void)p; return ""; }
 void pcm_close(struct pcm *p) { (void)p; }
 int pcm_prepare(struct pcm *p) { (void)p; return 0; }
+int pcm_stop(struct pcm *p) { (void)p; return 0; }
 int pcm_writei(struct pcm *p, const void *d, unsigned int n) { (void)p; (void)d; return (int)n; }
 '''
 

@@ -39,6 +39,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
+#include <sched.h>
 #include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -85,14 +86,17 @@ enum le_ad_reason {
 	LE_AD_RACE = 7,          /* page kept changing under the reader */
 	LE_AD_FIONREAD_FAILED = 8,
 	LE_AD_FLUSH_PENDING = 9, /* flushed; engine has not published since */
-	LE_AD_REASON_COUNT = 10
+	LE_AD_ENGINE_BUSY = 10,  /* engine page present but never stable in the
+	                          * bounded retry window: engine alive, not absent */
+	LE_AD_REASON_COUNT = 11
 };
 
 static inline const char *le_ad_reason_name(unsigned int reason)
 {
 	static const char *const names[LE_AD_REASON_COUNT] = {
 		"ok", "no-page", "stale", "no-engine", "engine-stale",
-		"alsa-unknown", "no-pipe", "race", "fionread-failed", "flush-pending"
+		"alsa-unknown", "no-pipe", "race", "fionread-failed", "flush-pending",
+		"engine-busy"
 	};
 	return reason < LE_AD_REASON_COUNT ? names[reason] : "unknown";
 }
@@ -201,15 +205,29 @@ static inline int le_ad_write_in_progress(const void *page)
 	return (le_ad_seq_load(page) & 1u) != 0;
 }
 
-/* Copy a page if it is stable and carries the expected magic. */
+/* le_ad_read_page() results besides 0 (a stable page with the right magic). */
+#define LE_AD_READ_ABSENT (-1) /* wrong magic: not a page of this kind */
+#define LE_AD_READ_BUSY (-2)   /* never stable in the retry window (writer active) */
+#define LE_AD_READ_ATTEMPTS 8u
+
+/* Copy a page if it is stable and carries the expected magic.  A writer's
+ * critical section is a few stores, so a retry only has to let it finish:
+ * the first retry just yields, later ones sleep tens of microseconds
+ * (about 1.3 ms in total, bounded).  Returns 0, LE_AD_READ_ABSENT, or
+ * LE_AD_READ_BUSY so callers can tell "no such page" from "caught mid-update". */
 static inline int le_ad_read_page(const void *page, void *dst, size_t size,
 				  uint32_t magic)
 {
 	unsigned int attempt;
 
-	for (attempt = 0; attempt < 8; ++attempt) {
-		uint32_t before = le_ad_seq_load(page), after;
+	for (attempt = 0; attempt < LE_AD_READ_ATTEMPTS; ++attempt) {
+		uint32_t before, after;
 
+		if (attempt == 1)
+			(void)sched_yield();
+		else if (attempt > 1)
+			usleep(20u << (attempt - 2u > 5u ? 5u : attempt - 2u));
+		before = le_ad_seq_load(page);
 		if (before & 1u)
 			continue;
 		memcpy(dst, page, size);
@@ -217,9 +235,9 @@ static inline int le_ad_read_page(const void *page, void *dst, size_t size,
 		after = __atomic_load_n((const uint32_t *)page + 1, __ATOMIC_RELAXED);
 		if (before != after)
 			continue;
-		return *(const uint32_t *)dst == magic ? 0 : -1;
+		return *(const uint32_t *)dst == magic ? 0 : LE_AD_READ_ABSENT;
 	}
-	return -1;
+	return LE_AD_READ_BUSY;
 }
 
 /* ---- mapped pages ------------------------------------------------------ */
@@ -514,10 +532,17 @@ static inline unsigned int le_ad_bridge_update(struct le_ad_bridge_ctx *ctx,
 	struct le_ad_engine e;
 	const void *map = le_ad_reader_get(&ctx->engine, ctx->engine_path, 0);
 	unsigned int reason;
+	int read = map ? le_ad_read_page(map, &e, sizeof(e), LE_AD_MAGIC_ENGINE)
+		       : LE_AD_READ_ABSENT;
 
 	memset(parts, 0, sizeof(*parts));
 	parts->pend_frames = pend_frames;
-	if (!map || le_ad_read_page(map, &e, sizeof(e), LE_AD_MAGIC_ENGINE) != 0) {
+	if (read == LE_AD_READ_BUSY) {
+		/* The engine is there and publishing; this tick just lost the race
+		 * against every retry.  Not "no engine": nothing is re-mapped and the
+		 * flush path must still reset the engine. */
+		reason = LE_AD_ENGINE_BUSY;
+	} else if (read != 0) {
 		(void)le_ad_reader_get(&ctx->engine, ctx->engine_path, 1);
 		reason = LE_AD_NO_ENGINE;
 	} else if (ctx->await_active && (e.seq & ~1u) == ctx->await_seq &&
