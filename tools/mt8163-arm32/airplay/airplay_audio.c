@@ -432,6 +432,8 @@ struct forwarder {
 	uint32_t flush_handled;
 	uint32_t seen_resyncs, seen_late_drops;
 	uint64_t flushes, flush_discarded_bytes;
+	/* Flushes in a live session whose engine queue could not be reset. */
+	uint64_t flush_engine_unreset;
 	uint64_t ev_pending[EV_COUNT];
 	uint64_t ev_last_ms[EV_COUNT];
 	char ev_detail[EV_COUNT][96];
@@ -558,6 +560,7 @@ static void write_status(struct forwarder *f, int active)
 		     "flush_expired=%u\n"
 		     "flush_engine_failed=%u\n"
 		     "flush_engine_late=%u\n"
+		     "flush_engine_unreset=%llu\n"
 		     "shairport_flush_calls=%u\n"
 		     "shairport_flush_timeouts=%u\n"
 		     "shairport_resyncs=%u\n"
@@ -576,6 +579,7 @@ static void write_status(struct forwarder *f, int active)
 		     (unsigned long long)f->flushes,
 		     (unsigned long long)f->flush_discarded_bytes,
 		     f->delay.flush_expired, f->delay.flush_failed, f->delay.flush_late,
+		     (unsigned long long)f->flush_engine_unreset,
 		     f->have_counters ? f->counters.flush_calls : 0u,
 		     f->have_counters ? f->counters.flush_timeouts : 0u,
 		     f->have_counters ? f->counters.resyncs : 0u,
@@ -796,6 +800,9 @@ static void service_flush(struct forwarder *f)
 	drained = drained_bytes;
 	f->flushes++;
 	f->flush_discarded_bytes += held + drained;
+	/* Only a missing or silent engine skips the reset.  A page that was merely
+	 * busy at the last tick (LE_AD_ENGINE_BUSY) is an engine that is there:
+	 * skipping would leave its queue holding the old track. */
 	if (f->session_active && f->delay_reason != LE_AD_NO_ENGINE &&
 	    f->delay_reason != LE_AD_ENGINE_STALE) {
 		if (reset_engine() == 0) {
@@ -826,6 +833,8 @@ static void service_flush(struct forwarder *f)
 			f->delay.flush_failed++;
 		}
 	}
+	if (f->session_active && !engine_reset)
+		f->flush_engine_unreset++;
 	f->flush_handled = req;
 	f->delay.flush_done = req;
 	publish_delay(f);

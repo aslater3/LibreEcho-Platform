@@ -83,6 +83,10 @@ static void callback(const char *root, const char *text)
 {
     remove_file(root, "airplay.volume"); put(root, "airplay.volume", text); ack(root);
 }
+/* wait_for_period() publishes the output-delay snapshot (no PCM open here). */
+unsigned int pcm_get_buffer_size(const struct pcm *pcm) { (void)pcm; return 0u; }
+int pcm_get_htimestamp(struct pcm *pcm, unsigned int *avail, struct timespec *ts)
+{ (void)pcm; (void)avail; (void)ts; return -1; }
 int main(void)
 {
     char root[256];

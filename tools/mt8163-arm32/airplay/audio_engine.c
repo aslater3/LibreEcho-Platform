@@ -1554,6 +1554,76 @@ static int airplay_marker_stat(const char *root, struct stat *marker)
 	       lstat(path, marker) == 0 && S_ISREG(marker->st_mode);
 }
 
+/*
+ * AirPlay session boundary (issue #356).  When the session marker disappears
+ * or is replaced, audio the engine already committed for the ended session
+ * (the ALSA ring, ~3000 frames) must not play after the boundary, or Stop ->
+ * new song and Pause -> resume play a ~0.1 s tail of the old audio.  The
+ * bridge's held bytes, the media FIFO and the engine's own AirPlay queue are
+ * dropped by the reset/discard paths above; this is the remaining downstream
+ * part: read_sources() notes the boundary and the playback loop, which owns
+ * the PCM, stops (drops) and re-prepares it before the next period.
+ *
+ * Fencing: the drop runs between read_sources() and the next write, so it can
+ * only remove periods written before the boundary was observed; a new
+ * session's audio is read into the AirPlay queue by that same read_sources()
+ * call and written afterwards.  A flush with an unchanged marker (skip, seek)
+ * is not a boundary and keeps playing the ring out as before.  The drop is
+ * skipped while any other bus or a Sendspin generation shares the ring, so
+ * TTS, alarms and Sendspin are never cut.
+ */
+static int g_airplay_marker_valid;
+static struct stat g_airplay_live_marker;
+static int g_airplay_drop_pending;
+static unsigned int g_airplay_drops, g_airplay_drops_shared;
+
+static void note_airplay_boundary(int airplay, const struct stat *marker)
+{
+	if (g_airplay_marker_valid &&
+	    (!airplay || !same_marker(marker, &g_airplay_live_marker))) {
+		g_airplay_marker_valid = 0;
+		g_airplay_drop_pending = 1;
+	}
+	if (airplay && !g_airplay_marker_valid) {
+		g_airplay_live_marker = *marker;
+		g_airplay_marker_valid = 1;
+	}
+}
+
+/* Drop what the ALSA ring still holds for an ended AirPlay session.  Called
+ * by the playback loop right after read_sources().  No PCM (nothing queued),
+ * or a ring shared with another bus, means there is nothing safe to drop. */
+static void drop_airplay_downstream(struct pcm *pcm,
+				    const struct source_bus *sources)
+{
+	unsigned int i;
+
+	if (!g_airplay_drop_pending)
+		return;
+	g_airplay_drop_pending = 0;
+	if (!pcm)
+		return;
+	for (i = 0; i < SOURCE_COUNT; ++i)
+		if (i != SOURCE_AIRPLAY &&
+		    (sources[i].idle_periods > 0 || sources[i].received > 0))
+			goto shared;
+	if (sendspin_live(&g_sendspin) || sendspin_held(&g_sendspin) ||
+	    g_sendspin.have_generation)
+		goto shared;
+	if (pcm_stop(pcm) < 0 || pcm_prepare(pcm) < 0) {
+		fprintf(stderr, "audio-engine: airplay session end: PCM drop failed: %s\n",
+			pcm_get_error(pcm));
+		return;
+	}
+	++g_airplay_drops;
+	fprintf(stderr, "audio-engine: airplay session ended or replaced: "
+		"ALSA ring dropped (%u drops)\n", g_airplay_drops);
+	airplay_delay_publish(pcm, sources);
+	return;
+shared:
+	++g_airplay_drops_shared;
+}
+
 /* Hooks hold the forwarding lock until this exact-token acknowledgement.
  * Drain queued periods and the dedicated FIFO before releasing the hook. */
 static int service_airplay_reset(struct source_bus *ap, const char *root)
@@ -1623,6 +1693,7 @@ static int read_sources(struct source_bus *sources, const char *root)
 	                !same_marker(&marker, &ap->airplay_marker)) &&
 	    !ap->airplay_reset_pending)
 		airplay = 0; /* replacement without a reset is not a generation */
+	note_airplay_boundary(airplay, &marker);
 
 	if (!airplay || !ap->airplay_session_seen ||
 	    !same_marker(&marker, &ap->airplay_marker)) {
@@ -1763,6 +1834,7 @@ static int wait_for_period(struct source_bus *sources, const char *root)
 	while (!stopping && !period_ready(sources)) {
 		if (!sources_active(sources))
 			return 0;
+		airplay_delay_publish(NULL, sources);
 		if (poll_sources(sources, 20) < 0)
 			return -1;
 		if (read_sources(sources, root) < 0)
@@ -2730,6 +2802,12 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				"volume is unavailable\n");
 		}
 		SENDSPIN_TRACE("s-prepared");
+		/* Start path (arm, open, prepare, verify, power, first write): the
+		 * engine reads no FIFO and writes no period for a while.  Publish a
+		 * truthful "starting" snapshot (PCM not draining, the first period
+		 * still queued, nothing in ALSA) between the steps so delay() keeps
+		 * answering instead of going stale (LE_AD_STALE_NS) (issue #356). */
+		airplay_delay_publish(NULL, sources);
 		if (arm_output_controls(card) < 0) {
 			fprintf(stderr, "audio-engine: output arm failed\n");
 			clear_source_activity(sources, &announcement_led_active,
@@ -2737,6 +2815,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			continue;
 		}
 		SENDSPIN_TRACE("s-armed");
+		airplay_delay_publish(NULL, sources);
 		pcm = open_output_pcm(card, device, &config);
 		if (!pcm || !pcm_is_ready(pcm)) {
 			fprintf(stderr, "audio-engine: PCM %u,%u unavailable: %s\n",
@@ -2750,6 +2829,10 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			usleep(250000);
 			continue;
 		}
+		/* A fresh PCM has an empty ring: a boundary seen before the open
+		 * has nothing to drop, and one seen after it is a new event. */
+		g_airplay_drop_pending = 0;
+		airplay_delay_publish(NULL, sources);
 		/* The clock domain is declared only because the PCM was opened
 		 * monotonic.  A chain without a measured output latency stays
 		 * uncalibrated, so its finish estimates remain invalid (fail
@@ -2775,17 +2858,21 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		/* The codec stays at its safe fixed reference; software owns gain. */
 		int playback_start_failed = 0;
 		SENDSPIN_TRACE("s-opened");
+		airplay_delay_publish(NULL, sources);
 
 		if (pcm_prepare(pcm) < 0)
 			playback_start_failed = 1;
 		else {
 			SENDSPIN_TRACE("s-prepare");
+			airplay_delay_publish(NULL, sources);
 			if (verify_codec_reference(card) < 0)
 				playback_start_failed = 1;
 			SENDSPIN_TRACE("s-verified");
+			airplay_delay_publish(NULL, sources);
 			if (!playback_start_failed && power_output_controls(card) < 0)
 				playback_start_failed = 1;
 			SENDSPIN_TRACE("s-powered");
+			airplay_delay_publish(NULL, sources);
 			if (!playback_start_failed) {
 				/* Queue the first period only after amp settle.  The PCM starts
 				 * muted, and unmute follows this write. */
@@ -2835,6 +2922,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 				stopping = 1;
 				break;
 			}
+			drop_airplay_downstream(pcm, sources);
 			if (!period_ready(sources))
 				break;
 			sync_announcement_led(sources, &announcement_led_active);

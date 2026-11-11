@@ -81,6 +81,24 @@ byte text file, overwritten in place every 10 s) shows the FIFO fills,
 remainder, engine queue, ALSA delay, the `delay()` value Shairport last read,
 the running discard, reopen and fallback counts, the flush counts and
 Shairport's own resync / late-packet / sync-correction counts.
+`flush_engine_unreset` counts flushes in a live session whose engine queue could
+not be reset (engine absent, snapshot stale, or the reset not acknowledged). A
+page that is only caught mid-update is reported as `engine-busy` (the page
+reader backs off for about 1.3 ms in total before giving up) and never skips the
+reset.
+
+Session end and replacement (Stop, Stop to a new song, Pause then resume) drop
+everything downstream, like a flush: the bridge and the engine drain the held
+bytes, the FIFO and the engine's AirPlay queue, and the engine also stops and
+re-prepares the ALSA PCM (`pcm_stop` + `pcm_prepare`), so the ring's last ~60 ms
+of the ended session never plays after it. The engine notes a boundary when the
+marker it last played is gone or replaced; a flush with the marker untouched
+(skip, seek) is not a boundary. The drop runs between reading the FIFO and the
+next period write, so a new session's audio is never cut, and it is skipped
+while another bus or a Sendspin generation shares the ring. While the output
+starts (arm, open, prepare, verify, power, first write) the engine publishes a
+"starting" snapshot between the steps (not draining, the first period queued,
+nothing in ALSA), so `delay()` stays answerable instead of going stale.
 
 Skips, seeks and AirPlay 2 pauses take effect at once. The pipe backend gets a
 `flush()` in the same patch: Shairport's player thread calls it (with

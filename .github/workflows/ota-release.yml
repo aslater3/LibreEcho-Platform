@@ -145,6 +145,7 @@ jobs:
           python tools/mt8163-arm32/airplay/test_shairport_pipe_delay_patch.py
           python tools/mt8163-arm32/airplay/test_airplay_bridge_no_drop.py
           python tools/mt8163-arm32/airplay/test_airplay_delay_channel.py
+          python tools/mt8163-arm32/airplay/test_airplay_session_end_drop.py
           python tools/mt8163-arm32/sendspin/test_packaging.py
           bash tools/mt8163-arm32/airplay/test_speaker_dsp.sh
           bash tools/mt8163-arm32/airplay/test_speaker_mbcl.sh

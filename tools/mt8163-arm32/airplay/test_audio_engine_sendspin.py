@@ -95,6 +95,7 @@ int pcm_is_ready(struct pcm *pcm);
 const char *pcm_get_error(struct pcm *pcm);
 void pcm_close(struct pcm *pcm);
 int pcm_prepare(struct pcm *pcm);
+int pcm_stop(struct pcm *pcm);
 int pcm_writei(struct pcm *pcm, const void *data, unsigned int frame_count);
 unsigned int pcm_get_buffer_size(const struct pcm *pcm);
 int pcm_get_htimestamp(struct pcm *pcm, unsigned int *avail,
@@ -180,6 +181,12 @@ const char *pcm_get_error(struct pcm *pcm)
 void pcm_close(struct pcm *pcm)
 {
     free(pcm);
+}
+
+int pcm_stop(struct pcm *pcm)
+{
+    (void)pcm;
+    return 0;
 }
 
 int pcm_prepare(struct pcm *pcm)
@@ -1541,6 +1548,12 @@ void pcm_close(struct pcm *pcm)
     logev(T_PCM_CLOSE, 0u, 0u, 0u, 0);
     notify('C');
     free(pcm);
+}
+
+int pcm_stop(struct pcm *pcm)
+{
+    (void)pcm;
+    return 0;
 }
 
 int pcm_prepare(struct pcm *pcm)

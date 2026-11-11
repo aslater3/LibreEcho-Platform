@@ -51,6 +51,8 @@ static inline const char *pcm_get_error(const struct pcm *pcm)
 { (void)pcm; return ""; }
 static inline int pcm_prepare(struct pcm *pcm)
 { (void)pcm; return 0; }
+static inline int pcm_stop(struct pcm *pcm)
+{ (void)pcm; return 0; }
 static inline int pcm_writei(struct pcm *pcm, const void *data,
                              unsigned int frames)
 { (void)pcm; (void)data; return (int)frames; }

@@ -88,6 +88,11 @@ ENGINE_PROGRAM = r'''
 #include <stdlib.h>
 #include <unistd.h>
 
+/* wait_for_period() publishes the output-delay snapshot (no PCM open here). */
+unsigned int pcm_get_buffer_size(const struct pcm *pcm) { (void)pcm; return 0u; }
+int pcm_get_htimestamp(struct pcm *pcm, unsigned int *avail, struct timespec *ts)
+{ (void)pcm; (void)avail; (void)ts; return -1; }
+
 static int fail(const char *message)
 {
     fprintf(stderr, "%s\n", message);
@@ -314,6 +319,7 @@ int pcm_is_ready(struct pcm *pcm);
 const char *pcm_get_error(struct pcm *pcm);
 void pcm_close(struct pcm *pcm);
 int pcm_prepare(struct pcm *pcm);
+int pcm_stop(struct pcm *pcm);
 int pcm_writei(struct pcm *pcm, const void *data, unsigned int frame_count);
 unsigned int pcm_get_buffer_size(const struct pcm *pcm);
 int pcm_get_htimestamp(struct pcm *pcm, unsigned int *avail,
