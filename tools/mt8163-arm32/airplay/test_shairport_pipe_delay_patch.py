@@ -318,10 +318,10 @@ class Driver:
 
 
 def bridge_page(path: Path, *, downstream=0, playing=0, valid=1, reason=0, at=None,
-                seq=2, magic=MAGIC_BRIDGE, flush_done=0):
+                seq=2, magic=MAGIC_BRIDGE, flush_done=0, start=0):
     at = time.monotonic_ns() if at is None else at
-    raw = struct.pack("<IIQIIIIIIIIIII", magic, seq, at, downstream, playing, valid, reason,
-                      0, 0, 0, 0, flush_done, 0, 0)
+    raw = struct.pack("<IIQIIIIIIIIIIII", magic, seq, at, downstream, playing, valid,
+                      reason, 0, 0, 0, 0, flush_done, 0, 0, start)
     path.write_bytes(raw.ljust(PAGE, b"\0"))
 
 
@@ -358,8 +358,8 @@ class FakeBridge(threading.Thread):
         self.publish()
 
     def publish(self):
-        body = struct.pack("<IQIIIIIIIIIII", MAGIC_BRIDGE, time.monotonic_ns(), self.downstream,
-                           0, 1, 0, 0, 0, 0, 0, self.done, 0, 0)
+        body = struct.pack("<IQIIIIIIIIIIII", MAGIC_BRIDGE, time.monotonic_ns(), self.downstream,
+                           0, 1, 0, 0, 0, 0, 0, self.done, 0, 0, 0)
         # Seqlock write in place (never truncate a page a reader has mapped).
         self.seq += 2
         os.pwrite(self.fd, struct.pack("<I", self.seq - 1), 4)
@@ -640,6 +640,21 @@ def run():
             bridge_page(bridge, downstream=5000, playing=0)
             assert driver.delay() == (0, 5600)
 
+            # 5b. Output starting: nothing drains, but the start wait (48000
+            # of the 52000 frames) runs down with the snapshot's age.
+            before = time.monotonic_ns()
+            bridge_page(bridge, downstream=52000, playing=0, start=48000,
+                        at=before - 100_000_000)
+            rc, value = driver.delay()
+            after = time.monotonic_ns()
+            assert rc == 0
+            high = 600 + 52000 - 100_000_000 * 48 // 1_000_000
+            low = 600 + 52000 - (after - before + 100_000_000) * 48 // 1_000_000
+            assert low <= value <= high, (low, value, high)
+            bridge_page(bridge, downstream=4000 + 4800, playing=0, start=4800,
+                        at=time.monotonic_ns() - 200_000_000)  # wait over: queue stays
+            assert driver.delay() == (0, 600 + 4000), "queued frames never run down"
+
             # 6. Stale snapshot: refuse rather than guess.
             bridge_page(bridge, downstream=5000, playing=1,
                         at=time.monotonic_ns() - 400_000_000)
@@ -668,7 +683,7 @@ def run():
             bridge_page(bridge, downstream=700, playing=0)
             assert driver.delay() == (0, 700 + 600)
             info = read_record(record)
-            assert info["reads"] == 4 and info["fallbacks"] == 7, info
+            assert info["reads"] == 6 and info["fallbacks"] == 7, info
             assert record.stat().st_size == PAGE
         finally:
             driver.close()

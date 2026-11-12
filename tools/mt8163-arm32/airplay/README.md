@@ -67,7 +67,7 @@ number it returns is frames in `airplay.pcm` (read with `FIONREAD`) plus
 AirPlay queue and the ALSA ring, each fixed-size seqlock page being defined in
 `airplay_delay.h` (`<bus root>/airplay.engine-delay` from the engine,
 `<airplay.pcm>.delay` from the bridge, `<airplay.pcm>.delay-read` from
-Shairport). A snapshot older than 250 ms, a missing or torn page or an
+Shairport). A snapshot older than 250 ms (4 s while the output starts), a missing or torn page or an
 unknown ALSA level makes `delay()` return `-ENODEV`, which is Shairport's
 previous no-`delay()` behaviour. The patch also lowers the pipe backend's
 default desired buffer to 0.35 s so the queue stays inside the FIFOs.
@@ -98,7 +98,13 @@ next period write, so a new session's audio is never cut, and it is skipped
 while another bus or a Sendspin generation shares the ring. While the output
 starts (arm, open, prepare, verify, power, first write) the engine publishes a
 "starting" snapshot between the steps (not draining, the first period queued,
-nothing in ALSA), so `delay()` stays answerable instead of going stale.
+nothing in ALSA), so `delay()` stays answerable instead of going stale. The
+snapshot also carries the monotonic time at which the engine expects the PCM to
+start draining (the duration of the previous start, 1.2 s for the first). The
+bridge adds the wait still ahead to `downstream_frames` (`delay_start_frames`
+in `airplay.status`), and the figure falls at 48 kHz from that time on without
+a step. A "starting" snapshot is trusted for up to 4 s because the blocked
+engine cannot publish, an ordinary one for 250 ms.
 
 Skips, seeks and AirPlay 2 pauses take effect at once. The pipe backend gets a
 `flush()` in the same patch: Shairport's player thread calls it (with

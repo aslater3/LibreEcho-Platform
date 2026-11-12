@@ -18,7 +18,8 @@ session marker, reset and volume handshake.  Proves:
 * The engine keeps publishing its output-delay snapshot through the slow start
   path (arm, open, prepare, verify, power, first write), with a truthful
   "starting" figure (not draining, first period queued, nothing in ALSA), so
-  delay() never sees a page older than LE_AD_STALE_NS.
+  delay() never sees a page older than LE_AD_STALE_NS.  Those snapshots carry the time the PCM is expected to drain and every exit
+  from the start path clears it.
 * Source contract: the drop sits between read_sources() and the period write
   and is cleared when a fresh PCM is opened.
 """
@@ -338,7 +339,8 @@ def read_page(path):
     raw = path.read_bytes()
     magic, seq, epoch, mono, read_bytes, queue, alsa, playing, valid = \
         struct.unpack("<IIQQQIIII", raw[:48])
-    return seq, mono, queue, alsa, playing, valid
+    due = struct.unpack("<Q", raw[48:56])[0]
+    return seq, mono, queue, alsa, playing, valid, due
 
 
 def scenario_start_path_keeps_the_page_fresh(directory):
@@ -357,11 +359,11 @@ def scenario_start_path_keeps_the_page_fresh(directory):
             while not done.is_set():
                 if sampling.is_set():
                     try:
-                        seq, mono, queue, alsa, playing, valid = read_page(page)
+                        seq, mono, queue, alsa, playing, valid, due = read_page(page)
                     except (OSError, struct.error):
                         continue
                     if seq != last and seq % 2 == 0:
-                        samples.append((time.monotonic(), queue, alsa, playing))
+                        samples.append((time.monotonic(), queue, alsa, playing, mono, due))
                         last = seq
                 time.sleep(0.001)
         thread = threading.Thread(target=sample, daemon=True)
@@ -384,6 +386,13 @@ def scenario_start_path_keeps_the_page_fresh(directory):
         starting = [s for s in samples if s[1] >= PERIOD_FRAMES and s[3] == 0 and s[2] == 0]
         assert starting, "no truthful 'starting' snapshot (not draining, first period queued, ALSA empty)"
         assert samples[-1][3] == 1, "the engine never reported playing"
+        # Every starting snapshot says when the PCM is expected to drain (the
+        # first start of the process uses the default estimate, ahead of the
+        # snapshot); a draining snapshot carries none.
+        assert all(s[5] > s[4] for s in starting), "starting snapshot without a start time"
+        assert all(s[5] == 0 for s in samples if s[3] == 1), "playing snapshot with a start time"
+        assert all(abs((s[5] - s[4]) / 1e6 - 1200) < 1000 for s in starting)
+        assert len({s[5] for s in starting}) == 1, "the expected start time moved during one start"
     finally:
         rig.close()
 
@@ -400,6 +409,26 @@ def scenario_source_contract():
     assert re.search(r"g_airplay_drop_pending = 0;\n\t\tairplay_delay_publish\(NULL, sources\);\n\t\t/\* The clock domain",
                      loop), "a fresh PCM must clear the pending drop"
     assert loop.count("airplay_delay_publish(NULL, sources);") >= 7, "start path publishes"
+    # The expected start time is set before the first starting publish and is
+    # cleared on every way out of the start path: each failure, the idle
+    # publish, the first playing publish and the end of the playback loop.
+    start = loop.index("g_output_start_due_ns = start_began_ns + g_output_start_est_ns;")
+    first_playing = loop.index("airplay_delay_publish(pcm, sources);", start)
+    block = loop[start:first_playing]
+    assert block.index("airplay_delay_publish(NULL, sources);") > 0
+    for exit_point in ("output arm failed", "unavailable: %s", "playback start failed"):
+        at = block.index(exit_point)
+        assert "g_output_start_due_ns = 0;" in block[at:at + 400], f"{exit_point} must clear the start time"
+    assert block.count("continue;") == 3, "a new exit from the start path must clear the start time"
+    assert block.count("g_output_start_due_ns = 0;") == 3 + 1  # three failures + the success path
+    assert "g_output_start_due_ns = 0;\n\t\tairplay_delay_publish(pcm, sources);" in loop[start:]
+    top = loop.index("while (!stopping) {")
+    assert "g_output_start_due_ns = 0;\n\t\tairplay_delay_publish(NULL, sources);\n\t\tif (poll_sources_ex" \
+        in loop[top:start], "the idle publish must carry no start time"
+    after_loop = loop[loop.index("SENDSPIN_TRACE(\"close\")") - 120:loop.index("SENDSPIN_TRACE(\"close\")")]
+    assert "g_output_start_due_ns = 0;" in after_loop
+    publish = text[text.index("static void airplay_delay_publish"):text.index("static void output_start_measured")]
+    assert "pcm ? 0 : g_output_start_due_ns" in publish, "only no-PCM publishes carry the start time"
     body = text[text.index("static void drop_airplay_downstream"):text.index("static int service_airplay_reset")]
     assert "pcm_stop(pcm)" in body and "pcm_prepare(pcm)" in body
     for other in ("idle_periods > 0", "have_generation", "sendspin_live"):
