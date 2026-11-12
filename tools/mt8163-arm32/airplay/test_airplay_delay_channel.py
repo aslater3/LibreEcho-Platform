@@ -60,6 +60,14 @@ int main(void)
     assert(sizeof(struct le_ad_engine) <= LE_AD_PAGE_SIZE);
     assert(sizeof(struct le_ad_bridge) <= LE_AD_PAGE_SIZE);
     assert(sizeof(struct le_ad_read) <= LE_AD_PAGE_SIZE);
+    /* The bridge page layout is read by older Shairport builds: pin it. */
+    assert(offsetof(struct le_ad_bridge, downstream_frames) == 16);
+    assert(offsetof(struct le_ad_bridge, playing) == 20);
+    assert(offsetof(struct le_ad_bridge, valid) == 24);
+    assert(offsetof(struct le_ad_bridge, reason) == 28);
+    assert(offsetof(struct le_ad_bridge, flush_done) == 48);
+    assert(offsetof(struct le_ad_bridge, start_frames) == 60);
+    assert(sizeof(struct le_ad_bridge) == LE_AD_PAGE_SIZE);
     memset(&ctx, 0, sizeof(ctx));
 
     /* First sight of an engine re-bases the byte counters on the live FIFO. */
@@ -167,7 +175,7 @@ int main(void)
         assert(fd >= 0); close(fd);
         memset(&pub, 0, sizeof(pub));
         assert(le_ad_engine_open(&pub, path) == 0);
-        le_ad_engine_publish(&pub, le_ad_now_ns(), 0, 0, 0, 1, 0);
+        le_ad_engine_publish(&pub, le_ad_now_ns(), 0, 0, 0, 1, 0, 0);
         le_ad_bridge_open(&bridge, "/tmp/le-ad-busy-bridge-page", path);
         assert(le_ad_bridge_update(&bridge, le_ad_now_ns(), 0, 0, 0, &parts) == LE_AD_OK);
         le_ad_write_begin(pub.page);  /* the engine "is publishing" for good */
@@ -185,6 +193,132 @@ int main(void)
         assert(le_ad_bridge_update(&bridge, le_ad_now_ns(), 0, 0, 0, &parts) == LE_AD_NO_ENGINE);
         le_ad_bridge_close(&bridge);
         unlink("/tmp/le-ad-busy-bridge-page");
+    }
+    /* Output start (issue #356).  An engine that is not draining and expects
+     * its PCM to start at start_due_ns: the wait left is added as frames and
+     * the snapshot is trusted for longer than LE_AD_STALE_NS. */
+    memset(&ctx, 0, sizeof(ctx));
+    e = engine(t0, 0, 4096, 0, 1, 0);
+    e.start_due_ns = t0 + 1000 * ms;
+    /* 1. older than 250 ms, younger than 4 s: accepted; queued + remaining wait. */
+    assert(le_ad_downstream(&ctx, &e, t0 + 300 * ms, 0, 0, 100, &p) == LE_AD_OK);
+    assert(p.start_frames == 700 * 48 && !p.playing);
+    assert(p.downstream_frames == 100 + 4096 + 700 * 48);
+    assert(le_ad_downstream(&ctx, &e, t0 + 3999 * ms, 0, 0, 0, &p) == LE_AD_OK);
+    assert(p.start_frames == 0 && p.downstream_frames == 4096);
+    /* 2. no wait left at or past the due time, never negative or wrapped. */
+    assert(le_ad_downstream(&ctx, &e, t0 + 1000 * ms, 0, 0, 0, &p) == LE_AD_OK);
+    assert(p.start_frames == 0 && p.downstream_frames == 4096);
+    assert(le_ad_downstream(&ctx, &e, t0 + 1001 * ms, 0, 0, 0, &p) == LE_AD_OK);
+    assert(p.start_frames == 0 && p.downstream_frames == 4096);
+    e.start_due_ns = t0 + 100000ULL * ms;  /* an absurd due time is bounded */
+    assert(le_ad_downstream(&ctx, &e, t0, 0, 0, 0, &p) == LE_AD_OK);
+    assert(p.start_frames == LE_AD_START_MAX_NS * LE_AD_RATE / 1000000000ULL);
+    e.start_due_ns = t0 + 1000 * ms;
+    /* 3. older than LE_AD_START_MAX_NS: stale. */
+    assert(le_ad_downstream(&ctx, &e, t0 + 4000 * ms, 0, 0, 0, &p) == LE_AD_OK);
+    assert(le_ad_downstream(&ctx, &e, t0 + 4001 * ms, 0, 0, 0, &p) == LE_AD_ENGINE_STALE);
+    /* 4. not starting, not playing, older than 250 ms: still stale. */
+    e.start_due_ns = 0;
+    assert(le_ad_downstream(&ctx, &e, t0 + 251 * ms, 0, 0, 0, &p) == LE_AD_ENGINE_STALE);
+    assert(le_ad_downstream(&ctx, &e, t0 + 250 * ms, 0, 0, 0, &p) == LE_AD_OK);
+    assert(p.start_frames == 0);
+    /* 5. a draining snapshot ignores start_due_ns, even a stale-looking one. */
+    e = engine(t0, 0, 2000, 3000, 1, 1);
+    e.start_due_ns = t0 + 1000 * ms;
+    assert(le_ad_downstream(&ctx, &e, t0 + 50 * ms, 0, 0, 0, &p) == LE_AD_OK);
+    assert(p.start_frames == 0 && p.downstream_frames == 5000 - 2400);
+    assert(le_ad_downstream(&ctx, &e, t0 + 251 * ms, 0, 0, 0, &p) == LE_AD_ENGINE_STALE);
+    /* The publisher never writes a start time for a draining snapshot. */
+    {
+        char path[] = "/tmp/le-ad-start-XXXXXX";
+        struct le_ad_engine_pub pub;
+        struct le_ad_reader r;
+        struct le_ad_engine copy;
+        int fd = mkstemp(path);
+        assert(fd >= 0); close(fd);
+        memset(&pub, 0, sizeof(pub));
+        memset(&r, 0, sizeof(r));
+        assert(le_ad_engine_open(&pub, path) == 0);
+        /* A page no writer has touched (an older engine) has start_due_ns 0. */
+        assert(le_ad_read_page(pub.page, &copy, sizeof(copy), LE_AD_MAGIC_ENGINE) == 0);
+        assert(copy.start_due_ns == 0);
+        le_ad_engine_publish(&pub, t0, 0, 4096, 0, 1, 0, t0 + 1000 * ms);
+        assert(le_ad_reader_get(&r, path, 0));
+        assert(le_ad_read_page(r.map, &copy, sizeof(copy), LE_AD_MAGIC_ENGINE) == 0);
+        assert(copy.start_due_ns == t0 + 1000 * ms && !copy.playing);
+        le_ad_engine_publish(&pub, t0, 0, 4096, 0, 1, 1, t0 + 1000 * ms);
+        assert(le_ad_read_page(r.map, &copy, sizeof(copy), LE_AD_MAGIC_ENGINE) == 0);
+        assert(copy.start_due_ns == 0 && copy.playing);
+        le_ad_reader_close(&r);
+        le_ad_engine_close(&pub);
+        unlink(path);
+    }
+    /* The bridge carries the wait on its page and zero when not valid. */
+    {
+        char path[] = "/tmp/le-ad-start-bridge-XXXXXX";
+        struct le_ad_bridge_ctx bridge;
+        struct le_ad_bridge copy;
+        int fd = mkstemp(path);
+        assert(fd >= 0); close(fd);
+        memset(&bridge, 0, sizeof(bridge));
+        le_ad_bridge_open(&bridge, path, "/nonexistent/engine-page");
+        memset(&p, 0, sizeof(p));
+        p.downstream_frames = 9000; p.start_frames = 4800;
+        le_ad_bridge_publish(&bridge, t0, LE_AD_OK, &p);
+        assert(le_ad_read_page(bridge.page, &copy, sizeof(copy), LE_AD_MAGIC_BRIDGE) == 0);
+        assert(copy.valid && copy.start_frames == 4800 && copy.downstream_frames == 9000);
+        le_ad_bridge_publish(&bridge, t0, LE_AD_ENGINE_STALE, &p);
+        assert(le_ad_read_page(bridge.page, &copy, sizeof(copy), LE_AD_MAGIC_BRIDGE) == 0);
+        assert(!copy.valid && copy.start_frames == 0 && copy.downstream_frames == 0);
+        le_ad_bridge_close(&bridge);
+        unlink(path);
+    }
+    /* 6. Shairport side: with nothing draining only the start wait runs down. */
+    memset(&b, 0, sizeof(b));
+    b.magic = LE_AD_MAGIC_BRIDGE; b.mono_ns = t0; b.valid = 1;
+    b.downstream_frames = 4096 + 48000; b.start_frames = 48000;
+    assert(le_ad_delay_from_snapshot(&b, t0, 300, &d) == LE_AD_OK && d == 300 + 4096 + 48000);
+    assert(le_ad_delay_from_snapshot(&b, t0 + 100 * ms, 300, &d) == LE_AD_OK &&
+           d == 300 + 4096 + 48000 - 4800);
+    /* bounded by start_frames: the queued frames never run down. */
+    assert(le_ad_delay_from_snapshot(&b, t0 + 249 * ms, 300, &d) == LE_AD_OK &&
+           d == 300 + 4096 + 48000 - 249 * 48);
+    b.start_frames = 4800;
+    b.downstream_frames = 4096 + 4800;
+    assert(le_ad_delay_from_snapshot(&b, t0 + 200 * ms, 300, &d) == LE_AD_OK &&
+           d == 300 + 4096);
+    assert(le_ad_delay_from_snapshot(&b, t0 + 251 * ms, 300, &d) == LE_AD_STALE);
+    /* A page from before this field (start_frames 0) is the old behaviour. */
+    b.start_frames = 0; b.downstream_frames = 4096;
+    assert(le_ad_delay_from_snapshot(&b, t0 + 200 * ms, 300, &d) == LE_AD_OK && d == 300 + 4096);
+    /* Playing: unchanged, start_frames is not used. */
+    b.playing = 1; b.start_frames = 4800; b.downstream_frames = 9000;
+    assert(le_ad_delay_from_snapshot(&b, t0 + 100 * ms, 0, &d) == LE_AD_OK && d == 9000 - 4800);
+    /* 7. Continuity: the figure just before the start instant equals the
+     * figure just after it.  The engine promises the PCM at t0 + 1000 ms with
+     * 4096 frames queued.  Before: queued + the wait left.  After the PCM
+     * started at that instant (the first period moved to ALSA, 100 ms old at
+     * the snapshot): queued + ALSA, decayed at the DAC rate. */
+    {
+        const uint64_t due = t0 + 1000 * ms, step = 1000000ULL;
+        long before, after;
+        struct le_ad_engine pre = engine(t0, 0, 4096, 0, 1, 0);
+        struct le_ad_engine post;
+
+        pre.start_due_ns = due;
+        memset(&ctx, 0, sizeof(ctx));
+        assert(le_ad_downstream(&ctx, &pre, due - step, 0, 0, 0, &p) == LE_AD_OK);
+        before = (long)p.downstream_frames;
+        /* 2048 queued, 2048 handed to ALSA at the start instant, snapshot
+         * taken 1 ms later with 48 of them already played; read 1 ms after. */
+        post = engine(due + step, 0, 2048, 2048 - 48, 1, 1);
+        memset(&ctx, 0, sizeof(ctx));
+        assert(le_ad_downstream(&ctx, &post, due + 2 * step, 0, 0, 0, &p) == LE_AD_OK);
+        after = (long)p.downstream_frames;
+        /* The two readings are 3 ms apart: exactly 3 ms of drain (144 frames),
+         * not a step of the size of the start wait or of a period. */
+        assert(before - after == 3 * 48);
     }
     puts("math ok");
     return 0;
@@ -258,7 +392,56 @@ int main(int argc, char **argv)
     /* PCM closed: nothing queued in ALSA, nothing draining. */
     airplay_delay_publish(NULL, buses);
     e = snap(path);
-    assert(!e.playing && e.alsa_frames == 0 && e.alsa_valid);
+    assert(!e.playing && e.alsa_frames == 0 && e.alsa_valid && e.start_due_ns == 0);
+
+    /* A start in progress publishes when the PCM is expected to drain, only
+     * with no PCM; a published PCM (draining) never carries it. */
+    g_output_start_due_ns = le_ad_now_ns() + 1200000000ULL;
+    airplay_delay_publish(NULL, buses);
+    e = snap(path);
+    assert(!e.playing && e.start_due_ns == g_output_start_due_ns);
+    airplay_delay_publish(&pcm, buses);
+    e = snap(path);
+    assert(e.playing && e.start_due_ns == 0);
+    g_output_start_due_ns = 0;
+    airplay_delay_publish(NULL, buses);
+    e = snap(path);
+    assert(e.start_due_ns == 0);
+
+    /* The start duration is measured to the instant the PCM began consuming:
+     * the first publish's ALSA time minus what had drained by then. */
+    {
+        uint64_t began = le_ad_now_ns() - 1500000000ULL;
+        struct pcm first = { 4096 - 970, 0, 0 };   /* one period, 1078 frames played */
+
+        airplay_delay_publish(&first, buses);
+        output_start_measured(began);
+        /* ~1.5 s since `began`, minus 1078 / 48 kHz = 22.46 ms. */
+        assert(g_output_start_est_ns > 1470000000ULL - 20000000ULL &&
+               g_output_start_est_ns < 1480000000ULL + 20000000ULL);
+        /* Two periods in the ring (2996 left): drained 1100 frames. */
+        first.avail = 4096 - 2996;
+        airplay_delay_publish(&first, buses);
+        output_start_measured(began);
+        assert(g_output_start_est_ns > 1477000000ULL - 20000000ULL &&
+               g_output_start_est_ns < 1478000000ULL + 20000000ULL);
+        /* An unknown ALSA level keeps the estimate; so does a start whose
+         * publish is not after its beginning; the range is clamped. */
+        g_output_start_est_ns = 777000000ULL;
+        first.fail = 1;
+        airplay_delay_publish(&first, buses);
+        output_start_measured(began);
+        assert(g_output_start_est_ns == 777000000ULL);
+        first.fail = 0;
+        airplay_delay_publish(&first, buses);
+        output_start_measured(le_ad_now_ns() + 1000000000ULL);
+        assert(g_output_start_est_ns == 777000000ULL);
+        output_start_measured(le_ad_now_ns() - 10000000ULL);
+        assert(g_output_start_est_ns == OUTPUT_START_MIN_NS);
+        output_start_measured(le_ad_now_ns() - 20000000000ULL);
+        assert(g_output_start_est_ns == OUTPUT_START_MAX_NS);
+        g_output_start_est_ns = OUTPUT_START_DEFAULT_NS;
+    }
 
     /* A failed ALSA query is reported as unknown, never as zero. */
     pcm.fail = 1;
@@ -323,9 +506,10 @@ def read_bridge_page(path):
     for _ in range(50):
         magic, seq, at, down, playing, valid, reason, pend, fifo, queue, alsa = \
             struct.unpack("<IIQIIIIIIII", raw[:48])
+        start = struct.unpack("<I", raw[60:64])[0]
         if seq % 2 == 0:
-            return dict(seq=seq, at=at, down=down, playing=playing, valid=valid, reason=reason,
-                        pend=pend, fifo=fifo, queue=queue, alsa=alsa)
+            return dict(seq=seq, at=at, down=down, start=start, playing=playing, valid=valid,
+                        reason=reason, pend=pend, fifo=fifo, queue=queue, alsa=alsa)
         raw = path.read_bytes()
     raise AssertionError("bridge page stuck mid-update")
 

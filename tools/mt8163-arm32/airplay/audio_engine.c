@@ -1479,6 +1479,27 @@ static int poll_sources(struct source_bus *sources, int timeout_ms)
 static uint64_t g_airplay_media_read_bytes;
 static struct le_ad_engine_pub g_airplay_delay;
 
+/*
+ * Output start time (issue #356).  Starting the output (arm, open, prepare,
+ * verify, power, first write) blocks this single thread for about a second
+ * (mostly one codec-driver prepare), so no snapshot can be published meanwhile
+ * and the AirPlay delay would otherwise go stale and ignore the wait.  While
+ * g_output_start_due_ns is set, "starting" snapshots carry it: the monotonic
+ * time at which the PCM is expected to start draining.  The expectation is the
+ * duration measured on the previous successful start (RAM only), initially a
+ * deliberately short default: promising too little wait is the benign error.
+ */
+#define OUTPUT_START_DEFAULT_NS 1200000000ULL
+#define OUTPUT_START_MIN_NS 50000000ULL
+#define OUTPUT_START_MAX_NS 3000000000ULL
+static uint64_t g_output_start_est_ns = OUTPUT_START_DEFAULT_NS;
+static uint64_t g_output_start_due_ns;
+/* The last publish that had a PCM: when its ALSA level was true, the level and
+ * whether it is a real measurement. */
+static uint64_t g_pcm_publish_at;
+static uint32_t g_pcm_publish_alsa;
+static int g_pcm_publish_valid;
+
 static void airplay_delay_publish(struct pcm *pcm,
 				  const struct source_bus *sources)
 {
@@ -1509,9 +1530,57 @@ static void airplay_delay_publish(struct pcm *pcm,
 			alsa_valid = 0;
 		}
 	}
+	if (pcm) {
+		g_pcm_publish_at = at;
+		g_pcm_publish_alsa = alsa;
+		g_pcm_publish_valid = alsa_valid;
+	}
 	le_ad_engine_publish(&g_airplay_delay, at, g_airplay_media_read_bytes,
 			     (uint32_t)(ap->received / (INPUT_CHANNELS * sizeof(int16_t))),
-			     alsa, alsa_valid, playing);
+			     alsa, alsa_valid, playing,
+			     pcm ? 0 : g_output_start_due_ns);
+}
+
+/*
+ * Called right after the first publish with the started PCM; start_ns is when
+ * the start began.  Learns how long a start takes, defined as the time until
+ * the PCM actually began consuming frames, so the delay reported before and
+ * after that instant is the same figure:
+ *
+ * - Before it, a "starting" snapshot reports the queued frames plus the wait
+ *   (due - now), so it falls with time down to the queued frames at the due
+ *   time.
+ * - After it, the snapshot reports queued + ALSA frames and falls at the DAC
+ *   rate from the moment draining began.
+ *
+ * The PCM is opened with start_threshold 1, so draining begins with the first
+ * write; write_period() writes whole periods (silence_size 0: no prefill by the
+ * library), and the ALSA ring holds whole periods minus what has drained since.
+ * The drain of the first publish therefore is  periods * PERIOD_SIZE - alsa
+ * frames (periods = ceil(alsa / PERIOD_SIZE)), always less than one period
+ * because the publish follows the write by a few milliseconds.  The drain began
+ * that many frames before the level's timestamp, which gives the start instant.
+ * An unmeasured ALSA level keeps the previous estimate.
+ */
+static void output_start_measured(uint64_t start_ns)
+{
+	uint64_t periods, drained, drained_ns, at, begin, est;
+
+	if (!g_airplay_delay.page || !g_pcm_publish_valid || start_ns == 0)
+		return;
+	at = g_pcm_publish_at;
+	if (at <= start_ns)
+		return;
+	periods = (g_pcm_publish_alsa + PERIOD_SIZE - 1U) / PERIOD_SIZE;
+	drained = periods * PERIOD_SIZE - g_pcm_publish_alsa;
+	drained_ns = drained * 1000000000ULL / DEFAULT_RATE;
+	begin = at - start_ns > drained_ns ? at - drained_ns : start_ns;
+	est = begin - start_ns;
+	if (est < OUTPUT_START_MIN_NS)
+		est = OUTPUT_START_MIN_NS;
+	if (est > OUTPUT_START_MAX_NS)
+		est = OUTPUT_START_MAX_NS;
+	g_output_start_est_ns = est;
 }
 
 /* The dedicated AirPlay FIFO is never reclassified as generic media. */
@@ -2754,11 +2823,13 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 	while (!stopping) {
 		struct pcm *pcm = NULL;
 		unsigned int first_activity;
+		uint64_t start_began_ns = 0;
 		int ready;
 		int poll_timeout = 20; /* service resets even when all buses are idle */
 
 		/* Idle snapshot, taken before the wait: its FIFO counter and queue
 		 * are a consistent pair, and the poll bounds its age to one tick. */
+		g_output_start_due_ns = 0;
 		airplay_delay_publish(NULL, sources);
 		if (poll_sources_ex(sources, poll_timeout, 1) < 0)
 			break;
@@ -2806,10 +2877,15 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		 * engine reads no FIFO and writes no period for a while.  Publish a
 		 * truthful "starting" snapshot (PCM not draining, the first period
 		 * still queued, nothing in ALSA) between the steps so delay() keeps
-		 * answering instead of going stale (LE_AD_STALE_NS) (issue #356). */
+		 * answering instead of going stale (LE_AD_STALE_NS) (issue #356).
+		 * They also carry when the PCM is expected to start draining, which
+		 * covers the long blocking steps; every exit below clears it. */
+		start_began_ns = le_ad_now_ns();
+		g_output_start_due_ns = start_began_ns + g_output_start_est_ns;
 		airplay_delay_publish(NULL, sources);
 		if (arm_output_controls(card) < 0) {
 			fprintf(stderr, "audio-engine: output arm failed\n");
+			g_output_start_due_ns = 0;
 			clear_source_activity(sources, &announcement_led_active,
 					      &visualizer, &status);
 			continue;
@@ -2821,6 +2897,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			fprintf(stderr, "audio-engine: PCM %u,%u unavailable: %s\n",
 				card, device,
 				pcm ? pcm_get_error(pcm) : "open failed");
+			g_output_start_due_ns = 0;
 			if (pcm)
 				pcm_close(pcm);
 			(void)disable_output_controls(card);
@@ -2897,6 +2974,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		if (playback_start_failed) {
 			fprintf(stderr, "audio-engine: playback start failed: %s\n",
 				pcm_get_error(pcm));
+			g_output_start_due_ns = 0;
 			sendspin_close_timing(&g_sendspin);
 			(void)disable_output_controls(card);
 			pcm_close(pcm);
@@ -2906,7 +2984,9 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 		}
 		process_music_visualizer(&visualizer, sources);
 		consume_period(sources);
+		g_output_start_due_ns = 0;
 		airplay_delay_publish(pcm, sources);
+		output_start_measured(start_began_ns);
 
 		while (!stopping && sources_active(sources)) {
 			/* A live Sendspin generation paces every period itself
@@ -3000,6 +3080,7 @@ static int run_engine(const char *root, unsigned int card, unsigned int device)
 			consume_period(sources);
 			airplay_delay_publish(pcm, sources);
 		}
+		g_output_start_due_ns = 0;
 		airplay_delay_publish(NULL, sources);
 		SENDSPIN_TRACE("close");
 		clear_source_activity(sources, &announcement_led_active,

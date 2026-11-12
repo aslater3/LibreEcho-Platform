@@ -366,6 +366,7 @@ def scenario_status_file_is_fixed_size(directory):
             seen.add(fields["mono_ms"])
             for key in ("pipe_fill_frames", "bridge_remainder_frames", "media_fifo_frames",
                         "engine_queue_frames", "alsa_delay_frames", "downstream_frames",
+                        "delay_start_frames",
                         "shairport_delay_frames", "delay_fallbacks", "discards", "reopens",
                         "flushes", "flush_discarded_bytes", "flush_expired", "flush_engine_failed",
                         "flush_engine_unreset",

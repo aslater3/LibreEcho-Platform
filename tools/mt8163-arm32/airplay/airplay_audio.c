@@ -547,6 +547,7 @@ static void write_status(struct forwarder *f, int active)
 		     "engine_queue_frames=%u\n"
 		     "alsa_delay_frames=%u\n"
 		     "downstream_frames=%u\n"
+		     "delay_start_frames=%u\n"
 		     "delay_state=%s\n"
 		     "shairport_delay_frames=%lld\n"
 		     "shairport_delay_age_ms=%lld\n"
@@ -572,7 +573,8 @@ static void write_status(struct forwarder *f, int active)
 		     f->pending_len / FRAME_BYTES,
 		     (int)(fifo_bytes(f->output) / (int)FRAME_BYTES),
 		     f->parts.queue_frames, f->parts.alsa_frames,
-		     f->parts.downstream_frames, le_ad_reason_name(f->delay_reason),
+		     f->parts.downstream_frames, f->parts.start_frames,
+		     le_ad_reason_name(f->delay_reason),
 		     shairport_delay, age_ms, fallbacks, le_ad_reason_name(last_reason),
 		     (unsigned long long)f->discards, (unsigned long long)f->discarded_bytes,
 		     (unsigned long long)f->reopens,

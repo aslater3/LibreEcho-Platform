@@ -11,10 +11,15 @@
  *   <audio root>/airplay.engine-delay   written by libreecho-audio-engine
  *       cumulative bytes the engine has read from airplay-media.pcm, the
  *       frames queued inside the engine for the AirPlay bus, the frames
- *       queued in ALSA, a monotonic timestamp and a "draining" flag.
+ *       queued in ALSA, a monotonic timestamp and a "draining" flag.  While
+ *       the engine starts its output (arm, open, prepare, power, first
+ *       write; about 1.5 s on the Radar, mostly one blocking prepare) it is
+ *       not draining and cannot publish, so it also carries start_due_ns:
+ *       the monotonic time at which it expects the PCM to start draining.
  *   <airplay.pcm>.delay                 written by libreecho-airplay-audio
  *       downstream_frames = bridge remainder + airplay-media FIFO +
- *       engine queue + ALSA queue, at a monotonic timestamp.
+ *       engine queue + ALSA queue + the output-start wait still ahead
+ *       (start_frames), at a monotonic timestamp.
  *   <airplay.pcm>.delay-read            written by Shairport's pipe backend
  *       the delay() value it last read plus a fallback counter, for the
  *       bridge's status file and event lines.
@@ -27,6 +32,18 @@
  * Shairport's delay() then returns
  *     frames in airplay.pcm (FIONREAD, read at call time) + downstream
  * decayed by the time elapsed since the snapshot while the engine drains.
+ * Before the engine drains, only the start wait (start_frames, which is part
+ * of downstream) runs down with time: the queued frames stay put until the
+ * PCM starts, so the figure falls to the queued frames at start_due_ns and
+ * then keeps falling at the DAC rate, without a step.  The engine is a single
+ * thread blocked in the start, so a "starting" snapshot (not playing,
+ * start_due_ns != 0) stays true until its next publish and is trusted for up
+ * to LE_AD_START_MAX_NS instead of LE_AD_STALE_NS.  A page written by an
+ * engine without start_due_ns has zero there (pages are zero-filled), which
+ * is the old behaviour.  start_frames takes the last slot of the bridge page
+ * and no other field moved: a Shairport built without it still reads a valid
+ * figure while the output starts, it just does not run the wait down between
+ * bridge ticks.
  * Anything stale, missing or inconsistent makes delay() fail so Shairport
  * falls back to its previous no-delay() behaviour instead of using garbage.
  *
@@ -60,6 +77,11 @@
 /* A snapshot older than this is not trusted.  The engine publishes at least
  * every ~45 ms while playing and every 20 ms while idle. */
 #define LE_AD_STALE_NS 250000000ULL
+/* The longest a "starting" engine snapshot (not playing, start_due_ns != 0)
+ * is trusted: the engine cannot publish while it blocks in the output start,
+ * and a "not draining yet" figure stays true until its next publish.  Also
+ * the bound on the start wait a snapshot can claim. */
+#define LE_AD_START_MAX_NS 4000000000ULL
 #define LE_AD_PAGE_SIZE 64u
 #define LE_AD_MAGIC_ENGINE 0x3145454cu /* "LEE1" */
 #define LE_AD_MAGIC_BRIDGE 0x3142454cu /* "LEB1" */
@@ -111,6 +133,9 @@ struct le_ad_engine {
 	uint32_t alsa_frames;      /* frames queued in the ALSA ring at mono_ns */
 	uint32_t playing;          /* PCM open and draining the AirPlay bus */
 	uint32_t alsa_valid;       /* alsa_frames is a real measurement */
+	uint64_t start_due_ns;     /* CLOCK_MONOTONIC time at which the engine expects
+	                            * the PCM to start draining; 0 when no output
+	                            * start is in progress */
 };
 
 struct le_ad_bridge {
@@ -128,7 +153,11 @@ struct le_ad_bridge {
 	uint32_t flush_done;        /* last flush request the bridge has answered */
 	uint32_t flush_expired;     /* requests answered without a discard (too old) */
 	uint32_t flush_failed;      /* flushes where the engine could not be reset */
-	uint32_t flush_late;        /* flushes answered before the engine's post-reset snapshot */
+	uint32_t start_frames;      /* the part of downstream_frames that is the
+	                             * output-start wait at mono_ns; it runs down
+	                             * with time even though nothing is draining
+	                             * (in the slot flush_late used to have; that
+	                             * count lives in the bridge, not on the page) */
 };
 
 struct le_ad_read {
@@ -336,7 +365,8 @@ static inline int le_ad_engine_open(struct le_ad_engine_pub *pub, const char *pa
 static inline void le_ad_engine_publish(struct le_ad_engine_pub *pub,
 					uint64_t mono_ns, uint64_t media_read_bytes,
 					uint32_t queue_frames, uint32_t alsa_frames,
-					int alsa_valid, int playing)
+					int alsa_valid, int playing,
+					uint64_t start_due_ns)
 {
 	struct le_ad_engine *page = pub->page;
 
@@ -350,6 +380,8 @@ static inline void le_ad_engine_publish(struct le_ad_engine_pub *pub,
 	page->alsa_frames = alsa_valid ? alsa_frames : 0u;
 	page->alsa_valid = alsa_valid ? 1u : 0u;
 	page->playing = playing ? 1u : 0u;
+	/* Only a snapshot that is not draining has an output start ahead of it. */
+	page->start_due_ns = playing ? 0 : start_due_ns;
 	le_ad_write_end(page);
 }
 
@@ -369,6 +401,7 @@ struct le_ad_parts {
 	uint32_t alsa_frames;
 	uint32_t downstream_frames;
 	uint32_t playing;
+	uint32_t start_frames; /* output-start wait still ahead (part of downstream) */
 };
 
 struct le_ad_bridge_ctx {
@@ -397,6 +430,15 @@ static inline uint64_t le_ad_frames_for_ns(uint64_t ns)
 	return ns * LE_AD_RATE / 1000000000ULL;
 }
 
+/* Frames at LE_AD_RATE for an output-start wait, bounded by LE_AD_START_MAX_NS
+ * (le_ad_frames_for_ns() caps at one second, which is too short here). */
+static inline uint64_t le_ad_start_frames_for_ns(uint64_t ns)
+{
+	if (ns > LE_AD_START_MAX_NS)
+		ns = LE_AD_START_MAX_NS;
+	return ns * LE_AD_RATE / 1000000000ULL;
+}
+
 /* Combine an engine snapshot with the bridge's own counters.
  *
  * Bytes the bridge has written into airplay-media.pcm minus bytes the engine
@@ -405,6 +447,10 @@ static inline uint64_t le_ad_frames_for_ns(uint64_t ns)
  * re-bases the two counters whenever the engine restarts or the bridge starts
  * after it.  Everything past the pipe drains at the DAC rate while the engine
  * is playing the AirPlay bus, so the sum is decayed by the snapshot's age.
+ * A snapshot of an engine that is starting its output (not playing,
+ * start_due_ns set) adds the wait that is left until then, as frames, and is
+ * trusted for LE_AD_START_MAX_NS: nothing drains yet, so the queued frames
+ * stay as they are while the single-threaded engine is blocked.
  * Returns LE_AD_OK or the reason the number cannot be trusted. */
 static inline unsigned int le_ad_downstream(struct le_ad_bridge_ctx *ctx,
 					    const struct le_ad_engine *e,
@@ -414,11 +460,12 @@ static inline unsigned int le_ad_downstream(struct le_ad_bridge_ctx *ctx,
 					    struct le_ad_parts *parts)
 {
 	int64_t fifo_bytes;
-	uint64_t elapsed, total, consumed;
+	uint64_t elapsed, total, consumed, start_frames = 0;
+	int starting = !e->playing && e->start_due_ns != 0;
 
 	memset(parts, 0, sizeof(*parts));
 	elapsed = now_ns > e->mono_ns ? now_ns - e->mono_ns : 0;
-	if (elapsed > LE_AD_STALE_NS)
+	if (elapsed > (starting ? LE_AD_START_MAX_NS : LE_AD_STALE_NS))
 		return LE_AD_ENGINE_STALE;
 	if (e->playing && !e->alsa_valid)
 		return LE_AD_ALSA_UNKNOWN;
@@ -441,8 +488,11 @@ static inline unsigned int le_ad_downstream(struct le_ad_bridge_ctx *ctx,
 	parts->queue_frames = e->queue_frames;
 	parts->alsa_frames = e->alsa_frames;
 	parts->playing = e->playing ? 1u : 0u;
+	if (starting && e->start_due_ns > now_ns)
+		start_frames = le_ad_start_frames_for_ns(e->start_due_ns - now_ns);
+	parts->start_frames = (uint32_t)start_frames;
 	total = (uint64_t)pend_frames + parts->fifo_frames + e->queue_frames +
-		e->alsa_frames;
+		e->alsa_frames + start_frames;
 	consumed = e->playing ? le_ad_frames_for_ns(elapsed) : 0;
 	if (consumed > total)
 		consumed = total;
@@ -482,6 +532,7 @@ static inline void le_ad_bridge_publish(struct le_ad_bridge_ctx *ctx, uint64_t n
 	page->reason = reason;
 	page->downstream_frames = reason == LE_AD_OK ? parts->downstream_frames : 0;
 	page->playing = reason == LE_AD_OK ? parts->playing : 0;
+	page->start_frames = reason == LE_AD_OK ? parts->start_frames : 0;
 	page->pend_frames = parts->pend_frames;
 	page->fifo_frames = parts->fifo_frames;
 	page->queue_frames = parts->queue_frames;
@@ -489,7 +540,6 @@ static inline void le_ad_bridge_publish(struct le_ad_bridge_ctx *ctx, uint64_t n
 	page->flush_done = ctx->flush_done;
 	page->flush_expired = ctx->flush_expired;
 	page->flush_failed = ctx->flush_failed;
-	page->flush_late = ctx->flush_late;
 	le_ad_write_end(page);
 }
 
@@ -584,7 +634,14 @@ static inline unsigned int le_ad_delay_from_snapshot(const struct le_ad_bridge *
 	if (age > LE_AD_STALE_NS)
 		return LE_AD_STALE;
 	downstream = b->downstream_frames;
-	consumed = b->playing ? le_ad_frames_for_ns(age) : 0;
+	if (b->playing) {
+		consumed = le_ad_frames_for_ns(age);
+	} else {
+		/* Nothing drains yet; only the output-start wait runs down. */
+		consumed = le_ad_start_frames_for_ns(age);
+		if (consumed > b->start_frames)
+			consumed = b->start_frames;
+	}
 	if (consumed > downstream)
 		consumed = downstream;
 	*delay = (long)(pipe_frames + downstream - consumed);
