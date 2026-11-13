@@ -1487,9 +1487,12 @@ static struct le_ad_engine_pub g_airplay_delay;
  * g_output_start_due_ns is set, "starting" snapshots carry it: the monotonic
  * time at which the PCM is expected to start draining.  The expectation is the
  * duration measured on the previous successful start (RAM only), initially a
- * deliberately short default: promising too little wait is the benign error.
+ * default for the first start after the engine starts.  A short promise is not
+ * harmless: on the Radar a 1.2 s default against a 1.45 s start made Shairport
+ * drop ~37 late packets on that first session.  Radar and Dot both measure
+ * 1.43-1.51 s, so the default sits at the top of that range.
  */
-#define OUTPUT_START_DEFAULT_NS 1200000000ULL
+#define OUTPUT_START_DEFAULT_NS 1500000000ULL
 #define OUTPUT_START_MIN_NS 50000000ULL
 #define OUTPUT_START_MAX_NS 3000000000ULL
 static uint64_t g_output_start_est_ns = OUTPUT_START_DEFAULT_NS;

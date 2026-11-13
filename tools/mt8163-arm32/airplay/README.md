@@ -100,7 +100,8 @@ starts (arm, open, prepare, verify, power, first write) the engine publishes a
 "starting" snapshot between the steps (not draining, the first period queued,
 nothing in ALSA), so `delay()` stays answerable instead of going stale. The
 snapshot also carries the monotonic time at which the engine expects the PCM to
-start draining (the duration of the previous start, 1.2 s for the first). The
+start draining (the duration of the previous start, 1.5 s for the first; Radar
+and Dot both measure 1.43-1.51 s). The
 bridge adds the wait still ahead to `downstream_frames` (`delay_start_frames`
 in `airplay.status`), and the figure falls at 48 kHz from that time on without
 a step. A "starting" snapshot is trusted for up to 4 s because the blocked
