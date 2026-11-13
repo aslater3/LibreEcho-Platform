@@ -475,6 +475,69 @@ ota_confirm_error_token()
     printf '%s\n' "${confirm_token:-ERROR:confirm-failed-no-detail}"
 }
 
+# `libreecho-update confirm` fails `update_busy` while another updater process
+# holds the install lock.  In THIS boot that holder is normally a
+# `libreecho-update-fetch` that is resolving the release over the network
+# (mirror probe 20 s + release pointer 60 s, see select_release_source and
+# read_dev_release_pointer), which releases the lock before it downloads.  A
+# healthy candidate must not be restarted -- burning one of its boot tries --
+# for that, so a busy lock held by this boot is waited out: retry every 5 s
+# for up to 120 s (the ~80 s worst-case resolve plus margin), logging the wait
+# once.  A lock tagged with an EARLIER boot is not waited for (the updater
+# reclaims those itself); an untagged lock can only be this boot's here
+# because the early-boot sweep already removed older ones, so it is waited for
+# too.  A lock already gone is retried once at once.  Any other failure, or a
+# lock still held after the window, returns the
+# confirm's own failure unchanged.  Health checks, tries and the confirm
+# sequence are not touched.
+ota_confirm_with_lock_wait()
+{
+    confirm_wait_max=120
+    confirm_wait_step=5
+    confirm_waited=0
+    confirm_wait_logged=0
+    confirm_gone_retry=0
+    while :; do
+        if /usr/local/sbin/libreecho-update confirm >/tmp/ota-confirm.log 2>&1; then
+            return 0
+        fi
+        [ "$(ota_confirm_error_token /tmp/ota-confirm.log)" = ERROR:update_busy ] || return 1
+        [ "$confirm_waited" -lt "$confirm_wait_max" ] || return 1
+        confirm_lock=/data/libreecho/update/install.lock
+        confirm_lock_owner=untagged
+        if [ ! -d "$confirm_lock" ]; then
+            # Released between the failure and now: retry once at once, and
+            # fail as before if it is still busy with nothing to wait for.
+            [ "$confirm_gone_retry" -eq 0 ] || return 1
+            confirm_gone_retry=1
+            continue
+        fi
+        if [ -f "$confirm_lock/owner" ] && [ ! -L "$confirm_lock/owner" ]; then
+            confirm_lock_size=$($BB stat -c %s "$confirm_lock/owner" 2>/dev/null)
+            case "$confirm_lock_size" in
+                ''|*[!0-9]*) confirm_lock_size=513 ;;
+            esac
+            if [ "$confirm_lock_size" -le 512 ]; then
+                confirm_lock_tag=$($BB sed -n 's/^owner=//p' "$confirm_lock/owner" 2>/dev/null |
+                    $BB head -n 1 | $BB tr -cd 'A-Za-z0-9_-' | $BB cut -c 1-32)
+                [ -z "$confirm_lock_tag" ] || confirm_lock_owner=$confirm_lock_tag
+                confirm_lock_boot=$($BB sed -n 's/^boot_id=//p' "$confirm_lock/owner" 2>/dev/null |
+                    $BB head -n 1)
+                confirm_now_boot=$($BB cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+                if [ -n "$confirm_lock_boot" ] && [ "$confirm_lock_boot" != "$confirm_now_boot" ]; then
+                    return 1
+                fi
+            fi
+        fi
+        if [ "$confirm_wait_logged" -eq 0 ]; then
+            log "ota-confirm-lock-wait:$confirm_lock_owner"
+            confirm_wait_logged=1
+        fi
+        $BB sleep "$confirm_wait_step"
+        confirm_waited=$((confirm_waited + confirm_wait_step))
+    done
+}
+
 # The kernel already carries ramoops/pstore and pmsg support, but this reduced
 # userspace previously mounted neither pstore nor the dynamically allocated
 # pmsg character device. Materialise both without assuming a fixed major.
@@ -3413,8 +3476,10 @@ ota_health_confirm_worker()
         return 0
     fi
 
+    # The confirm is `libreecho-update confirm`; it waits out a busy install lock
+    # held by this boot's fetcher (see ota_confirm_with_lock_wait).
     if [ "$passed" -eq 3 ] &&
-       /usr/local/sbin/libreecho-update confirm >/tmp/ota-confirm.log 2>&1; then
+       ota_confirm_with_lock_wait; then
         log ota-slot-confirmed
         pmsg_marker ota-slot-confirmed
         bh_state=confirmed

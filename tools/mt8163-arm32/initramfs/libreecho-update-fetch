@@ -1296,6 +1296,13 @@ check_or_install()
 {
     requested_action=$1
     require_environment
+    # While an update awaits confirmation the answer is always
+    # update_already_pending (download_and_inspect would say it after the
+    # network resolve).  Say it BEFORE taking any lock: this check/install can
+    # never need the install lock then, and holding it for the length of the
+    # release resolve made the health worker's `libreecho-update confirm`
+    # fail update_busy and restart a healthy candidate.
+    [ ! -r "$ROOT/pending" ] || die update_already_pending
     fetch_lock
     install_lock
     seed_channel

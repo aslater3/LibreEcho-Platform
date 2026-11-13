@@ -236,5 +236,106 @@ class EarlyBootSweepTests(Fixture):
         self.assertIn("CHECK_OK", result.stdout)
 
 
+class PendingCheckTakesNoLockTests(Fixture):
+    """A check/install while an update awaits confirmation never locks."""
+
+    def run_check(self, action: str = "check") -> subprocess.CompletedProcess:
+        source = FETCH.read_text()
+        source = source[:source.rfind('case "${1:-}" in')]
+        source = source.replace("ROOT=/data/libreecho/update", f"ROOT={self.update}")
+        # Fail loudly if anything past the pending gate runs or locks.
+        entry = (f"RUN_ROOT={self.root}/run\n"
+                 "require_environment() { $BB mkdir -p \"$RUN_ROOT/libreecho\"; }\n"
+                 "fetch_lock() { echo LOCKED_FETCH >&2; exit 97; }\n"
+                 "install_lock() { echo LOCKED_INSTALL >&2; exit 98; }\n"
+                 f"check_or_install {action}\n")
+        return self.sh(source + "\n" + entry)
+
+    def test_check_while_pending_reports_pending_without_locking(self) -> None:
+        (self.update / "pending").write_text("schema=3\nslot=b\n")
+        for action in ("check", "install", "auto-install"):
+            with self.subTest(action=action):
+                result = self.run_check(action)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("ERROR:update_already_pending", result.stderr)
+                self.assertNotIn("LOCKED", result.stderr)
+                self.assertFalse(self.lock.exists())
+                status = (self.update / "check-status").read_text()
+                self.assertIn("status=error", status)
+                self.assertIn("error=update_already_pending", status)
+
+    def test_check_without_pending_still_takes_the_locks(self) -> None:
+        result = self.run_check()
+        self.assertEqual(result.returncode, 97, result.stderr)
+
+
+class ConfirmLockWaitTests(Fixture):
+    """The health worker's confirm waits out a same-boot fetcher's lock."""
+
+    def run_confirm(self, release_after: float | None, tag: str | None = "update-fetch",
+                    boot: str = "boot-aaaa") -> subprocess.CompletedProcess:
+        stub = self.root / "libreecho-update"
+        stub.write_text(
+            "#!/bin/sh\n"
+            f'if [ -d "{self.lock}" ]; then echo ERROR:update_busy >&2; exit 1; fi\n'
+            f'echo confirmed >> "{self.root}/confirms"\nexit 0\n')
+        stub.chmod(0o755)
+        init = INIT.read_text()
+        body = (function_text(init, "ota_confirm_with_lock_wait") + function_text(init, "ota_confirm_error_token"))
+        body = (body.replace("/usr/local/sbin/libreecho-update", str(stub))
+                    .replace("/tmp/ota-confirm.log", str(self.root / "confirm.log"))
+                    .replace("/data/libreecho/update", str(self.update))
+                    .replace("confirm_wait_max=120", "confirm_wait_max=3")
+                    .replace("confirm_wait_step=5", "confirm_wait_step=1"))
+        self.plant(tag, boot if tag else None)
+        release = ""
+        if release_after is not None:
+            release = f'( sleep {release_after}; rm -rf "{self.lock}" ) &\n'
+        script = (f'BB={BB}\nlog() {{ echo "$1" >> "{self.root}/log"; }}\n' + body + release
+                  + "ota_confirm_with_lock_wait\necho rc=$?\nwait\n")
+        return self.sh(script)
+
+    def log_lines(self) -> list[str]:
+        path = self.root / "log"
+        return path.read_text().splitlines() if path.exists() else []
+
+    def test_confirm_waits_and_succeeds_when_the_lock_is_released(self) -> None:
+        result = self.run_confirm(release_after=1.5)
+        self.assertIn("rc=0", result.stdout, result.stderr)
+        self.assertEqual((self.root / "confirms").read_text(), "confirmed\n")
+        self.assertEqual(self.log_lines(), ["ota-confirm-lock-wait:update-fetch"])
+
+    def test_confirm_fails_unchanged_when_the_lock_is_never_released(self) -> None:
+        result = self.run_confirm(release_after=None)
+        self.assertIn("rc=1", result.stdout, result.stderr)
+        self.assertFalse((self.root / "confirms").exists())
+        self.assertEqual(self.log_lines(), ["ota-confirm-lock-wait:update-fetch"])
+        self.assertIn("ERROR:update_busy", (self.root / "confirm.log").read_text())
+
+    def test_lock_from_an_earlier_boot_is_not_waited_for(self) -> None:
+        result = self.run_confirm(release_after=None, boot="boot-old")
+        self.assertIn("rc=1", result.stdout, result.stderr)
+        self.assertEqual(self.log_lines(), [])
+
+    def test_untagged_lock_is_waited_for(self) -> None:
+        result = self.run_confirm(release_after=1.5, tag=None)
+        self.assertIn("rc=0", result.stdout, result.stderr)
+        self.assertEqual(self.log_lines(), ["ota-confirm-lock-wait:untagged"])
+
+    def test_confirm_succeeds_when_the_lock_is_already_gone(self) -> None:
+        (self.root / "libreecho-update").write_text("")
+        result = self.run_confirm(release_after=0)
+        self.assertIn("rc=0", result.stdout, result.stderr)
+
+    def test_window_covers_the_fetch_resolve_timeouts(self) -> None:
+        init = INIT.read_text()
+        fetch = FETCH.read_text()
+        self.assertIn("confirm_wait_max=120", init)
+        self.assertIn("confirm_wait_step=5", init)
+        # mirror probe (20 s) + release pointer (60 s) is the lock-held span.
+        self.assertIn('bounded_curl "$probe" "$CURL_HEADERS" 64 20 ', fetch)
+        self.assertIn('bounded_curl "$pointer" "$CURL_HEADERS" 257 60 ', fetch)
+
+
 if __name__ == "__main__":
     unittest.main()
