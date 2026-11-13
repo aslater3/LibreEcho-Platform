@@ -1004,9 +1004,55 @@ userdata_mount()
 # whether the migration/cleanup helper was happy; it is advisory.  A cleanup
 # failure must never stop the device booting, reporting health or networking --
 # userdata is the user's to modify.
+# The OTA install lock (/data/libreecho/update/install.lock) is persistent, so a
+# reboot or power loss while an updater held it -- for example inside
+# `libreecho-update confirm`, after the bootloader confirm and before the state
+# write -- leaves it behind and every later update check fails `update_busy`.
+# This runs once, right after /data is mounted and before anything that can
+# take the lock exists in this boot: the OTA health worker, the update web
+# API, `libreecho-update-fetch`, the first-install adoption and the
+# rollback-resume worker are all started later by this script, and no process
+# of an earlier boot survives.  So any lock found here was left by an earlier
+# boot and is removed, tagged or not (untagged = an updater without the tag,
+# or a crash between mkdir and the tag write).  A lock tagged with the CURRENT
+# boot_id is never touched (cannot happen at this point; kept as a guard
+# against this function ever running later).  The rollback-resume worker takes
+# and tags its own lock later in the boot and is unaffected.
+ota_stale_install_lock_sweep()
+{
+    sweep_lock=/data/libreecho/update/install.lock
+    [ -d "$sweep_lock" ] && [ ! -L "$sweep_lock" ] || return 0
+    sweep_owner=untagged
+    if [ -f "$sweep_lock/owner" ] && [ ! -L "$sweep_lock/owner" ]; then
+        sweep_size=$($BB stat -c %s "$sweep_lock/owner" 2>/dev/null)
+        case "$sweep_size" in
+            ''|*[!0-9]*) sweep_size=513 ;;
+        esac
+        if [ "$sweep_size" -le 512 ]; then
+            sweep_tag=$($BB sed -n 's/^owner=//p' "$sweep_lock/owner" 2>/dev/null |
+                $BB head -n 1 | $BB tr -cd 'A-Za-z0-9_-' | $BB cut -c 1-32)
+            [ -z "$sweep_tag" ] || sweep_owner=$sweep_tag
+            sweep_held=$($BB sed -n 's/^boot_id=//p' "$sweep_lock/owner" 2>/dev/null |
+                $BB head -n 1)
+            sweep_boot=$($BB cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+            if [ -n "$sweep_held" ] && [ "$sweep_held" = "$sweep_boot" ]; then
+                log "ota-stale-install-lock-kept:$sweep_owner"
+                return 0
+            fi
+        fi
+    fi
+    $BB rm -f "$sweep_lock/owner" 2>/dev/null
+    if $BB rmdir "$sweep_lock" 2>/dev/null; then
+        log "ota-stale-install-lock-reclaimed:$sweep_owner"
+    else
+        log "ota-stale-install-lock-reclaim-failed:$sweep_owner"
+    fi
+    return 0
+}
 DATA_MOUNTED=0
 if userdata_mount; then
     DATA_MOUNTED=1
+    ota_stale_install_lock_sweep
     if [ -x /usr/local/sbin/libreecho-data-cleanup ]; then
         if DATA_ROOT=/data /usr/local/sbin/libreecho-data-cleanup \
                 >/tmp/data-cleanup.log 2>&1; then

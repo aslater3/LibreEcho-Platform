@@ -670,7 +670,7 @@ cleanup_locks()
 {
     cleanup_download_artifacts
     [ "$FETCH_LOCK_HELD" -eq 1 ] && $BB rmdir "$LOCK" 2>/dev/null
-    [ "$INSTALL_LOCK_HELD" -eq 1 ] && $BB rmdir "$INSTALL_LOCK" 2>/dev/null
+    [ "$INSTALL_LOCK_HELD" -eq 1 ] && install_lock_release
 }
 
 fetch_lock()
@@ -692,10 +692,50 @@ fetch_lock()
     trap 'download_signal TERM' TERM
 }
 
+install_lock_boot_id()
+{
+    $BB cat /proc/sys/kernel/random/boot_id 2>/dev/null | $BB tr -cd 'A-Za-z0-9-'
+}
+
+# Same rules as libreecho-update's lock_take: the install lock is persistent,
+# so holders tag it with their boot and a lock tagged with an EARLIER boot is
+# reclaimed (its holder cannot have survived the reboot).  A lock tagged with
+# this boot stays busy; an untagged one is swept by libreecho-init at early
+# boot and never reclaimed here.
+install_lock_reclaim_stale()
+{
+    [ -d "$INSTALL_LOCK" ] && [ ! -L "$INSTALL_LOCK" ] || return 1
+    [ -f "$INSTALL_LOCK/owner" ] && [ ! -L "$INSTALL_LOCK/owner" ] || return 1
+    il_size=$($BB stat -c %s "$INSTALL_LOCK/owner" 2>/dev/null)
+    case "$il_size" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$il_size" -le 512 ] || return 1
+    il_held=$($BB sed -n 's/^boot_id=//p' "$INSTALL_LOCK/owner" 2>/dev/null | $BB head -n 1)
+    il_now=$(install_lock_boot_id)
+    [ -n "$il_held" ] && [ -n "$il_now" ] || return 1
+    [ "$il_held" != "$il_now" ] || return 1
+    $BB rm -f "$INSTALL_LOCK/owner" 2>/dev/null
+    $BB rmdir "$INSTALL_LOCK" 2>/dev/null || return 1
+    return 0
+}
+
+install_lock_release()
+{
+    $BB rm -f "$INSTALL_LOCK/owner" 2>/dev/null
+    $BB rmdir "$INSTALL_LOCK" 2>/dev/null
+}
+
 install_lock()
 {
     [ "$INSTALL_LOCK_HELD" -eq 1 ] && return 0
-    $BB mkdir "$INSTALL_LOCK" 2>/dev/null || die update_busy
+    if ! $BB mkdir "$INSTALL_LOCK" 2>/dev/null; then
+        install_lock_reclaim_stale || die update_busy
+        $BB mkdir "$INSTALL_LOCK" 2>/dev/null || die update_busy
+    fi
+    il_boot=$(install_lock_boot_id)
+    if [ -n "$il_boot" ]; then
+        printf 'owner=update-fetch\nboot_id=%s\npid=%s\n' "$il_boot" "$$" \
+            > "$INSTALL_LOCK/owner" 2>/dev/null || :
+    fi
     INSTALL_LOCK_HELD=1
     trap cleanup_locks EXIT
 }
@@ -703,6 +743,7 @@ install_lock()
 install_unlock()
 {
     [ "$INSTALL_LOCK_HELD" -eq 1 ] || return 0
+    $BB rm -f "$INSTALL_LOCK/owner" 2>/dev/null
     $BB rmdir "$INSTALL_LOCK" 2>/dev/null || die update_lock_release
     INSTALL_LOCK_HELD=0
 }

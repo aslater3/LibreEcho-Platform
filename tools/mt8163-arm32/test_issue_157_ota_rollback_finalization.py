@@ -381,7 +381,8 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
         self.assertIn('GENERATIONS=${GENERATIONS:-/data/libreecho/generations}', generation)
         self.assertIn("INSTALL_LOCK=$ROOT/install.lock", fetcher)
         self.assertIn("$RUN_ROOT/libreecho/fetch.lock", fetcher)
-        self.assertIn('$BB mkdir "$INSTALL_LOCK" 2>/dev/null || die update_busy', fetcher)
+        self.assertIn('$BB mkdir "$INSTALL_LOCK" 2>/dev/null', fetcher)
+        self.assertIn("install_lock_reclaim_stale || die update_busy", fetcher)
         # The installer takes the same path.
         self.assertIn("LOCK=$UPDATE_ROOT/install.lock", installer)
         self.assertIn('$BB mkdir "$LOCK" 2>/dev/null', installer)
