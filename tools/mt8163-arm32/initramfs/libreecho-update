@@ -277,12 +277,61 @@ state_write()
     $BB sync
 }
 
+lock_boot_id()
+{
+    $BB cat /proc/sys/kernel/random/boot_id 2>/dev/null | $BB tr -cd 'A-Za-z0-9-'
+}
+
+# The install lock lives in persistent /data, so a power loss or reboot while a
+# holder has it (for example inside `confirm`, after the bootloader confirm and
+# before the state write) leaves it behind for every later boot.  Each holder
+# therefore tags the lock with the boot it was taken in, and a lock tagged with
+# an EARLIER boot is reclaimed here: no process of an earlier boot survives, so
+# it cannot be a live installer.  A lock tagged with THIS boot is a live (or
+# just-crashed, same-boot) holder and stays busy -- liveness is deliberately
+# not guessed from the recorded pid (pid reuse, no stable cmdline).  An
+# untagged lock is never reclaimed here; libreecho-init sweeps those once,
+# early in boot, before any updater of that boot can exist.
+lock_reclaim_stale()
+{
+    [ -d "$LOCK" ] && [ ! -L "$LOCK" ] || return 1
+    [ -f "$LOCK/owner" ] && [ ! -L "$LOCK/owner" ] || return 1
+    lock_owner_size=$($BB stat -c %s "$LOCK/owner" 2>/dev/null)
+    case "$lock_owner_size" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$lock_owner_size" -le 512 ] || return 1
+    lock_held_boot=$($BB sed -n 's/^boot_id=//p' "$LOCK/owner" 2>/dev/null | $BB head -n 1)
+    lock_now_boot=$(lock_boot_id)
+    [ -n "$lock_held_boot" ] && [ -n "$lock_now_boot" ] || return 1
+    [ "$lock_held_boot" != "$lock_now_boot" ] || return 1
+    $BB rm -f "$LOCK/owner" 2>/dev/null
+    $BB rmdir "$LOCK" 2>/dev/null || return 1
+    return 0
+}
+
+# Best effort: an untagged lock is still swept at the next boot, so a failed
+# tag write must not stop an update.
+lock_tag()
+{
+    lock_tag_boot=$(lock_boot_id)
+    [ -n "$lock_tag_boot" ] || return 0
+    printf 'owner=update\nboot_id=%s\npid=%s\n' "$lock_tag_boot" "$$" \
+        > "$LOCK/owner" 2>/dev/null || :
+}
+
+lock_release()
+{
+    $BB rm -f "$LOCK/owner" 2>/dev/null
+    $BB rmdir "$LOCK" 2>/dev/null
+}
+
 lock_take()
 {
     if ! $BB mkdir "$LOCK" 2>/dev/null; then
-        die update_busy
+        lock_reclaim_stale || die update_busy
+        $BB mkdir "$LOCK" 2>/dev/null || die update_busy
     fi
-    trap '$BB rmdir "$LOCK" 2>/dev/null' EXIT
+    lock_tag
+    trap 'lock_release' EXIT
 }
 
 manifest_value()
