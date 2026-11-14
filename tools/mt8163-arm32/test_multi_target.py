@@ -534,7 +534,9 @@ class RadarTreeDiffTests(unittest.TestCase):
     # The reconciler was subsequently re-reviewed for v3: its payload gate is
     # the authenticated generation mount, not the legacy v2 tree. Its staged
     # bytes are pinned to that exact reviewed commit instead of ESPHome's.
-    PINNED_COMMIT = {'usr/local/sbin/libreecho-reconcile-features': '73e5ea7d1d3f87887be833b89772884aa91592f5'}
+    # Re-reviewed again for 0.14.6 (Platform #322): Home Assistant voice mode
+    # keeps ttsd, so reminders and the announce action can speak.
+    PINNED_COMMIT = {'usr/local/sbin/libreecho-reconcile-features': 'd71439068144a110d518ff2f0f8d2dfe7a8234a0'}
 
     @staticmethod
     def tree(stage):

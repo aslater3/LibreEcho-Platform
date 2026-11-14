@@ -2161,7 +2161,7 @@ stop_ui_voice_owners()
     # rewrite voice_pipeline_mode; the saved Local/Custom selection survives.
     stop_owners=wyomingd
     if [ "${ha_enabled:-0}" -eq 1 ]; then
-        stop_owners="$stop_owners agentd sttd ttsd"
+        stop_owners="$stop_owners agentd sttd"
     else
         stop_owners="$stop_owners esphomed"
     fi
@@ -2257,7 +2257,7 @@ start_ui_services()
         if [ "$ha_enabled" -eq 1 ]; then
             log ui-home-assistant-mode-enabled
             services="logd networkd timed audiod micd waked ledd buttond btd timerd watchdogd"
-            services="$services airplayd radiod esphomed web"
+            services="$services airplayd radiod ttsd esphomed web"
         else
             services="logd networkd timed audiod micd waked"
             services="$services ledd buttond btd timerd watchdogd"
@@ -2269,7 +2269,7 @@ start_ui_services()
     else
         if [ "$ha_enabled" -eq 1 ]; then
             services="logd networkd timed audiod micd waked ledd buttond btd timerd watchdogd"
-            services="$services airplayd radiod esphomed web"
+            services="$services airplayd radiod ttsd esphomed web"
         else
             services="logd networkd timed audiod micd waked"
             services="$services ledd buttond btd timerd watchdogd"

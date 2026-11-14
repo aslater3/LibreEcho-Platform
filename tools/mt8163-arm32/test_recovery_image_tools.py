@@ -2412,8 +2412,8 @@ class PolicyTests(unittest.TestCase):
         self.assertIn('return "$failed"', source)
 
         order = (
-            'persisted_features="wakeword airplay2"',
-            'persisted_features=airplay2',
+            'persisted_features="wakeword airplay2 tts"',
+            'persisted_features="airplay2 tts"',
             'persisted_features="wakeword stt airplay2 tts assistant"',
             'persisted_features="stt airplay2 tts assistant"',
         )
@@ -2681,10 +2681,10 @@ class PolicyTests(unittest.TestCase):
                 [
                     "libreecho-agentd.init:stop",
                     "libreecho-sttd.init:stop",
-                    "libreecho-ttsd.init:stop",
                     "libreecho-esphomed.init:start",
                     "libreecho-waked.init:start",
                     "libreecho-airplayd.init:start",
+                    "libreecho-ttsd.init:start",
                 ],
             )
             self.assertNotIn(
@@ -2713,18 +2713,35 @@ class PolicyTests(unittest.TestCase):
                 [
                     "libreecho-agentd.init:stop",
                     "libreecho-sttd.init:stop",
-                    "libreecho-ttsd.init:stop",
                     "libreecho-esphomed.init:start",
                     "libreecho-waked.init:start",
                     "libreecho-airplayd.init:start",
+                    "libreecho-ttsd.init:start",
                 ],
             )
+            # Home Assistant mode keeps ttsd (reminders and announce speak
+            # through it) but never starts it without its feature payload.
+            set_mounted("tts", False)
+            actions.write_text("")
+            (var_run / "libreecho-airplayd.pid").write_text(f"{os.getpid()}\n")
+            no_tts = subprocess.run(["sh", str(helper)], env=env, check=False, timeout=10)
+            self.assertNotEqual(no_tts.returncode, 0)
+            self.assertIn(
+                "feature-reconcile-payload-missing:tts",
+                (root / "reconcile.log").read_text(),
+            )
+            self.assertNotIn("libreecho-ttsd.init:start", actions.read_text().splitlines())
+            self.assertNotIn("libreecho-sttd.init:start", actions.read_text().splitlines())
+            self.assertNotIn("libreecho-agentd.init:start", actions.read_text().splitlines())
+            set_mounted("tts", True)
             # HA-off restores the saved Custom graph and never rewrites the
             # owner's selection; remote clients need no local STT/TTS model.
             actions.write_text("")
             saved_custom = '{"integrations":4,"voice_pipeline_mode":"custom"}\n'
             (data / "libreecho/config/web-config.json").write_text(saved_custom)
             for service in ("sttd", "ttsd", "agentd"):
+                if socket_paths[service].exists():
+                    continue  # ttsd stays up (and bound) in Home Assistant mode
                 listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 listener.bind(str(socket_paths[service]))
                 listener.listen(1)
@@ -3002,6 +3019,12 @@ ota_health_services_ready
         ]
         self.assertIn('services="$services airplayd radiod ttsd web"', service_start)
         self.assertNotIn('services="$services airplayd radiod ttsd agentd web"', service_start)
+        # Home Assistant mode keeps ttsd: reminders and the announce action
+        # speak through it. Only agentd and sttd are local-voice-only.
+        self.assertIn('services="$services airplayd radiod ttsd esphomed web"', service_start)
+        self.assertNotIn('services="$services airplayd radiod esphomed web"', service_start)
+        self.assertIn('stop_owners="$stop_owners agentd sttd"\n', init_script)
+        self.assertNotIn('stop_owners="$stop_owners agentd sttd ttsd"', init_script)
 
     def test_airplay_controller_staging_follows_discovery_and_audio_toggles(self) -> None:
         stager = (TOOLS_DIR / "stage_feature_root.sh").read_text()
@@ -4994,7 +5017,7 @@ class EsphomeShippingTests(unittest.TestCase):
         end = init.index("\nstart_ui_services &", start)
         body = init[start:end]
         self.assertNotIn("radiod wyomingd", body)
-        self.assertIn("radiod esphomed", body)
+        self.assertIn("radiod ttsd esphomed", body)
         self.assertLess(body.index("stop_ui_voice_owners"), body.index("for service in $services"))
         self.assertIn("watchdogd", body)
         mdns = (TOOLS_DIR / "mdns/test_packaged_runtime.sh").read_text()
