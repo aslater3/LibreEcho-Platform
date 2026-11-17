@@ -135,14 +135,14 @@ select_topology()
     if [ "$ha_enabled" -eq 1 ]; then
         case "$FEATURE_POLICY" in
             preserve|community-noncommercial)
-                persisted_features="wakeword airplay2"
+                persisted_features="wakeword airplay2 tts"
                 ;;
             redistributable)
                 log feature-reconcile-home-assistant-requires-wakeword
                 return 1
                 ;;
             *)
-                persisted_features=airplay2
+                persisted_features="airplay2 tts"
                 ;;
         esac
     else
@@ -293,9 +293,10 @@ reconcile_topology()
         stop_service wyomingd || return 1
     fi
     if [ "$ha_enabled" -eq 1 ]; then
+        # ttsd stays wanted in Home Assistant mode: timerd reminders and the
+        # esphomed announce action speak through the local TTS socket.
         stop_service agentd "$RUN_ROOT/libreecho/agent.sock" || return 1
         stop_service sttd "$RUN_ROOT/libreecho/stt.sock" || return 1
-        stop_service ttsd "$RUN_ROOT/libreecho/tts.sock" || return 1
         start_daemon_service esphomed || return 1
     else
         stop_service esphomed || return 1

@@ -519,7 +519,13 @@ class RadarTreeDiffTests(unittest.TestCase):
                'usr/local/share/licenses/libreecho-core/iw-5.19-COPYING.txt',
                'usr/local/share/licenses/libreecho-core/opus-1.4-COPYING.txt',
                'usr/local/share/licenses/libreecho-core/libogg-1.3.5-COPYING.txt',
-               'usr/local/share/licenses/libreecho-core/opusfile-0.12-COPYING.txt'}
+               'usr/local/share/licenses/libreecho-core/opusfile-0.12-COPYING.txt',
+               # Mbed TLS 3.6.4 -> 3.6.7 security bump for 0.14.5: the base
+               # tree's notice is replaced by the new version's.
+               'usr/local/share/licenses/libreecho-core/mbedtls-3.6.4-NOTICE.txt',
+               'usr/local/share/licenses/libreecho-core/mbedtls-3.6.7-NOTICE.txt',
+               # Persistent local services supervisor (#170), new in the core initramfs.
+               'usr/local/sbin/libreecho-local'}
     # Separately reviewed ESPHome satellite change (Platform #212), pinned to
     # its exact reviewed bytes rather than widening the multi-target allowlist.
     ESPHOME_COMMIT = '37de1c11109453194ce6170f360450f887a615d4'
@@ -528,7 +534,9 @@ class RadarTreeDiffTests(unittest.TestCase):
     # The reconciler was subsequently re-reviewed for v3: its payload gate is
     # the authenticated generation mount, not the legacy v2 tree. Its staged
     # bytes are pinned to that exact reviewed commit instead of ESPHome's.
-    PINNED_COMMIT = {'usr/local/sbin/libreecho-reconcile-features': '73e5ea7d1d3f87887be833b89772884aa91592f5'}
+    # Re-reviewed again for 0.14.6 (Platform #322): Home Assistant voice mode
+    # keeps ttsd, so reminders and the announce action can speak.
+    PINNED_COMMIT = {'usr/local/sbin/libreecho-reconcile-features': 'd71439068144a110d518ff2f0f8d2dfe7a8234a0'}
 
     @staticmethod
     def tree(stage):

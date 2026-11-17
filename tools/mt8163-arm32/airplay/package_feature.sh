@@ -7,6 +7,9 @@ PAYLOAD="${3:?usage: package_feature.sh <airplay-build-output> <ui-bundle> <payl
 MANIFEST="${4:?usage: package_feature.sh <airplay-build-output> <ui-bundle> <payload> <manifest>}"
 PIPELINE_ROOT="${LIBREECHO_PIPELINE_ROOT:?ERROR: set LIBREECHO_PIPELINE_ROOT explicitly}"
 PACKAGER="$PIPELINE_ROOT/package_feature_payload.sh"
+# Optional Sendspin player (sendspin/build_sendspind.sh output). A payload
+# without it is valid; airplayd then reports Sendspin unavailable.
+SENDSPIN_OUTPUT="${LIBREECHO_AIRPLAY_SENDSPIN:-}"
 
 [[ -x "$PACKAGER" ]] || { echo "ERROR: feature packager is missing: $PACKAGER" >&2; exit 1; }
 [[ -d "$AIRPLAY_OUTPUT" && -d "$AIRPLAY_OUTPUT/runtime" ]] || {
@@ -34,6 +37,25 @@ find "$LICENSE_ROOT/debian" -mindepth 2 -maxdepth 2 -type f -name copyright \
     exit 1
   }
 
+if [[ -n "$SENDSPIN_OUTPUT" ]]; then
+  SENDSPIN_LICENSES="$SENDSPIN_OUTPUT/licenses/libreecho-sendspin"
+  [[ -f "$SENDSPIN_OUTPUT/libreecho-sendspind" && ! -L "$SENDSPIN_OUTPUT/libreecho-sendspind" ]] || {
+    echo "ERROR: Sendspin player binary is missing from $SENDSPIN_OUTPUT" >&2
+    exit 1
+  }
+  [[ -f "$SENDSPIN_LICENSES/COMPONENTS.tsv" && -f "$SENDSPIN_LICENSES/glibc-copyright" && \
+     -f "$SENDSPIN_LICENSES/gcc-runtime-copyright" ]] || {
+    echo "ERROR: Sendspin license closure is incomplete" >&2
+    exit 1
+  }
+  for component in sdk arduinojson ixwebsocket micro-flac micro-ogg-demuxer noise-c; do
+    find "$SENDSPIN_LICENSES/$component" -maxdepth 1 -type f -print -quit 2>/dev/null | grep -q . || {
+      echo "ERROR: Sendspin source license is missing for $component" >&2
+      exit 1
+    }
+  done
+fi
+
 root="$(mktemp -d /tmp/libreecho-airplay-feature.XXXXXX)"
 trap 'rm -rf "$root"' EXIT
 cp -a "$AIRPLAY_OUTPUT/runtime/." "$root/"
@@ -45,6 +67,11 @@ for binary in nqptp shairport-sync libreecho-airplay-audio \
 do
   install -m 0755 "$AIRPLAY_OUTPUT/$binary" "$root/usr/local/sbin/$binary"
 done
+if [[ -n "$SENDSPIN_OUTPUT" ]]; then
+  install -m 0755 "$SENDSPIN_OUTPUT/libreecho-sendspind" "$root/usr/local/sbin/libreecho-sendspind"
+  mkdir -p "$root/usr/local/share/licenses"
+  cp -a "$SENDSPIN_LICENSES" "$root/usr/local/share/licenses/libreecho-sendspin"
+fi
 install -m 0644 "$UI_BUNDLE/etc/libreecho/airplay2.conf" \
   "$root/etc/libreecho/airplay2.conf"
 printf '%s\n' '127.0.0.1 localhost libreecho libreecho-dev' > "$root/etc/hosts"

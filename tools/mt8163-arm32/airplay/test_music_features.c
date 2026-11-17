@@ -235,6 +235,42 @@ static int test_stable_tempo(void)
 	return 0;
 }
 
+/*
+ * The engine sends one frame per period.  A kick must be in the frame of the
+ * period it lands in (not lost), stay latched for at least MF_EVENT_HOLD
+ * consecutive periods (survives one dropped best-effort frame), and clear well
+ * before the next hit (a bounded flag, not a stuck one).  The held low-group
+ * onset may re-fire after its refractory, so the run can exceed the hold.
+ */
+static int test_event_latch_per_period(void)
+{
+	struct click_context click = { 40, 80.0, 26000.0 };
+	int periods = run_scenario(gen_tempo_clicks, &click, 120, 0);
+	int onset;
+
+	for (onset = 40; onset < periods; onset += 40) {
+		int run = 0;
+		int period;
+
+		if ((trace[onset].events & MUSIC_EVENT_KICK) == 0) {
+			fprintf(stderr, "kick at period %d not in its frame\n",
+				onset);
+			return 1;
+		}
+		for (period = onset; period < onset + 20 &&
+		     (trace[period].events & MUSIC_EVENT_KICK) != 0; ++period)
+			++run;
+		if (run < (int)MF_EVENT_HOLD || run >= 20 ||
+		    (trace[onset - 1].events & MUSIC_EVENT_KICK) != 0) {
+			fprintf(stderr, "kick at %d latched %d periods, want "
+				"%u..19 and clear before\n", onset, run,
+				(unsigned int)MF_EVENT_HOLD);
+			return 1;
+		}
+	}
+	return 0;
+}
+
 static int test_differentiated_onsets(void)
 {
 	struct click_context low = { 100, 80.0, 26000.0 };
@@ -736,7 +772,8 @@ int main(void)
 	       sizeof(struct music_features_state),
 	       sizeof(struct audio_visualizer),
 	       (unsigned int)MUSIC_FEATURES_FRAME_MAX);
-	if (test_stable_tempo() || test_differentiated_onsets() ||
+	if (test_stable_tempo() || test_event_latch_per_period() ||
+	    test_differentiated_onsets() ||
 	    test_balance_axes() || test_build_and_drop() ||
 	    test_gap_and_reentry() || test_section_change() ||
 	    test_fill_accent() ||

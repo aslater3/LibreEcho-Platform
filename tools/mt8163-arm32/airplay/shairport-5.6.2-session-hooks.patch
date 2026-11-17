@@ -1,59 +1,59 @@
 --- a/common.c
 +++ b/common.c
-@@ -1306 +1306 @@
+@@ -1341 +1341 @@
 -void command_set_volume(double volume) {
 +void command_set_volume(double volume, const char *session_token) {
-@@ -1308 +1308 @@
+@@ -1343 +1343 @@
 -  if (config.cmd_set_volume) {
 +  if (config.cmd_set_volume && session_token && session_token[0]) {
-@@ -1312 +1312 @@
+@@ -1347 +1347 @@
 -      size_t command_buffer_size = strlen(config.cmd_set_volume) + 32;
 +      size_t command_buffer_size = strlen(config.cmd_set_volume) + 32 + 33;
-@@ -1318 +1318 @@
+@@ -1353 +1353 @@
 -        snprintf(command_buffer, command_buffer_size, "%s %f", config.cmd_set_volume, volume);
 +        snprintf(command_buffer, command_buffer_size, "%s %s %f", config.cmd_set_volume, session_token, volume);
-@@ -1353 +1353 @@
+@@ -1388 +1388 @@
 -void command_start(void) {
 +void command_start(const char *session_token) {
-@@ -1355 +1355 @@
+@@ -1390 +1390 @@
 -  if (config.cmd_start) {
 +  if (config.cmd_start && session_token && session_token[0]) {
-@@ -1379,0 +1380,5 @@
+@@ -1414,0 +1415,5 @@
 +      // The per-play token is a bounded hexadecimal argument supplied by player_play.
 +      char command_buffer[2048];
 +      if (snprintf(command_buffer, sizeof(command_buffer), "%s %s", config.cmd_start,
 +                   session_token) >= (int)sizeof(command_buffer))
 +        _exit(EXIT_FAILURE);
-@@ -1381 +1386 @@
+@@ -1416 +1421 @@
 -      if (poptParseArgvString(config.cmd_start, &argC, (const char ***)&argV) !=
 +      if (poptParseArgvString(command_buffer, &argC, (const char ***)&argV) !=
-@@ -1463 +1468 @@
+@@ -1498 +1503 @@
 -void command_stop(void) {
 +void command_stop(const char *session_token) {
-@@ -1465,2 +1470,2 @@
+@@ -1500,2 +1505,2 @@
 -  if (config.cmd_stop)
 -    command_execute(config.cmd_stop, "", config.cmd_blocking);
 +  if (config.cmd_stop && session_token && session_token[0])
 +    command_execute(config.cmd_stop, session_token, config.cmd_blocking);
 --- a/common.h
 +++ b/common.h
-@@ -577,2 +577,2 @@
+@@ -538,2 +538,2 @@
 -void command_start(void);
 -void command_stop(void);
 +void command_start(const char *session_token);
 +void command_stop(const char *session_token);
-@@ -580 +580 @@
+@@ -541 +541 @@
 -void command_set_volume(double volume);
 +void command_set_volume(double volume, const char *session_token);
 --- a/player.c
 +++ b/player.c
-@@ -5242 +5242,4 @@
+@@ -5427 +5427,4 @@
 -  command_set_volume(airplay_volume);
 +  if (conn->playback_session_token[0])
 +    command_set_volume(airplay_volume, conn->playback_session_token);
 +  else
 +    conn->own_airplay_volume_set = 1; // retain a pre-start sender volume for the first callback
-@@ -5272,0 +5276,37 @@
+@@ -5484,0 +5488,37 @@
 +/* A new ordered token for each play, even with a persistent RTSP connection.
 + * The high half is a monotonic nanosecond tick, low half is random. Ordering
 + * fences delayed start hooks, while the random half avoids token reuse. */
@@ -91,17 +91,17 @@
 +  return 0;
 +}
 +
-@@ -5275 +5301,4 @@
+@@ -5488 +5528,4 @@
 -  command_start(); // before startup, and before the prepare() method runs
 +  conn->playback_session_token[0] = '\0';
 +  if (new_playback_session_token(conn->playback_session_token) < 0)
 +    return -1;
 +  command_start(conn->playback_session_token); // before startup, and before the prepare() method runs
-@@ -5347 +5376,2 @@
+@@ -5561 +5604,2 @@
 -    command_stop();
 +    command_stop(conn->playback_session_token);
 +    conn->playback_session_token[0] = '\0';
 --- a/player.h
 +++ b/player.h
-@@ -340,0 +341 @@
+@@ -369,0 +370 @@
 +  char playback_session_token[33]; // unique to each player_play, empty before start

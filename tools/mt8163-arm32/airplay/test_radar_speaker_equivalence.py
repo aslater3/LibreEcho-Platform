@@ -59,6 +59,7 @@ int pcm_is_ready(struct pcm *p) { (void)p; return 0; }
 const char *pcm_get_error(struct pcm *p) { (void)p; return ""; }
 void pcm_close(struct pcm *p) { (void)p; }
 int pcm_prepare(struct pcm *p) { (void)p; return 0; }
+int pcm_stop(struct pcm *p) { (void)p; return 0; }
 int pcm_writei(struct pcm *p, const void *d, unsigned int n) { (void)p; (void)d; return (int)n; }
 '''
 
@@ -141,8 +142,15 @@ int main(int argc, char **argv)
             if (biscuit_chain)
                 biscuit_dsp_set_volume(biscuit_chain, speaker_volume_percent(sources, master));
 #endif
+#ifdef LIBREECHO_AUDIO_SINK_H
+            /* Sendspin-capable engine carries the (idle) stream input.  Not
+             * keyed on NEW_ENGINE: DRIVER.replace("ENGINE", ...) rewrites it. */
+            render_period(sources, NULL, 0, output, &dynamics, &speaker,
+                          logical_master_gain(master), &master_gain);
+#else
             render_period(sources, output, &dynamics, &speaker,
                           logical_master_gain(master), &master_gain);
+#endif
             fwrite(output, sizeof(output), 1, pcm_out);
         }
     }

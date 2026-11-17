@@ -4,7 +4,7 @@
 `audio_visualizer.c` into the frozen **version-2** visualizer feature frame that
 LibreEcho-UI replays for the scene director (UI #64) and the event-driven
 transition effects (UI #65).  `audio_engine.c` owns the transport: it packages
-one frame from the final post-limiter mono programme every second PCM period and
+one frame from the unity-gain music tap every PCM period (~23.4 frames/s) and
 sends it to the LED daemon on the existing owner-scoped socket.
 
 This unit **publishes bounded perceptual evidence, not exact instrument
@@ -118,21 +118,36 @@ emitted correctly by `music_features_format_frame(..., feature_version=1, ...)`.
   period so a steady programme settles to near zero.
 - Tempo is estimated by autocorrelation of the onset envelope over lags
   spanning ~44–234 BPM; `bpm_x100` is published only while confidence is
-  sufficient, and confidence decays when the signal is beatless.
+  sufficient (≥ 32), and confidence decays when the signal is beatless.
+- The beat period is fractional (Q8 updates): the whole-period best lag is
+  re-measured at up to four beats (n × lag ± n/2, never past lag 64) and the
+  peak is refined by a parabola through its neighbours, then divided by n.  A
+  120 BPM beat is 11.72 updates; a whole lag reported 117.19 BPM.  The
+  metrical-level check compares peak mass (a lag plus its stronger neighbour),
+  since a fractional beat splits its score across two lags.
+- `beat_phase` advances by 65536 / period every update whenever a tempo is
+  published (confidence ≥ 32, previously ≥ 64, so it stood still on most real
+  music).  The first detected beat snaps it to zero; later beats pull it
+  halfway to zero, so motion stays smooth and whole-period onset timing
+  averages out.  `beat_confidence`, `groove` and `beat_strength` keep their
+  previous meaning and gates.
 - `kick`/`snare`/`high` come from per-group adaptive onset thresholds with a
   short refractory; these are ordinary beat/transient evidence, not structural
   events.
 - Structural gates (`build`, `breakdown`, `reentry`, `section`, `drop`, `fill`)
   are multi-frame and cooldown-guarded.  A `drop` requires an armed build plus a
   dip-and-recovery or a high-impact downbeat, so an isolated loud hit never
-  opens it.  Event flags are latched for a few updates so an event that lands
-  between two emitted frames is still delivered.
+  opens it.  Event flags are latched for `MF_EVENT_HOLD` (4) updates, ~171 ms,
+  so an event survives a frame the LED daemon did not take.  With one frame per
+  period the same event therefore appears in up to four consecutive frames;
+  consumers treat the flags as level state behind their own cooldowns, never
+  as counted edges.
 
 ## Bounded resources and determinism
 
 - No allocation, no floating point in the analysis, no wall clock, no
-  randomness.  `struct music_features_state` is 312 bytes and
-  `struct audio_visualizer` is 512 bytes on the host (`x86-64`); fixed-size
+  randomness.  `struct music_features_state` is 316 bytes and
+  `struct audio_visualizer` is 516 bytes on the host (`x86-64`); fixed-size
   rings only.
 - The same synthetic PCM stream yields a bit-identical feature sequence on every
   run and host.  Host analysis cost is ~100 µs per 2048-frame period.
@@ -150,7 +165,12 @@ python3 tools/mt8163-arm32/airplay/test_music_feature_packet.py
   stable tempo clicks, differentiated low/mid/high bursts, warmth/brightness
   axes, build/drop, quiet gap and re-entry, a section change, a fill accent, a
   steady dense false-positive, beatless confidence decay, bit-identical replay,
-  the v1/v2 packet contract, bounded memory and host runtime.
+  the v1/v2 packet contract, bounded memory and host runtime.  It also builds
+  `test_beat_tracking.c`: sample-accurate kick and kit tracks at 100, 120 and
+  128 BPM, a swung 112 BPM kit and a 124 BPM track with noise must read within
+  ±1.5 BPM on every update with the phase advancing and near zero on beats; a
+  busy 118 BPM track with off-grid hits (confidence 32..63) must hold its
+  median tempo and keep the phase moving.
 - `test_music_feature_trace.sh` emits a deterministic JSONL trace of real
   version-2 packets for the cross-repository roundtrip.
 - `test_music_transport_wrap.sh` drives the real transport at the production
@@ -162,3 +182,43 @@ python3 tools/mt8163-arm32/airplay/test_music_feature_packet.py
 
 `MF_DEBUG=1` on `test-music-features` dumps a per-period CSV trace for
 calibration.
+
+## Offline trace and regression corpus (#46)
+
+`music_trace.c` runs the production producer path (the same
+`audio_visualizer_process_features()`, transport and frame formatter the audio
+engine uses) over a recording and writes the version-2 frames as JSONL. The
+same input always gives a byte-identical trace.
+
+```sh
+cc -O2 -std=c99 audio_visualizer.c music_trace.c -lm -o music-trace
+ffmpeg -i song.flac -ar 48000 -ac 2 -c:a pcm_s16le song.wav   # 48 kHz 16-bit PCM WAV
+./music-trace song.wav song.jsonl
+./music-trace --gain-db -20 song.wav song-quiet.jsonl          # same programme, quieter
+```
+
+`corpus/gen_corpus.py DIR` writes a synthetic corpus (click tracks at 90, 120
+and 150 BPM, a beatless pad, white noise, a sweep, silence and a -20 dB copy)
+with integer synthesis, so every host produces identical files and no audio is
+committed. `test_music_trace.py` checks it in CI: silence is inert, beatless
+material reports no tempo, click tracks get a confident tempo, and level does
+not move tempo or confidence, and 90, 120 and 150 BPM are reported at the
+right metrical level. One known gap is an expected failure until fixed: energy
+and density follow the recording level, so a -20 dB master reads quieter.
+
+The engine analyses a unity-gain tap (#44): the media and AirPlay buses summed
+in stereo before sender volume, master volume, speaker EQ and limiting.  Volume
+changes the speaker output but not the features; a bus at zero gain is left out
+so a muted sender does not animate the LEDs.  `test_music_analysis_tap.sh` runs
+the engine's own tap and analyser and checks that a -20 dB sender gain leaves
+every feature byte-identical.
+
+To evaluate on real music, keep the recordings and a list of them outside the
+repository and run `music-trace` over them; never commit copyrighted audio.
+
+The tempo search correlates a detrended onset envelope (each value minus its
+trailing 8-frame mean), so a smooth or slowly swelling envelope no longer
+produces a confident tempo on beatless material. A periodic onset train also
+correlates at two and three periods, so when the lag a half or a third as long
+scores at least 80% (`MF_METRICAL_RATIO_Q8`) of the best lag, the faster level
+is reported.

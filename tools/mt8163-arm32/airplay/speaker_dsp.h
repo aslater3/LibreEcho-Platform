@@ -31,15 +31,23 @@
 
 #include <math.h>
 #include <stdint.h>
+#include <string.h>
 #include "speaker_mbcl.h"
+#include "speaker_boost.h"
 
 /* M_PI is a POSIX extension and is not exposed under strict -std=c99. */
 #define SPEAKER_DSP_TWO_PI 6.28318530717958647692f
 
-/* five loudness sections, then two parametric-EQ sections */
+/* five loudness sections and two parametric-EQ sections; the owner equaliser
+ * is its own stage after them (struct speaker_dsp_owner_eq) */
 #define SPEAKER_DSP_SECTIONS 7
 #define SPEAKER_DSP_LOUDNESS_SECTIONS 5
+#define SPEAKER_DSP_PARAMETRIC_SECTIONS 2
 #define SPEAKER_DSP_VOLUME_RAMP_FRAMES 4800
+/* Owner equaliser bands: bass shelf, low-mid peak, high-mid peak, treble
+ * shelf.  A live change crossfades over one engine period (2048 frames). */
+#define SPEAKER_DSP_OWNER_BANDS 4
+#define SPEAKER_DSP_OWNER_FADE_FRAMES 2048
 
 /* Volume steps the loudness ladder is anchored on (stock "Volume Boundary"). */
 #define SPEAKER_DSP_STEP_COUNT 5
@@ -62,12 +70,32 @@ struct speaker_dsp_biquad {
 	float z1, z2; /* transposed direct form II state */
 };
 
+/*
+ * Owner equaliser.  Only bands with a non-zero gain run (bit i of on), so the
+ * all-flat stage is no code at all.  A live change runs the old and the new
+ * band set side by side for SPEAKER_DSP_OWNER_FADE_FRAMES and crossfades their
+ * outputs; a change that arrives during a fade waits for it to finish.
+ */
+struct speaker_dsp_owner_eq {
+	struct speaker_dsp_biquad band[SPEAKER_DSP_OWNER_BANDS];
+	struct speaker_dsp_biquad next[SPEAKER_DSP_OWNER_BANDS];
+	float db[SPEAKER_DSP_OWNER_BANDS];
+	float pending_db[SPEAKER_DSP_OWNER_BANDS];
+	unsigned int on, next_on;
+	int fade; /* frames left in the crossfade, 0 when steady */
+	int pending;
+};
+
 struct speaker_dsp {
 	struct speaker_dsp_biquad sections[SPEAKER_DSP_SECTIONS];
 	struct speaker_dsp_biquad next_sections[SPEAKER_DSP_SECTIONS];
 	struct speaker_mbcl mbcl;
 	int active;
 	int next_active;
+	struct speaker_dsp_owner_eq owner; /* after the volume blend, before MBCL */
+	float boost_gain; /* owner makeup before MBCL; 1.0f is stock */
+	float boost_target; /* where a live boost ramp ends */
+	int boost_ramp; /* frames left in the boost ramp */
 	int volume_percent;
 	int queued_volume_percent;
 	int volume_ramp_remaining;
@@ -162,6 +190,41 @@ static inline void speaker_biquad_design(struct speaker_dsp_biquad *bq,
 	bq->z2 = 0.0f;
 }
 
+/* Owner equaliser bands, applied after the stock-derived EQ and before MBCL.
+ * Fixed frequencies, +/-6 dB at most.  Flat bands are not run at all, so the
+ * default chain is the stock chain bit for bit. */
+#define SPEAKER_DSP_BASS_FC_HZ 120.0f
+#define SPEAKER_DSP_LOW_MID_FC_HZ 400.0f
+#define SPEAKER_DSP_HIGH_MID_FC_HZ 2500.0f
+#define SPEAKER_DSP_TREBLE_FC_HZ 6000.0f
+#define SPEAKER_DSP_MID_Q 0.9f
+
+static const struct speaker_dsp_section speaker_owner_bands[SPEAKER_DSP_OWNER_BANDS] = {
+	{ SPEAKER_SHAPE_LOWSHELF,  SPEAKER_DSP_BASS_FC_HZ,     0.707f,            0.0f },
+	{ SPEAKER_SHAPE_PEAK,      SPEAKER_DSP_LOW_MID_FC_HZ,  SPEAKER_DSP_MID_Q, 0.0f },
+	{ SPEAKER_SHAPE_PEAK,      SPEAKER_DSP_HIGH_MID_FC_HZ, SPEAKER_DSP_MID_Q, 0.0f },
+	{ SPEAKER_SHAPE_HIGHSHELF, SPEAKER_DSP_TREBLE_FC_HZ,   0.707f,            0.0f }
+};
+
+/* Designs every band (flat bands too, which are then simply not run) and
+ * returns the mask of bands that run. */
+static inline unsigned int speaker_dsp_owner_design(struct speaker_dsp_biquad *out,
+						    const float *db)
+{
+	unsigned int on = 0;
+	int i;
+
+	for (i = 0; i < SPEAKER_DSP_OWNER_BANDS; ++i) {
+		struct speaker_dsp_section s = speaker_owner_bands[i];
+
+		s.gain_db = db[i];
+		speaker_biquad_design(&out[i], &s);
+		if (db[i] != 0.0f)
+			on |= 1u << i;
+	}
+	return on;
+}
+
 /* Select the first configured upper boundary, without interpolating presets. */
 static inline void speaker_dsp_loudness_gains(float volume, float *gains)
 {
@@ -191,6 +254,10 @@ static inline void speaker_dsp_init(struct speaker_dsp *dsp, int volume_percent)
 	}
 	dsp->active = 0;
 	dsp->next_active = 0;
+	memset(&dsp->owner, 0, sizeof(dsp->owner));
+	dsp->boost_gain = 1.0f;
+	dsp->boost_target = 1.0f;
+	dsp->boost_ramp = 0;
 	dsp->volume_percent = volume_percent;
 	dsp->queued_volume_percent = -2; /* -1 is a valid unknown level. */
 	dsp->volume_ramp_remaining = 0;
@@ -214,6 +281,96 @@ static inline void speaker_dsp_init(struct speaker_dsp *dsp, int volume_percent)
 	dsp->active = 1;
 }
 
+/* Apply the owner equaliser at once (dB, within +/-6), for playback start.
+ * The stage is not part of the volume ladder, so a volume change keeps it. */
+static inline void speaker_dsp_set_tone(struct speaker_dsp *dsp, float bass_db,
+					float low_mid_db, float high_mid_db,
+					float treble_db)
+{
+	struct speaker_dsp_owner_eq *eq = &dsp->owner;
+	struct speaker_dsp_biquad band[SPEAKER_DSP_OWNER_BANDS];
+	int i;
+
+	eq->db[0] = bass_db;
+	eq->db[1] = low_mid_db;
+	eq->db[2] = high_mid_db;
+	eq->db[3] = treble_db;
+	eq->on = speaker_dsp_owner_design(band, eq->db);
+	/* Coefficients only: the filter history carries over. */
+	for (i = 0; i < SPEAKER_DSP_OWNER_BANDS; ++i) {
+		band[i].z1 = eq->band[i].z1;
+		band[i].z2 = eq->band[i].z2;
+		eq->band[i] = band[i];
+	}
+	eq->fade = 0;
+	eq->pending = 0;
+}
+
+static inline void speaker_dsp_owner_start_fade(struct speaker_dsp_owner_eq *eq,
+						const float *db)
+{
+	int i, same = 1;
+
+	for (i = 0; i < SPEAKER_DSP_OWNER_BANDS; ++i)
+		if (db[i] != eq->db[i])
+			same = 0;
+	if (same)
+		return;
+	memcpy(eq->db, db, sizeof(eq->db));
+	eq->next_on = speaker_dsp_owner_design(eq->next, db);
+	/* A band that runs before and after starts from the running history;
+	 * a band switching on starts from rest.  Either way its output enters
+	 * at zero weight. */
+	for (i = 0; i < SPEAKER_DSP_OWNER_BANDS; ++i)
+		if (eq->on & eq->next_on & (1u << i)) {
+			eq->next[i].z1 = eq->band[i].z1;
+			eq->next[i].z2 = eq->band[i].z2;
+		}
+	eq->fade = SPEAKER_DSP_OWNER_FADE_FRAMES;
+}
+
+/* Change the owner equaliser during playback: the old and new settings are
+ * crossfaded over one engine period, so the change does not click. */
+static inline void speaker_dsp_fade_tone(struct speaker_dsp *dsp, float bass_db,
+					 float low_mid_db, float high_mid_db,
+					 float treble_db)
+{
+	struct speaker_dsp_owner_eq *eq = &dsp->owner;
+	float db[SPEAKER_DSP_OWNER_BANDS];
+
+	db[0] = bass_db;
+	db[1] = low_mid_db;
+	db[2] = high_mid_db;
+	db[3] = treble_db;
+	if (eq->fade > 0) {
+		memcpy(eq->pending_db, db, sizeof(db));
+		eq->pending = 1;
+		return;
+	}
+	speaker_dsp_owner_start_fade(eq, db);
+}
+
+/* Owner makeup gain (0, +3 or +6 dB, see speaker_boost.h) ahead of MBCL.  It
+ * is a plain gain: MBCL and its ceiling still act on the boosted bus, and a
+ * volume change does not reset it because it is not part of the ladder. */
+static inline void speaker_dsp_set_boost(struct speaker_dsp *dsp, float boost_db)
+{
+	dsp->boost_gain = dsp->boost_target = speaker_boost_gain(boost_db);
+	dsp->boost_ramp = 0;
+}
+
+/* Change the boost during playback: the gain ramps linearly to the new step
+ * over one engine period.  A ramp back to 0 dB ends on exactly 1.0f. */
+static inline void speaker_dsp_fade_boost(struct speaker_dsp *dsp, float boost_db)
+{
+	float target = speaker_boost_gain(boost_db);
+
+	if (target == dsp->boost_target)
+		return;
+	dsp->boost_target = target;
+	dsp->boost_ramp = SPEAKER_DSP_OWNER_FADE_FRAMES;
+}
+
 /* Run both stable cascades during a volume change.  Blending their outputs
  * leaves the filter history intact and avoids resetting the shared dynamics
  * while AirPlay updates its phone volume in a single open PCM stream. */
@@ -233,6 +390,7 @@ static inline void speaker_dsp_set_volume(struct speaker_dsp *dsp,
 	if (dsp->volume_percent == volume_percent)
 		return;
 	speaker_dsp_init(&next, volume_percent);
+	/* Only the ladder cascade is replaced: the owner stage and boost stay. */
 	for (i = 0; i < SPEAKER_DSP_SECTIONS; ++i)
 		dsp->next_sections[i] = next.sections[i];
 	dsp->next_active = next.active;
@@ -250,6 +408,42 @@ static inline float speaker_dsp_step(struct speaker_dsp_biquad *bq, float x)
 	return y;
 }
 
+static inline float speaker_dsp_owner_run(struct speaker_dsp_biquad *band,
+					  unsigned int on, float x)
+{
+	int i;
+
+	for (i = 0; i < SPEAKER_DSP_OWNER_BANDS; ++i)
+		if (on & (1u << i))
+			x = speaker_dsp_step(&band[i], x);
+	return x;
+}
+
+static inline float speaker_dsp_owner_process(struct speaker_dsp_owner_eq *eq, float x)
+{
+	float y;
+
+	if (!eq->on && !eq->fade)
+		return x; /* flat: the stock chain */
+	y = speaker_dsp_owner_run(eq->band, eq->on, x);
+	if (eq->fade > 0) {
+		float next = speaker_dsp_owner_run(eq->next, eq->next_on, x);
+		float fraction = (float)(SPEAKER_DSP_OWNER_FADE_FRAMES - eq->fade + 1) /
+			(float)SPEAKER_DSP_OWNER_FADE_FRAMES;
+
+		y += (next - y) * fraction;
+		if (--eq->fade == 0) {
+			memcpy(eq->band, eq->next, sizeof(eq->band));
+			eq->on = eq->next_on;
+			if (eq->pending) {
+				eq->pending = 0;
+				speaker_dsp_owner_start_fade(eq, eq->pending_db);
+			}
+		}
+	}
+	return y;
+}
+
 /* Equalise on the wide mono bus; no S16 conversion happens before MBCL. */
 static inline float speaker_dsp_equalize_f(struct speaker_dsp *dsp, float sample)
 {
@@ -257,7 +451,8 @@ static inline float speaker_dsp_equalize_f(struct speaker_dsp *dsp, float sample
 	int i;
 
 	if (dsp->active)
-		for (i = 0; i < SPEAKER_DSP_SECTIONS; ++i)
+		for (i = 0; i < SPEAKER_DSP_LOUDNESS_SECTIONS +
+				SPEAKER_DSP_PARAMETRIC_SECTIONS; ++i)
 			x = speaker_dsp_step(&dsp->sections[i], x);
 	if (dsp->volume_ramp_remaining > 0) {
 		float next = sample;
@@ -265,7 +460,8 @@ static inline float speaker_dsp_equalize_f(struct speaker_dsp *dsp, float sample
 			(float)SPEAKER_DSP_VOLUME_RAMP_FRAMES;
 
 		if (dsp->next_active)
-			for (i = 0; i < SPEAKER_DSP_SECTIONS; ++i)
+			for (i = 0; i < SPEAKER_DSP_LOUDNESS_SECTIONS +
+					SPEAKER_DSP_PARAMETRIC_SECTIONS; ++i)
 				next = speaker_dsp_step(&dsp->next_sections[i], next);
 		x += (next - x) * fraction;
 		if (--dsp->volume_ramp_remaining == 0) {
@@ -278,7 +474,7 @@ static inline float speaker_dsp_equalize_f(struct speaker_dsp *dsp, float sample
 				speaker_dsp_set_volume(dsp, queued);
 		}
 	}
-	return x;
+	return speaker_dsp_owner_process(&dsp->owner, x);
 }
 
 static inline float speaker_dsp_equalize(struct speaker_dsp *dsp, int32_t sample)
@@ -286,14 +482,31 @@ static inline float speaker_dsp_equalize(struct speaker_dsp *dsp, int32_t sample
 	return speaker_dsp_equalize_f(dsp, (float)sample);
 }
 
+/* The bus MBCL sees: equaliser, owner equaliser, then the owner boost. */
+static inline float speaker_dsp_bus_f(struct speaker_dsp *dsp, float sample)
+{
+	float x = speaker_dsp_equalize_f(dsp, sample);
+
+	if (dsp->boost_ramp > 0) {
+		dsp->boost_gain += (dsp->boost_target - dsp->boost_gain) /
+			(float)dsp->boost_ramp;
+		if (--dsp->boost_ramp == 0)
+			dsp->boost_gain = dsp->boost_target;
+	}
+	if (dsp->boost_gain != 1.0f)
+		x *= dsp->boost_gain;
+	return x;
+}
+
 /* Stock-like multiband protection acts once on the mixed programme, before
  * OutputTrim.  The later linked limiter remains an emergency PCM guard.
  * The float form keeps sub-LSB resolution for a 24-bit output PCM. */
 static inline float speaker_dsp_process_f(struct speaker_dsp *dsp, float sample)
 {
-	float x = speaker_dsp_equalize_f(dsp, sample);
+	float x = speaker_dsp_bus_f(dsp, sample);
 
 	x = speaker_mbcl_process(&dsp->mbcl, x);
+
 	/* This guard is for pathological filter state, never normal EQ overshoot. */
 	if (x > (float)(INT32_MAX / 4))
 		x = (float)(INT32_MAX / 4);

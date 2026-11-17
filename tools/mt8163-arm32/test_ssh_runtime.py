@@ -16,7 +16,7 @@ BUSYBOX_EXEC = ('exec %s "$@"' % BUSYBOX) if BUSYBOX else 'exec "$@"'
 
 
 class SSHRuntimeTests(unittest.TestCase):
-    def test_saved_ssh_switch_is_fail_closed(self):
+    def test_saved_ssh_switch_defaults_on(self):
         source = (ROOT / 'ssh/libreecho-ssh.init').read_text()
         function = source[source.index('ssh_config_enabled()'):source.index('write_static_accounts()')]
         with tempfile.TemporaryDirectory() as tmp:
@@ -43,12 +43,14 @@ fi
                 return result.returncode == 0
 
             self.assertTrue(enabled('{"ssh":true,"api_lan":false}'))
-            self.assertFalse(enabled('{"ssh":false,"api_lan":false}'))
-            self.assertFalse(enabled('{"api_lan":false}'))
-            self.assertFalse(enabled('{"ssh":true,"ssh":false}'))
+            self.assertFalse(enabled('{"ssh":false,"api_lan":false}'), 'a saved false turns SSH off')
+            self.assertFalse(enabled('{"ssh" : false}'))
+            self.assertTrue(enabled('{"api_lan":false}'), 'no saved value: on by default')
+            self.assertTrue(enabled('{"ssh":true,"ssh":false}'), 'ambiguous: the default applies')
+            self.assertTrue(enabled('{"ssh":"false"}'), 'only a literal false turns it off')
             config.unlink()
-            self.assertFalse(subprocess.run(['sh', '-c', function + '\nssh_config_enabled'],
-                                            env=env, timeout=5).returncode == 0)
+            self.assertTrue(subprocess.run(['sh', '-c', function + '\nssh_config_enabled'],
+                                           env=env, timeout=5).returncode == 0, 'missing file: on by default')
 
     def _dropbear_env(self, root):
         """Fake dropbear/dropbearkey plus a stat shim that reports root-owned 0700/0600."""

@@ -50,13 +50,13 @@ recorded in `COMPONENTS.json`, the image manifest, and the release SPDX SBOM.
   corresponding source ships with the LibreEcho UI source offer; the
   LGPL-2.1 text accompanies this bundle. Relinking instructions are in the
   UI `Makefile`.
-- **Mbed TLS 3.6.4** — Apache-2.0 (dual-licensed Apache-2.0 OR
+- **Mbed TLS 3.6.7** — Apache-2.0 (dual-licensed Apache-2.0 OR
   GPL-2.0-or-later; LibreEcho uses the Apache-2.0 option). The release rebuilds
   static ARM32 `libmbedtls`, `libmbedx509`, and `libmbedcrypto` archives from
   the pinned upstream release archive and links them into `libreecho-web` and
   `libreecho-radiod` for HTTPS. The source-archive SHA-256, build requirements,
   and produced archive hashes are recorded in
-  `tools/mt8163-arm32/mbedtls/SOURCE.lock` and `mbedtls-3.6.4-NOTICE.txt`.
+  `tools/mt8163-arm32/mbedtls/SOURCE.lock` and `mbedtls-3.6.7-NOTICE.txt`.
   No dynamic Mbed TLS library is shipped.
 - **libogg 1.3.5 / libopus 1.4 / libopusfile 0.12** — BSD-3-Clause (Xiph.Org).
   The release rebuilds the pinned static, HTTP/TLS-free ARM32 Opus decode stack

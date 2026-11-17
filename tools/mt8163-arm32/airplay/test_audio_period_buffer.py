@@ -88,6 +88,11 @@ ENGINE_PROGRAM = r'''
 #include <stdlib.h>
 #include <unistd.h>
 
+/* wait_for_period() publishes the output-delay snapshot (no PCM open here). */
+unsigned int pcm_get_buffer_size(const struct pcm *pcm) { (void)pcm; return 0u; }
+int pcm_get_htimestamp(struct pcm *pcm, unsigned int *avail, struct timespec *ts)
+{ (void)pcm; (void)avail; (void)ts; return -1; }
+
 static int fail(const char *message)
 {
     fprintf(stderr, "%s\n", message);
@@ -149,7 +154,7 @@ int main(void)
 
     puffin_dynamics_init(&dynamics);
     speaker_dsp_init(&speaker, 100);
-    render_period(sources, output, &dynamics, &speaker, 32768, &master_gain);
+    render_period(sources, NULL, 0, output, &dynamics, &speaker, 32768, &master_gain);
     /* A new LR4 filterbank has a measured three-frame startup delay. */
     for (i = 0; i < PERIOD_SIZE; ++i) {
         if (output[i * OUTPUT_CHANNELS] != output[i * OUTPUT_CHANNELS + 1] ||
@@ -248,7 +253,7 @@ int main(void)
             master_gain = 32768;
             puffin_dynamics_init(&dynamics);
             speaker_dsp_init(&speaker, 60);
-            render_period(sources, output, &dynamics, &speaker, 32768, &master_gain);
+            render_period(sources, NULL, 0, output, &dynamics, &speaker, 32768, &master_gain);
             if (bus == 0)
                 memcpy(reference, output, sizeof(reference));
             else if (memcmp(reference, output, sizeof(reference)) != 0)
@@ -290,7 +295,10 @@ int mixer_ctl_get_value(struct mixer_ctl *ctl, unsigned int index);
 
 PCM_HEADER = """#ifndef TINYALSA_PCM_H
 #define TINYALSA_PCM_H
+#include <time.h>
 #define PCM_OUT 0x00000000U
+#define PCM_MONOTONIC 0x00000008U
+#define PCM_NORESTART 0x00000004U
 enum pcm_format { PCM_FORMAT_S16_LE = 0, PCM_FORMAT_S32_LE = 1 };
 struct pcm_config {
     unsigned int channels;
@@ -311,7 +319,11 @@ int pcm_is_ready(struct pcm *pcm);
 const char *pcm_get_error(struct pcm *pcm);
 void pcm_close(struct pcm *pcm);
 int pcm_prepare(struct pcm *pcm);
+int pcm_stop(struct pcm *pcm);
 int pcm_writei(struct pcm *pcm, const void *data, unsigned int frame_count);
+unsigned int pcm_get_buffer_size(const struct pcm *pcm);
+int pcm_get_htimestamp(struct pcm *pcm, unsigned int *avail,
+                       struct timespec *timestamp);
 #endif
 """
 
@@ -361,6 +373,8 @@ def main() -> None:
             str(directory_path),
             "-I",
             str(SOURCE_DIR),
+            str(SOURCE_DIR / "audio_sink.c"),
+            str(SOURCE_DIR / "audio_timing.c"),
             str(engine_source),
             "-Wl,--gc-sections",
             "-lm",

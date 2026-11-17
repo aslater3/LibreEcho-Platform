@@ -645,6 +645,82 @@ class SupervisorReadinessTests(unittest.TestCase):
             self.assertIn("cleaned", log_text)
 
 
+class SupervisorSessionTests(unittest.TestCase):
+    """The supervisor must not share the session of the shell that restarted it.
+
+    A restart issued over adb or SSH ran the supervisor as a plain background
+    job, so it died with that shell session (and took dbus/avahi with it).
+    Run the real start_supervisor() from a caller shell and check the
+    supervisor landed in its own session with stdin on /dev/null.
+    """
+
+    INIT = HERE.parent / "initramfs/libreecho-mdnsd"
+
+    def test_supervisor_is_not_in_the_callers_session(self) -> None:
+        busybox = shutil.which("busybox") or ""
+        if not busybox:
+            self.skipTest("busybox unavailable")
+        if not Path("/proc/self/stat").is_file():
+            self.skipTest("procfs unavailable")
+        with tempfile.TemporaryDirectory(prefix="le-mdns-session-") as tmp:
+            root = Path(tmp)
+            record = root / "supervisor.record"
+            log_path = root / "supervisor.log"
+            supervisor = root / "supervisor.sh"
+            supervisor.write_text(
+                "#!/bin/sh\n"
+                f"{shlex.quote(busybox)} cat /proc/$$/stat > {shlex.quote(str(record))}\n"
+                f"{shlex.quote(busybox)} readlink /proc/$$/fd/0 >> {shlex.quote(str(record))}\n"
+                "exec sleep 30\n"
+            )
+            supervisor.chmod(0o755)
+            function = self._function(self.INIT.read_text(), "start_supervisor() {\n")
+            harness = root / "harness.sh"
+            harness.write_text(
+                "\n".join([
+                    "#!/bin/sh",
+                    "set -u",
+                    f"BB={shlex.quote(busybox)}",
+                    f"SUPERVISOR={shlex.quote(str(supervisor))}",
+                    f"LOG={shlex.quote(str(log_path))}",
+                    "START_TIMEOUT=2",
+                    "STOP_TIMEOUT=1",
+                    "status() { return 1; }",
+                    'pid_alive() { $BB kill -0 "$1" 2>/dev/null; }',
+                    'stopped_wait() { wait "$1" 2>/dev/null || true; return 0; }',
+                    'runtime_responder_pids() { return 1; }',
+                    'stop() { return 0; }',
+                    'log() { printf "%s\n" "$*" >> "$LOG"; }',
+                    function,
+                    "start_supervisor >/dev/null 2>&1",
+                    "",
+                ])
+            )
+            subprocess.run([busybox, "sh", str(harness)], text=True,
+                           capture_output=True, timeout=20)
+            self.assertTrue(record.is_file(), "supervisor never ran")
+            stat_line, stdin_target = record.read_text().splitlines()[:2]
+            # /proc/<pid>/stat: "pid (comm) state ppid pgrp session ...";
+            # fields after the closing parenthesis start at state.
+            session = stat_line.rsplit(")", 1)[1].split()[3]
+            self.assertNotEqual(session, str(os.getsid(0)),
+                                "supervisor shares the caller's session")
+            self.assertEqual(stdin_target, "/dev/null")
+
+    @staticmethod
+    def _function(source: str, marker: str) -> str:
+        start = source.index(marker)
+        depth = 0
+        for offset, char in enumerate(source[start:], start):
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[start:offset + 1]
+        raise AssertionError(f"{marker!r} is unterminated")
+
+
 class SupervisorLifecycleTests(unittest.TestCase):
     """status/stop must work for the supervisor path, not only the fallback.
 
@@ -804,6 +880,24 @@ class SupervisorLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(supervisor.poll(),
                              "supervisor survived a successful stop")
         self.assertIn("mdns-supervisor-stop-timeout:", self.log.read_text())
+
+    def test_stop_ends_a_supervisor_whose_binary_was_replaced(self) -> None:
+        # Hot-staging or restoring the supervisor binary while it runs leaves
+        # /proc/<pid>/exe as "<path> (deleted)". stop must still find it, or
+        # it reports success while the old supervisor keeps running.
+        supervisor = self._spawn(self.supervisor)
+        time.sleep(0.2)
+        replacement = self.work / "libreecho-mdnsd.new"
+        shutil.copy(self.supervisor, replacement)
+        self.supervisor.unlink()
+        replacement.rename(self.supervisor)
+        self.assertTrue(os.readlink(f"/proc/{supervisor.pid}/exe").endswith(" (deleted)"))
+        self._spawn(self.dbus)
+        self._spawn(self.avahi)
+        self._bus()
+        self.assertIn(str(supervisor.pid), self._run("supervisor_pids"))
+        self.assertIn("rc=0", self._run("stop"))
+        supervisor.wait(timeout=5)
 
     def test_record_runtime_pair_writes_the_identity_pair(self) -> None:
         self._spawn(self.supervisor)

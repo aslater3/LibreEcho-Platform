@@ -26,7 +26,7 @@
 #define TRACE_FRAMES 2048U
 #define TRACE_RATE 48000.0
 #define TRACE_PERIODS 420
-#define TRACE_FRAME_PERIODS 2U
+#define TRACE_FRAME_PERIODS 1U	/* engine cadence: one frame per period */
 #define TRACE_SESSION 0x2a2a0001U
 
 static const double dense_centres[AUDIO_VISUALIZER_BANDS] = {

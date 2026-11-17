@@ -106,12 +106,12 @@ class ReleaseSourceSelectionTests(unittest.TestCase):
         ])
         self.assertEqual(leftovers, [])
 
-    def test_unhealthy_domain_falls_back_to_organisation_github(self):
+    def test_unhealthy_domain_falls_back_to_published_github_releases(self):
         for health in ('down', 'http500', 'wrong'):
             with self.subTest(health=health):
                 result, out, requested, leftovers = self.run_selection(health)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                github = 'https://github.com/LibreEcho/LibreEcho/releases'
+                github = 'https://github.com/aslater3/LibreEcho/releases'
                 self.assertEqual(out['base'], github)
                 self.assertEqual(out['latest'], github + '/latest/download/'
                                  'libreecho-radar-puffin-dev.ota.tar')
@@ -130,10 +130,10 @@ class ReleaseSourceSelectionTests(unittest.TestCase):
     def test_generation_only_accepts_project_transports(self):
         for given, expected in (
             ('https://dl.libreecho.org', 'https://dl.libreecho.org'),
-            ('https://github.com/LibreEcho/LibreEcho/releases',
-             'https://github.com/LibreEcho/LibreEcho/releases'),
-            ('https://evil.invalid', 'https://github.com/LibreEcho/LibreEcho/releases'),
-            ('', 'https://github.com/LibreEcho/LibreEcho/releases'),
+            ('https://github.com/aslater3/LibreEcho/releases', 'https://github.com/aslater3/LibreEcho/releases'),
+            ('https://github.com/LibreEcho/LibreEcho/releases', 'https://github.com/LibreEcho/LibreEcho/releases'),
+            ('https://evil.invalid', 'https://github.com/aslater3/LibreEcho/releases'),
+            ('', 'https://github.com/aslater3/LibreEcho/releases'),
         ):
             with self.subTest(given=given):
                 head = GENERATION.read_text().split('\nfail() {', 1)[0]

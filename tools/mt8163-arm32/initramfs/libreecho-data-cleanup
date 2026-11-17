@@ -232,6 +232,7 @@ check_children() {
     [ -d "$directory" ] || return 0
     for child in "$directory"/* "$directory"/.[!.]*; do
         [ -e "$child" ] || [ -L "$child" ] || continue
+        [ "$child" = "${CHECK_SKIP:-}" ] && continue
         [ ! -L "$child" ] || { unknown_item "$child"; continue; }
         name=${child##*/}
         allowed=0
@@ -262,8 +263,19 @@ check_children "$DATA_ROOT" libreecho lost+found
 # collected by libreecho-generation-transaction; incoming/ is the recovery
 # direct-install landing zone whose files are hardlinked into a generation.
 # Neither is descended into here -- the transaction tool verifies them.
+# local/ holds the owner's persistent local services (#170): their own files,
+# never descended into or cleaned here, and never created here (its absence
+# means the feature is unused).  If it is not a plain directory the services
+# supervisor refuses to run it, so the shape is reported but tolerated: an
+# owner's mistake must not take the network down.
+LOCAL_ROOT="$DATA_ROOT/libreecho/local"
+if [ -L "$LOCAL_ROOT" ] || { [ -e "$LOCAL_ROOT" ] && [ ! -d "$LOCAL_ROOT" ]; }; then
+    tolerated_item "$LOCAL_ROOT"
+fi
+CHECK_SKIP=$LOCAL_ROOT
 check_children "$DATA_ROOT/libreecho" config secrets features update data-manifest.json \
-    generations incoming
+    generations incoming local
+CHECK_SKIP=
 for v3_directory in "$DATA_ROOT/libreecho/generations" "$DATA_ROOT/libreecho/incoming"; do
     if [ -e "$v3_directory" ] || [ -L "$v3_directory" ]; then
         [ ! -L "$v3_directory" ] && [ -d "$v3_directory" ] || unknown_item "$v3_directory"
@@ -303,10 +315,11 @@ check_children "$DATA_ROOT/libreecho/update" \
     channel incoming staging state pending installed rolled-back check-status \
     automatic-updates install.lock bootctl.confirm bootctl.confirmed feature-commit committed-manifest committed-manifest.sig restart-record first-install.pending \
     first-install.confirmed boot-health boot-count boot-history \
-    current previous generation.lock asset-cache fetch.lock \
+    current previous generation.lock asset-cache fetch.lock ota.log ota.log.1 \
     config-status features-status transaction-slot \
     ping-last-week ping-last-month ping-last-year ping-next-payload ping-status \
     ping-install-counted \
+    news-cache.json news-cache.json.tmp news-cache.json.bak news-status news-status.tmp news-status.bak news-download.tmp \
     ping-last-week.tmp ping-last-month.tmp ping-last-year.tmp ping-next-payload.tmp ping-status.tmp \
     ping-install-counted.tmp
 

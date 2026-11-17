@@ -9,8 +9,8 @@ listen (LibreEcho-UI issue #250).
 ## Pinned source
 
 `SOURCE.lock` records the upstream version, license, release-archive URL, and
-archive SHA-256 (`3.6.4`,
-`ec35b18a6c593cf98c3e30db8b98ff93e8940a8c4e690e66b41dfc011d678110`). This
+archive SHA-256 (`3.6.7`,
+`a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6`). This
 repository never downloads source: the builder consumes the archive supplied by
 the image build and fails closed on any hash mismatch.
 
@@ -18,7 +18,7 @@ the image build and fails closed on any hash mismatch.
 
 ```sh
 tools/mt8163-arm32/mbedtls/build_mbedtls.sh \
-  --archive /path/to/mbedtls-3.6.4.tar.bz2 \
+  --archive /path/to/mbedtls-3.6.7.tar.bz2 \
   --output /path/to/mbedtls-arm32 \
   --cc /usr/bin/arm-linux-gnueabihf-gcc
 ```
@@ -64,7 +64,7 @@ Install them for the interpreter that runs the build, for example:
 python3 -m venv /path/to/mbedtls-build-venv
 /path/to/mbedtls-build-venv/bin/pip install jinja2==3.1.6 jsonschema==4.25.1
 tools/mt8163-arm32/mbedtls/build_mbedtls.sh \
-  --archive /path/to/mbedtls-3.6.4.tar.bz2 \
+  --archive /path/to/mbedtls-3.6.7.tar.bz2 \
   --output /path/to/mbedtls-arm32 \
   --cc /usr/bin/arm-linux-gnueabihf-gcc \
   --python /path/to/mbedtls-build-venv/bin/python

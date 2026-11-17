@@ -52,12 +52,12 @@ def launcher_block(text: str) -> str:
     anything else still gets extracted and the tests fail on its behaviour
     instead of silently bypassing the gate under test.
     """
-    start_line = text.index("ota_health_confirm_worker &\n")
+    start_line = text.index("( ota_health_confirm_worker; : > \"$OTA_HEALTH_SETTLED\" ) &\n")
     start = text.rindex("\nif [", 0, start_line) + 1
     end = text.index("\nfi\n", start_line) + len("\nfi\n")
     block = text[start:end]
     foreground, replaced = re.subn(
-        r"^    ota_health_confirm_worker &\n",
+        r'^    \( ota_health_confirm_worker; : > "\$OTA_HEALTH_SETTLED" \) &\n',
         "    ota_health_confirm_worker\n",
         block,
         count=1,
@@ -381,7 +381,8 @@ class RollbackFinalizationSourceContracts(unittest.TestCase):
         self.assertIn('GENERATIONS=${GENERATIONS:-/data/libreecho/generations}', generation)
         self.assertIn("INSTALL_LOCK=$ROOT/install.lock", fetcher)
         self.assertIn("$RUN_ROOT/libreecho/fetch.lock", fetcher)
-        self.assertIn('$BB mkdir "$INSTALL_LOCK" 2>/dev/null || die update_busy', fetcher)
+        self.assertIn('$BB mkdir "$INSTALL_LOCK" 2>/dev/null', fetcher)
+        self.assertIn("install_lock_reclaim_stale || die update_busy", fetcher)
         # The installer takes the same path.
         self.assertIn("LOCK=$UPDATE_ROOT/install.lock", installer)
         self.assertIn('$BB mkdir "$LOCK" 2>/dev/null', installer)

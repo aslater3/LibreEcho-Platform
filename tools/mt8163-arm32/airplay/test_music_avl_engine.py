@@ -5,7 +5,9 @@ Levels are measured after the master volume (stock "smart volume").  At
 volume 50 (-32 dB) a typical -12 dBFS programme is lifted toward +15 dB
 (~+13.6 dB after 25 s of the 10 s release); a -34 dBFS tone sits partly under
 the -55 dBFS gate and gets ~+5 dB; volume 95 (level 10) gets no boost; the
-system bus is untouched; the boost ramps within each period; and the runtime
+system bus and the Sendspin stream are untouched (per-device levelling would
+skew the loudness of grouped rooms the server keeps in step); the boost ramps
+within each period; and the runtime
 kill switch (<root>/avl.disabled) turns it off.
 """
 import subprocess, sys, tempfile
@@ -28,11 +30,14 @@ static double rms_db(const int16_t *o) { double s = 0; size_t i;
     for (i = 0; i < PERIOD_SIZE; ++i) s += (double)o[i * 2] * o[i * 2];
     return 10 * log10(s / PERIOD_SIZE / (32768.0 * 32768.0) + 1e-30); }
 
-/* Render `periods` of a 1 kHz tone at `amp` on `bus`; returns last-period dB. */
+/* Render `periods` of a 1 kHz tone at `amp` on `bus` (SOURCE_COUNT selects the
+ * Sendspin stream input); returns last-period dB. */
 static double run(unsigned int bus, double amp, int periods, int avl, int vol, double *max_step)
 {
     static struct source_bus sources[SOURCE_COUNT];
     static int16_t output[PERIOD_SIZE * OUTPUT_CHANNELS];
+    static int16_t sendspin[PERIOD_SIZE * OUTPUT_CHANNELS];
+    int ss = bus == SOURCE_COUNT;
     struct puffin_dynamics dyn; struct speaker_dsp dsp;
     size_t pb = PERIOD_SIZE * INPUT_CHANNELS * sizeof(int16_t), i; int p; int32_t mg;
     double last = 0, prev = 0; int16_t prev_last = 0;
@@ -42,10 +47,12 @@ static double run(unsigned int bus, double amp, int periods, int avl, int vol, d
     puffin_dynamics_init(&dyn); speaker_dsp_init(&dsp, vol); mg = logical_master_gain(vol);
     *max_step = 0;
     for (p = 0; p < periods; ++p) {
-        sources[bus].received = pb;
+        int16_t *dst = ss ? sendspin : (int16_t *)sources[bus].samples;
+        if (!ss) sources[bus].received = pb;
         for (i = 0; i < PERIOD_SIZE; ++i) { int16_t v = (int16_t)lrint(amp * sin(2 * M_PI * 1000.0 * (double)(p * PERIOD_SIZE + i) / 48000.0));
-            sources[bus].samples[2 * i] = v; sources[bus].samples[2 * i + 1] = v; }
-        render_period(sources, output, &dyn, &dsp, logical_master_gain(vol), &mg);
+            dst[2 * i] = v; dst[2 * i + 1] = v; }
+        render_period(sources, ss ? sendspin : NULL, ss ? PERIOD_SIZE : 0, output,
+                      &dyn, &dsp, logical_master_gain(vol), &mg);
         last = rms_db(output);
         if (p > 4 && fabs(last - prev) > *max_step) *max_step = fabs(last - prev);
         prev = last; (void)prev_last;
@@ -77,6 +84,11 @@ int main(int argc, char **argv)
     sys_on  = run(SOURCE_SYSTEM, 32768 * 0.2512, 300, 1, 50, &step);
     printf("system bus: boost %+.2f dB\n", sys_on - sys_off);
     if (!(fabs(sys_on - sys_off) < 0.05)) { puts("FAIL: system bus was levelled"); ++fails; }
+    sys_off = run(SOURCE_COUNT, 32768 * 0.2512, 590, 0, 50, &step);
+    sys_on  = run(SOURCE_COUNT, 32768 * 0.2512, 590, 1, 50, &step);
+    printf("sendspin stream: boost %+.2f dB (level %.1f dBFS)\n", sys_on - sys_off, sys_off);
+    if (!(fabs(sys_on - sys_off) < 0.05)) { puts("FAIL: Sendspin stream was AVL levelled"); ++fails; }
+    if (!(sys_off > -60.0)) { puts("FAIL: Sendspin stream did not reach the render output"); ++fails; }
     off = run(SOURCE_MEDIA, 32768 * 0.2512, 590, 0, 50, &step);
     /* Kill switch: the file turns AVL off at the next period. */
     snprintf(avl_disable_path, sizeof(avl_disable_path), "%s/avl.disabled", argv[1]);
@@ -102,7 +114,7 @@ def main() -> None:
         subprocess.run(["cc", "-std=c99", "-O2", "-w", "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                         "-I", str(work), "-I", str(AIRPLAY), str(src), "-lm", "-o", str(exe)], check=True, timeout=180)
         subprocess.run([str(exe), str(work)], check=True, timeout=300)
-    print("music_avl_engine: post-volume lift, gate, top-level, system bus, smooth, kill switch PASS")
+    print("music_avl_engine: post-volume lift, gate, top-level, system bus, sendspin, smooth, kill switch PASS")
 
 if __name__ == "__main__":
     main()

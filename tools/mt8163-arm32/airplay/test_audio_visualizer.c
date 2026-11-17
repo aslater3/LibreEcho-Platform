@@ -209,10 +209,128 @@ static int test_dense_mix_keeps_motion(void)
 	return 0;
 }
 
+static int levels_equal(const uint8_t *a, const uint8_t *b)
+{
+	unsigned int band;
+
+	for (band = 0; band < AUDIO_VISUALIZER_BANDS; ++band)
+		if (a[band] != b[band])
+			return 0;
+	return 1;
+}
+
+/* Fill the engine's interleaved stereo layout (stride = OUTPUT_CHANNELS) with
+ * the same sample in both channels. */
+static void fill_constant(int16_t *samples, int value)
+{
+	unsigned int frame;
+
+	for (frame = 0; frame < TEST_FRAMES; ++frame) {
+		samples[frame * 2] = (int16_t)value;
+		samples[frame * 2 + 1] = (int16_t)value;
+	}
+}
+
+static int process_constant(const uint8_t *expected, int value,
+			    const char *label)
+{
+	struct audio_visualizer visualizer;
+	int16_t samples[TEST_FRAMES * 2];
+	uint8_t levels[AUDIO_VISUALIZER_BANDS];
+	unsigned int period;
+	unsigned int band;
+
+	audio_visualizer_init(&visualizer);
+	memset(levels, 0, sizeof(levels));
+	fill_constant(samples, value);
+	for (period = 0; period < 8; ++period)
+		audio_visualizer_process(&visualizer, samples, TEST_FRAMES, 2,
+					 levels);
+	if (!levels_equal(levels, expected)) {
+		fprintf(stderr, "%s levels changed:", label);
+		for (band = 0; band < AUDIO_VISUALIZER_BANDS; ++band)
+			fprintf(stderr, " %u", levels[band]);
+		fputc('\n', stderr);
+		return 1;
+	}
+	return 0;
+}
+
+/*
+ * REGRESSION: the hot path scaled each sample with
+ * ``(int32_t)sample << FILTER_INPUT_SHIFT``.  Left-shifting a negative signed
+ * value is undefined in C, so any negative media sample made the shared engine
+ * exhibit UB on the media-only visualizer path (the legacy scenario hid it by
+ * keeping a higher-priority bus live).  The scaling is now a bounded multiply;
+ * this test drives bipolar and full-scale extreme vectors in the engine's real
+ * interleaved layout under UBSan (halt_on_error=1), so reintroducing the
+ * negative shift aborts here.  The expected levels were captured from the
+ * intended (numerically identical) pre-fix behaviour, so the fix cannot
+ * silently change amplitudes.
+ */
+static int test_bipolar_extreme(void)
+{
+	static const uint8_t pos12000[AUDIO_VISUALIZER_BANDS] =
+		{ 59, 19, 19, 14, 12, 11, 7, 5, 0, 0, 0, 0 };
+	static const uint8_t neg12000[AUDIO_VISUALIZER_BANDS] =
+		{ 59, 19, 19, 14, 12, 11, 7, 5, 0, 0, 0, 0 };
+	static const uint8_t extreme[AUDIO_VISUALIZER_BANDS] =
+		{ 65, 25, 25, 21, 19, 14, 14, 11, 11, 5, 4, 0 };
+	struct audio_visualizer visualizer;
+	int16_t samples[TEST_FRAMES * 2];
+	uint8_t levels[AUDIO_VISUALIZER_BANDS];
+	unsigned int frame;
+	unsigned int band;
+
+	/* A negative constant must scale to exactly the same magnitude as its
+	 * positive twin: the front end is linear and the input scaling is a
+	 * defined multiply, never a signed left shift. */
+	if (process_constant(pos12000, 12000, "positive tone") ||
+	    process_constant(neg12000, -12000, "negative tone"))
+		return 1;
+	if (!levels_equal(pos12000, neg12000)) {
+		fprintf(stderr, "bipolar amplitudes are not symmetric\n");
+		return 1;
+	}
+
+	/* Both signed extremes and the full-scale magnitude edge. */
+	if (process_constant(extreme, -32768, "INT16_MIN") ||
+	    process_constant(extreme, 32767, "INT16_MAX") ||
+	    process_constant(extreme, -32767, "INT16_MIN+1"))
+		return 1;
+
+	/* A dense vector alternating the signed extremes: every frame is a
+	 * negative or positive full-scale edge, the worst case for the old
+	 * negative shift. */
+	audio_visualizer_init(&visualizer);
+	memset(levels, 0, sizeof(levels));
+	for (frame = 0; frame < TEST_FRAMES; ++frame) {
+		int value = (frame & 1u) ? INT16_MIN : INT16_MAX;
+
+		samples[frame * 2] = (int16_t)value;
+		samples[frame * 2 + 1] = (int16_t)value;
+	}
+	for (frame = 0; frame < 8; ++frame)
+		audio_visualizer_process(&visualizer, samples, TEST_FRAMES, 2,
+					 levels);
+	{
+		unsigned int maximum = 0;
+
+		for (band = 0; band < AUDIO_VISUALIZER_BANDS; ++band)
+			if (levels[band] > maximum)
+				maximum = levels[band];
+		if (maximum == 0) {
+			fprintf(stderr, "extreme vector produced no energy\n");
+			return 1;
+		}
+	}
+	return 0;
+}
+
 int main(void)
 {
 	if (test_silence() || test_band_centres() || test_attack_and_decay() ||
-	    test_dense_mix_keeps_motion())
+	    test_dense_mix_keeps_motion() || test_bipolar_extreme())
 		return 1;
 	puts("audio visualizer analyzer: ok");
 	return 0;

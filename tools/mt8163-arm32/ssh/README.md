@@ -5,10 +5,11 @@ The SSH bundle is opt-in at image build time. It contains the static ARM32
 non-secret `/etc/passwd`/`/etc/group` scaffolding.
 
 When the bundle is present, `libreecho-init` starts
-`/etc/init.d/libreecho-ssh.init`. The supervisor keeps the server stopped unless
-the saved WebUI configuration has `"ssh": true` and
-`/data/libreecho/config/users` is a root-owned, private, non-empty database using
-the WebUI format:
+`/etc/init.d/libreecho-ssh.init`. SSH is on by default: the supervisor runs the
+server while `/data/libreecho/config/users` is a root-owned, private, non-empty
+database using the WebUI format, unless the saved WebUI configuration (root-owned,
+0600) holds exactly one `"ssh"` key set to `false`. A missing, untrusted or
+ambiguous configuration keeps the default. The users database uses the format:
 
 ```text
 username:sha256:salt:digest

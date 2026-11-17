@@ -42,6 +42,12 @@
 #define MUSIC_FEATURES_ONSET_HISTORY 128U
 #define MUSIC_FEATURES_MIN_LAG 6U
 #define MUSIC_FEATURES_MAX_LAG 32U
+/* Fractional tempo refinement: the beat lag is re-measured at up to this many
+ * beats (the peak of the n-beat lag carries n times the resolution) without
+ * correlating past this lag, so at least 64 of the 128 history entries
+ * contribute to every refinement product sum. */
+#define MUSIC_FEATURES_REFINE_MAX_LAG 64U
+#define MUSIC_FEATURES_REFINE_BEATS 4U
 /* Slow-axis delay used to measure the multi-second loudness trend. */
 #define MUSIC_FEATURES_SLOW_HISTORY 64U
 
@@ -111,6 +117,8 @@ struct music_features_state {
 	uint16_t slow_raw_q8[MUSIC_FEATURES_BANDS];
 	uint8_t prev_raw[MUSIC_FEATURES_BANDS];
 	uint8_t onset_out[MUSIC_FEATURES_BAND_GROUPS];
+	/* Recent peak of each group's raw flux: the onset normalisation scale. */
+	uint16_t onset_peak[MUSIC_FEATURES_BAND_GROUPS];
 	uint8_t onset_hist[MUSIC_FEATURES_ONSET_HISTORY];
 	uint16_t hist_index;
 	uint16_t hist_filled;
@@ -122,12 +130,13 @@ struct music_features_state {
 	uint8_t build_peak;
 	uint8_t dip_active;
 	uint8_t dip_low;
-	/* Tempo hypothesis. */
-	uint16_t period_frames;
-	uint16_t lag_candidate;
+	/* Tempo hypothesis.  Periods are in updates, Q8 (fractional). */
+	uint16_t period_q8;
+	uint16_t candidate_q8;
 	uint8_t lag_votes;
 	uint8_t confidence;
 	uint16_t phase;
+	uint8_t phase_locked;
 	uint8_t beat_strength;
 	uint8_t beat_refractory;
 	uint8_t group_refractory[MUSIC_FEATURES_BAND_GROUPS];
@@ -141,7 +150,7 @@ struct music_features_state {
 	uint8_t section_frames;
 	uint16_t drop_window;
 	uint16_t cooldown[6];
-	/* Latch so a one-period event survives a multi-period frame cadence. */
+	/* Latch so a one-period event survives a frame ledd did not take. */
 	uint16_t event_latch;
 	uint8_t event_hold;
 	uint32_t period_index;
@@ -235,12 +244,46 @@ static inline void music_features_state_init(struct music_features_state *state)
 #define MF_BEAT_ATTACK 1U
 #define MF_BEAT_DECAY 5U
 #define MF_BEAT_MIN_SCORE 48U
+/* Detrending window for the tempo search, and the minimum mean squared
+   detrended onset level (per frame) for any tempo to be considered. */
+#define MF_DETREND_FRAMES 8U
+#define MF_BEAT_MIN_VARIANCE 16U
+/* A faster metrical level is chosen when it scores at least this fraction (Q8) of the best lag. */
+#define MF_METRICAL_RATIO_Q8 205U
 #define MF_BEAT_CONFIDENCE_LEVEL 32U
-#define MF_BEAT_PHASE_LEVEL 64U
+/* Phase runs whenever a tempo is published (the same confidence level), so
+ * beat-driven motion does not stand still on real music, whose confidence
+ * often sits between 32 and 64. */
+#define MF_BEAT_PHASE_LEVEL MF_BEAT_CONFIDENCE_LEVEL
 #define MF_BEAT_COHERENT_LEVEL 48U
 #define MF_LAG_VOTES 3U
+/* A new lag estimate within 1/16 (~6%) of the candidate votes for it and
+ * moves it by 1/4 of the difference; anything further starts a new one. */
+#define MF_LAG_TOLERANCE_SHIFT 4U
+#define MF_LAG_SMOOTH_SHIFT 2U
+/* A detected beat pulls the running phase halfway to zero (damped), instead
+ * of snapping it, so period-quantised onset timing averages out. */
+#define MF_PHASE_CORRECT_SHIFT 1U
 #define MF_ONSET_DECAY 20U
-#define MF_GROUP_FLOOR 24
+/*
+ * Onset normalisation.  A group's flux is the summed rise of its four band
+ * levels (about 23 per 6 dB each).  On mastered music a kick moves that sum
+ * by 60..250 of a possible 1020, so the raw value never reached the published
+ * 0..255 range and nothing downstream saw a beat.  Each group is therefore
+ * scaled by its own recent peak: the peak jumps to a stronger hit and
+ * decays with a ~2.7 s time constant, and never drops below
+ * MF_ONSET_PEAK_FLOOR, so the residue of steady material is not blown up into
+ * hits.  The strongest recent hit publishes near 255, weaker ones in
+ * proportion.
+ */
+#define MF_ONSET_PEAK_FLOOR 72U
+/* Raw flux below this is level ripple (pads, noise), not an onset. */
+#define MF_ONSET_NOISE 24U
+#define MF_ONSET_PEAK_DECAY_SHIFT 6U
+/* A group onset counts as a hit from this normalised level. */
+#define MF_GROUP_FLOOR 80
+/* The broadband envelope counts as a beat from this normalised level. */
+#define MF_BEAT_FLOOR 56
 #define MF_GROUP_REFRACTORY 3U
 
 #define MF_QUIET_LEVEL 20
@@ -267,8 +310,11 @@ static inline void music_features_state_init(struct music_features_state *state)
 #define MF_CD_SECTION 144U
 #define MF_CD_DROP 168U
 #define MF_CD_FILL 72U
-/* Event flags are held for this many updates so an event that lands between
- * two emitted frames is still delivered by the next one. */
+/* Event flags are held for this many updates (~171 ms at 2048/48000).  The
+ * engine now sends a frame every update, so the hold no longer bridges a frame
+ * gap; it keeps the event visible for the same wall-clock time as before and
+ * still delivers it when one best-effort send is dropped.  Consumers treat the
+ * flags as level state gated by their own cooldowns, not as counted edges. */
 #define MF_EVENT_HOLD 4U
 
 static inline int mf_cooldown_ok(const struct music_features_state *state,
@@ -284,18 +330,91 @@ static inline void mf_cooldown_arm(struct music_features_state *state,
 	state->cooldown[which] = periods;
 }
 
-static inline uint16_t mf_lag_to_bpm_x100(uint32_t fps_q8, uint16_t lag)
+/* Beat period in updates (Q8) to BPM x100: fps * 60 * 100 / period. */
+static inline uint16_t mf_lag_q8_to_bpm_x100(uint32_t fps_q8, uint16_t lag_q8)
 {
 	uint64_t numerator;
 
-	if (lag == 0)
+	if (lag_q8 == 0)
 		return 0;
 	numerator = (uint64_t)fps_q8 * 100U * 60U;
-	numerator = numerator / 256U;
-	numerator = (numerator + lag / 2U) / lag;
+	numerator = (numerator + lag_q8 / 2U) / lag_q8;
 	if (numerator > 30000U)
 		numerator = 30000U;
 	return (uint16_t)numerator;
+}
+
+/* A lag's score plus its stronger in-range neighbour's. */
+static inline int32_t mf_peak_mass(const int32_t *scores, unsigned int lag)
+{
+	int32_t below = lag > MUSIC_FEATURES_MIN_LAG ? scores[lag - 1U] : 0;
+	int32_t above = lag < MUSIC_FEATURES_MAX_LAG ? scores[lag + 1U] : 0;
+
+	return scores[lag] + (below > above ? below : above);
+}
+
+/* Detrended onset autocorrelation at one lag, per product, Q8 of den. */
+static inline int32_t mf_lag_score(const int16_t *detrended, unsigned int lag,
+				   uint32_t den)
+{
+	int32_t num = 0;
+	unsigned int k;
+
+	for (k = lag; k < MUSIC_FEATURES_ONSET_HISTORY; ++k)
+		num += (int32_t)detrended[k] * detrended[k - lag];
+	return (int32_t)((int64_t)num * 256 * MUSIC_FEATURES_ONSET_HISTORY /
+			 ((int64_t)den * (MUSIC_FEATURES_ONSET_HISTORY - lag)));
+}
+
+/*
+ * Fractional beat period (Q8 updates) around the whole-period lag ``lag``.
+ * Onsets fall on whole updates, so a 120 BPM beat (11.72 updates) splits its
+ * correlation between lags 11 and 12 and a whole lag reads 117 BPM.  The
+ * n-beat lag (n up to MUSIC_FEATURES_REFINE_BEATS) holds the same period with
+ * n times the resolution: find its peak in the window n*lag +/- n/2, refine
+ * the peak by a parabola through its two neighbours, and divide by n.  Cost is
+ * at most n + 3 extra lags of < 128 products each.
+ */
+static inline uint16_t mf_refine_lag_q8(const int16_t *detrended,
+					unsigned int lag, uint32_t den)
+{
+	int32_t window[MUSIC_FEATURES_REFINE_BEATS + 3U];
+	unsigned int beats = (MUSIC_FEATURES_REFINE_MAX_LAG - 2U) / (lag + 1U);
+	unsigned int first, count, i, peak;
+	int32_t below, above, curvature, offset_q8 = 0;
+	int32_t estimate;
+
+	if (beats < 1U)
+		beats = 1U;
+	if (beats > MUSIC_FEATURES_REFINE_BEATS)
+		beats = MUSIC_FEATURES_REFINE_BEATS;
+	first = beats * lag - beats / 2U - 1U;
+	count = (beats / 2U) * 2U + 3U;
+	for (i = 0; i < count; ++i)
+		window[i] = mf_lag_score(detrended, first + i, den);
+	peak = 1U;
+	for (i = 2U; i + 1U < count; ++i)
+		if (window[i] > window[peak])
+			peak = i;
+	below = window[peak - 1U];
+	above = window[peak + 1U];
+	curvature = below - 2 * window[peak] + above;
+	if (window[peak] > 0 && curvature < 0) {
+		offset_q8 = (int32_t)(((int64_t)(below - above) * 128) /
+				      curvature);
+		if (offset_q8 > 128)
+			offset_q8 = 128;
+		if (offset_q8 < -128)
+			offset_q8 = -128;
+	}
+	estimate = ((int32_t)(first + peak) * 256 + offset_q8 +
+		    (int32_t)beats / 2) / (int32_t)beats;
+	/* Stay within half a period of the whole-period lag it refines. */
+	if (estimate < (int32_t)lag * 256 - 128)
+		estimate = (int32_t)lag * 256 - 128;
+	if (estimate > (int32_t)lag * 256 + 128)
+		estimate = (int32_t)lag * 256 + 128;
+	return (uint16_t)estimate;
 }
 
 static inline void music_features_update(struct music_features_state *state,
@@ -315,7 +434,9 @@ static inline void music_features_update(struct music_features_state *state,
 	unsigned int i, g;
 	unsigned int best_lag = 0;
 	int32_t best_score = -1;
+	uint16_t best_q8 = 0;
 	uint8_t onset_env;
+	uint8_t impact;
 	uint8_t fast255, slow255;
 	uint16_t events = 0;
 	uint16_t beat_bpm = 0;
@@ -400,41 +521,70 @@ static inline void music_features_update(struct music_features_state *state,
 		(low * 255U) / (low + mid + high + 1U) << 8, MF_WARMTH_SHIFT);
 
 	/*
-	 * Differentiated onsets: positive spectral flux per band group, held
-	 * with a short peak decay so a single period of attack is visible in
+	 * Differentiated onsets: positive spectral flux per band group,
+	 * normalised by the group's recent peak (see MF_ONSET_PEAK_FLOOR) and
+	 * released by half per update, so each hit is a clear rising edge in
 	 * the published frame.  Steady material converges to zero flux.
 	 */
 	{
 		int raw_group[3];
-		uint8_t out_group[3];
+		uint32_t fresh[3];
 
-		raw_group[0] = flux_low >> 2;	/* 4 bands, 255 each */
-		raw_group[1] = flux_mid >> 2;
-		raw_group[2] = flux_high >> 2;
+		uint32_t loudest = MF_ONSET_PEAK_FLOOR * 2U;
+
+		raw_group[0] = flux_low;	/* 4 bands, 255 each */
+		raw_group[1] = flux_mid;
+		raw_group[2] = flux_high;
 		for (g = 0; g < MUSIC_FEATURES_BAND_GROUPS; ++g) {
-			int value = raw_group[g];
+			uint32_t flux = (uint32_t)raw_group[g];
+			uint32_t peak = state->onset_peak[g];
 
-			if (value > 255)
-				value = 255;
-			if (value < (int)state->onset_out[g] &&
-			    state->onset_out[g] > MF_ONSET_DECAY)
-				value = state->onset_out[g] - MF_ONSET_DECAY;
-			else if (value < state->onset_out[g])
-				value = 0;
-			out_group[g] = (uint8_t)value;
-			state->onset_out[g] = out_group[g];
+			flux = flux > MF_ONSET_NOISE ? flux - MF_ONSET_NOISE : 0U;
+			raw_group[g] = (int)flux;
+			if (flux > peak)
+				peak = flux;
+			else
+				peak -= (peak >> MF_ONSET_PEAK_DECAY_SHIFT) +
+					(peak != 0);
+			state->onset_peak[g] = (uint16_t)peak;
+			if (peak > loudest)
+				loudest = peak;
+		}
+		for (g = 0; g < MUSIC_FEATURES_BAND_GROUPS; ++g) {
+			uint32_t flux = (uint32_t)raw_group[g];
+			/* Scale by the mean of the group's own peak and the
+			 * loudest group's, so the spill of a kick into the
+			 * mid bands stays smaller than the kick. */
+			uint32_t scale = (state->onset_peak[g] + loudest + 1U) /
+					 2U;
+			uint32_t value;
+			uint32_t held = state->onset_out[g] / 2U;
+
+			value = flux * 255U / scale;
+			if (value > 255U)
+				value = 255U;
+			fresh[g] = value;
+			if (value < held)
+				value = held;
+			state->onset_out[g] = (uint8_t)value;
 			state->group_mean_q8[g] = music_features_ema_q8(
 				state->group_mean_q8[g],
-				(uint32_t)out_group[g] << 8, MF_GROUP_MEAN_SHIFT);
+				value << 8, MF_GROUP_MEAN_SHIFT);
 		}
+		/* Broadband envelope for the tempo search: bass weighs double. */
+		onset_env = (uint8_t)((2U * fresh[0] + fresh[1] + fresh[2] + 2U) /
+				      4U);
 	}
-	onset_env = music_features_u8(
+	/* Absolute broadband impact (not normalised), for transientness and
+	 * the drop/fill gates, which must not open on a quiet passage's
+	 * strongest note. */
+	impact = music_features_u8(
 		(uint16_t)(((uint32_t)(flux_low + flux_mid + flux_high) >> 4)
 			   << 8));
 
 	/* Transientness: fast rise, slower fall. */
 	{
-		uint16_t target_q8 = (uint16_t)((uint8_t)onset_env << 8);
+		uint16_t target_q8 = (uint16_t)((uint8_t)impact << 8);
 
 		state->transient_q8 = music_features_ema_q8(
 			state->transient_q8, target_q8,
@@ -500,53 +650,116 @@ static inline void music_features_update(struct music_features_state *state,
 	if (state->hist_filled < MUSIC_FEATURES_ONSET_HISTORY)
 		++state->hist_filled;
 
-	for (i = 0; i < MUSIC_FEATURES_ONSET_HISTORY; ++i)
-		den += (uint32_t)state->onset_hist[i] *
-			state->onset_hist[i];
+	/*
+	 * Detrend before correlating: each envelope value minus its trailing
+	 * MF_DETREND_FRAMES local mean, oldest first.  Raw autocorrelation of a
+	 * smooth or slowly swelling envelope (a pad, a crescendo) is high at every
+	 * lag, which reported a confident tempo on beatless material (#45/#46).
+	 * Only onsets that stand out from their surroundings now correlate, and an
+	 * envelope with almost no variation produces no score at all.
+	 */
+	if (state->hist_filled >= MUSIC_FEATURES_ONSET_HISTORY) {
+		int16_t detrended[MUSIC_FEATURES_ONSET_HISTORY];
+		unsigned int lag, k;
+		uint32_t window = 0;
 
-	if (state->hist_filled >= MUSIC_FEATURES_ONSET_HISTORY &&
-	    den != 0) {
-		unsigned int lag;
+		for (k = 0; k < MUSIC_FEATURES_ONSET_HISTORY; ++k) {
+			unsigned int idx = (state->hist_index + k) %
+				MUSIC_FEATURES_ONSET_HISTORY;
+			unsigned int count = k + 1U < MF_DETREND_FRAMES
+				? k + 1U : MF_DETREND_FRAMES;
 
-		for (lag = MUSIC_FEATURES_MIN_LAG;
-		     lag <= MUSIC_FEATURES_MAX_LAG; ++lag) {
-			uint32_t num = 0;
-			int32_t score;
-			unsigned int k;
+			window += state->onset_hist[idx];
+			if (k >= MF_DETREND_FRAMES)
+				window -= state->onset_hist[
+					(state->hist_index + k - MF_DETREND_FRAMES) %
+					MUSIC_FEATURES_ONSET_HISTORY];
+			detrended[k] = (int16_t)((int)state->onset_hist[idx] -
+						 (int)(window / count));
+			den += (uint32_t)((int32_t)detrended[k] * detrended[k]);
+		}
+		if (den >= MF_BEAT_MIN_VARIANCE * MUSIC_FEATURES_ONSET_HISTORY) {
+			int32_t scores[MUSIC_FEATURES_MAX_LAG + 1U];
+			unsigned int divisor;
 
-			for (k = 0; k < MUSIC_FEATURES_ONSET_HISTORY; ++k) {
-				unsigned int a = (state->hist_index +
-						  MUSIC_FEATURES_ONSET_HISTORY -
-						  1U - k) %
-					MUSIC_FEATURES_ONSET_HISTORY;
-				unsigned int b = (state->hist_index +
-						  MUSIC_FEATURES_ONSET_HISTORY -
-						  1U - k - lag) %
-					MUSIC_FEATURES_ONSET_HISTORY;
+			for (lag = MUSIC_FEATURES_MIN_LAG;
+			     lag <= MUSIC_FEATURES_MAX_LAG; ++lag) {
+				int32_t num = 0;
+				int32_t score;
 
-				num += (uint32_t)state->onset_hist[a] *
-					state->onset_hist[b];
+				for (k = lag; k < MUSIC_FEATURES_ONSET_HISTORY; ++k)
+					num += (int32_t)detrended[k] *
+						detrended[k - lag];
+				score = num > 0 ? (int32_t)((int64_t)num * 256 /
+							      (int64_t)den) : 0;
+				scores[lag] = score;
+				if (score > best_score) {
+					best_score = score;
+					best_lag = lag;
+				}
 			}
-			score = (int32_t)(num * 256U / den);
-			if (score > best_score) {
-				best_score = score;
-				best_lag = lag;
+			/*
+			 * Metrical level: a periodic onset train also correlates at two
+			 * and three periods, and the longer lag can win by a hair.  If
+			 * the lag a half or a third as long scores nearly as well, the
+			 * beat is the faster one (#45).  A beat that is not a whole
+			 * number of updates splits its score between two adjacent
+			 * lags, and the slower level rounds differently, so compare
+			 * peak mass (a lag plus its stronger neighbour) and take the
+			 * strongest lag next to a half or a third of the best.
+			 */
+			for (divisor = 3U; divisor >= 2U; --divisor) {
+				unsigned int fast = (unsigned int)(best_lag + divisor / 2U) / divisor;
+				unsigned int pick = fast;
+
+				if (best_score <= 0 || fast < MUSIC_FEATURES_MIN_LAG)
+					continue;
+				if (fast > MUSIC_FEATURES_MIN_LAG &&
+				    scores[fast - 1U] > scores[pick])
+					pick = fast - 1U;
+				if (fast < MUSIC_FEATURES_MAX_LAG &&
+				    scores[fast + 1U] > scores[pick])
+					pick = fast + 1U;
+				if (mf_peak_mass(scores, pick) * 256 >=
+				    mf_peak_mass(scores, best_lag) *
+					    (int32_t)MF_METRICAL_RATIO_Q8) {
+					best_lag = pick;
+					best_score = scores[pick];
+					break;
+				}
 			}
+			if (best_score >= (int32_t)MF_BEAT_MIN_SCORE)
+				best_q8 = mf_refine_lag_q8(detrended, best_lag,
+							   den);
 		}
 	}
 
 	if (best_score >= (int32_t)MF_BEAT_MIN_SCORE) {
 		int32_t target = best_score > 255 ? 255 : best_score;
 
-		if (state->lag_candidate == (uint16_t)best_lag) {
+		int32_t delta = (int32_t)best_q8 - (int32_t)state->candidate_q8;
+
+		/*
+		 * Vote with a tolerance rather than on the exact lag: a
+		 * fractional period wanders by a few Q8 units between updates
+		 * and must still accumulate votes, while a metrical or tempo
+		 * change (well over 6%) starts a fresh candidate.
+		 */
+		if (state->candidate_q8 != 0 &&
+		    (delta < 0 ? -delta : delta) <=
+			    (int32_t)(state->candidate_q8 >>
+				      MF_LAG_TOLERANCE_SHIFT)) {
 			if (state->lag_votes < 0xffU)
 				++state->lag_votes;
+			state->candidate_q8 = (uint16_t)(
+				(int32_t)state->candidate_q8 +
+				delta / (1 << MF_LAG_SMOOTH_SHIFT));
 		} else {
-			state->lag_candidate = (uint16_t)best_lag;
+			state->candidate_q8 = best_q8;
 			state->lag_votes = 1;
 		}
 		if (state->lag_votes >= MF_LAG_VOTES)
-			state->period_frames = (uint16_t)best_lag;
+			state->period_q8 = state->candidate_q8;
 		if ((int)state->confidence < target)
 			state->confidence = music_features_clamp8(
 				state->confidence +
@@ -567,13 +780,19 @@ static inline void music_features_update(struct music_features_state *state,
 			state->confidence = 0;
 	}
 
-	/* Phase advances at the estimated period; a beat snaps it to zero. */
+	/*
+	 * Phase advances at the fractional period whenever a tempo is
+	 * published; a detected beat then corrects it (below).
+	 */
 	if (state->confidence >= MF_BEAT_PHASE_LEVEL &&
-	    state->period_frames >= MUSIC_FEATURES_MIN_LAG &&
-	    state->period_frames <= MUSIC_FEATURES_MAX_LAG) {
-		uint32_t step = 65536U / state->period_frames;
+	    state->period_q8 >= MUSIC_FEATURES_MIN_LAG * 256U - 128U &&
+	    state->period_q8 <= MUSIC_FEATURES_MAX_LAG * 256U + 128U) {
+		uint32_t step = ((65536U << 8) + state->period_q8 / 2U) /
+			state->period_q8;
 
 		state->phase = (uint16_t)((state->phase + step) & 0xffffU);
+	} else {
+		state->phase_locked = 0;
 	}
 
 	/* Beat / per-group onset evidence. */
@@ -586,17 +805,38 @@ static inline void music_features_update(struct music_features_state *state,
 	{
 		int threshold = (int)(state->onset_mean_q8 >> 8) * 2;
 
-		if (threshold < MF_GROUP_FLOOR)
-			threshold = MF_GROUP_FLOOR;
+		if (threshold < MF_BEAT_FLOOR)
+			threshold = MF_BEAT_FLOOR;
 		if (state->beat_refractory == 0 &&
-		    state->confidence >= MF_BEAT_COHERENT_LEVEL &&
+		    state->confidence >= MF_BEAT_PHASE_LEVEL &&
 		    onset_env >= threshold) {
-			state->phase = 0;
+			unsigned int refractory =
+				(unsigned int)state->period_q8 * 3U / 1024U;
+			/* Signed distance from the beat, -0.5..+0.5 beat. */
+			int32_t error = state->phase >= 32768U
+				? (int32_t)state->phase - 65536
+				: (int32_t)state->phase;
+
+			/*
+			 * The first beat after the phase starts running snaps
+			 * it; later beats pull it halfway to zero, so the
+			 * phase keeps moving smoothly and the whole-period
+			 * timing of each onset averages out.
+			 */
+			if (!state->phase_locked) {
+				state->phase = 0;
+				state->phase_locked = 1;
+			} else {
+				state->phase = (uint16_t)(
+					((int32_t)state->phase -
+					 error / (1 << MF_PHASE_CORRECT_SHIFT)) &
+					0xffff);
+			}
 			state->beat_refractory = (uint8_t)(
-				(state->period_frames * 3U / 4U) < 3U ? 3U :
-				 state->period_frames * 3U / 4U);
-			state->beat_strength = music_features_clamp8(
-				(int)onset_env + state->confidence / 4);
+				refractory < 3U ? 3U : refractory);
+			if (state->confidence >= MF_BEAT_COHERENT_LEVEL)
+				state->beat_strength = music_features_clamp8(
+					(int)onset_env + state->confidence / 4);
 		}
 	}
 
@@ -704,7 +944,7 @@ static inline void music_features_update(struct music_features_state *state,
 		if (fast255 >= MF_DROP_LEVEL &&
 		    ((state->dip_active &&
 		      (int)fast255 >= (int)state->dip_low + MF_DROP_RECOVER) ||
-		     onset_env >= MF_DROP_ONSET) &&
+		     impact >= MF_DROP_ONSET) &&
 		    mf_cooldown_ok(state, MUSIC_COOLDOWN_DROP)) {
 			events |= MUSIC_EVENT_DROP;
 			mf_cooldown_arm(state, MUSIC_COOLDOWN_DROP, MF_CD_DROP);
@@ -741,13 +981,13 @@ static inline void music_features_update(struct music_features_state *state,
 	 * Fill: a strong broadband accent while the groove is confident.  A
 	 * single accent plus the cooldown keeps it from chattering.
 	 */
-	if (onset_env >= MF_FILL_LEVEL &&
+	if (impact >= MF_FILL_LEVEL &&
 	    state->confidence >= (MF_BEAT_CONFIDENCE_LEVEL + 8U) &&
 	    mf_cooldown_ok(state, MUSIC_COOLDOWN_FILL)) {
 		events |= MUSIC_EVENT_FILL;
 		mf_cooldown_arm(state, MUSIC_COOLDOWN_FILL, MF_CD_FILL);
 		state->event_strength_q8 = (uint16_t)(
-			(uint32_t)onset_env << 8);
+			(uint32_t)impact << 8);
 	}
 
 	/* Cooldowns and event strength decay. */
@@ -766,16 +1006,17 @@ static inline void music_features_update(struct music_features_state *state,
 			? (uint8_t)(state->beat_strength - MF_ONSET_DECAY) : 0;
 
 	if (state->confidence >= MF_BEAT_CONFIDENCE_LEVEL &&
-	    state->period_frames >= MUSIC_FEATURES_MIN_LAG &&
-	    state->period_frames <= MUSIC_FEATURES_MAX_LAG)
-		beat_bpm = mf_lag_to_bpm_x100(fps_q8, state->period_frames);
+	    state->period_q8 >= MUSIC_FEATURES_MIN_LAG * 256U - 128U &&
+	    state->period_q8 <= MUSIC_FEATURES_MAX_LAG * 256U + 128U)
+		beat_bpm = mf_lag_q8_to_bpm_x100(fps_q8, state->period_q8);
 
 	++state->period_index;
 
 	/*
 	 * Latch event flags for a short hold.  The engine emits a frame every
-	 * second period, so a one-period kick/build/drop must survive until
-	 * the next frame instead of being silently lost.
+	 * period, but the send is best-effort, so a one-period kick/build/drop
+	 * stays set for MF_EVENT_HOLD periods instead of being lost with a
+	 * dropped frame.
 	 */
 	if (events != 0) {
 		state->event_latch |= events;

@@ -118,8 +118,33 @@ struct biscuit_band {
 	struct biscuit_limiter lim;
 };
 
+/* Owner equaliser bands: bass shelf, low-mid peak, high-mid peak, treble
+ * shelf.  A live change crossfades over one engine period (2048 frames). */
+#define BISCUIT_OWNER_BANDS 4
+#define BISCUIT_OWNER_FADE_FRAMES 2048
+
+/* Only bands with a non-zero gain run (bit i of on); all flat is no code.  A
+ * live change runs the old and new band sets side by side for one fade and
+ * crossfades their outputs; a change during a fade waits for it to end. */
+struct biscuit_owner_eq {
+	struct biscuit_biquad band[BISCUIT_OWNER_BANDS];
+	struct biscuit_biquad next[BISCUIT_OWNER_BANDS];
+	float db[BISCUIT_OWNER_BANDS];
+	float pending_db[BISCUIT_OWNER_BANDS];
+	unsigned int on, next_on;
+	int fade, pending;
+};
+
 struct biscuit_dsp {
 	struct biscuit_biquad eq[BISCUIT_EQ_SECTIONS];
+	/* Owner equaliser, after the loudness EQ and before the compressors
+	 * and limiters; flat (no band on) is the stock chain. */
+	struct biscuit_owner_eq owner;
+	/* Owner makeup (linear) before the compressors and limiters; 1.0 is
+	 * stock.  The limiters still bound the output after the boost.  A live
+	 * change ramps boost to boost_target over boost_ramp frames. */
+	double boost, boost_target;
+	int boost_ramp;
 	double eq_gain, next_eq_gain;
 	/* Post-compressor makeup on the bass bands (<115 Hz, 115-500 Hz), set
 	 * from the per-target audio profile; 0 dB (the zero state) is stock. */
@@ -278,6 +303,7 @@ static inline void biscuit_dsp_init_params(struct biscuit_dsp *d, int volume,
 {
 	int i;
 	memset(d, 0, sizeof(*d));
+	d->boost = d->boost_target = 1.0;
 	for (i = 0; i < BISCUIT_EQ_SECTIONS; ++i)
 		biscuit_design(&d->eq[i], biscuit_eq[i].shape, biscuit_eq[i].fc,
 			       biscuit_eq[i].q, biscuit_eq[i].gain_db);
@@ -324,6 +350,158 @@ static inline void biscuit_dsp_configure(struct biscuit_dsp *d, float bass_makeu
 	d->makeup[0] = d->makeup[1] = powf(10.0f, bass_makeup_db / 20.0f);
 }
 
+/* Owner equaliser bands (dB, within +/-6), same frequencies as Radar. */
+#define BISCUIT_BASS_FC_HZ 120.0
+#define BISCUIT_LOW_MID_FC_HZ 400.0
+#define BISCUIT_HIGH_MID_FC_HZ 2500.0
+#define BISCUIT_TREBLE_FC_HZ 6000.0
+#define BISCUIT_MID_Q 0.9
+#define BISCUIT_SHELF_Q 0.707
+static const struct biscuit_section biscuit_owner_bands[BISCUIT_OWNER_BANDS] = {
+	{ BISCUIT_LOWSHELF,  BISCUIT_BASS_FC_HZ,     BISCUIT_SHELF_Q, 0 },
+	{ BISCUIT_PEAK,      BISCUIT_LOW_MID_FC_HZ,  BISCUIT_MID_Q,   0 },
+	{ BISCUIT_PEAK,      BISCUIT_HIGH_MID_FC_HZ, BISCUIT_MID_Q,   0 },
+	{ BISCUIT_HIGHSHELF, BISCUIT_TREBLE_FC_HZ,   BISCUIT_SHELF_Q, 0 }
+};
+
+static inline unsigned int biscuit_owner_design(struct biscuit_biquad *out, const float *db)
+{
+	unsigned int on = 0;
+	int i;
+
+	for (i = 0; i < BISCUIT_OWNER_BANDS; ++i) {
+		const struct biscuit_section *s = &biscuit_owner_bands[i];
+
+		biscuit_design(&out[i], s->shape, s->fc, s->q, (double)db[i]);
+		if (db[i] != 0.0f)
+			on |= 1u << i;
+	}
+	return on;
+}
+
+/* Apply the owner equaliser at once, for playback start.  Coefficients only:
+ * the filter history carries over. */
+static inline void biscuit_dsp_set_tone(struct biscuit_dsp *d, float bass_db, float low_mid_db,
+					float high_mid_db, float treble_db)
+{
+	struct biscuit_owner_eq *eq = &d->owner;
+	struct biscuit_biquad band[BISCUIT_OWNER_BANDS];
+	int i;
+
+	eq->db[0] = bass_db;
+	eq->db[1] = low_mid_db;
+	eq->db[2] = high_mid_db;
+	eq->db[3] = treble_db;
+	eq->on = biscuit_owner_design(band, eq->db);
+	for (i = 0; i < BISCUIT_OWNER_BANDS; ++i) {
+		band[i].z1 = eq->band[i].z1;
+		band[i].z2 = eq->band[i].z2;
+		eq->band[i] = band[i];
+	}
+	eq->fade = 0;
+	eq->pending = 0;
+}
+
+static inline void biscuit_owner_start_fade(struct biscuit_owner_eq *eq, const float *db)
+{
+	int i, same = 1;
+
+	for (i = 0; i < BISCUIT_OWNER_BANDS; ++i)
+		if (db[i] != eq->db[i])
+			same = 0;
+	if (same)
+		return;
+	memcpy(eq->db, db, sizeof(eq->db));
+	eq->next_on = biscuit_owner_design(eq->next, db);
+	/* A band running before and after continues from its history; a band
+	 * switching on starts from rest.  Both enter at zero weight. */
+	for (i = 0; i < BISCUIT_OWNER_BANDS; ++i)
+		if (eq->on & eq->next_on & (1u << i)) {
+			eq->next[i].z1 = eq->band[i].z1;
+			eq->next[i].z2 = eq->band[i].z2;
+		}
+	eq->fade = BISCUIT_OWNER_FADE_FRAMES;
+}
+
+/* Change the owner equaliser during playback: old and new settings are
+ * crossfaded over one engine period, so the change does not click. */
+static inline void biscuit_dsp_fade_tone(struct biscuit_dsp *d, float bass_db, float low_mid_db,
+					 float high_mid_db, float treble_db)
+{
+	struct biscuit_owner_eq *eq = &d->owner;
+	float db[BISCUIT_OWNER_BANDS];
+
+	db[0] = bass_db;
+	db[1] = low_mid_db;
+	db[2] = high_mid_db;
+	db[3] = treble_db;
+	if (eq->fade > 0) {
+		memcpy(eq->pending_db, db, sizeof(db));
+		eq->pending = 1;
+		return;
+	}
+	biscuit_owner_start_fade(eq, db);
+}
+
+static inline double biscuit_owner_run(struct biscuit_biquad *band, unsigned int on, double x)
+{
+	int i;
+
+	for (i = 0; i < BISCUIT_OWNER_BANDS; ++i)
+		if (on & (1u << i))
+			x = biscuit_step(&band[i], x);
+	return x;
+}
+
+static inline double biscuit_owner_process(struct biscuit_owner_eq *eq, double x)
+{
+	double y;
+
+	if (!eq->on && !eq->fade)
+		return x; /* flat: the stock chain */
+	y = biscuit_owner_run(eq->band, eq->on, x);
+	if (eq->fade > 0) {
+		double next = biscuit_owner_run(eq->next, eq->next_on, x);
+
+		y += (next - y) * (double)(BISCUIT_OWNER_FADE_FRAMES - eq->fade + 1) /
+			(double)BISCUIT_OWNER_FADE_FRAMES;
+		if (--eq->fade == 0) {
+			memcpy(eq->band, eq->next, sizeof(eq->band));
+			eq->on = eq->next_on;
+			if (eq->pending) {
+				eq->pending = 0;
+				biscuit_owner_start_fade(eq, eq->pending_db);
+			}
+		}
+	}
+	return y;
+}
+
+static inline double biscuit_boost_gain(float boost_db)
+{
+	return boost_db == 0.0f ? 1.0 : pow(10.0, (double)boost_db / 20.0);
+}
+
+/* Owner makeup (dB, 0, +3 or +6; see speaker_boost.h).  A plain gain ahead of
+ * the Dot's compressors and limiters: protection is not bypassed. */
+static inline void biscuit_dsp_set_boost(struct biscuit_dsp *d, float boost_db)
+{
+	d->boost = d->boost_target = biscuit_boost_gain(boost_db);
+	d->boost_ramp = 0;
+}
+
+/* Change the boost during playback: a linear ramp over one engine period
+ * that ends on exactly the new step (1.0 for 0 dB). */
+static inline void biscuit_dsp_fade_boost(struct biscuit_dsp *d, float boost_db)
+{
+	double target = biscuit_boost_gain(boost_db);
+
+	if (target == d->boost_target)
+		return;
+	d->boost_target = target;
+	d->boost_ramp = BISCUIT_OWNER_FADE_FRAMES;
+}
+
 /* Volume changes only move a broadband gain; ramp it to avoid zipper noise. */
 static inline void biscuit_dsp_set_volume(struct biscuit_dsp *d, int volume)
 {
@@ -333,9 +511,16 @@ static inline void biscuit_dsp_set_volume(struct biscuit_dsp *d, int volume)
 	 * whether it runs, and that is rare enough to switch directly. */
 	if ((volume >= 0) != d->eq_active) {
 		float bass_makeup_db = d->bass_makeup_db;
+		struct biscuit_owner_eq owner = d->owner;
+		double boost = d->boost, boost_target = d->boost_target;
+		int boost_ramp = d->boost_ramp;
 
 		biscuit_dsp_init(d, volume);
 		biscuit_dsp_configure(d, bass_makeup_db);
+		d->owner = owner;
+		d->boost = boost;
+		d->boost_target = boost_target;
+		d->boost_ramp = boost_ramp;
 		return;
 	}
 	d->volume = volume;
@@ -346,22 +531,40 @@ static inline void biscuit_dsp_set_volume(struct biscuit_dsp *d, int volume)
 /* Input and output are PCM-scaled floats on the mono programme bus.  The
  * output is held at the full-band limiter ceiling (-0.1 dBFS) and is
  * delayed by 2 * BISCUIT_LA samples of limiter look-ahead. */
-static inline float biscuit_dsp_process(struct biscuit_dsp *d, float sample)
+/* The bus the compressors see: loudness EQ, owner equaliser, volume gain,
+ * then the owner boost. */
+static inline double biscuit_dsp_bus(struct biscuit_dsp *d, double x)
 {
-	double x = sample, lo0, hi0, lo1, hi1, lo2, hi2, bands[BISCUIT_BANDS];
-	float sum = 0.0f;
-	int i, group_end;
+	int i;
 
-	if (!isfinite(sample))
-		return 0.0f;
 	if (d->eq_active)
 		for (i = 0; i < BISCUIT_EQ_SECTIONS; ++i)
 			x = biscuit_step(&d->eq[i], x);
+	x = biscuit_owner_process(&d->owner, x);
 	if (d->ramp > 0) {
 		d->eq_gain += (d->next_eq_gain - d->eq_gain) / d->ramp;
 		--d->ramp;
 	}
 	x *= d->eq_gain;
+	if (d->boost_ramp > 0) {
+		d->boost += (d->boost_target - d->boost) / d->boost_ramp;
+		if (--d->boost_ramp == 0)
+			d->boost = d->boost_target;
+	}
+	if (d->boost != 1.0)
+		x *= d->boost;
+	return x;
+}
+
+static inline float biscuit_dsp_process(struct biscuit_dsp *d, float sample)
+{
+	double x, lo0, hi0, lo1, hi1, lo2, hi2, bands[BISCUIT_BANDS];
+	float sum = 0.0f;
+	int i, group_end;
+
+	if (!isfinite(sample))
+		return 0.0f;
+	x = biscuit_dsp_bus(d, (double)sample);
 
 	biscuit_lr4_step(&d->split[0], x, &lo0, &hi0);
 	biscuit_lr4_step(&d->split[1], hi0, &lo1, &hi1);

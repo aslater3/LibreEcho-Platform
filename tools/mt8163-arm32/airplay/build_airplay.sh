@@ -17,18 +17,28 @@ KERNEL_HEADERS=${LIBREECHO_AIRPLAY_KERNEL_HEADERS:-}
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd -P)
 AIRPLAY_AUDIO_SOURCE=${LIBREECHO_AIRPLAY_AUDIO_SOURCE:-$SCRIPT_DIR/airplay_audio.c}
 AUDIO_ENGINE_SOURCE=${LIBREECHO_AUDIO_ENGINE_SOURCE:-$SCRIPT_DIR/audio_engine.c}
+AUDIO_SINK_SOURCE=${LIBREECHO_AUDIO_SINK_SOURCE:-$SCRIPT_DIR/audio_sink.c}
+AUDIO_TIMING_SOURCE=${LIBREECHO_AUDIO_TIMING_SOURCE:-$SCRIPT_DIR/audio_timing.c}
 AUDIO_VISUALIZER_SOURCE=${LIBREECHO_AUDIO_VISUALIZER_SOURCE:-$SCRIPT_DIR/audio_visualizer.c}
 PLAYBACK_STATUS_SOURCE=${LIBREECHO_PLAYBACK_STATUS_SOURCE:-$SCRIPT_DIR/playback_status.c}
 AEC_REFERENCE_SOURCE=${LIBREECHO_AEC_REFERENCE_SOURCE:-$SCRIPT_DIR/aec_reference.c}
 RELINK_OUTPUT=${LIBREECHO_AIRPLAY_RELINK_OUTPUT:-}
 python3 "$SCRIPT_DIR/test_audio_engine_contract.py"
 python3 "$SCRIPT_DIR/test_audio_period_buffer.py"
+python3 "$SCRIPT_DIR/test_audio_sink.py"
+python3 "$SCRIPT_DIR/test_audio_timing.py"
+python3 "$SCRIPT_DIR/test_airplay_engine_build_contract_sendspin.py"
+python3 "$SCRIPT_DIR/test_audio_engine_sendspin.py"
 python3 "$SCRIPT_DIR/test_airplay_volume_contract.py"
 python3 "$SCRIPT_DIR/test_airplay_session_dsp.py"
 python3 "$SCRIPT_DIR/test_airplay_generation_fence.py"
 python3 "$SCRIPT_DIR/test_airplay_hook_identity.py"
 python3 "$SCRIPT_DIR/test_airplay_hook_lock_priority.py"
 python3 "$SCRIPT_DIR/test_shairport_hook_patch.py"
+python3 "$SCRIPT_DIR/test_shairport_pipe_delay_patch.py"
+python3 "$SCRIPT_DIR/test_airplay_bridge_no_drop.py"
+python3 "$SCRIPT_DIR/test_airplay_delay_channel.py"
+python3 "$SCRIPT_DIR/test_airplay_session_end_drop.py"
 "$SCRIPT_DIR/test_speaker_dsp.sh"
 "$SCRIPT_DIR/test_speaker_mbcl.sh"
 "$SCRIPT_DIR/test_biscuit_speaker_dsp.sh"
@@ -36,6 +46,9 @@ python3 "$SCRIPT_DIR/test_radar_speaker_equivalence.py"
 python3 "$SCRIPT_DIR/test_wide_output.py"
 "$SCRIPT_DIR/test_music_avl.sh"
 python3 "$SCRIPT_DIR/test_music_avl_engine.py"
+python3 "$SCRIPT_DIR/test_reply_volume_engine.py"
+python3 "$SCRIPT_DIR/test_owner_settings_engine.py"
+python3 "$SCRIPT_DIR/test_owner_eq_flat_equivalence.py"
 
 for archive in "$NQPTP_ARCHIVE" "$SHAIRPORT_ARCHIVE" "$FFMPEG_ARCHIVE" "$TINYALSA_ARCHIVE"; do
     [[ -f "$archive" ]] || { echo "ERROR: AirPlay source archive is missing: $archive" >&2; exit 1; }
@@ -71,6 +84,14 @@ command -v readelf >/dev/null 2>&1 || { echo "ERROR: readelf is required" >&2; e
 }
 [[ -f "$AUDIO_ENGINE_SOURCE" ]] || {
     echo "ERROR: shared audio engine source is missing: $AUDIO_ENGINE_SOURCE" >&2
+    exit 1
+}
+[[ -f "$AUDIO_SINK_SOURCE" ]] || {
+    echo "ERROR: Sendspin audio sink source is missing: $AUDIO_SINK_SOURCE" >&2
+    exit 1
+}
+[[ -f "$AUDIO_TIMING_SOURCE" ]] || {
+    echo "ERROR: audio timing source is missing: $AUDIO_TIMING_SOURCE" >&2
     exit 1
 }
 [[ -f "$AUDIO_VISUALIZER_SOURCE" ]] || {
@@ -120,16 +141,22 @@ tinyalsa_source=$(find "$work" -mindepth 1 -maxdepth 1 -type d -name 'tinyalsa-*
     echo "ERROR: source archive layout is not recognised" >&2
     exit 1
 }
-# Refuse an upstream drift before applying the exact Shairport 5.1 hook patch.
+# Refuse an upstream drift before applying the exact Shairport 5.6.2 hook patch.
 (
     cd "$shairport_source"
     printf '%s\n' \
-        '4561e4b6d7a5c4c24c22f246651bf36626eaeca2ed4b10afcbb090edd171b22a  common.c' \
-        'bb18c3c7c1a6e88569a54a685ddaf3a2c502e2deb864cc1f4f6c8164368f1eb3  common.h' \
-        'ecc08bf0d38554addf882af95e25e4f2f4dd862017487dcc05150efea62151e2  player.c' \
-        '51242bda9351bacfd2dcead44dbb5c1137b678c89d2fe969852b9a9235b6fd5b  player.h' |
+        '7011bff6f49ddada8ce9b34ea36216611c3bfe1847222ca5b72e7798c922667f  common.c' \
+        '66ef34c7bc1a5c4612786b4c8860da6769ae5e1d146800ccb3a5f5537b1eaa3e  common.h' \
+        '18b5ee672237592d80d8b62e5a5d9236ae0d5537a6ecf47097dd6c586c360c33  player.c' \
+        'df449b1074ec67da077631a26cb9d8ca5433474a60efe47d1b47bd4bb8a165a9  player.h' \
+        '27d5ce1a40923c559b2dcc058b5fc74c24b56d25c1babb0b2644c9c461ad4fa1  audio_pipe.c' |
         sha256sum -c -
-    patch --batch --fuzz=0 -p1 -i "$SCRIPT_DIR/shairport-5.1-session-hooks.patch"
+    patch --batch --fuzz=0 -p1 -i "$SCRIPT_DIR/shairport-5.6.2-session-hooks.patch"
+    # Real delay() for the pipe backend (issue #356). The patched audio_pipe.c
+    # includes airplay_delay.h, the one definition shared with the bridge and
+    # the engine, so it is installed beside it rather than duplicated.
+    patch --batch --fuzz=0 -p1 -i "$SCRIPT_DIR/shairport-5.6.2-pipe-delay.patch"
+    install -m 0644 "$SCRIPT_DIR/airplay_delay.h" airplay_delay.h
 )
 reproducible_path_flags="-ffile-prefix-map=$work=/usr/src/libreecho-airplay -fdebug-prefix-map=$work=/usr/src/libreecho-airplay"
 
@@ -250,7 +277,7 @@ build_tinyalsa() {
 build_audio_components() {
     local bridge_cflags="--sysroot=$SYSROOT -O2 -std=c99 -Wall -Wextra -Wpedantic $reproducible_path_flags"
     local objects="$work/libreecho-objects"
-    bridge_cflags+=" -I$tinyalsa_source/include"
+    bridge_cflags+=" -I$SCRIPT_DIR -I$tinyalsa_source/include"
     if [[ -n "$KERNEL_HEADERS" ]]; then
         bridge_cflags+=" -I$KERNEL_HEADERS/include/uapi -I$KERNEL_HEADERS/include"
     fi
@@ -262,6 +289,10 @@ build_audio_components() {
         -o "$OUTPUT/libreecho-airplay-audio"
     "$CC" $bridge_cflags -c "$AUDIO_ENGINE_SOURCE" \
         -o "$objects/audio_engine.o"
+    "$CC" $bridge_cflags -c "$AUDIO_SINK_SOURCE" \
+        -o "$objects/audio_sink.o"
+    "$CC" $bridge_cflags -c "$AUDIO_TIMING_SOURCE" \
+        -o "$objects/audio_timing.o"
     "$CC" $bridge_cflags -c "$AUDIO_VISUALIZER_SOURCE" \
         -o "$objects/audio_visualizer.o"
     "$CC" $bridge_cflags -c "$PLAYBACK_STATUS_SOURCE" \
@@ -269,6 +300,7 @@ build_audio_components() {
     "$CC" $bridge_cflags -c "$AEC_REFERENCE_SOURCE" \
         -o "$objects/aec_reference.o"
     "$CC" $bridge_cflags "$objects/audio_engine.o" \
+        "$objects/audio_sink.o" "$objects/audio_timing.o" \
         "$objects/audio_visualizer.o" "$objects/playback_status.o" \
         "$objects/aec_reference.o" "$tinyalsa_source/src/libtinyalsa.a" \
         -ldl -lm -o "$OUTPUT/libreecho-audio-engine"

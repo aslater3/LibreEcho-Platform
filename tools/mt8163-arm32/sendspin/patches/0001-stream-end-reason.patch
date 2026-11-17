@@ -1,0 +1,563 @@
+diff -ruN a/include/sendspin/client.h b/include/sendspin/client.h
+--- a/include/sendspin/client.h
++++ b/include/sendspin/client.h
+@@ -378,7 +378,8 @@
+     ///
+     /// Sends a client/goodbye (reason shutdown) to every peer, waits a short bound for those
+     /// sends to complete, then closes the server and every connection regardless, joins the role
+-    /// threads, resets every role, and delivers the roles' clear callbacks (on_stream_end(),
++    /// threads, resets every role, and delivers the roles' clear callbacks
++    /// (on_stream_end(SendspinStreamEndReason::DISCONNECTED),
+     /// on_image_clear(), on_metadata_clear(), ...) before returning. A pairing prompt still
+     /// showing is dismissed the same way (on_clear_pairing_code() / on_close_pairing_window()),
+     /// and a pairing record staged by a pair-finalize is persisted first. No-op when stopped.
+diff -ruN a/include/sendspin/player_role.h b/include/sendspin/player_role.h
+--- a/include/sendspin/player_role.h
++++ b/include/sendspin/player_role.h
+@@ -42,6 +42,25 @@
+     SET_OUTPUT_DELAY,  // Set the output delay
+ };
+ 
++/// @brief Why a player stream ended, delivered to PlayerRoleListener::on_stream_end().
++///
++/// The three reasons are indistinguishable from the listener's public surface otherwise: the
++/// public client API carries no active-role signal (client.h exposes no on_activate and no role
++/// add/remove callback), and the natural-end and teardown producers enqueue the same event type.
++/// A consumer that must finish the buffered tail on a natural end but fence and discard it on a
++/// removal or a lost connection relies on this typed reason.
++enum class SendspinStreamEndReason : uint8_t {
++    /// The server sent stream/end while the player role stays in the session's active roles: the
++    /// buffered tail should be allowed to finish (drain / FINISH).
++    NATURAL = 0,
++    /// A server/activate took player@v1 out of active_roles: the stream must be fenced and the
++    /// buffered audio discarded, not finished. The connection itself survives.
++    ROLE_REMOVED = 1,
++    /// The connection was lost (drop_connection()/cleanup_connection_state()) or the client was
++    /// stopped: fence and discard.
++    DISCONNECTED = 2,
++};
++
+ /// @brief Stream parameters sent by the server in stream/start messages
+ struct ServerPlayerStreamObject {
+     std::optional<SendspinCodecFormat> codec{};
+@@ -94,12 +113,35 @@
+     /// @brief Called when a new audio stream starts
+     virtual void on_stream_start() {}
+ 
+-    /// @brief Called when the audio stream ends
++    /// @brief Called when the audio stream ends, with the reason it ended
++    ///
++    /// The default forwards to the legacy reason-less on_stream_end() below, so an implementer
++    /// that overrides only that form keeps receiving every stream end unchanged. New
++    /// implementations should override this overload and branch on @p reason: finish the buffered
++    /// tail only for NATURAL, and fence/discard for ROLE_REMOVED or DISCONNECTED.
++    /// @param reason Why the stream ended (see SendspinStreamEndReason).
++    virtual void on_stream_end(SendspinStreamEndReason reason) {
++        (void)reason;
++        this->on_stream_end();
++    }
++
++    /// @brief Called when the audio stream ends (legacy, reason-less form)
+     ///
+-    /// Also fires when a server/activate takes the player role out of the session's active roles,
+-    /// which stops the decode and discards the buffered audio rather than letting it finish.
++    /// Kept for source compatibility: the reason-carrying overload above calls this by default.
++    /// Prefer overriding on_stream_end(SendspinStreamEndReason) so a removal or a disconnect is
++    /// not silently treated as a natural end.
+     virtual void on_stream_end() {}
+ 
++    /// @brief Called when the server seeks within the active stream (server stream/clear)
++    ///
++    /// stream/clear is not a stream lifecycle event: the stream stays open, no stream/start
++    /// follows, and the role's internal ring buffer is flushed while decoding resumes for the same
++    /// stream. It fires on the main loop, in arrival order relative to on_stream_start() and
++    /// on_stream_end(). The SDK flushes only its own encoded ring; a consumer that has already
++    /// accepted (written and had acknowledged) audio into a downstream sink must discard its
++    /// not-yet-played accepted bytes here, or pre-seek audio replays after the seek.
++    virtual void on_stream_clear() {}
++
+     /// @brief Called when the volume is changed by the server
+     virtual void on_volume_changed(uint8_t /*volume*/) {}
+ 
+diff -ruN a/src/client.cpp b/src/client.cpp
+--- a/src/client.cpp
++++ b/src/client.cpp
+@@ -1077,7 +1077,7 @@
+ 
+ #ifdef SENDSPIN_ENABLE_PLAYER
+     if (this->player_) {
+-        this->player_->impl_->cleanup();
++        this->player_->impl_->cleanup(SendspinStreamEndReason::DISCONNECTED);
+     }
+ #endif
+ #ifdef SENDSPIN_ENABLE_CONTROLLER
+@@ -2043,7 +2043,7 @@
+     // publishes, and a stream role re-arms on the next stream/start.
+ #ifdef SENDSPIN_ENABLE_PLAYER
+     if (this->player_ && role_removed(roles_before, roles_after, SendspinRole::PLAYER)) {
+-        this->player_->impl_->cleanup();
++        this->player_->impl_->cleanup(SendspinStreamEndReason::ROLE_REMOVED);
+     }
+ #endif
+ #ifdef SENDSPIN_ENABLE_CONTROLLER
+diff -ruN a/src/player_role.cpp b/src/player_role.cpp
+--- a/src/player_role.cpp
++++ b/src/player_role.cpp
+@@ -403,8 +403,11 @@
+     }
+ 
+     if (!header_sent) {
++        // A start that could not open a stream is not a natural end of one; it carries the
++        // natural code so any consumer that nevertheless observes it (the stream_active gate in
++        // drain_events() normally suppresses it) treats it as "no tail to finish".
+         this->sync_task->signal_stream_end();
+-        this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation);
++        this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END_NATURAL, generation);
+         return;
+     }
+ 
+@@ -431,8 +434,10 @@
+ }
+ 
+ void PlayerRole::Impl::handle_stream_end(uint32_t generation) const {
++    // The server ended the stream while the player role stays active: the consumer is told
++    // NATURAL so it can let the buffered tail finish.
+     this->sync_task->signal_stream_end();
+-    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation);
++    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END_NATURAL, generation);
+ }
+ 
+ void PlayerRole::Impl::handle_stream_clear(uint32_t generation) const {
+@@ -453,6 +458,11 @@
+         // may be discarded along with the old.
+         SS_LOGW(TAG, "Failed to enqueue stream/clear marker; seek boundary may be imprecise");
+     }
++    // Notify the consumer so it can discard audio it already accepted into its own sink: the
++    // marker above bounds the *SDK's* ring, not a consumer buffer that already holds
++    // acknowledged pre-seek frames. Queued through the inbox (not fired here) like every other
++    // stream event, so the callback runs on the main loop in arrival order.
++    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_CLEAR, generation);
+ }
+ 
+ void PlayerRole::Impl::handle_server_command(const ServerCommandMessage& cmd,
+@@ -534,7 +544,7 @@
+     }
+ 
+     // --- Process awaiting sync idle events ---
+-    // Stream lifecycle arrivals (STREAM_START/STREAM_END) are appended directly to
++    // Stream lifecycle arrivals (STREAM_START / STREAM_END_* / STREAM_CLEAR) are appended directly to
+     // awaiting_sync_idle_events by on_stream_ring_event(), called from the ring drain in
+     // SendspinClient::loop() before role drain_events() runs each tick, so every event pushed
+     // this tick is already in the vector below in FIFO arrival order.
+@@ -550,18 +560,22 @@
+         // NOLINTNEXTLINE(modernize-loop-convert): body mutates the vector, see above
+         for (size_t idx = 0; idx < this->awaiting_sync_idle_events.size(); ++idx) {
+             const PlayerStreamCallbackType event = this->awaiting_sync_idle_events[idx];
+-            if (event == PlayerStreamCallbackType::STREAM_END && !sync_idle) {
++            const std::optional<SendspinStreamEndReason> end_reason = stream_end_reason_of(event);
++            if (end_reason.has_value() && !sync_idle) {
+                 break;  // Wait for sync task to go idle before firing this and anything after it
+             }
+ 
+             switch (event) {
+-                case PlayerStreamCallbackType::STREAM_END:
++                case PlayerStreamCallbackType::STREAM_END_NATURAL:
++                case PlayerStreamCallbackType::STREAM_END_ROLE_REMOVED:
++                case PlayerStreamCallbackType::STREAM_END_DISCONNECTED: {
+                     // Only fire the callback when a stream is actually open: cleanup() enqueues
+-                    // an unconditional STREAM_END (and a failed stream start enqueues one with no
++                    // an unconditional end event (and a failed stream start enqueues one with no
+                     // preceding START), so gating here keeps on_stream_end() paired 1:1 with
+-                    // on_stream_start()
++                    // on_stream_start(). The typed reason tells the consumer whether to finish
++                    // the buffered tail (NATURAL) or fence and discard it (removal/disconnect).
+                     if (this->listener && this->stream_active) {
+-                        this->listener->on_stream_end();
++                        this->listener->on_stream_end(end_reason.value());
+                     }
+                     this->stream_active = false;
+                     if (this->high_performance_requested_for_playback) {
+@@ -569,6 +583,16 @@
+                         this->high_performance_requested_for_playback = false;
+                     }
+                     break;
++                }
++                case PlayerStreamCallbackType::STREAM_CLEAR:
++                    // A seek is not a stream lifecycle event: it neither opens nor closes the
++                    // stream, so it is delivered regardless of stream_active, leaves the
++                    // start/end pairing and the high-performance hold untouched, and keeps its
++                    // arrival position (a clear queued before a pending end is seen first).
++                    if (this->listener) {
++                        this->listener->on_stream_clear();
++                    }
++                    break;
+                 case PlayerStreamCallbackType::STREAM_START: {
+                     // Request high-performance networking for playback (deferred from the
+                     // network thread's handle_stream_start so the listener callback and the
+@@ -629,7 +653,7 @@
+     }
+ }
+ 
+-void PlayerRole::Impl::cleanup() {
++void PlayerRole::Impl::cleanup(SendspinStreamEndReason reason) {
+     // Flag the teardown before anything else: it tells a drain_events() frame that may be on the
+     // call stack right now (a listener callback re-entering teardown) that the stream is gone,
+     // and it stamps every event queued from here on, so the STREAM_END below is delivered while
+@@ -650,9 +674,9 @@
+     this->event_state->stream_params_slot.reset();
+     this->event_state->command_slot.reset();
+ 
+-    // Enqueue a clean STREAM_END - drain_events() will fire the callback (enqueue_stream_event()
+-    // logs if the ring is too full to take it)
+-    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation);
++    // Enqueue a clean STREAM_END carrying `reason` - drain_events() will fire the callback
++    // (enqueue_stream_event() logs if the ring is too full to take it)
++    this->enqueue_stream_event(stream_end_code_of(reason), generation);
+ 
+     // Clear awaiting events too (main-thread only, no mutex needed)
+     this->awaiting_sync_idle_events.clear();
+@@ -682,13 +706,12 @@
+ void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event,
+                                             uint32_t generation) const {
+     // A dropped STREAM_START would leave the sync task waiting for its start signal forever;
+-    // a dropped STREAM_END would leave the consumer believing the stream is still active. Both
++    // a dropped STREAM_END_* would leave the consumer believing the stream is still active. Both
+     // wedge the stream, so log the drop at ERROR (the helper defaults to WARN, which suits the
+     // idempotent CLEARED events but understates a wedged player stream).
+-    push_event_or_log(
+-        this->inbox, InboxEventType::PLAYER_STREAM, static_cast<uint8_t>(event), TAG,
+-        event == PlayerStreamCallbackType::STREAM_START ? "STREAM_START" : "STREAM_END", generation,
+-        /*error_level=*/true);
++    push_event_or_log(this->inbox, InboxEventType::PLAYER_STREAM, static_cast<uint8_t>(event), TAG,
++                      stream_event_name(event), generation,
++                      /*error_level=*/true);
+ }
+ 
+ void PlayerRole::Impl::load_output_delay() {
+diff -ruN a/src/player_role_impl.h b/src/player_role_impl.h
+--- a/src/player_role_impl.h
++++ b/src/player_role_impl.h
+@@ -35,11 +35,65 @@
+ struct ClientStateMessage;
+ 
+ /// @brief Deferred stream lifecycle callback types queued from the network thread
++///
++/// The value rides InboxEvent::code (uint8_t) into the shared ring; the client's PLAYER_STREAM
++/// dispatch casts it back and hands it to on_stream_ring_event(). The STREAM_END_* variants carry
++/// the SendspinStreamEndReason that drain_events() delivers to on_stream_end(reason), and
++/// STREAM_CLEAR marks a seek (server stream/clear) that drain_events() delivers to
++/// on_stream_clear(). STREAM_START keeps the value 0 it has always had, so the ring's
++/// "code == 0 when unused" contract is unchanged.
+ enum class PlayerStreamCallbackType : uint8_t {
+-    STREAM_START,  // New stream is starting
+-    STREAM_END,    // Stream ended normally
++    STREAM_START = 0,             // New stream is starting
++    STREAM_END_NATURAL = 1,       // Stream ended normally; the role stays active
++    STREAM_END_ROLE_REMOVED = 2,  // server/activate removed the player role
++    STREAM_END_DISCONNECTED = 3,  // connection lost / client stopped
++    STREAM_CLEAR = 4,             // server stream/clear (seek) within the active stream
+ };
+ 
++/// @brief Maps a stream-end event to the public reason it carries, or nullopt for a non-end event.
++inline std::optional<SendspinStreamEndReason> stream_end_reason_of(PlayerStreamCallbackType event) {
++    switch (event) {
++        case PlayerStreamCallbackType::STREAM_END_NATURAL:
++            return SendspinStreamEndReason::NATURAL;
++        case PlayerStreamCallbackType::STREAM_END_ROLE_REMOVED:
++            return SendspinStreamEndReason::ROLE_REMOVED;
++        case PlayerStreamCallbackType::STREAM_END_DISCONNECTED:
++            return SendspinStreamEndReason::DISCONNECTED;
++        default:
++            return std::nullopt;
++    }
++}
++
++/// @brief Maps a public stream-end reason to the ring event code that carries it.
++inline PlayerStreamCallbackType stream_end_code_of(SendspinStreamEndReason reason) {
++    switch (reason) {
++        case SendspinStreamEndReason::ROLE_REMOVED:
++            return PlayerStreamCallbackType::STREAM_END_ROLE_REMOVED;
++        case SendspinStreamEndReason::DISCONNECTED:
++            return PlayerStreamCallbackType::STREAM_END_DISCONNECTED;
++        case SendspinStreamEndReason::NATURAL:
++        default:
++            return PlayerStreamCallbackType::STREAM_END_NATURAL;
++    }
++}
++
++/// @brief Human-readable name of a player stream event for the drop log.
++inline const char* stream_event_name(PlayerStreamCallbackType event) {
++    switch (event) {
++        case PlayerStreamCallbackType::STREAM_START:
++            return "STREAM_START";
++        case PlayerStreamCallbackType::STREAM_END_NATURAL:
++            return "STREAM_END_NATURAL";
++        case PlayerStreamCallbackType::STREAM_END_ROLE_REMOVED:
++            return "STREAM_END_ROLE_REMOVED";
++        case PlayerStreamCallbackType::STREAM_END_DISCONNECTED:
++            return "STREAM_END_DISCONNECTED";
++        case PlayerStreamCallbackType::STREAM_CLEAR:
++            return "STREAM_CLEAR";
++    }
++    return "PLAYER_STREAM_EVENT";
++}
++
+ /// @brief One binary audio chunk, split into the parts roles/player/v1.md "Audio Chunks
+ /// (Binary)" defines after the message type byte.
+ struct AudioChunk {
+@@ -117,14 +171,16 @@
+         return generation == this->cleanup_generation.load(std::memory_order_acquire);
+     }
+ 
+-    /// @brief Stops the role and discards its state. Main loop only.
++    /// @brief Stops the role and discards its state, reporting why. Main loop only.
+     ///
+     /// Shared by the two paths that take the role out of service: a connection being torn down
+-    /// (SendspinClient::cleanup_connection_state()) and a server/activate that removes the role
+-    /// from active_roles (SendspinClient::apply_role_removals()). Listener callbacks are queued on
+-    /// the inbox rather than fired here, because both callers run under the connection manager's
+-    /// conn_ptr_mutex_.
+-    void cleanup();
++    /// (SendspinClient::cleanup_connection_state(), reason DISCONNECTED) and a server/activate that
++    /// removes the role from active_roles (SendspinClient::apply_role_removals(), reason
++    /// ROLE_REMOVED). The reason is carried on the queued STREAM_END event and delivered to
++    /// on_stream_end(reason). Listener callbacks are queued on the inbox rather than fired here,
++    /// because both callers run under the connection manager's conn_ptr_mutex_.
++    /// @param reason Why the role is being taken out of service.
++    void cleanup(SendspinStreamEndReason reason);
+     /// @brief Joins the sync task thread and discards its buffered audio; no-op if not started.
+     void stop() const;
+ 
+diff -ruN a/tests/lifecycle_test_fixtures.h b/tests/lifecycle_test_fixtures.h
+--- a/tests/lifecycle_test_fixtures.h
++++ b/tests/lifecycle_test_fixtures.h
+@@ -1146,13 +1146,16 @@
+     void on_stream_start() override {
+         ++this->stream_starts;
+     }
+-    void on_stream_end() override {
++    void on_stream_end(SendspinStreamEndReason reason) override {
+         ++this->stream_ends;
++        this->last_stream_end_reason = reason;
+     }
+ 
+     std::atomic<size_t> audio_writes{0};
+     int stream_starts{0};
+     int stream_ends{0};
++    /// Why the most recent end fired; main-loop thread only, like the counters above.
++    SendspinStreamEndReason last_stream_end_reason{SendspinStreamEndReason::NATURAL};
+ };
+ 
+ /// Records what each metadata update carried, and counts the clears behind a teardown.
+diff -ruN a/tests/test_player_role.cpp b/tests/test_player_role.cpp
+--- a/tests/test_player_role.cpp
++++ b/tests/test_player_role.cpp
+@@ -337,10 +337,12 @@
+         if (events[i].type != InboxEventType::PLAYER_STREAM) {
+             continue;
+         }
+-        if (static_cast<PlayerStreamCallbackType>(events[i].code) ==
+-            PlayerStreamCallbackType::STREAM_START) {
++        const PlayerStreamCallbackType event =
++            static_cast<PlayerStreamCallbackType>(events[i].code);
++        if (event == PlayerStreamCallbackType::STREAM_START) {
+             ++counts.starts;
+-        } else {
++        } else if (stream_end_reason_of(event).has_value()) {
++            // STREAM_CLEAR is a seek marker, not a stream end; only the STREAM_END_* codes count.
+             ++counts.ends;
+         }
+     }
+@@ -412,7 +414,7 @@
+         auto impl = make_impl();
+         const uint32_t captured = live_generation(*impl);
+ 
+-        impl->cleanup();
++        impl->cleanup(SendspinStreamEndReason::DISCONNECTED);
+         ASSERT_EQ(drain_stream_events(*impl).ends, 1) << "cleanup() queued no STREAM_END";
+         ASSERT_TRUE(impl->sync_task->encoded_ring_buffer_->is_empty());
+ 
+@@ -605,3 +607,171 @@
+         EXPECT_EQ(fixture.player->get_output_delay_ms(), row.expected_delay_ms);
+     }
+ }
++
++
++// ============================================================================
++// Stream-end reason + seek-clear notification
++// ============================================================================
++//
++// The three reasons were previously indistinguishable at the public boundary: natural end, role
++// removal and connection shutdown all delivered the same reason-less on_stream_end(). These
++// tests pin the typed contract and the seek/clear notification, and prove the legacy reason-less
++// override still fires (source compatibility). They drain the role's ring through the same
++// generation gate SendspinClient::loop() applies to a PLAYER_STREAM event before calling
++// on_stream_ring_event(), then run the tick's drain_events(), so the ordering/fencing they assert
++// is the ordering/fencing a real client produces.
++
++namespace {
++
++// A listener that records callback order and the stream-end reason of every end.
++class ReasonRecordingListener : public PlayerRoleListener {
++public:
++    size_t on_audio_write(uint8_t*, size_t length, uint32_t) override { return length; }
++    void on_stream_start() override { this->events.emplace_back("start"); }
++    void on_stream_end(SendspinStreamEndReason reason) override {
++        this->events.emplace_back("end");
++        this->end_reasons.push_back(reason);
++    }
++    void on_stream_clear() override { this->events.emplace_back("clear"); }
++
++    std::vector<std::string> events;
++    std::vector<SendspinStreamEndReason> end_reasons;
++};
++
++// A listener that overrides ONLY the legacy reason-less form: the new reason overload must still
++// reach it unchanged (source compatibility for existing implementers).
++class LegacyNoArgListener : public PlayerRoleListener {
++public:
++    size_t on_audio_write(uint8_t*, size_t length, uint32_t) override { return length; }
++    void on_stream_end() override { ++this->ends; }
++    int ends{0};
++};
++
++// Drains the role's own ring exactly as SendspinClient::loop() dispatches a PLAYER_STREAM batch:
++// each event is admitted only if its epoch still matches the role's teardown generation, then
++// handed to on_stream_ring_event(); the tick's drain_events() runs once afterwards.
++void pump_role_tick(PlayerRole::Impl& impl) {
++    InboxEvent events[Inbox::EVENT_CAPACITY];
++    const size_t n = impl.inbox->take_events(events, Inbox::EVENT_CAPACITY);
++    for (size_t i = 0; i < n; ++i) {
++        if (events[i].type != InboxEventType::PLAYER_STREAM) {
++            continue;
++        }
++        if (event_is_current(events[i].epoch,
++                             impl.cleanup_generation.load(std::memory_order_acquire),
++                             "test", "a player stream event")) {
++            impl.on_stream_ring_event(static_cast<PlayerStreamCallbackType>(events[i].code));
++        }
++    }
++    impl.drain_events();
++}
++
++// Starts a stream and drains the start tick, so the role is an active stream before the case runs.
++void start_active_stream(PlayerRole::Impl& impl, uint32_t generation) {
++    impl.handle_stream_start(pcm_stream_params(), generation);
++    pump_role_tick(impl);
++}
++
++}  // namespace
++
++TEST(PlayerStreamEndReason, NaturalEndIsReportedAsNatural) {
++    auto impl = make_impl();
++    ReasonRecordingListener listener;
++    impl->listener = &listener;
++    const uint32_t gen = live_generation(*impl);
++    start_active_stream(*impl, gen);
++    impl->handle_stream_end(gen);
++    pump_role_tick(*impl);
++
++    ASSERT_EQ(listener.end_reasons.size(), 1u);
++    EXPECT_EQ(listener.end_reasons.back(), SendspinStreamEndReason::NATURAL);
++}
++
++TEST(PlayerStreamEndReason, RoleRemovalIsReportedAsRoleRemoved) {
++    auto impl = make_impl();
++    ReasonRecordingListener listener;
++    impl->listener = &listener;
++    const uint32_t gen = live_generation(*impl);
++    start_active_stream(*impl, gen);
++    impl->cleanup(SendspinStreamEndReason::ROLE_REMOVED);  // == apply_role_removals()
++    pump_role_tick(*impl);
++
++    ASSERT_EQ(listener.end_reasons.size(), 1u);
++    EXPECT_EQ(listener.end_reasons.back(), SendspinStreamEndReason::ROLE_REMOVED);
++}
++
++TEST(PlayerStreamEndReason, ConnectionShutdownIsReportedAsDisconnected) {
++    auto impl = make_impl();
++    ReasonRecordingListener listener;
++    impl->listener = &listener;
++    const uint32_t gen = live_generation(*impl);
++    start_active_stream(*impl, gen);
++    impl->cleanup(SendspinStreamEndReason::DISCONNECTED);  // == cleanup_connection_state()
++    pump_role_tick(*impl);
++
++    ASSERT_EQ(listener.end_reasons.size(), 1u);
++    EXPECT_EQ(listener.end_reasons.back(), SendspinStreamEndReason::DISCONNECTED);
++}
++
++TEST(PlayerStreamEndReason, LegacyNoArgOverrideStillReceivesEveryEnd) {
++    auto impl = make_impl();
++    LegacyNoArgListener listener;
++    impl->listener = &listener;
++    const uint32_t gen = live_generation(*impl);
++    start_active_stream(*impl, gen);
++    impl->cleanup(SendspinStreamEndReason::ROLE_REMOVED);
++    pump_role_tick(*impl);
++
++    EXPECT_EQ(listener.ends, 1);
++}
++
++// A seek (server stream/clear) on an active stream notifies the consumer exactly once, in order,
++// and is NOT reported as a stream end: the stream stays open.
++TEST(PlayerStreamEndReason, SeekClearNotifiesAndIsNotAStreamEnd) {
++    auto impl = make_impl();
++    ReasonRecordingListener listener;
++    impl->listener = &listener;
++    const uint32_t gen = live_generation(*impl);
++    start_active_stream(*impl, gen);
++    impl->handle_stream_clear(gen);
++    pump_role_tick(*impl);
++
++    EXPECT_EQ(listener.events, (std::vector<std::string>{"start", "clear"}));
++    EXPECT_TRUE(listener.end_reasons.empty());
++}
++
++// Ordering probe: a clear and an end queued in the same tick are delivered in FIFO arrival order
++// and neither is lost or duplicated.
++TEST(PlayerStreamEndReason, ClearThenEndIsDeliveredInArrivalOrder) {
++    auto impl = make_impl();
++    ReasonRecordingListener listener;
++    impl->listener = &listener;
++    const uint32_t gen = live_generation(*impl);
++    start_active_stream(*impl, gen);
++    impl->handle_stream_clear(gen);
++    impl->handle_stream_end(gen);
++    pump_role_tick(*impl);
++
++    EXPECT_EQ(listener.events, (std::vector<std::string>{"start", "clear", "end"}));
++    ASSERT_EQ(listener.end_reasons.size(), 1u);
++    EXPECT_EQ(listener.end_reasons.back(), SendspinStreamEndReason::NATURAL);
++}
++
++// Same-tick fencing: a natural end is queued and then the player role is removed before any tick
++// drains. The removal's generation bump discards the queued natural end through the same epoch
++// gate the client applies, so the consumer sees exactly ONE end and it is ROLE_REMOVED, never a
++// natural end it might have finished.
++TEST(PlayerStreamEndReason, SameTickNaturalThenRemovalYieldsOneRemovalEnd) {
++    auto impl = make_impl();
++    ReasonRecordingListener listener;
++    impl->listener = &listener;
++    const uint32_t gen = live_generation(*impl);
++    start_active_stream(*impl, gen);
++    impl->handle_stream_end(gen);                          // natural end queued first
++    impl->cleanup(SendspinStreamEndReason::ROLE_REMOVED);  // removal before the tick drains
++    pump_role_tick(*impl);
++
++    ASSERT_EQ(listener.end_reasons.size(), 1u) << "the fenced natural end was still delivered";
++    EXPECT_EQ(listener.end_reasons.back(), SendspinStreamEndReason::ROLE_REMOVED);
++    EXPECT_EQ(listener.events, (std::vector<std::string>{"start", "end"}));
++}
+diff -ruN a/tests/test_role_deactivation.cpp b/tests/test_role_deactivation.cpp
+--- a/tests/test_role_deactivation.cpp
++++ b/tests/test_role_deactivation.cpp
+@@ -221,6 +221,8 @@
+ 
+     ASSERT_TRUE(server->send_app_json(activate_json(R"(["visualizer@v1","metadata@v1"])")));
+     pump_until(client, [&] { return player_listener.stream_ends == 1; });
++    EXPECT_EQ(player_listener.last_stream_end_reason, SendspinStreamEndReason::ROLE_REMOVED)
++        << "a removed role was reported as a natural end";
+     EXPECT_FALSE(client.player()->impl_->sync_task->is_running())
+         << "the sync task kept decoding a stream the activation removed";
+ 

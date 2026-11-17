@@ -132,12 +132,12 @@ class OtaFailureEvidenceContracts(unittest.TestCase):
         worker = shell_function(self.init, "ota_health_confirm_worker")
         start = worker.index(
             '    if [ "$passed" -eq 3 ] &&\n'
-            '       /usr/local/sbin/libreecho-update confirm'
+            '       ota_confirm_with_lock_wait'
         )
         end = worker.index("    # Issue #41", start)
         self.assertLess(worker.index('persist_failure_log ota-health-confirm-failed', start),
                         worker.index('$BB reboot -f', end))
-        functions = ["sanitize_failure_text", "persist_failure_log"]
+        functions = ["sanitize_failure_text", "persist_failure_log", "ota_confirm_with_lock_wait"]
         if "\nota_confirm_error_token()\n" in self.init:
             functions.append("ota_confirm_error_token")
         for lines, expected in (
@@ -176,16 +176,18 @@ class OtaFailureEvidenceContracts(unittest.TestCase):
                     f'printf "%s\\n" {shlex.quote(line)} >&2\n' for line in lines
                 ) + "exit 1\n")
                 updater.chmod(0o755)
-                branch = worker[start:end].replace(
+                branch = worker[start:end]
+                fn_text = lambda name: shell_function(self.init, name).replace(
                     "/usr/local/sbin/libreecho-update", shlex.quote(str(updater))
                 ).replace("/tmp/ota-confirm.log", shlex.quote(str(root / "confirm.log")))
+                branch = branch.replace("/tmp/ota-confirm.log", shlex.quote(str(root / "confirm.log")))
                 script = (
                     f"BB={shlex.quote(busybox)}\n"
                     f"FAILURE_LOG_DIR={shlex.quote(str(out))}\n"
                     f"INIT_LOG={shlex.quote(str(init_log))}\n"
                     f"LIBREECHO_CMDLINE_FILE={shlex.quote(str(cmdline))}\n"
                     "log() { :; }\npmsg_marker() { :; }\n"
-                    + "".join(shell_function(self.init, name) + "\n" for name in functions)
+                    + "".join(fn_text(name) + "\n" for name in functions)
                     + "passed=3\nattempt=3\nlast_check=none\npending_slot=a\nselected_slot=a\n"
                     + branch
                     + 'printf "record=%s\\n" "$failure_log"\n'
