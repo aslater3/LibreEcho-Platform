@@ -20,7 +20,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y device-tree-compiler
-          python3 -m pip install --disable-pip-version-check PyNaCl==1.5.0
+          python3 -m pip install --disable-pip-version-check PyNaCl==1.6.2
       - name: Check bundle shell syntax
         run: bash -n tools/mt8163-arm32/ui/build_ui_bundle.sh
       - name: Check Python syntax
